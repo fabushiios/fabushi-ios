@@ -2239,7 +2239,7 @@ fn self_validate_loopback_blocking2_alipay_ws_revocation_and_chat_idempotency() 
 
 #[test]
 fn self_validate_loopback_hardening_non_ascii_utf8_prefix_safety() {
-    let server = LoopbackServer::start();
+    let server = LoopbackServer::start().expect("start loopback server");
     let addr = server.addr();
 
     // Multi-byte UTF-8 straddling byte 7 (`全` at 5..8) and byte 8 (`球` at 7..10)
@@ -2300,7 +2300,7 @@ fn self_validate_loopback_hardening_non_ascii_utf8_prefix_safety() {
 
 #[test]
 fn self_validate_loopback_hardening_percent_decoded_query_params() {
-    let server = LoopbackServer::start();
+    let server = LoopbackServer::start().expect("start loopback server");
     let addr = server.addr();
 
     let unique_salt = B64.encode([0x9Au8; 16]);
@@ -2413,7 +2413,7 @@ fn self_validate_loopback_hardening_percent_decoded_query_params() {
 
 #[test]
 fn self_validate_loopback_hardening_reject_empty_whitespace_unseeded_auth() {
-    let server = LoopbackServer::start();
+    let server = LoopbackServer::start().expect("start loopback server");
     let addr = server.addr();
 
     // Unseeded POST /api/v1/auth/login with empty or whitespace-only credentials MUST fail closed with 401
@@ -2481,7 +2481,7 @@ fn self_validate_loopback_hardening_reject_empty_whitespace_unseeded_auth() {
 
 #[test]
 fn self_validate_loopback_hardening_media_routes_enforce_token_revocation() {
-    let server = LoopbackServer::start();
+    let server = LoopbackServer::start().expect("start loopback server");
     let addr = server.addr();
 
     let verifier = B64.encode([0x77u8; 32]);
