@@ -748,6 +748,21 @@ fn tc_t3_pair_31_f24_x_f17_hermes_agent_invokes_webmcp_during_floating_pip_resto
 #[test]
 fn tc_t3_pair_32_f24_x_f29_global_dharma_offline_free_vs_paid_storekit_entitlement() {
     let h = FabushiE2EHarness::connect_production();
+    let pkg = b"GLOBAL_DHARMA_OFFLINE_P32_V167";
+    let pkg_sha = sha256_hex(pkg);
+    let verified = h.expect_ok(
+        "miniapp.verify_offline_package",
+        json!({
+            "package_id": "global-dharma",
+            "version": "1.6.7",
+            "sha256_digest": pkg_sha,
+            "ed25519_sig_b64": B64.encode([0x55u8; 64]),
+            "bytes_b64": B64.encode(pkg)
+        }),
+    );
+    assert_eq!(verified["verified"], true);
+    assert_eq!(verified["offline_ready"], true);
+
     h.server().set_offline(true);
     let free = h.expect_ok(
         "webmcp.invoke",
@@ -755,7 +770,7 @@ fn tc_t3_pair_32_f24_x_f29_global_dharma_offline_free_vs_paid_storekit_entitleme
             "account_id": "acc_1",
             "app_id": "global-dharma",
             "version": "1.6.7",
-            "digest": "sha256:offline",
+            "digest": pkg_sha,
             "instance_id": "p32_inst",
             "nonce": "p32_nonce",
             "generation": h.current_generation(),
@@ -772,7 +787,7 @@ fn tc_t3_pair_32_f24_x_f29_global_dharma_offline_free_vs_paid_storekit_entitleme
             "account_id": "acc_1",
             "app_id": "global-dharma",
             "version": "1.6.7",
-            "digest": "sha256:offline",
+            "digest": pkg_sha,
             "instance_id": "p32_inst",
             "nonce": "p32_nonce",
             "generation": h.current_generation(),

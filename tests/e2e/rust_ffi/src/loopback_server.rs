@@ -16,11 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const WS_MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
+const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(100);
+const MAX_HTTP_TRAILER_LINES: usize = 64;
 const WS_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const WS_FRAME_BODY_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_WS_FRAME_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
@@ -50,7 +53,9 @@ struct InjectedFault {
 struct UserRecord {
     user_id: u64,
     username: String,
+    first_name: String,
     auth_version: i64,
+    key_version: u64,
     password: Option<String>,
     auth_salt_b64: String,
     auth_verifier_b64: Option<String>,
@@ -88,6 +93,45 @@ struct QrPairRecord {
     requires_2fa: bool,
     issued_session: Option<Value>,
     expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct AlipayAttemptRecord {
+    attempt_id: String,
+    state: String,
+    status: String, // "pending" | "confirmed" | "consumed" | "cancelled" | "expired"
+    issued_session: Option<Value>,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PasskeyRecord {
+    credential_id: String,
+    user_id: u64,
+    public_key: String,
+    device_name: String,
+    sign_count: u64,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PasskeyChallengeRecord {
+    user_id: Option<u64>,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PhoneOtpRecord {
+    expected_code: String,
+    attempts: u32,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ComputerLeaseRecord {
+    lease_id: String,
+    generation: u64,
+    override_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +177,7 @@ struct DeviceSyncRecord {
 #[derive(Debug, Clone)]
 struct UploadSession {
     upload_id: String,
+    filename: Value,
     total_size: u64,
     part_size: u64,
     expected_sha256: Option<String>,
@@ -150,7 +195,13 @@ struct ServerState {
     ws_received_frames: Vec<String>,
     media_blobs: HashMap<String, Vec<u8>>,
     journal_floors: HashMap<i64, u64>,
-    oauth_confirmed: HashMap<String, Value>,
+    alipay_attempts: HashMap<String, AlipayAttemptRecord>,
+    alipay_state_to_attempt: HashMap<String, String>,
+    consumed_alipay_codes: HashSet<String>,
+    passkeys: HashMap<String, PasskeyRecord>,
+    passkey_challenges: HashMap<String, PasskeyChallengeRecord>,
+    phone_challenges: HashMap<String, PhoneOtpRecord>,
+    computer_leases: HashMap<String, ComputerLeaseRecord>,
     users_by_id: HashMap<u64, UserRecord>,
     username_to_id: HashMap<String, u64>,
     sessions_by_token: HashMap<String, SessionRecord>,
@@ -159,6 +210,7 @@ struct ServerState {
     two_factor_challenges: HashMap<String, TwoFactorChallenge>,
     qr_pairs: HashMap<String, QrPairRecord>,
     chats: HashMap<i64, ChatRecord>,
+    chats_by_nonce: HashMap<String, i64>,
     chat_invites: HashMap<String, ChatInviteRecord>,
     chat_messages: HashMap<i64, Vec<StoredMessage>>,
     chat_pts: HashMap<i64, u64>,
@@ -207,6 +259,13 @@ impl ServerState {
         rec
     }
 
+    fn is_token_rejected(&self, tok: &str) -> bool {
+        self.revoked_tokens.contains(tok)
+            || self.sessions_by_token.get(tok).is_some_and(|s| s.revoked)
+            || (tok.starts_with("tok_") && !self.sessions_by_token.contains_key(tok))
+            || (!self.revoked_tokens.is_empty() && !self.sessions_by_token.contains_key(tok))
+    }
+
     fn default_user_id(&self) -> u64 {
         self.users_by_id
             .keys()
@@ -219,7 +278,9 @@ impl ServerState {
         self.users_by_id.entry(user_id).or_insert_with(|| UserRecord {
             user_id,
             username: format!("user_{user_id}"),
+            first_name: format!("User {user_id}"),
             auth_version: 2,
+            key_version: 1,
             password: None,
             auth_salt_b64: B64.encode([0x42u8; 16]),
             auth_verifier_b64: None,
@@ -381,9 +442,112 @@ impl LoopbackServer {
         }
     }
 
-    pub fn confirm_alipay_attempt(&self, attempt_id: &str, session: Value) {
+    pub fn confirm_alipay_attempt(&self, attempt_id: &str, mut session: Value) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.oauth_confirmed.insert(attempt_id.to_owned(), session);
+            let ts = now_ms();
+            let user_id = session
+                .get("user_id")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    guard.next_user_id += 1;
+                    guard.next_user_id
+                });
+            guard.ensure_user_by_id(user_id);
+
+            let token_opt = session
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+
+            if let Some(tok) = token_opt {
+                let session_id = session
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("sess_alipay_{}", guard.alloc_seq()));
+                let expires_at_ms = session
+                    .get("expires_at")
+                    .or_else(|| session.get("expires_at_ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(ts + 86_400_000);
+                let device_name = session
+                    .get("device_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("iOS Alipay")
+                    .to_owned();
+
+                guard.revoked_tokens.remove(&tok);
+                let rec = SessionRecord {
+                    session_id: session_id.clone(),
+                    user_id,
+                    token: tok.clone(),
+                    device_name,
+                    created_at_ms: ts,
+                    expires_at_ms,
+                    revoked: false,
+                };
+                guard
+                    .session_id_to_token
+                    .insert(session_id.clone(), tok.clone());
+                guard.sessions_by_token.insert(tok, rec);
+
+                if let Some(obj) = session.as_object_mut() {
+                    obj.entry("user_id".to_owned())
+                        .or_insert_with(|| json!(user_id));
+                    obj.entry("session_id".to_owned())
+                        .or_insert_with(|| json!(session_id));
+                    obj.entry("expires_at".to_owned())
+                        .or_insert_with(|| json!(expires_at_ms));
+                }
+            } else {
+                let sess = guard.mint_session(user_id, "iOS Alipay", ts);
+                if let Some(obj) = session.as_object_mut() {
+                    obj.insert("user_id".to_owned(), json!(user_id));
+                    obj.insert("session_id".to_owned(), json!(sess.session_id));
+                    obj.insert("token".to_owned(), json!(sess.token));
+                    obj.insert("expires_at".to_owned(), json!(sess.expires_at_ms));
+                } else {
+                    session = json!({
+                        "user_id": user_id,
+                        "session_id": sess.session_id,
+                        "token": sess.token,
+                        "expires_at": sess.expires_at_ms
+                    });
+                }
+            }
+
+            if let Some(attempt) = guard.alipay_attempts.get_mut(attempt_id) {
+                attempt.status = "confirmed".to_owned();
+                attempt.issued_session = Some(session);
+            } else {
+                let fallback_state = format!("fbs_{}", Uuid::new_v4().simple());
+                guard
+                    .alipay_state_to_attempt
+                    .insert(fallback_state.clone(), attempt_id.to_owned());
+                guard.alipay_attempts.insert(
+                    attempt_id.to_owned(),
+                    AlipayAttemptRecord {
+                        attempt_id: attempt_id.to_owned(),
+                        state: fallback_state,
+                        status: "confirmed".to_owned(),
+                        issued_session: Some(session),
+                        expires_at_ms: ts + 600_000,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn expire_alipay_attempt(&self, attempt_id: &str) {
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(attempt) = guard.alipay_attempts.get_mut(attempt_id) {
+                attempt.expires_at_ms = now_ms() - 1;
+                attempt.status = "expired".to_owned();
+            }
         }
     }
 
@@ -439,6 +603,88 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn ms_to_rfc3339(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+
+    // Howard Hinnant's civil-from-days algorithm (UTC Gregorian calendar).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn matches_segment_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn normalize_request_target(raw_target: &str) -> (String, String) {
+    // Normalize RFC 9112 §3.2.2 absolute-form HTTP proxy targets (http://host[:port]/path?q).
+    let normalized = if raw_target.len() > 7
+        && (raw_target[..7].eq_ignore_ascii_case("http://")
+            || (raw_target.len() > 8 && raw_target[..8].eq_ignore_ascii_case("https://")))
+    {
+        let scheme_end = raw_target.find("://").unwrap_or(0);
+        let after_scheme = &raw_target[scheme_end + 3..];
+        let slash_pos = after_scheme.find('/');
+        let query_pos = after_scheme.find('?');
+        match (slash_pos, query_pos) {
+            (Some(s), Some(q)) if s < q => after_scheme[s..].to_owned(),
+            (Some(s), None) => after_scheme[s..].to_owned(),
+            (_, Some(q)) => format!("/{}", &after_scheme[q..]),
+            (None, None) => "/".to_owned(),
+        }
+    } else {
+        raw_target.to_owned()
+    };
+
+    match normalized.split_once('?') {
+        Some((p, q)) => (p.to_owned(), q.to_owned()),
+        None => (normalized, String::new()),
+    }
+}
+
 fn status_reason(code: u16) -> &'static str {
     match code {
         101 => "Switching Protocols",
@@ -460,12 +706,13 @@ fn status_reason(code: u16) -> &'static str {
     }
 }
 
-fn write_http_response(
+fn write_http_response_mode(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
     extra_headers: &[(&str, String)],
     body: &[u8],
+    head_only: bool,
 ) {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -479,8 +726,20 @@ fn write_http_response(
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
+    if !head_only {
+        let _ = stream.write_all(body);
+    }
     let _ = stream.flush();
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(&str, String)],
+    body: &[u8],
+) {
+    write_http_response_mode(stream, status, content_type, extra_headers, body, false);
 }
 
 enum HttpReadError {
@@ -505,14 +764,18 @@ fn read_more_with_deadline(
     deadline: Instant,
     eof_err: &'static str,
     timeout_err: &'static str,
+    shutdown: &AtomicBool,
 ) -> Result<usize, HttpReadError> {
     let mut tmp = [0u8; 8192];
     let to_read = max_read.clamp(1, tmp.len());
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(HttpReadError::Closed);
+        }
         let Some(rem) = remaining_timeout(deadline) else {
             return Err(HttpReadError::BadRequest(timeout_err));
         };
-        let _ = stream.set_read_timeout(Some(rem));
+        let _ = stream.set_read_timeout(Some(rem.min(SHUTDOWN_POLL_SLICE)));
         match stream.read(&mut tmp[..to_read]) {
             Ok(0) => return Err(HttpReadError::BadRequest(eof_err)),
             Ok(n) => {
@@ -521,6 +784,9 @@ fn read_more_with_deadline(
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Err(HttpReadError::Closed);
+                }
                 if Instant::now() >= deadline {
                     return Err(HttpReadError::BadRequest(timeout_err));
                 }
@@ -535,6 +801,7 @@ fn read_exact_len_with_deadline(
     body: &mut Vec<u8>,
     target_len: usize,
     deadline: Instant,
+    shutdown: &AtomicBool,
 ) -> Result<(), HttpReadError> {
     while body.len() < target_len {
         let want = (target_len - body.len()).min(8192);
@@ -545,6 +812,7 @@ fn read_exact_len_with_deadline(
             deadline,
             "truncated_body_eof",
             "truncated_body_timeout",
+            shutdown,
         )?;
     }
     Ok(())
@@ -556,6 +824,7 @@ fn ensure_raw_bytes_with_deadline(
     cursor: usize,
     needed: usize,
     deadline: Instant,
+    shutdown: &AtomicBool,
 ) -> Result<(), HttpReadError> {
     while raw.len().saturating_sub(cursor) < needed {
         let deficit = needed - raw.len().saturating_sub(cursor);
@@ -566,6 +835,7 @@ fn ensure_raw_bytes_with_deadline(
             deadline,
             "truncated_chunk_payload",
             "truncated_chunk_timeout",
+            shutdown,
         )?;
     }
     Ok(())
@@ -576,6 +846,7 @@ fn read_crlf_line_with_deadline(
     raw: &mut Vec<u8>,
     cursor: &mut usize,
     deadline: Instant,
+    shutdown: &AtomicBool,
 ) -> Result<String, HttpReadError> {
     const MAX_LINE_LEN: usize = 1024;
     loop {
@@ -594,6 +865,7 @@ fn read_crlf_line_with_deadline(
             deadline,
             "truncated_chunk_header",
             "truncated_chunk_header_timeout",
+            shutdown,
         )?;
     }
 }
@@ -602,27 +874,39 @@ fn read_chunked_body_with_deadline(
     stream: &mut TcpStream,
     initial: &[u8],
     deadline: Instant,
+    shutdown: &AtomicBool,
 ) -> Result<Vec<u8>, HttpReadError> {
     let mut raw = initial.to_vec();
     let mut cursor = 0usize;
     let mut decoded = Vec::new();
 
     loop {
-        let size_line = read_crlf_line_with_deadline(stream, &mut raw, &mut cursor, deadline)?;
+        let size_line =
+            read_crlf_line_with_deadline(stream, &mut raw, &mut cursor, deadline, shutdown)?;
         let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        if size_hex.is_empty() {
-            return Err(HttpReadError::BadRequest("empty_chunk_size"));
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(HttpReadError::BadRequest("invalid_chunk_size"));
         }
         let chunk_size = usize::from_str_radix(size_hex, 16)
             .map_err(|_| HttpReadError::BadRequest("invalid_chunk_size"))?;
 
         if chunk_size == 0 {
-            // Consume optional trailers until empty CRLF line.
+            // Consume optional trailers until empty CRLF line (capped to prevent DoS).
+            let mut trailer_count = 0usize;
             loop {
-                let trailer =
-                    read_crlf_line_with_deadline(stream, &mut raw, &mut cursor, deadline)?;
+                let trailer = read_crlf_line_with_deadline(
+                    stream,
+                    &mut raw,
+                    &mut cursor,
+                    deadline,
+                    shutdown,
+                )?;
                 if trailer.is_empty() {
                     return Ok(decoded);
+                }
+                trailer_count += 1;
+                if trailer_count > MAX_HTTP_TRAILER_LINES {
+                    return Err(HttpReadError::BadRequest("too_many_chunk_trailers"));
                 }
             }
         }
@@ -631,7 +915,7 @@ fn read_chunked_body_with_deadline(
             return Err(HttpReadError::PayloadTooLarge);
         }
 
-        ensure_raw_bytes_with_deadline(stream, &mut raw, cursor, chunk_size + 2, deadline)?;
+        ensure_raw_bytes_with_deadline(stream, &mut raw, cursor, chunk_size + 2, deadline, shutdown)?;
         if &raw[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
             return Err(HttpReadError::BadRequest("missing_chunk_crlf"));
         }
@@ -645,17 +929,23 @@ fn read_chunked_body_with_deadline(
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<RecordedRequest, HttpReadError> {
+fn read_http_request(
+    stream: &mut TcpStream,
+    shutdown: &AtomicBool,
+) -> Result<RecordedRequest, HttpReadError> {
     let deadline = Instant::now() + HTTP_READ_DEADLINE;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end;
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(HttpReadError::Closed);
+        }
         let Some(rem) = remaining_timeout(deadline) else {
             return Err(HttpReadError::BadRequest("header_timeout"));
         };
-        let _ = stream.set_read_timeout(Some(rem));
+        let _ = stream.set_read_timeout(Some(rem.min(SHUTDOWN_POLL_SLICE)));
         match stream.read(&mut tmp) {
             Ok(0) => {
                 if buf.is_empty() {
@@ -675,6 +965,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<RecordedRequest, HttpRead
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Err(HttpReadError::Closed);
+                }
                 if Instant::now() >= deadline {
                     return Err(HttpReadError::BadRequest("header_timeout"));
                 }
@@ -701,10 +994,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<RecordedRequest, HttpRead
     let raw_target = parts
         .next()
         .ok_or(HttpReadError::BadRequest("missing_target"))?;
-    let (path, query) = match raw_target.split_once('?') {
-        Some((p, q)) => (p.to_owned(), q.to_owned()),
-        None => (raw_target.to_owned(), String::new()),
-    };
+    let (path, query) = normalize_request_target(raw_target);
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -726,7 +1016,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<RecordedRequest, HttpRead
         .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
 
     let body = if is_chunked {
-        read_chunked_body_with_deadline(stream, &buf[header_end..], deadline)?
+        read_chunked_body_with_deadline(stream, &buf[header_end..], deadline, shutdown)?
     } else if let Some(cl_raw) = headers.get("content-length") {
         let content_length: usize = cl_raw
             .trim()
@@ -737,7 +1027,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<RecordedRequest, HttpRead
         }
         let mut body = buf[header_end..].to_vec();
         if body.len() < content_length {
-            read_exact_len_with_deadline(stream, &mut body, content_length, deadline)?;
+            read_exact_len_with_deadline(stream, &mut body, content_length, deadline, shutdown)?;
         }
         if body.len() > content_length {
             body.truncate(content_length);
@@ -810,14 +1100,22 @@ struct WsConnReader {
 }
 
 impl WsConnReader {
-    fn ensure_bytes(&mut self, stream: &mut TcpStream, needed: usize) -> Result<(), WsReadError> {
+    fn ensure_bytes(
+        &mut self,
+        stream: &mut TcpStream,
+        needed: usize,
+        shutdown: &AtomicBool,
+    ) -> Result<(), WsReadError> {
         let deadline = Instant::now() + WS_FRAME_BODY_DEADLINE;
         let mut tmp = [0u8; 4096];
         while self.buf.len() < needed {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(WsReadError::Io);
+            }
             let Some(rem) = remaining_timeout(deadline) else {
                 return Err(WsReadError::Io);
             };
-            let _ = stream.set_read_timeout(Some(rem));
+            let _ = stream.set_read_timeout(Some(rem.min(SHUTDOWN_POLL_SLICE)));
             match stream.read(&mut tmp) {
                 Ok(0) => {
                     return Err(WsReadError::Io);
@@ -825,7 +1123,7 @@ impl WsConnReader {
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    if Instant::now() >= deadline {
+                    if shutdown.load(Ordering::SeqCst) || Instant::now() >= deadline {
                         return Err(WsReadError::Io);
                     }
                 }
@@ -835,8 +1133,15 @@ impl WsConnReader {
         Ok(())
     }
 
-    fn read_frame(&mut self, stream: &mut TcpStream) -> Result<Option<WsFrame>, WsReadError> {
+    fn read_frame(
+        &mut self,
+        stream: &mut TcpStream,
+        shutdown: &AtomicBool,
+    ) -> Result<Option<WsFrame>, WsReadError> {
         if self.buf.is_empty() {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(WsReadError::Io);
+            }
             let _ = stream.set_read_timeout(Some(WS_POLL_TIMEOUT));
             let mut tmp = [0u8; 4096];
             match stream.read(&mut tmp) {
@@ -852,7 +1157,7 @@ impl WsConnReader {
             }
         }
 
-        self.ensure_bytes(stream, 2)?;
+        self.ensure_bytes(stream, 2, shutdown)?;
         let fin = (self.buf[0] & 0x80) != 0;
         if (self.buf[0] & 0x70) != 0 {
             return Err(WsReadError::Protocol(1002, "non_zero_rsv"));
@@ -867,10 +1172,10 @@ impl WsConnReader {
         let (offset, payload_len_u64) = if len7 <= 125 {
             (2usize, u64::from(len7))
         } else if len7 == 126 {
-            self.ensure_bytes(stream, 4)?;
+            self.ensure_bytes(stream, 4, shutdown)?;
             (4usize, u64::from(u16::from_be_bytes([self.buf[2], self.buf[3]])))
         } else {
-            self.ensure_bytes(stream, 10)?;
+            self.ensure_bytes(stream, 10, shutdown)?;
             let v = u64::from_be_bytes([
                 self.buf[2],
                 self.buf[3],
@@ -897,7 +1202,7 @@ impl WsConnReader {
 
         let payload_len = payload_len_u64 as usize;
         let total = offset + 4 + payload_len;
-        self.ensure_bytes(stream, total)?;
+        self.ensure_bytes(stream, total, shutdown)?;
 
         let mask_key = [
             self.buf[offset],
@@ -927,7 +1232,10 @@ fn dispatch_ws_message(
     state: &Arc<Mutex<ServerState>>,
 ) -> bool {
     if op == 0x1 {
-        let text = String::from_utf8_lossy(&payload).into_owned();
+        let Ok(text) = String::from_utf8(payload) else {
+            let _ = write_ws_close(stream, 1007, "invalid_utf8");
+            return false;
+        };
         if let Ok(mut g) = state.lock() {
             g.ws_received_frames.push(text.clone());
         }
@@ -948,6 +1256,7 @@ fn dispatch_ws_message(
 fn handle_websocket(
     mut stream: TcpStream,
     ws_key: &str,
+    ws_token: Option<String>,
     state: Arc<Mutex<ServerState>>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -978,18 +1287,25 @@ fn handle_websocket(
     let mut frag_buf: Vec<u8> = Vec::new();
 
     while !shutdown.load(Ordering::SeqCst) {
-        let queued: Vec<String> = state
+        let (is_offline, is_revoked, queued) = state
             .lock()
             .map(|mut g| {
-                if g.offline {
-                    Vec::new()
+                let rev = ws_token
+                    .as_deref()
+                    .is_some_and(|tok| g.is_token_rejected(tok));
+                if g.offline || rev {
+                    (g.offline, rev, Vec::new())
                 } else {
-                    g.ws_push_queue.drain(..).collect()
+                    (false, false, g.ws_push_queue.drain(..).collect::<Vec<String>>())
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or((false, false, Vec::new()));
 
-        if state.lock().map(|g| g.offline).unwrap_or(false) {
+        if is_revoked {
+            let _ = write_ws_close(&mut stream, 4001, "session_revoked");
+            break;
+        }
+        if is_offline {
             let _ = write_ws_close(&mut stream, 1001, "offline");
             break;
         }
@@ -1000,7 +1316,7 @@ fn handle_websocket(
             }
         }
 
-        match reader.read_frame(&mut stream) {
+        match reader.read_frame(&mut stream, &shutdown) {
             Ok(Some(frame)) => match frame.opcode {
                 0x9 => {
                     if write_ws_frame(&mut stream, 0xA, &frame.payload).is_err() {
@@ -1099,8 +1415,9 @@ fn parse_byte_range(header: &str, total: usize) -> Option<Result<(usize, usize),
 fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            if k == key && !v.is_empty() {
-                return Some(v);
+            let trimmed = v.trim();
+            if k == key && !trimmed.is_empty() {
+                return Some(trimmed);
             }
         }
     }
@@ -1144,8 +1461,17 @@ fn resolve_media_get_id(path: &str) -> Option<&str> {
     if let Some(id) = path.strip_prefix("/api/v1/media/stream/") {
         return (!id.is_empty()).then_some(id);
     }
+    if let Some(id) = path.strip_prefix("/api/v1/media/download/") {
+        return (!id.is_empty()).then_some(id);
+    }
     if let Some(rest) = path.strip_prefix("/api/v1/media/") {
-        if !rest.is_empty() && !rest.contains('/') && !rest.starts_with("upload") {
+        if !rest.is_empty()
+            && !rest.contains('/')
+            && !rest.starts_with("upload")
+            && rest != "edit"
+            && rest != "instant-view"
+            && rest != "instant_view"
+        {
             return Some(rest);
         }
     }
@@ -1155,32 +1481,69 @@ fn resolve_media_get_id(path: &str) -> Option<&str> {
 fn is_protected_route(path: &str) -> bool {
     if matches!(
         path,
-        "/api/v1/auth/2fa/verify"
+        "/health"
+            | "/healthz"
+            | "/api/v1/health"
+            | "/api/v1/status"
+            | "/api/v1/auth/2fa/verify"
             | "/api/v1/auth/two-factor/verify"
             | "/api/v1/auth/pair/init"
             | "/api/v1/auth/pair/verify"
             | "/api/v1/auth/login"
             | "/api/v1/auth/register"
             | "/api/v1/auth/kdf-params"
-    ) || path.starts_with("/api/v1/auth/pair/poll")
+            | "/api/v1/auth/kdf_params"
+            | "/api/v1/auth/passkey/challenge"
+            | "/api/v1/auth/passkeys/challenge"
+            | "/api/v1/auth/passkey/verify"
+            | "/api/v1/auth/passkeys/verify"
+            | "/api/v1/auth/passkey/login"
+            | "/api/v1/auth/passkey/authenticate"
+    ) || matches_segment_prefix(path, "/api/v1/auth/pair/poll")
+        || matches_segment_prefix(path, "/api/v1/auth/email")
+        || matches_segment_prefix(path, "/api/v1/auth/phone")
+        || matches_segment_prefix(path, "/api/v1/auth/alipay")
+        || matches_segment_prefix(path, "/article")
+        || matches_segment_prefix(path, "/iv")
+        || matches_segment_prefix(path, "/.well-known")
     {
         return false;
     }
-    path == "/api/v1/auth/me"
-        || path.starts_with("/api/v1/auth/sessions")
-        || path == "/api/v1/auth/2fa"
-        || path.starts_with("/api/v1/auth/two-factor/")
-        || path == "/api/v1/auth/pair/accept"
-        || path == "/api/v1/auth/upgrade-split-key"
-        || path == "/api/v1/auth/change-password"
-        || path.starts_with("/api/v1/chats")
-        || path.starts_with("/api/v1/messages")
-        || path.starts_with("/api/v1/sync")
-        || path.starts_with("/api/v1/user-vault")
-        || path.starts_with("/api/v1/vault")
-        || path.starts_with("/api/v1/folders")
-        || path.starts_with("/api/v1/contacts")
-        || path.starts_with("/api/v1/settings")
+    matches!(
+        path,
+        "/api/v1/auth/me"
+            | "/api/v1/auth/logout"
+            | "/api/v1/auth/pair/accept"
+            | "/api/v1/auth/upgrade-split-key"
+            | "/api/v1/auth/upgrade_split_key"
+            | "/api/v1/auth/change-password"
+            | "/api/v1/auth/change_password"
+    ) || matches_segment_prefix(path, "/api/v1/auth/sessions")
+        || matches_segment_prefix(path, "/api/v1/auth/2fa")
+        || matches_segment_prefix(path, "/api/v1/auth/two-factor")
+        || matches_segment_prefix(path, "/api/v1/auth/passkey")
+        || matches_segment_prefix(path, "/api/v1/auth/passkeys")
+        || matches_segment_prefix(path, "/api/v1/chats")
+        || matches_segment_prefix(path, "/api/v1/messages")
+        || matches_segment_prefix(path, "/api/v1/sync")
+        || matches_segment_prefix(path, "/api/v1/user-vault")
+        || matches_segment_prefix(path, "/api/v1/vault")
+        || matches_segment_prefix(path, "/api/v1/folders")
+        || matches_segment_prefix(path, "/api/v1/contacts")
+        || matches_segment_prefix(path, "/api/v1/settings")
+        || matches_segment_prefix(path, "/api/v1/agent")
+        || matches_segment_prefix(path, "/api/v1/tasks")
+        || matches_segment_prefix(path, "/api/v1/mcp")
+        || matches_segment_prefix(path, "/api/v1/computer")
+        || matches_segment_prefix(path, "/api/v1/computers")
+        || matches_segment_prefix(path, "/api/v1/talk")
+        || matches_segment_prefix(path, "/api/v1/webrtc")
+        || matches_segment_prefix(path, "/api/v1/search")
+        || matches_segment_prefix(path, "/api/v1/wallet")
+        || matches_segment_prefix(path, "/api/v1/e2ee")
+        || matches_segment_prefix(path, "/api/v1/push")
+        || matches_segment_prefix(path, "/api/v1/stories")
+        || matches_segment_prefix(path, "/api/v1/ws")
 }
 
 fn handle_connection(
@@ -1193,7 +1556,7 @@ fn handle_connection(
         return;
     }
 
-    let req = match read_http_request(&mut stream) {
+    let req = match read_http_request(&mut stream, &shutdown) {
         Ok(r) => r,
         Err(HttpReadError::Closed) => return,
         Err(HttpReadError::BadRequest(msg)) => {
@@ -1247,29 +1610,114 @@ fn handle_connection(
         thread::sleep(Duration::from_millis(delay_ms));
     }
 
-    // RFC 6455 WebSocket upgrade check.
+    // HTTP proxy CONNECT probe (RFC 9110 §9.3.6).
+    if req.method == "CONNECT" {
+        let _ = stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+
+    // RFC 6455 WebSocket upgrade check (with path validation, fault injection, and Bearer revocation gate BEFORE 101).
     if req
         .headers
         .get("upgrade")
         .is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
     {
         if let Some(ws_key) = req.headers.get("sec-websocket-key").cloned() {
-            handle_websocket(stream, &ws_key, state, shutdown);
+            if req.path != "/api/v1/ws" && req.path != "/ws" {
+                let body = json!({
+                    "error": "not_found",
+                    "message": format!("unrecognized websocket path: {}", req.path),
+                    "path": req.path
+                })
+                .to_string();
+                write_http_response(&mut stream, 404, "application/json", &[], body.as_bytes());
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+            if let Some(f) = fault {
+                let mut extras = Vec::new();
+                if let Some(ms) = f.retry_after_ms {
+                    extras.push(("Retry-After", ms.div_ceil(1000).to_string()));
+                }
+                write_http_response(
+                    &mut stream,
+                    f.status,
+                    "application/json",
+                    &extras,
+                    f.body.as_bytes(),
+                );
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+            let ws_token = extract_bearer_token(&req);
+            if let Some(ref tok) = ws_token {
+                let rejected = state
+                    .lock()
+                    .map(|g| g.is_token_rejected(tok))
+                    .unwrap_or(false);
+                if rejected {
+                    let body = json!({
+                        "error": "unauthorized",
+                        "message": "session_revoked"
+                    })
+                    .to_string();
+                    write_http_response(
+                        &mut stream,
+                        401,
+                        "application/json",
+                        &[],
+                        body.as_bytes(),
+                    );
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+            handle_websocket(stream, &ws_key, ws_token, state, shutdown);
             return;
         }
     }
+
+    let is_head = req.method == "HEAD";
 
     if let Some(f) = fault {
         let mut extras = Vec::new();
         if let Some(ms) = f.retry_after_ms {
             extras.push(("Retry-After", ms.div_ceil(1000).to_string()));
         }
-        write_http_response(
+        write_http_response_mode(
             &mut stream,
             f.status,
             "application/json",
             &extras,
             f.body.as_bytes(),
+            is_head,
+        );
+        return;
+    }
+
+    // Instant View HTML article routes MUST execute before JSON dispatch (strictly segment-bounded).
+    if matches!(req.method.as_str(), "GET" | "HEAD")
+        && (matches_segment_prefix(&req.path, "/article")
+            || matches_segment_prefix(&req.path, "/iv"))
+    {
+        let slug = req
+            .path
+            .strip_prefix("/article/")
+            .or_else(|| req.path.strip_prefix("/iv/"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("v167");
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Fabushi v1.6.7 Instant View</title></head><body><article><h1>Fabushi v1.6.7</h1><p>Instant View content for {slug}.</p></article></body></html>"
+        );
+        write_http_response_mode(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            &[],
+            html.as_bytes(),
+            is_head,
         );
         return;
     }
@@ -1304,6 +1752,7 @@ fn handle_connection(
             let (status, resp_json) = match part_s.parse::<usize>() {
                 Ok(part_index) => {
                     let bytes = extract_media_bytes(&req);
+                    let bytes_received = bytes.len();
                     let mut g = state.lock().expect("state lock");
                     if let Some(session) = g.uploads.get_mut(upload_id) {
                         session.parts.insert(part_index, bytes);
@@ -1313,6 +1762,8 @@ fn handle_connection(
                             json!({
                                 "upload_id": session.upload_id,
                                 "part_index": part_index,
+                                "bytes_received": bytes_received,
+                                "status": "accepted",
                                 "received_parts": received
                             }),
                         )
@@ -1328,8 +1779,8 @@ fn handle_connection(
         }
     }
 
-    // Unified GET media retrieval (200 / 206 / 416 / 404).
-    if req.method == "GET" {
+    // Unified GET/HEAD media retrieval (200 / 206 / 416 / 404).
+    if matches!(req.method.as_str(), "GET" | "HEAD") {
         if let Some(file_id) = resolve_media_get_id(&req.path) {
             let maybe_blob = state
                 .lock()
@@ -1337,7 +1788,14 @@ fn handle_connection(
                 .and_then(|g| g.media_blobs.get(file_id).cloned());
             let Some(blob) = maybe_blob else {
                 let body = json!({"error": "media_not_found"}).to_string();
-                write_http_response(&mut stream, 404, "application/json", &[], body.as_bytes());
+                write_http_response_mode(
+                    &mut stream,
+                    404,
+                    "application/json",
+                    &[],
+                    body.as_bytes(),
+                    is_head,
+                );
                 return;
             };
             if let Some(range_hdr) = req.headers.get("range") {
@@ -1345,7 +1803,7 @@ fn handle_connection(
                     Some(Ok((start, end))) => {
                         let slice = &blob[start..=end];
                         let cr = format!("bytes {start}-{end}/{}", blob.len());
-                        write_http_response(
+                        write_http_response_mode(
                             &mut stream,
                             206,
                             "application/octet-stream",
@@ -1354,29 +1812,32 @@ fn handle_connection(
                                 ("Content-Range", cr),
                             ],
                             slice,
+                            is_head,
                         );
                         return;
                     }
                     Some(Err(())) | None => {
                         let cr = format!("bytes */{}", blob.len());
                         let body = json!({"error": "range_not_satisfiable"}).to_string();
-                        write_http_response(
+                        write_http_response_mode(
                             &mut stream,
                             416,
                             "application/json",
                             &[("Content-Range", cr)],
                             body.as_bytes(),
+                            is_head,
                         );
                         return;
                     }
                 }
             }
-            write_http_response(
+            write_http_response_mode(
                 &mut stream,
                 200,
                 "application/octet-stream",
                 &[("Accept-Ranges", "bytes".to_owned())],
                 &blob,
+                is_head,
             );
             return;
         }
@@ -1386,7 +1847,14 @@ fn handle_connection(
     let req_json: Value = serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}));
     let (status, resp_json) = route_api_request(&req, &req_json, &state);
     let bytes = resp_json.to_string().into_bytes();
-    write_http_response(&mut stream, status, "application/json", &[], &bytes);
+    write_http_response_mode(
+        &mut stream,
+        status,
+        "application/json",
+        &[],
+        &bytes,
+        is_head,
+    );
 }
 
 fn compute_device_sync_code(request_id: &str, pub_b64: &str) -> String {
@@ -1408,9 +1876,150 @@ fn stored_message_to_json(m: &StoredMessage) -> Value {
         "content": m.content,
         "client_nonce": m.client_nonce,
         "delivery_status": "sent",
+        "status": "sent",
         "timestamp_ms": m.timestamp_ms
     })
 }
+
+fn extract_client_nonce_key(body: &Value) -> Option<String> {
+    match body.get("client_nonce") {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn poll_alipay_attempt(
+    state: &Arc<Mutex<ServerState>>,
+    attempt_id: &str,
+    ts: i64,
+) -> (u16, Value) {
+    let mut g = state.lock().expect("state lock");
+    let Some(attempt) = g.alipay_attempts.get_mut(attempt_id) else {
+        return (404, json!({"error": "oauth_attempt_not_found"}));
+    };
+    if attempt.status == "cancelled" {
+        return (
+            409,
+            json!({
+                "error": "oauth_cancelled",
+                "attempt_id": attempt.attempt_id,
+                "state": attempt.state,
+                "status": "cancelled"
+            }),
+        );
+    }
+    if attempt.status == "confirmed" || attempt.status == "consumed" {
+        return (
+            200,
+            json!({
+                "attempt_id": attempt.attempt_id,
+                "state": attempt.state,
+                "status": "confirmed",
+                "session": attempt.issued_session,
+                "expires_at_ms": attempt.expires_at_ms
+            }),
+        );
+    }
+    if ts > attempt.expires_at_ms || attempt.status == "expired" {
+        attempt.status = "expired".to_owned();
+        return (
+            400,
+            json!({
+                "error": "oauth_expired",
+                "attempt_id": attempt.attempt_id,
+                "state": attempt.state,
+                "status": "expired"
+            }),
+        );
+    }
+    (
+        200,
+        json!({
+            "attempt_id": attempt.attempt_id,
+            "state": attempt.state,
+            "status": "pending",
+            "poll_after_ms": 1000,
+            "expires_at_ms": attempt.expires_at_ms
+        }),
+    )
+}
+
+fn cancel_alipay_attempt(
+    state: &Arc<Mutex<ServerState>>,
+    attempt_id: Option<&str>,
+    state_tok: Option<&str>,
+) -> (u16, Value) {
+    let mut g = state.lock().expect("state lock");
+    let resolved_id = if let Some(aid) = attempt_id {
+        Some(aid.to_owned())
+    } else if let Some(st) = state_tok {
+        g.alipay_state_to_attempt.get(st).cloned()
+    } else {
+        None
+    };
+    let Some(aid) = resolved_id else {
+        return (404, json!({"error": "oauth_attempt_not_found"}));
+    };
+    let Some(attempt) = g.alipay_attempts.get_mut(&aid) else {
+        return (404, json!({"error": "oauth_attempt_not_found"}));
+    };
+    attempt.status = "cancelled".to_owned();
+    attempt.issued_session = None;
+    (
+        200,
+        json!({
+            "ok": true,
+            "attempt_id": attempt.attempt_id,
+            "state": attempt.state,
+            "status": "cancelled",
+            "cancelled": true
+        }),
+    )
+}
+
+const ALLOWED_FALLBACK_NAMESPACES: &[&str] = &[
+    "/api/v1/chats",
+    "/api/v1/messages",
+    "/api/v1/topics",
+    "/api/v1/folders",
+    "/api/v1/contacts",
+    "/api/v1/peers",
+    "/api/v1/users",
+    "/api/v1/blocked",
+    "/api/v1/settings",
+    "/api/v1/fabushi",
+    "/api/v1/agent",
+    "/api/v1/multi-agent",
+    "/api/v1/multi_agent",
+    "/api/v1/coding",
+    "/api/v1/tasks",
+    "/api/v1/magpie",
+    "/api/v1/mcp",
+    "/api/v1/computer",
+    "/api/v1/computers",
+    "/api/v1/remote",
+    "/api/v1/tailnet",
+    "/api/v1/miniapps",
+    "/api/v1/webmcp",
+    "/api/v1/stickers",
+    "/api/v1/gifs",
+    "/api/v1/stories",
+    "/api/v1/calls",
+    "/api/v1/webrtc",
+    "/api/v1/talk",
+    "/api/v1/search",
+    "/api/v1/e2ee",
+    "/api/v1/wallet",
+    "/api/v1/actions",
+    "/api/v1/devices",
+    "/api/v1/push",
+    "/api/v1/updates",
+    "/api/v1/proxy",
+];
 
 fn route_api_request(
     req: &RecordedRequest,
@@ -1423,20 +2032,15 @@ fn route_api_request(
     let ts = now_ms();
     let bearer_token = extract_bearer_token(req);
 
-    // Enforce Bearer revocation / invalidation on all protected routes.
+    // Enforce Bearer revocation / invalidation on all protected routes via unified ServerState rule.
     let caller_session: Option<SessionRecord> = {
         let g = state.lock().expect("state lock");
         if let Some(ref tok) = bearer_token {
-            if is_protected_route(path) {
-                let is_revoked = g.revoked_tokens.contains(tok)
-                    || g.sessions_by_token.get(tok).is_some_and(|s| s.revoked)
-                    || (tok.starts_with("tok_") && !g.sessions_by_token.contains_key(tok));
-                if is_revoked {
-                    return (
-                        401,
-                        json!({"error": "unauthorized", "message": "session_revoked"}),
-                    );
-                }
+            if is_protected_route(path) && g.is_token_rejected(tok) {
+                return (
+                    401,
+                    json!({"error": "unauthorized", "message": "session_revoked"}),
+                );
             }
             g.sessions_by_token.get(tok).cloned()
         } else {
@@ -1445,18 +2049,58 @@ fn route_api_request(
     };
 
     match (method, path) {
-        // Health & status
-        ("GET", "/health") | ("GET", "/healthz") | ("GET", "/api/v1/health") => {
+        // Health, status & OAuth 2.1 MCP discovery
+        ("GET" | "HEAD", "/health")
+        | ("GET" | "HEAD", "/healthz")
+        | ("GET" | "HEAD", "/api/v1/health") => {
             (200, json!({"ok": true, "version": "1.6.7", "ts_ms": ts}))
         }
-        ("GET", "/api/v1/status") => {
-            (200, json!({"ok": true, "version": "1.6.7", "status": "ready", "ts_ms": ts}))
-        }
+        ("GET" | "HEAD", "/api/v1/status") => (
+            200,
+            json!({
+                "ok": true,
+                "server": "gpui_telegram_server",
+                "status": "healthy",
+                "version": "1.6.7",
+                "ts_ms": ts
+            }),
+        ),
+        ("GET", "/.well-known/oauth-authorization-server")
+        | ("GET", "/.well-known/oauth-protected-resource") => (
+            200,
+            json!({
+                "issuer": "http://127.0.0.1",
+                "authorization_endpoint": "/api/v1/mcp/oauth/authorize",
+                "token_endpoint": "/api/v1/mcp/oauth/token",
+                "registration_endpoint": "/api/v1/mcp/oauth/register",
+                "code_challenge_methods_supported": ["S256"],
+                "supported_mcp_versions": ["2025-11-25"],
+                "scopes_supported": [
+                    "mcp:read",
+                    "mcp:write",
+                    "mcp:tools",
+                    "mcp:resources",
+                    "mcp:prompts",
+                    "mcp:tasks",
+                    "mcp:sampling",
+                    "mcp:roots",
+                    "mcp:notifications",
+                    "mcp:elicitation",
+                    "mcp:computer",
+                    "mcp:agent",
+                    "mcp:vault",
+                    "mcp:audit"
+                ]
+            }),
+        ),
 
         // Auth KDF params
-        ("GET", "/api/v1/auth/kdf-params") => {
+        ("GET" | "POST", "/api/v1/auth/kdf-params")
+        | ("GET" | "POST", "/api/v1/auth/kdf_params") => {
             let ident = extract_query_param(query, "identifier")
-                .or_else(|| extract_query_param(query, "username"));
+                .or_else(|| extract_query_param(query, "username"))
+                .or_else(|| body.get("identifier").and_then(Value::as_str))
+                .or_else(|| body.get("username").and_then(Value::as_str));
             let g = state.lock().expect("state lock");
             if let Some(name) = ident {
                 if let Some(uid) = g.username_to_id.get(name) {
@@ -1465,6 +2109,7 @@ fn route_api_request(
                             200,
                             json!({
                                 "auth_version": user.auth_version,
+                                "key_version": user.key_version,
                                 "kdf_alg": if user.auth_version >= 2 { "split_key_v2" } else { "legacy_v1" },
                                 "auth_salt_b64": user.auth_salt_b64,
                                 "kdf_params": user.kdf_params
@@ -1477,6 +2122,7 @@ fn route_api_request(
                 200,
                 json!({
                     "auth_version": 2,
+                    "key_version": 1,
                     "kdf_alg": "split_key_v2",
                     "auth_salt_b64": B64.encode([0x42u8; 16]),
                     "kdf_params": { "m_cost_kib": 65536, "t_cost": 3, "p_cost": 4 }
@@ -1484,7 +2130,7 @@ fn route_api_request(
             )
         }
 
-        // Auth register
+        // Auth register (Split-Key V2 never persists plaintext password fallback; emits RFC 3339 expires_at + expires_at_ms)
         ("POST", "/api/v1/auth/register") => {
             let mut g = state.lock().expect("state lock");
             let username = body
@@ -1501,6 +2147,13 @@ fn route_api_request(
             g.next_user_id += 1;
             let uid = g.next_user_id;
             let uname = username.unwrap_or_else(|| format!("user_{uid}"));
+            let first_name = body
+                .get("first_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| uname.clone());
             let auth_version = body.get("auth_version").and_then(Value::as_i64).unwrap_or(2);
             let auth_salt_b64 = body
                 .get("auth_salt_b64")
@@ -1512,11 +2165,25 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            let password = body
-                .get("password")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
+            let password = if auth_verifier_b64.is_some() {
+                None
+            } else {
+                body.get("password")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            let vault_envelope = body.get("vault_envelope").cloned();
+            let key_version = body
+                .get("key_version")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    vault_envelope
+                        .as_ref()
+                        .and_then(|e| e.get("key_version"))
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(1);
             let kdf_params = body
                 .get("kdf_params")
                 .cloned()
@@ -1529,12 +2196,14 @@ fn route_api_request(
             let user = UserRecord {
                 user_id: uid,
                 username: uname.clone(),
+                first_name: first_name.clone(),
                 auth_version,
+                key_version,
                 password,
                 auth_salt_b64,
                 auth_verifier_b64,
                 kdf_params,
-                vault_envelope: body.get("vault_envelope").cloned(),
+                vault_envelope,
                 two_factor_password: None,
                 two_factor_hint: None,
                 two_factor_recovery_email: None,
@@ -1547,17 +2216,21 @@ fn route_api_request(
                 json!({
                     "user_id": uid,
                     "username": uname,
+                    "first_name": first_name,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms,
+                    "created_at": ms_to_rfc3339(sess.created_at_ms),
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms,
                     "auth_version": auth_version,
+                    "key_version": key_version,
                     "vault_unlocked": true,
                     "requires_2fa": false
                 }),
             )
         }
 
-        // Auth login
+        // Auth login (strict fail-closed verification for Split-Key V2 users)
         ("POST", "/api/v1/auth/login") => {
             let mut g = state.lock().expect("state lock");
             let username_opt = body
@@ -1576,28 +2249,35 @@ fn route_api_request(
             if let Some(ref uname) = username_opt {
                 if let Some(&uid) = g.username_to_id.get(uname) {
                     let user = g.users_by_id.get(&uid).cloned().expect("user record");
+                    let provided_v = body
+                        .get("auth_verifier_b64")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    let provided_pw = body
+                        .get("password")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty());
+
                     if let Some(ref expected_v) = user.auth_verifier_b64 {
-                        if let Some(provided_v) = body
-                            .get("auth_verifier_b64")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            if provided_v != expected_v {
+                        if let Some(pv) = provided_v {
+                            if pv != expected_v {
                                 return (401, json!({"error": "invalid_credentials"}));
                             }
                         } else if let Some(ref expected_pw) = user.password {
-                            let provided_pw =
-                                body.get("password").and_then(Value::as_str).unwrap_or("");
-                            if provided_pw != expected_pw {
+                            if provided_pw != Some(expected_pw.as_str()) {
                                 return (401, json!({"error": "invalid_credentials"}));
                             }
-                        }
-                    } else if let Some(ref expected_pw) = user.password {
-                        let provided_pw =
-                            body.get("password").and_then(Value::as_str).unwrap_or("");
-                        if provided_pw != expected_pw {
+                        } else {
+                            // Fail closed: Split-Key V2 user MUST supply matching auth_verifier_b64.
                             return (401, json!({"error": "invalid_credentials"}));
                         }
+                    } else if let Some(ref expected_pw) = user.password {
+                        if provided_pw != Some(expected_pw.as_str()) {
+                            return (401, json!({"error": "invalid_credentials"}));
+                        }
+                    } else {
+                        // Fail closed: existing user without password/verifier cannot authenticate with empty credentials.
+                        return (401, json!({"error": "invalid_credentials"}));
                     }
 
                     if user.two_factor_password.is_some() {
@@ -1628,10 +2308,14 @@ fn route_api_request(
                         json!({
                             "user_id": uid,
                             "username": user.username,
+                            "first_name": user.first_name,
                             "session_id": sess.session_id,
                             "token": sess.token,
-                            "expires_at": sess.expires_at_ms,
+                            "created_at": ms_to_rfc3339(sess.created_at_ms),
+                            "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                            "expires_at_ms": sess.expires_at_ms,
                             "auth_version": user.auth_version,
+                            "key_version": user.key_version,
                             "vault_envelope": user.vault_envelope,
                             "vault_unlocked": true,
                             "requires_2fa": false
@@ -1645,25 +2329,32 @@ fn route_api_request(
             let uid = g.next_user_id;
             let uname = username_opt.unwrap_or_else(|| format!("user_{uid}"));
             let auth_version = body.get("auth_version").and_then(Value::as_i64).unwrap_or(2);
+            let auth_verifier_b64 = body
+                .get("auth_verifier_b64")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let password = if auth_verifier_b64.is_some() {
+                None
+            } else {
+                body.get("password")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
             let user = UserRecord {
                 user_id: uid,
                 username: uname.clone(),
+                first_name: uname.clone(),
                 auth_version,
-                password: body
-                    .get("password")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned),
+                key_version: 1,
+                password,
                 auth_salt_b64: body
                     .get("auth_salt_b64")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .unwrap_or_else(|| B64.encode([0x42u8; 16])),
-                auth_verifier_b64: body
-                    .get("auth_verifier_b64")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned),
+                auth_verifier_b64,
                 kdf_params: body
                     .get("kdf_params")
                     .cloned()
@@ -1681,58 +2372,352 @@ fn route_api_request(
                 json!({
                     "user_id": uid,
                     "username": uname,
+                    "first_name": uname,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms,
+                    "created_at": ms_to_rfc3339(sess.created_at_ms),
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms,
                     "auth_version": auth_version,
+                    "key_version": 1,
                     "vault_unlocked": true,
                     "requires_2fa": false
                 }),
             )
         }
 
-        // Auth upgrade / change-password / me
-        ("POST", "/api/v1/auth/upgrade-split-key") | ("POST", "/api/v1/auth/change-password") => {
+        // Auth logout (revokes caller Bearer token across HTTP and WS)
+        ("POST", "/api/v1/auth/logout") => {
+            let mut g = state.lock().expect("state lock");
+            let mut revoked_sid = None;
+            if let Some(ref tok) = bearer_token {
+                if let Some(sess) = g.sessions_by_token.get_mut(tok) {
+                    sess.revoked = true;
+                    revoked_sid = Some(sess.session_id.clone());
+                }
+                g.revoked_tokens.insert(tok.clone());
+            }
+            let gen_num = g.alloc_seq();
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "logged_out": true,
+                    "revoked": true,
+                    "session_id": revoked_sid,
+                    "account_generation": gen_num
+                }),
+            )
+        }
+
+        // Auth Split-Key V2 upgrade (preserves active session)
+        ("POST", "/api/v1/auth/upgrade-split-key") | ("POST", "/api/v1/auth/upgrade_split_key") => {
             let mut g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
                 .map(|s| s.user_id)
                 .unwrap_or_else(|| g.default_user_id());
+            let existing = g.ensure_user_by_id(uid).clone();
+
+            let current_pw = body
+                .get("current_password")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let current_v = body
+                .get("current_auth_verifier_b64")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            if let (Some(expected_pw), Some(provided_pw)) = (existing.password.as_deref(), current_pw)
+            {
+                if provided_pw != expected_pw {
+                    return (401, json!({"error": "invalid_credentials"}));
+                }
+            }
+            if let (Some(expected_v), Some(provided_v)) =
+                (existing.auth_verifier_b64.as_deref(), current_v)
+            {
+                if provided_v != expected_v {
+                    return (401, json!({"error": "invalid_credentials"}));
+                }
+            }
+
+            let new_salt = body
+                .get("new_auth_salt_b64")
+                .or_else(|| body.get("auth_salt_b64"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let new_verifier = body
+                .get("new_auth_verifier_b64")
+                .or_else(|| body.get("auth_verifier_b64"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let new_kdf = body
+                .get("new_kdf_params")
+                .or_else(|| body.get("new_argon2_params"))
+                .or_else(|| body.get("kdf_params"))
+                .or_else(|| body.get("argon2_params"))
+                .cloned();
+            let new_env = body
+                .get("rewrapped_vault_envelope")
+                .or_else(|| body.get("vault_envelope"))
+                .cloned();
+            let new_key_version = body
+                .get("key_version")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    new_env
+                        .as_ref()
+                        .and_then(|e| e.get("key_version"))
+                        .and_then(Value::as_u64)
+                });
+
             let user = g.ensure_user_by_id(uid);
             user.auth_version = body.get("auth_version").and_then(Value::as_i64).unwrap_or(2);
-            if let Some(salt) = body.get("auth_salt_b64").and_then(Value::as_str) {
-                user.auth_salt_b64 = salt.to_owned();
+            if let Some(salt) = new_salt {
+                user.auth_salt_b64 = salt;
             }
-            if let Some(v) = body.get("auth_verifier_b64").and_then(Value::as_str) {
-                user.auth_verifier_b64 = Some(v.to_owned());
+            if let Some(v) = new_verifier {
+                user.auth_verifier_b64 = Some(v);
+                user.password = None;
             }
-            if let Some(kdf) = body.get("kdf_params") {
-                user.kdf_params = kdf.clone();
+            if let Some(kdf) = new_kdf {
+                user.kdf_params = kdf;
             }
-            if let Some(env) = body.get("vault_envelope") {
-                user.vault_envelope = Some(env.clone());
+            if let Some(env) = new_env {
+                user.vault_envelope = Some(env);
+            }
+            if let Some(kv) = new_key_version {
+                user.key_version = kv;
             }
             let av = user.auth_version;
-            (200, json!({"ok": true, "upgraded": true, "auth_version": av}))
+            let kv = user.key_version;
+            let gen_num = g.alloc_seq();
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "upgraded": true,
+                    "auth_version": av,
+                    "key_version": kv,
+                    "vault_unlocked": true,
+                    "account_generation": gen_num
+                }),
+            )
         }
+
+        // Atomic password rotation (verifies current credentials, rotates salt/verifier/envelope, revokes prior sessions, mints fresh token)
+        ("POST", "/api/v1/auth/change-password") | ("POST", "/api/v1/auth/change_password") => {
+            let mut g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let existing = g.ensure_user_by_id(uid).clone();
+
+            // 1. Fail-closed current credential verification BEFORE any state mutation.
+            let current_v = body
+                .get("current_auth_verifier_b64")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let current_pw = body
+                .get("current_password")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+
+            if let Some(ref expected_v) = existing.auth_verifier_b64 {
+                if let Some(provided_v) = current_v {
+                    if provided_v != expected_v {
+                        return (401, json!({"error": "invalid_credentials"}));
+                    }
+                } else if let Some(ref expected_pw) = existing.password {
+                    if current_pw != Some(expected_pw.as_str()) {
+                        return (401, json!({"error": "invalid_credentials"}));
+                    }
+                } else {
+                    return (401, json!({"error": "invalid_credentials"}));
+                }
+            } else if let Some(ref expected_pw) = existing.password {
+                if current_pw != Some(expected_pw.as_str()) {
+                    return (401, json!({"error": "invalid_credentials"}));
+                }
+            }
+
+            // 2. Extract all replacement fields before mutating (guarantees atomicity on 400).
+            let new_salt = body
+                .get("new_auth_salt_b64")
+                .or_else(|| body.get("auth_salt_b64"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let new_verifier = body
+                .get("new_auth_verifier_b64")
+                .or_else(|| body.get("auth_verifier_b64"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let new_password = body
+                .get("new_password")
+                .or_else(|| body.get("password"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let new_kdf = body
+                .get("new_kdf_params")
+                .or_else(|| body.get("new_argon2_params"))
+                .or_else(|| body.get("kdf_params"))
+                .or_else(|| body.get("argon2_params"))
+                .cloned();
+            let new_env = body
+                .get("rewrapped_vault_envelope")
+                .or_else(|| body.get("vault_envelope"))
+                .cloned();
+            let next_key_version = body
+                .get("key_version")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    new_env
+                        .as_ref()
+                        .and_then(|e| e.get("key_version"))
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(existing.key_version.saturating_add(1));
+
+            if new_verifier.is_none() && new_password.is_none() {
+                return (
+                    400,
+                    json!({"error": "invalid_params", "message": "missing new credential"}),
+                );
+            }
+
+            // 3. Apply atomic update to UserRecord.
+            let user = g.ensure_user_by_id(uid);
+            user.auth_version = body
+                .get("auth_version")
+                .and_then(Value::as_i64)
+                .unwrap_or(if new_verifier.is_some() {
+                    2
+                } else {
+                    user.auth_version
+                });
+            if let Some(salt) = new_salt {
+                user.auth_salt_b64 = salt;
+            }
+            if let Some(v) = new_verifier {
+                user.auth_verifier_b64 = Some(v);
+                user.password = None;
+            } else if let Some(pw) = new_password {
+                user.password = Some(pw);
+                user.auth_verifier_b64 = None;
+            }
+            if let Some(kdf) = new_kdf {
+                user.kdf_params = kdf;
+            }
+            if let Some(env) = new_env {
+                user.vault_envelope = Some(env);
+            }
+            user.key_version = next_key_version;
+            let av = user.auth_version;
+            let kv = user.key_version;
+
+            // 4. Revoke all prior sessions for this user, bump generation, and issue a fresh token.
+            let mut old_tokens = Vec::new();
+            for sess in g.sessions_by_token.values_mut() {
+                if sess.user_id == uid && !sess.revoked {
+                    sess.revoked = true;
+                    old_tokens.push(sess.token.clone());
+                }
+            }
+            let revoked_count = old_tokens.len();
+            for tok in old_tokens {
+                g.revoked_tokens.insert(tok);
+            }
+            let device_name = caller_session
+                .as_ref()
+                .map(|s| s.device_name.as_str())
+                .unwrap_or("iOS Device");
+            let fresh_sess = g.mint_session(uid, device_name, ts);
+            let gen_num = g.alloc_seq();
+
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "changed": true,
+                    "upgraded": true,
+                    "auth_version": av,
+                    "key_version": kv,
+                    "vault_unlocked": true,
+                    "account_generation": gen_num,
+                    "revoked_sessions_count": revoked_count,
+                    "session_id": fresh_sess.session_id,
+                    "token": fresh_sess.token,
+                    "expires_at": ms_to_rfc3339(fresh_sess.expires_at_ms),
+                    "expires_at_ms": fresh_sess.expires_at_ms
+                }),
+            )
+        }
+
+        // Auth me (compatible with gpui_telegram_client::UserMeResponse)
         ("GET", "/api/v1/auth/me") => {
             let g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
                 .map(|s| s.user_id)
                 .unwrap_or_else(|| g.default_user_id());
+            let sid = caller_session
+                .as_ref()
+                .map(|s| s.session_id.clone())
+                .unwrap_or_else(|| format!("sess_{uid}_default"));
+            let device_name = caller_session
+                .as_ref()
+                .map(|s| s.device_name.clone())
+                .unwrap_or_else(|| "iOS Device".to_owned());
+            let created_ms = caller_session
+                .as_ref()
+                .map(|s| s.created_at_ms)
+                .unwrap_or(ts);
+            let expires_ms = caller_session
+                .as_ref()
+                .map(|s| s.expires_at_ms)
+                .unwrap_or(ts + 86_400_000);
             if let Some(u) = g.users_by_id.get(&uid) {
                 (
                     200,
                     json!({
                         "user_id": u.user_id,
                         "username": u.username,
+                        "first_name": u.first_name,
+                        "session_id": sid,
+                        "device_name": device_name,
+                        "account_generation": g.next_seq,
+                        "created_at": ms_to_rfc3339(created_ms),
+                        "expires_at": ms_to_rfc3339(expires_ms),
+                        "expires_at_ms": expires_ms,
                         "auth_version": u.auth_version,
+                        "key_version": u.key_version,
                         "two_factor_enabled": u.two_factor_password.is_some()
                     }),
                 )
             } else {
-                (200, json!({"user_id": uid, "username": format!("user_{uid}"), "auth_version": 2}))
+                (
+                    200,
+                    json!({
+                        "user_id": uid,
+                        "username": format!("user_{uid}"),
+                        "first_name": format!("User {uid}"),
+                        "session_id": sid,
+                        "device_name": device_name,
+                        "account_generation": g.next_seq,
+                        "created_at": ms_to_rfc3339(created_ms),
+                        "expires_at": ms_to_rfc3339(expires_ms),
+                        "expires_at_ms": expires_ms,
+                        "auth_version": 2,
+                        "key_version": 1,
+                        "two_factor_enabled": false
+                    }),
+                )
             }
         }
 
@@ -1764,9 +2749,11 @@ fn route_api_request(
                     .unwrap_or("")
                     .cmp(b["session_id"].as_str().unwrap_or(""))
             });
-            (200, json!({"sessions": list}))
+            (200, json!({"user_id": uid, "sessions": list}))
         }
-        ("DELETE", "/api/v1/auth/sessions/others") => {
+        ("DELETE", "/api/v1/auth/sessions/others")
+        | ("POST", "/api/v1/auth/sessions/others")
+        | ("POST", "/api/v1/auth/sessions/revoke-others") => {
             let mut g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
@@ -1809,26 +2796,56 @@ fn route_api_request(
                 }),
             )
         }
+        ("POST", p)
+            if p.starts_with("/api/v1/auth/sessions/") && p.ends_with("/revoke") =>
+        {
+            let sid = p
+                .trim_start_matches("/api/v1/auth/sessions/")
+                .trim_end_matches("/revoke");
+            let mut g = state.lock().expect("state lock");
+            let Some(tok) = g.session_id_to_token.get(sid).cloned() else {
+                return (404, json!({"error": "session_not_found"}));
+            };
+            if let Some(sess) = g.sessions_by_token.get_mut(&tok) {
+                sess.revoked = true;
+            }
+            g.revoked_tokens.insert(tok);
+            let gen_num = g.alloc_seq();
+            (
+                200,
+                json!({
+                    "revoked": true,
+                    "session_id": sid,
+                    "account_generation": gen_num
+                }),
+            )
+        }
 
         // Cloud 2FA status / set / disable / verify
-        ("GET", "/api/v1/auth/2fa") | ("GET", "/api/v1/auth/two-factor/status") => {
+        ("GET", "/api/v1/auth/2fa")
+        | ("GET", "/api/v1/auth/two-factor")
+        | ("GET", "/api/v1/auth/two-factor/status") => {
             let g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
                 .map(|s| s.user_id)
                 .unwrap_or_else(|| g.default_user_id());
             let user = g.users_by_id.get(&uid);
+            let enabled = user.and_then(|u| u.two_factor_password.as_ref()).is_some();
+            let recovery_email = user.and_then(|u| u.two_factor_recovery_email.clone());
             (
                 200,
                 json!({
-                    "enabled": user.and_then(|u| u.two_factor_password.as_ref()).is_some(),
+                    "enabled": enabled,
+                    "has_password": enabled,
                     "hint": user.and_then(|u| u.two_factor_hint.clone()),
-                    "recovery_email": user.and_then(|u| u.two_factor_recovery_email.clone())
+                    "recovery_email": recovery_email,
+                    "has_recovery_email": recovery_email.as_deref().is_some_and(|s| !s.is_empty())
                 }),
             )
         }
-        ("POST", "/api/v1/auth/2fa")
-        | ("PUT", "/api/v1/auth/2fa")
+        ("POST" | "PUT", "/api/v1/auth/2fa")
+        | ("POST" | "PUT", "/api/v1/auth/two-factor")
         | ("POST", "/api/v1/auth/two-factor/set") => {
             let new_pw = body
                 .get("new_password")
@@ -1860,16 +2877,24 @@ fn route_api_request(
                 .get("recovery_email")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let has_rec = user
+                .two_factor_recovery_email
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
             (
                 200,
                 json!({
                     "enabled": true,
+                    "has_password": true,
                     "hint": user.two_factor_hint,
-                    "recovery_email": user.two_factor_recovery_email
+                    "recovery_email": user.two_factor_recovery_email,
+                    "has_recovery_email": has_rec
                 }),
             )
         }
-        ("DELETE", "/api/v1/auth/2fa") | ("POST", "/api/v1/auth/two-factor/disable") => {
+        ("DELETE", "/api/v1/auth/2fa")
+        | ("DELETE", "/api/v1/auth/two-factor")
+        | ("POST", "/api/v1/auth/two-factor/disable") => {
             let mut g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
@@ -1888,7 +2913,7 @@ fn route_api_request(
             }
             user.two_factor_password = None;
             user.two_factor_hint = None;
-            (200, json!({"enabled": false}))
+            (200, json!({"enabled": false, "has_password": false}))
         }
         ("POST", "/api/v1/auth/2fa/verify") | ("POST", "/api/v1/auth/two-factor/verify") => {
             let challenge_token = body
@@ -1928,7 +2953,8 @@ fn route_api_request(
                     "user_id": chal.user_id,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms
                 }),
             )
         }
@@ -1938,6 +2964,7 @@ fn route_api_request(
             let mut g = state.lock().expect("state lock");
             let seq = g.alloc_seq();
             let pair_token = format!("pair_{ts}_{seq}");
+            let qr_url = format!("tg://login?token={pair_token}");
             let device_name = body
                 .get("device_name")
                 .and_then(Value::as_str)
@@ -1960,7 +2987,8 @@ fn route_api_request(
                 200,
                 json!({
                     "pair_token": pair_token,
-                    "qr_url": format!("tg://login?token={pair_token}"),
+                    "qr_url": &qr_url,
+                    "qr_payload": &qr_url,
                     "expires_at_ms": expires_at_ms
                 }),
             )
@@ -1991,7 +3019,8 @@ fn route_api_request(
                     "user_id": uid,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms
                 }))
             };
             if let Some(entry) = g.qr_pairs.get_mut(pair_token) {
@@ -2019,8 +3048,12 @@ fn route_api_request(
                 }),
             )
         }
-        ("POST", "/api/v1/auth/pair/poll") => {
-            let pair_token = body.get("pair_token").and_then(Value::as_str).unwrap_or("");
+        ("GET" | "POST", "/api/v1/auth/pair/poll") => {
+            let pair_token = body
+                .get("pair_token")
+                .and_then(Value::as_str)
+                .or_else(|| extract_query_param(query, "pair_token"))
+                .unwrap_or("");
             let g = state.lock().expect("state lock");
             let Some(rec) = g.qr_pairs.get(pair_token) else {
                 return (404, json!({"error": "pair_token_not_found"}));
@@ -2067,7 +3100,8 @@ fn route_api_request(
                     "user_id": uid,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms
                 })
             };
             (
@@ -2078,13 +3112,14 @@ fn route_api_request(
                     "session_id": session_json["session_id"],
                     "token": session_json["token"],
                     "expires_at": session_json["expires_at"],
+                    "expires_at_ms": session_json["expires_at_ms"],
                     "session": session_json
                 }),
             )
         }
 
-        // Email / Phone OTP & Alipay OAuth & Passkeys
-        ("POST", "/api/v1/auth/email/send-code") => (
+        // Email OTP
+        ("POST", "/api/v1/auth/email/send-code") | ("POST", "/api/v1/auth/email/send_code") => (
             200,
             json!({
                 "ok": true,
@@ -2094,16 +3129,14 @@ fn route_api_request(
             }),
         ),
         ("POST", "/api/v1/auth/email/verify-code")
-        | ("POST", "/api/v1/auth/email/register")
-        | ("POST", "/api/v1/auth/phone/verify-code")
-        | ("POST", "/api/v1/auth/phone/login")
-        | ("POST", "/api/v1/auth/passkey/register")
-        | ("POST", "/api/v1/auth/passkey/login")
-        | ("POST", "/api/v1/auth/passkey/authenticate") => {
+        | ("POST", "/api/v1/auth/email/verify")
+        | ("POST", "/api/v1/auth/email/verify_code")
+        | ("POST", "/api/v1/auth/email/register") => {
             let mut g = state.lock().expect("state lock");
             g.next_user_id += 1;
             let uid = g.next_user_id;
-            let sess = g.mint_session(uid, "iOS Auth Device", ts);
+            g.ensure_user_by_id(uid);
+            let sess = g.mint_session(uid, "iOS Email Auth", ts);
             (
                 200,
                 json!({
@@ -2112,77 +3145,521 @@ fn route_api_request(
                     "user_id": uid,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms
                 }),
             )
         }
-        ("POST", "/api/v1/auth/phone/send-code") => (
-            200,
-            json!({
-                "ok": true,
-                "sent": true,
-                "phone_code_hash": format!("pch_{ts}"),
-                "expires_at_ms": ts + 300_000,
-                "resend_after_ms": ts + 60_000
-            }),
-        ),
-        ("POST", "/api/v1/auth/alipay/start") => {
+
+        // Phone OTP (stateful hash tracking, 5-attempt lockout, 2FA gate without premature token)
+        ("POST", "/api/v1/auth/phone/send-code") | ("POST", "/api/v1/auth/phone/send_code") => {
             let mut g = state.lock().expect("state lock");
             let seq = g.alloc_seq();
+            let hash = format!("pch_{ts}_{seq}");
+            let expires_at_ms = ts + 300_000;
+            g.phone_challenges.insert(
+                hash.clone(),
+                PhoneOtpRecord {
+                    expected_code: "123456".to_owned(),
+                    attempts: 0,
+                    expires_at_ms,
+                },
+            );
             (
                 200,
                 json!({
-                    "attempt_id": format!("alipay_{seq}"),
-                    "state": format!("st_{ts}_{seq}"),
-                    "auth_url": format!("https://openauth.alipay.com/oauth2/publicAppAuthorize.htm?state=st_{ts}_{seq}"),
-                    "expires_at_ms": ts + 600_000
+                    "ok": true,
+                    "sent": true,
+                    "phone_code_hash": hash,
+                    "debug_code": "123456",
+                    "expires_at_ms": expires_at_ms,
+                    "resend_after_ms": ts + 60_000
+                }),
+            )
+        }
+        ("POST", "/api/v1/auth/phone/verify")
+        | ("POST", "/api/v1/auth/phone/verify-code")
+        | ("POST", "/api/v1/auth/phone/verify_code")
+        | ("POST", "/api/v1/auth/phone/login") => {
+            let code = body.get("code").and_then(Value::as_str).map(str::trim);
+            if let Some(c) = code {
+                if c.len() != 6 || !c.bytes().all(|b| b.is_ascii_digit()) {
+                    return (400, json!({"error": "invalid_code"}));
+                }
+            }
+            let hash_opt = body
+                .get("phone_code_hash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let mut g = state.lock().expect("state lock");
+            if let Some(hash) = hash_opt {
+                let Some(rec) = g.phone_challenges.get_mut(hash) else {
+                    return (400, json!({"error": "invalid_phone_code_hash"}));
+                };
+                if rec.attempts >= 5 {
+                    return (400, json!({"error": "too_many_attempts"}));
+                }
+                if ts > rec.expires_at_ms {
+                    return (400, json!({"error": "code_expired"}));
+                }
+                if let Some(c) = code {
+                    if c != rec.expected_code {
+                        rec.attempts += 1;
+                        if rec.attempts >= 5 {
+                            return (400, json!({"error": "too_many_attempts"}));
+                        }
+                        return (400, json!({"error": "invalid_code"}));
+                    }
+                }
+                g.phone_challenges.remove(hash);
+            }
+
+            g.next_user_id += 1;
+            let uid = g.next_user_id;
+            g.ensure_user_by_id(uid);
+            let dev_name = body
+                .get("device_name")
+                .and_then(Value::as_str)
+                .unwrap_or("iOS Phone Auth")
+                .to_owned();
+            if body
+                .get("require_2fa_account")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                let seq = g.alloc_seq();
+                let challenge_token = format!("tfa_{uid}_{seq}");
+                g.two_factor_challenges.insert(
+                    challenge_token.clone(),
+                    TwoFactorChallenge {
+                        user_id: uid,
+                        device_name: dev_name,
+                        expires_at_ms: ts + 300_000,
+                    },
+                );
+                return (
+                    200,
+                    json!({
+                        "requires_2fa": true,
+                        "challenge_token": challenge_token,
+                        "user_id": uid
+                    }),
+                );
+            }
+            let sess = g.mint_session(uid, &dev_name, ts);
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "authenticated": true,
+                    "user_id": uid,
+                    "session_id": sess.session_id,
+                    "token": sess.token,
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms
+                }),
+            )
+        }
+
+        // Canonical WebAuthn / Passkey lifecycle (register, list, delete, single-use challenge, verify)
+        ("POST", "/api/v1/auth/passkey/register")
+        | ("POST", "/api/v1/auth/passkeys")
+        | ("POST", "/api/v1/auth/passkey/register/complete") => {
+            let credential_id = body
+                .get("credential_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let public_key = body
+                .get("public_key")
+                .or_else(|| body.get("public_key_b64"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let (Some(cred_id), Some(pub_key)) = (credential_id, public_key) else {
+                return (
+                    400,
+                    json!({"error": "invalid_passkey", "message": "credential_id and public_key are required"}),
+                );
+            };
+            let device_name = body
+                .get("device_name")
+                .and_then(Value::as_str)
+                .unwrap_or("iOS Passkey")
+                .to_owned();
+            let mut g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            g.ensure_user_by_id(uid);
+            let rec = PasskeyRecord {
+                credential_id: cred_id.to_owned(),
+                user_id: uid,
+                public_key: pub_key.to_owned(),
+                device_name: device_name.clone(),
+                sign_count: 0,
+                created_at_ms: ts,
+            };
+            g.passkeys.insert(cred_id.to_owned(), rec);
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "credential_id": cred_id,
+                    "user_id": uid,
+                    "device_name": device_name,
+                    "sign_count": 0,
+                    "created_at_ms": ts
+                }),
+            )
+        }
+        ("GET", "/api/v1/auth/passkey/list")
+        | ("GET", "/api/v1/auth/passkeys")
+        | ("GET", "/api/v1/auth/passkey") => {
+            let g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let mut list: Vec<Value> = g
+                .passkeys
+                .values()
+                .filter(|p| p.user_id == uid)
+                .map(|p| {
+                    json!({
+                        "credential_id": p.credential_id,
+                        "user_id": p.user_id,
+                        "public_key": p.public_key,
+                        "device_name": p.device_name,
+                        "sign_count": p.sign_count,
+                        "created_at_ms": p.created_at_ms
+                    })
+                })
+                .collect();
+            list.sort_by(|a, b| {
+                a["credential_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["credential_id"].as_str().unwrap_or(""))
+            });
+            (200, json!({"passkeys": list, "total": list.len()}))
+        }
+        ("DELETE", p)
+            if p.starts_with("/api/v1/auth/passkey/")
+                || p.starts_with("/api/v1/auth/passkeys/") =>
+        {
+            let cred_id = p
+                .strip_prefix("/api/v1/auth/passkeys/")
+                .or_else(|| p.strip_prefix("/api/v1/auth/passkey/"))
+                .unwrap_or("");
+            let mut g = state.lock().expect("state lock");
+            if g.passkeys.remove(cred_id).is_some() {
+                (200, json!({"ok": true, "deleted": true, "credential_id": cred_id}))
+            } else {
+                (404, json!({"error": "unknown_credential"}))
+            }
+        }
+        ("POST" | "GET", "/api/v1/auth/passkey/challenge")
+        | ("POST" | "GET", "/api/v1/auth/passkeys/challenge") => {
+            let mut g = state.lock().expect("state lock");
+            let user_id = body
+                .get("user_id")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    body.get("username")
+                        .and_then(Value::as_str)
+                        .or_else(|| extract_query_param(query, "username"))
+                        .and_then(|uname| g.username_to_id.get(uname).copied())
+                })
+                .or_else(|| caller_session.as_ref().map(|s| s.user_id));
+            let seq = g.alloc_seq();
+            let challenge = format!("pkchal_{seq}_{}", Uuid::new_v4().simple());
+            let timeout_ms: i64 = 300_000;
+            let expires_at_ms = ts + timeout_ms;
+            g.passkey_challenges.insert(
+                challenge.clone(),
+                PasskeyChallengeRecord {
+                    user_id,
+                    expires_at_ms,
+                },
+            );
+            (
+                200,
+                json!({
+                    "challenge": challenge,
+                    "rp_id": "gpui.telegram.local",
+                    "timeout_ms": timeout_ms,
+                    "user_id": user_id,
+                    "expires_at_ms": expires_at_ms
+                }),
+            )
+        }
+        ("POST", "/api/v1/auth/passkey/verify")
+        | ("POST", "/api/v1/auth/passkeys/verify")
+        | ("POST", "/api/v1/auth/passkey/login")
+        | ("POST", "/api/v1/auth/passkey/authenticate") => {
+            let challenge = body
+                .get("challenge")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let credential_id = body
+                .get("credential_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let Some(chal_str) = challenge else {
+                return (400, json!({"error": "invalid_challenge"}));
+            };
+            let mut g = state.lock().expect("state lock");
+            // Atomically consume single-use challenge to block replay attacks.
+            let Some(chal_rec) = g.passkey_challenges.remove(chal_str) else {
+                return (400, json!({"error": "invalid_challenge"}));
+            };
+            if ts > chal_rec.expires_at_ms {
+                return (400, json!({"error": "invalid_challenge"}));
+            }
+            let Some(cred_id) = credential_id else {
+                return (401, json!({"error": "unknown_credential"}));
+            };
+            let Some(pk) = g.passkeys.get_mut(cred_id) else {
+                return (401, json!({"error": "unknown_credential"}));
+            };
+            if let Some(expected_uid) = chal_rec.user_id {
+                if pk.user_id != expected_uid {
+                    return (401, json!({"error": "unknown_credential"}));
+                }
+            }
+            pk.sign_count += 1;
+            let uid = pk.user_id;
+            let sign_count = pk.sign_count;
+            let device_name = pk.device_name.clone();
+            let sess = g.mint_session(uid, &device_name, ts);
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "verified": true,
+                    "authenticated": true,
+                    "user_id": uid,
+                    "session_id": sess.session_id,
+                    "token": sess.token,
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms,
+                    "sign_count": sign_count
+                }),
+            )
+        }
+
+        // Alipay OAuth & QR state machine (fbs_<uuid>, qr_payload, single-use state & auth_code, cancel -> cancelled)
+        ("POST", "/api/v1/auth/alipay/start") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let attempt_id = format!("alipay_{seq}");
+            let state_tok = format!("fbs_{}", Uuid::new_v4().simple());
+            let auth_url = format!(
+                "https://openauth.alipay.com/oauth2/publicAppAuthorize.htm?state={state_tok}"
+            );
+            let expires_in_ms: i64 = 600_000;
+            let expires_at_ms = ts + expires_in_ms;
+            g.alipay_state_to_attempt
+                .insert(state_tok.clone(), attempt_id.clone());
+            g.alipay_attempts.insert(
+                attempt_id.clone(),
+                AlipayAttemptRecord {
+                    attempt_id: attempt_id.clone(),
+                    state: state_tok.clone(),
+                    status: "pending".to_owned(),
+                    issued_session: None,
+                    expires_at_ms,
+                },
+            );
+            (
+                200,
+                json!({
+                    "attempt_id": attempt_id,
+                    "state": state_tok,
+                    "auth_url": &auth_url,
+                    "qr_payload": &auth_url,
+                    "poll_after_ms": 1000,
+                    "expires_in_ms": expires_in_ms,
+                    "expires_at_ms": expires_at_ms
                 }),
             )
         }
         ("GET", p) if p.starts_with("/api/v1/auth/alipay/poll/") => {
             let attempt_id = p.trim_start_matches("/api/v1/auth/alipay/poll/");
-            let confirmed = state
-                .lock()
-                .ok()
-                .and_then(|g| g.oauth_confirmed.get(attempt_id).cloned());
-            match confirmed {
-                Some(session) => (
-                    200,
-                    json!({
-                        "attempt_id": attempt_id,
-                        "status": "confirmed",
-                        "session": session,
-                        "expires_at_ms": ts + 600_000
-                    }),
-                ),
-                None => (
-                    200,
-                    json!({
-                        "attempt_id": attempt_id,
-                        "status": "pending",
-                        "expires_at_ms": ts + 600_000
-                    }),
-                ),
-            }
+            poll_alipay_attempt(state, attempt_id, ts)
         }
-        ("POST", "/api/v1/auth/alipay/callback") | ("POST", "/api/v1/auth/alipay/exchange") => {
+        ("GET" | "POST", "/api/v1/auth/alipay/poll") => {
+            let attempt_id = body
+                .get("attempt_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .or_else(|| extract_query_param(query, "attempt_id"))
+                .unwrap_or("");
+            poll_alipay_attempt(state, attempt_id, ts)
+        }
+        ("POST", "/api/v1/auth/alipay/cancel") => {
+            let attempt_id = body
+                .get("attempt_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let state_tok = body
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            cancel_alipay_attempt(state, attempt_id, state_tok)
+        }
+        ("POST", p) if p.starts_with("/api/v1/auth/alipay/cancel/") => {
+            let attempt_id = p.trim_start_matches("/api/v1/auth/alipay/cancel/").trim();
+            cancel_alipay_attempt(
+                state,
+                (!attempt_id.is_empty()).then_some(attempt_id),
+                None,
+            )
+        }
+        ("DELETE", p) if p.starts_with("/api/v1/auth/alipay/") => {
+            let attempt_id = p.trim_start_matches("/api/v1/auth/alipay/").trim();
+            cancel_alipay_attempt(
+                state,
+                (!attempt_id.is_empty()).then_some(attempt_id),
+                None,
+            )
+        }
+        ("POST" | "GET", "/api/v1/auth/alipay/callback")
+        | ("POST", "/api/v1/auth/alipay/exchange") => {
+            let state_tok_opt = body
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| extract_query_param(query, "state"));
+            let Some(state_tok) = state_tok_opt else {
+                return (
+                    400,
+                    json!({"error": "oauth_state_mismatch", "message": "missing oauth state"}),
+                );
+            };
+            let auth_code_opt = body
+                .get("auth_code")
+                .or_else(|| body.get("code"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| extract_query_param(query, "auth_code"))
+                .or_else(|| extract_query_param(query, "code"));
+            let Some(auth_code) = auth_code_opt else {
+                return (
+                    400,
+                    json!({"error": "invalid_params", "message": "missing auth_code"}),
+                );
+            };
+            let expected_attempt = body
+                .get("attempt_id")
+                .or_else(|| body.get("expected_attempt_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| extract_query_param(query, "attempt_id"));
+
             let mut g = state.lock().expect("state lock");
+            let Some(attempt_id) = g.alipay_state_to_attempt.get(state_tok).cloned() else {
+                return (
+                    400,
+                    json!({"error": "oauth_state_mismatch", "message": "unknown oauth state"}),
+                );
+            };
+            if let Some(exp) = expected_attempt {
+                if exp != attempt_id {
+                    return (
+                        400,
+                        json!({"error": "oauth_state_mismatch", "message": "attempt_id mismatch"}),
+                    );
+                }
+            }
+            let Some(attempt_snapshot) = g.alipay_attempts.get(&attempt_id).cloned() else {
+                return (404, json!({"error": "oauth_attempt_not_found"}));
+            };
+            if attempt_snapshot.state != state_tok {
+                return (
+                    400,
+                    json!({"error": "oauth_state_mismatch", "message": "state token mismatch"}),
+                );
+            }
+            if attempt_snapshot.status == "cancelled" {
+                return (
+                    409,
+                    json!({
+                        "error": "oauth_cancelled",
+                        "message": "oauth attempt cancelled",
+                        "status": "cancelled"
+                    }),
+                );
+            }
+            if attempt_snapshot.status != "pending" {
+                return (
+                    400,
+                    json!({
+                        "error": "oauth_expired",
+                        "message": "oauth state already consumed"
+                    }),
+                );
+            }
+            if ts > attempt_snapshot.expires_at_ms {
+                if let Some(a) = g.alipay_attempts.get_mut(&attempt_id) {
+                    a.status = "expired".to_owned();
+                }
+                return (400, json!({"error": "oauth_expired", "status": "expired"}));
+            }
+            if g.consumed_alipay_codes.contains(auth_code) {
+                return (
+                    400,
+                    json!({
+                        "error": "oauth_expired",
+                        "message": "auth_code already consumed"
+                    }),
+                );
+            }
+
+            g.consumed_alipay_codes.insert(auth_code.to_owned());
             g.next_user_id += 1;
             let uid = g.next_user_id;
+            g.ensure_user_by_id(uid);
             let sess = g.mint_session(uid, "iOS Alipay", ts);
+            let session_json = json!({
+                "user_id": uid,
+                "session_id": sess.session_id,
+                "token": sess.token,
+                "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                "expires_at_ms": sess.expires_at_ms
+            });
+            if let Some(a) = g.alipay_attempts.get_mut(&attempt_id) {
+                a.status = "consumed".to_owned();
+                a.issued_session = Some(session_json.clone());
+            }
             (
                 200,
                 json!({
                     "authenticated": true,
+                    "attempt_id": attempt_id,
                     "user_id": uid,
                     "session_id": sess.session_id,
                     "token": sess.token,
-                    "expires_at": sess.expires_at_ms
+                    "expires_at": ms_to_rfc3339(sess.expires_at_ms),
+                    "expires_at_ms": sess.expires_at_ms,
+                    "session": session_json
                 }),
             )
         }
 
-        // Chats, invites & join
+        // Chats, invites & join (with string/integer client_nonce idempotency + deduplicated member_count)
         ("GET", "/api/v1/chats") => {
             let g = state.lock().expect("state lock");
             let mut chats: Vec<Value> = g
@@ -2190,6 +3667,7 @@ fn route_api_request(
                 .values()
                 .map(|c| {
                     json!({
+                        "id": c.chat_id,
                         "chat_id": c.chat_id,
                         "title": c.title,
                         "chat_type": c.chat_type,
@@ -2201,7 +3679,56 @@ fn route_api_request(
             (200, json!({"chats": chats, "total": chats.len()}))
         }
         ("POST", "/api/v1/chats") | ("POST", "/api/v1/chats/create") => {
+            let nonce_key = extract_client_nonce_key(body);
             let mut g = state.lock().expect("state lock");
+            if let Some(ref nk) = nonce_key {
+                if let Some(&existing_cid) = g.chats_by_nonce.get(nk) {
+                    if let Some(existing) = g.chats.get(&existing_cid) {
+                        return (
+                            200,
+                            json!({
+                                "id": existing.chat_id,
+                                "chat_id": existing.chat_id,
+                                "title": existing.title,
+                                "chat_type": existing.chat_type,
+                                "member_count": existing.member_count,
+                                "deduplicated": true
+                            }),
+                        );
+                    }
+                }
+            }
+            let creator_uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let member_count: u64 =
+                if let Some(arr) = body.get("member_ids").and_then(Value::as_array) {
+                    let mut unique: HashSet<u64> = HashSet::new();
+                    unique.insert(creator_uid);
+                    for v in arr {
+                        if let Some(id) = v.as_u64() {
+                            unique.insert(id);
+                        }
+                    }
+                    unique.len() as u64
+                } else if let Some(arr) = body.get("recipients").and_then(Value::as_array) {
+                    let mut unique: HashSet<u64> = HashSet::new();
+                    unique.insert(creator_uid);
+                    for v in arr {
+                        if let Some(id) = v
+                            .get("user_id")
+                            .and_then(Value::as_u64)
+                            .or_else(|| v.as_u64())
+                        {
+                            unique.insert(id);
+                        }
+                    }
+                    unique.len() as u64
+                } else {
+                    2
+                };
+
             g.next_chat_id += 1;
             let cid = g.next_chat_id;
             let title = body
@@ -2214,17 +3741,23 @@ fn route_api_request(
                 chat_id: cid,
                 title: title.clone(),
                 chat_type,
-                member_count: 2,
+                member_count,
             };
             g.chats.insert(cid, rec);
+            if let Some(nk) = nonce_key {
+                g.chats_by_nonce.insert(nk, cid);
+            }
             g.chat_pts.entry(cid).or_insert(0);
             (
                 200,
                 json!({
+                    "id": cid,
                     "chat_id": cid,
                     "title": title,
                     "chat_type": chat_type,
-                    "member_count": 2
+                    "member_count": member_count,
+                    "creator_id": creator_uid,
+                    "deduplicated": false
                 }),
             )
         }
@@ -2254,7 +3787,10 @@ fn route_api_request(
             let seq = g.alloc_seq();
             let invite_id = format!("inv_{seq}");
             let code = format!("join_{cid}_{seq}");
-            let max_uses = body.get("max_uses").and_then(Value::as_u64);
+            let max_uses = body
+                .get("max_uses")
+                .or_else(|| body.get("usage_limit"))
+                .and_then(Value::as_u64);
             let rec = ChatInviteRecord {
                 invite_id: invite_id.clone(),
                 chat_id: cid,
@@ -2271,6 +3807,7 @@ fn route_api_request(
                     "chat_id": cid,
                     "code": code,
                     "max_uses": max_uses,
+                    "usage_limit": max_uses,
                     "uses": 0,
                     "revoked": false
                 }),
@@ -2293,6 +3830,7 @@ fn route_api_request(
                         "chat_id": i.chat_id,
                         "code": i.code,
                         "max_uses": i.max_uses,
+                        "usage_limit": i.max_uses,
                         "uses": i.uses,
                         "revoked": i.revoked
                     })
@@ -2319,6 +3857,48 @@ fn route_api_request(
                 (404, json!({"error": "invite_not_found"}))
             }
         }
+        ("GET", p) if p.starts_with("/api/v1/chats/") && p.ends_with("/topics") => {
+            let cid: i64 = p
+                .trim_start_matches("/api/v1/chats/")
+                .trim_end_matches("/topics")
+                .parse()
+                .unwrap_or(1);
+            (200, json!({"chat_id": cid, "topics": []}))
+        }
+        ("GET", p)
+            if p.starts_with("/api/v1/chats/")
+                && !p.trim_start_matches("/api/v1/chats/").contains('/') =>
+        {
+            let cid_str = p.trim_start_matches("/api/v1/chats/");
+            if let Ok(cid) = cid_str.parse::<i64>() {
+                let g = state.lock().expect("state lock");
+                if let Some(chat) = g.chats.get(&cid) {
+                    return (
+                        200,
+                        json!({
+                            "id": chat.chat_id,
+                            "chat_id": chat.chat_id,
+                            "title": chat.title,
+                            "chat_type": chat.chat_type,
+                            "member_count": chat.member_count,
+                            "is_group": chat.chat_type > 0
+                        }),
+                    );
+                }
+                return (
+                    200,
+                    json!({
+                        "id": cid,
+                        "chat_id": cid,
+                        "title": format!("Chat {cid}"),
+                        "chat_type": 0,
+                        "member_count": 2,
+                        "is_group": false
+                    }),
+                );
+            }
+            (200, json!({"ok": true, "path": path, "method": method, "timestamp_ms": ts}))
+        }
 
         // Messages & Per-Chat PTS Journal
         ("POST", p)
@@ -2335,9 +3915,17 @@ fn route_api_request(
             };
             let client_nonce = body.get("client_nonce").and_then(Value::as_u64);
             let mut g = state.lock().expect("state lock");
+            let sender_id = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
             if let Some(nonce) = client_nonce {
                 if let Some(existing) = g.chat_nonce_map.get(&(cid, nonce)).cloned() {
-                    return (200, stored_message_to_json(&existing));
+                    let mut out = stored_message_to_json(&existing);
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert("sender_id".to_owned(), json!(sender_id));
+                    }
+                    return (200, out);
                 }
             }
             g.next_msg_id += 1;
@@ -2364,7 +3952,11 @@ fn route_api_request(
             if let Some(nonce) = client_nonce {
                 g.chat_nonce_map.insert((cid, nonce), msg.clone());
             }
-            (200, stored_message_to_json(&msg))
+            let mut out = stored_message_to_json(&msg);
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("sender_id".to_owned(), json!(sender_id));
+            }
+            (200, out)
         }
         ("GET", p)
             if (p.starts_with("/api/v1/chats/") && p.ends_with("/messages"))
@@ -2381,16 +3973,131 @@ fn route_api_request(
                     .unwrap_or(1)
             };
             let g = state.lock().expect("state lock");
+            let current_pts = g.chat_pts.get(&cid).copied().unwrap_or(0);
             let msgs: Vec<Value> = g
                 .chat_messages
                 .get(&cid)
                 .map(|v| v.iter().map(stored_message_to_json).collect())
                 .unwrap_or_default();
-            (200, json!({"chat_id": cid, "messages": msgs}))
+            (
+                200,
+                json!({
+                    "chat_id": cid,
+                    "messages": msgs,
+                    "has_more": false,
+                    "current_pts": current_pts
+                }),
+            )
+        }
+        ("POST", "/api/v1/messages/edit") => {
+            let cid = body.get("chat_id").and_then(Value::as_i64).unwrap_or(1);
+            let mid = body.get("message_id").and_then(Value::as_i64).unwrap_or(0);
+            let new_text = body
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let mut g = state.lock().expect("state lock");
+            let pts = {
+                let entry = g.chat_pts.entry(cid).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            if let Some(msgs) = g.chat_messages.get_mut(&cid) {
+                if let Some(m) = msgs.iter_mut().find(|m| m.message_id == mid) {
+                    m.text = new_text.clone();
+                }
+            }
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "success": true,
+                    "message_id": mid,
+                    "text": new_text,
+                    "pts": pts,
+                    "edited_at_ms": ts,
+                    "status": "edited"
+                }),
+            )
+        }
+        ("POST", "/api/v1/messages/delete") => {
+            let cid = body.get("chat_id").and_then(Value::as_i64).unwrap_or(1);
+            let revoke = body
+                .get("revoke")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let ids: HashSet<i64> = body
+                .get("message_ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default();
+            let mut g = state.lock().expect("state lock");
+            let pts = {
+                let entry = g.chat_pts.entry(cid).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let mut deleted_count = ids.len();
+            if let Some(msgs) = g.chat_messages.get_mut(&cid) {
+                let before = msgs.len();
+                msgs.retain(|m| !ids.contains(&m.message_id));
+                let removed = before.saturating_sub(msgs.len());
+                if removed > 0 {
+                    deleted_count = removed;
+                }
+            }
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "success": true,
+                    "pts": pts,
+                    "deleted_count": deleted_count,
+                    "revoke": revoke
+                }),
+            )
+        }
+        ("POST", "/api/v1/messages/reaction") => {
+            let cid = body.get("chat_id").and_then(Value::as_i64).unwrap_or(1);
+            let mut g = state.lock().expect("state lock");
+            let pts = {
+                let entry = g.chat_pts.entry(cid).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "success": true,
+                    "pts": pts,
+                    "status": "reaction_updated"
+                }),
+            )
+        }
+        ("POST", "/api/v1/messages/read") => {
+            let cid = body.get("chat_id").and_then(Value::as_i64).unwrap_or(1);
+            let mut g = state.lock().expect("state lock");
+            let pts = {
+                let entry = g.chat_pts.entry(cid).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "success": true,
+                    "pts": pts,
+                    "status": "history_read"
+                }),
+            )
         }
 
-        // PTS sync difference
-        ("POST", "/api/v1/sync/get_difference") | ("GET", "/api/v1/sync/difference") => {
+        // PTS sync difference & state/pts
+        ("POST" | "GET", "/api/v1/sync/get_difference")
+        | ("GET" | "POST", "/api/v1/sync/difference") => {
             let chat_id = body
                 .get("chat_id")
                 .and_then(Value::as_i64)
@@ -2410,7 +4117,12 @@ fn route_api_request(
 
             let g = state.lock().expect("state lock");
             let floor = g.journal_floors.get(&chat_id).copied().unwrap_or(1);
-            let current_pts = g.chat_pts.get(&chat_id).copied().unwrap_or(0).max(floor.saturating_sub(1));
+            let current_pts = g
+                .chat_pts
+                .get(&chat_id)
+                .copied()
+                .unwrap_or(0)
+                .max(floor.saturating_sub(1));
             let snapshot_required = req_pts.saturating_add(1) < floor;
 
             if snapshot_required {
@@ -2455,12 +4167,33 @@ fn route_api_request(
                 }),
             )
         }
+        ("GET", "/api/v1/sync/state") | ("GET", "/api/v1/sync/pts") => {
+            let chat_id = extract_query_param(query, "chat_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1);
+            let g = state.lock().expect("state lock");
+            let current_pts = g.chat_pts.get(&chat_id).copied().unwrap_or(0);
+            (
+                200,
+                json!({
+                    "chat_id": chat_id,
+                    "pts": current_pts,
+                    "current_pts": current_pts,
+                    "seq": g.next_seq
+                }),
+            )
+        }
 
-        // Resumable chunked media upload init / status / complete
+        // Resumable chunked media upload init / status / complete + edit + instant-view API
         ("POST", "/api/v1/media/upload/init") => {
-            let total_size = body.get("total_size").and_then(Value::as_u64).unwrap_or(0);
+            let total_size = body
+                .get("total_size")
+                .or_else(|| body.get("size_bytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let part_size = body
                 .get("part_size")
+                .or_else(|| body.get("chunk_size"))
                 .and_then(Value::as_u64)
                 .unwrap_or(65_536);
             if total_size > MAX_UPLOAD_TOTAL_SIZE {
@@ -2469,6 +4202,10 @@ fn route_api_request(
             if part_size == 0 || part_size > MAX_UPLOAD_PART_SIZE {
                 return (400, json!({"error": "invalid_part_size"}));
             }
+            let filename = body
+                .get("filename")
+                .cloned()
+                .unwrap_or_else(|| json!("upload.bin"));
             let mut g = state.lock().expect("state lock");
             let seq = g.alloc_seq();
             let upload_id = format!("upl_{seq}");
@@ -2480,6 +4217,7 @@ fn route_api_request(
                 upload_id.clone(),
                 UploadSession {
                     upload_id: upload_id.clone(),
+                    filename: filename.clone(),
                     total_size,
                     part_size,
                     expected_sha256,
@@ -2490,25 +4228,35 @@ fn route_api_request(
                 200,
                 json!({
                     "upload_id": upload_id,
+                    "filename": filename,
                     "part_size": part_size,
-                    "total_size": total_size
+                    "chunk_size": part_size,
+                    "total_size": total_size,
+                    "size_bytes": total_size
                 }),
             )
         }
         ("GET", p) if p.starts_with("/api/v1/media/upload/") && !p.contains("/part/") => {
-            let upload_id = p.trim_start_matches("/api/v1/media/upload/");
+            let raw_id = p.trim_start_matches("/api/v1/media/upload/");
+            let upload_id = raw_id.strip_suffix("/status").unwrap_or(raw_id);
             let g = state.lock().expect("state lock");
             let Some(session) = g.uploads.get(upload_id) else {
                 return (404, json!({"error": "upload_not_found"}));
             };
             let received: Vec<usize> = session.parts.keys().copied().collect();
+            let bytes_received: usize = session.parts.values().map(Vec::len).sum();
             (
                 200,
                 json!({
                     "upload_id": session.upload_id,
+                    "filename": session.filename,
                     "total_size": session.total_size,
+                    "size_bytes": session.total_size,
                     "part_size": session.part_size,
-                    "received_parts": received
+                    "chunk_size": session.part_size,
+                    "bytes_received": bytes_received,
+                    "received_parts": received,
+                    "status": "in_progress"
                 }),
             )
         }
@@ -2546,10 +4294,50 @@ fn route_api_request(
             (
                 200,
                 json!({
+                    "upload_id": session.upload_id,
+                    "filename": session.filename,
                     "file_id": file_id,
                     "media_id": file_id,
                     "sha256": digest,
-                    "size": size
+                    "size": size,
+                    "status": "completed"
+                }),
+            )
+        }
+        ("POST", "/api/v1/media/edit") => {
+            let media_id = body
+                .get("media_id")
+                .or_else(|| body.get("file_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("edited_media");
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "edited": true,
+                    "media_id": media_id,
+                    "file_id": media_id,
+                    "timestamp_ms": ts
+                }),
+            )
+        }
+        ("GET" | "POST", "/api/v1/media/instant-view")
+        | ("GET" | "POST", "/api/v1/media/instant_view") => {
+            let url = body
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| extract_query_param(query, "url"))
+                .unwrap_or("/article/v167");
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "url": url,
+                    "title": "Fabushi v1.6.7",
+                    "blocks": [
+                        {"type": "heading", "text": "Fabushi v1.6.7"},
+                        {"type": "paragraph", "text": "Instant View article content"}
+                    ]
                 }),
             )
         }
@@ -2565,19 +4353,35 @@ fn route_api_request(
                 .users_by_id
                 .get(&uid)
                 .and_then(|u| u.vault_envelope.clone());
-            (200, json!({"envelope": env}))
+            let mut out = serde_json::Map::new();
+            out.insert("envelope".to_owned(), env.clone().unwrap_or(Value::Null));
+            if let Some(Value::Object(map)) = env {
+                for (k, v) in map {
+                    if k != "envelope" {
+                        out.insert(k, v);
+                    }
+                }
+            }
+            (200, Value::Object(out))
         }
-        ("PUT", "/api/v1/user-vault/envelope") | ("PUT", "/api/v1/vault/envelope") => {
+        ("PUT" | "POST", "/api/v1/user-vault/envelope")
+        | ("PUT" | "POST", "/api/v1/vault/envelope") => {
             let mut g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
                 .map(|s| s.user_id)
                 .unwrap_or_else(|| g.default_user_id());
             let user = g.ensure_user_by_id(uid);
+            let kdf_alg = body
+                .get("kdf_alg")
+                .and_then(Value::as_str)
+                .unwrap_or("split_key_v2")
+                .to_owned();
             user.vault_envelope = Some(body.clone());
-            (200, json!({"ok": true, "saved": true}))
+            (200, json!({"ok": true, "saved": true, "kdf_alg": kdf_alg}))
         }
         ("GET", "/api/v1/user-vault/items") | ("GET", "/api/v1/vault/items") => {
+            let cat_filter = extract_query_param(query, "category");
             let g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
@@ -2586,15 +4390,15 @@ fn route_api_request(
             let items: Vec<Value> = g
                 .vault_items
                 .iter()
-                .filter(|((u, _, _), _)| *u == uid)
+                .filter(|((u, cat, _), _)| {
+                    *u == uid && cat_filter.is_none_or(|f| f == cat.as_str())
+                })
                 .map(|(_, v)| v.clone())
                 .collect();
             (200, json!({"items": items}))
         }
-        ("POST", "/api/v1/user-vault/items")
-        | ("PUT", "/api/v1/user-vault/items")
-        | ("POST", "/api/v1/vault/items")
-        | ("PUT", "/api/v1/vault/items") => {
+        ("POST" | "PUT", "/api/v1/user-vault/items")
+        | ("POST" | "PUT", "/api/v1/vault/items") => {
             let mut g = state.lock().expect("state lock");
             let uid = caller_session
                 .as_ref()
@@ -2610,7 +4414,65 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .unwrap_or("default")
                 .to_owned();
-            g.vault_items.insert((uid, cat.clone(), key.clone()), body.clone());
+            g.vault_items
+                .insert((uid, cat.clone(), key.clone()), body.clone());
+            (200, json!({"ok": true, "category": cat, "item_key": key}))
+        }
+        ("GET", p)
+            if p.starts_with("/api/v1/user-vault/items/") || p.starts_with("/api/v1/vault/items/") =>
+        {
+            let rest = p
+                .strip_prefix("/api/v1/user-vault/items/")
+                .or_else(|| p.strip_prefix("/api/v1/vault/items/"))
+                .unwrap_or("");
+            let g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            if let Some((raw_cat, raw_key)) = rest.split_once('/') {
+                let cat = percent_decode(raw_cat);
+                let key = percent_decode(raw_key);
+                if let Some(item) = g.vault_items.get(&(uid, cat, key)) {
+                    (200, item.clone())
+                } else {
+                    (404, json!({"error": "vault_item_not_found"}))
+                }
+            } else {
+                let cat = percent_decode(rest);
+                let items: Vec<Value> = g
+                    .vault_items
+                    .iter()
+                    .filter(|((u, c, _), _)| *u == uid && c == &cat)
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                (200, json!({"category": cat, "items": items}))
+            }
+        }
+        ("PUT" | "POST", p)
+            if p.starts_with("/api/v1/user-vault/items/") || p.starts_with("/api/v1/vault/items/") =>
+        {
+            let rest = p
+                .strip_prefix("/api/v1/user-vault/items/")
+                .or_else(|| p.strip_prefix("/api/v1/vault/items/"))
+                .unwrap_or("");
+            let (raw_cat, raw_key) = rest.split_once('/').unwrap_or(("general", rest));
+            let cat = percent_decode(raw_cat);
+            let key = percent_decode(raw_key);
+            let mut stored = body.clone();
+            if let Some(obj) = stored.as_object_mut() {
+                obj.entry("category".to_owned())
+                    .or_insert_with(|| json!(cat));
+                obj.entry("item_key".to_owned())
+                    .or_insert_with(|| json!(key));
+            }
+            let mut g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            g.vault_items
+                .insert((uid, cat.clone(), key.clone()), stored);
             (200, json!({"ok": true, "category": cat, "item_key": key}))
         }
         ("DELETE", p)
@@ -2625,9 +4487,11 @@ fn route_api_request(
                 .as_ref()
                 .map(|s| s.user_id)
                 .unwrap_or_else(|| g.default_user_id());
-            let (cat, key) = rest.split_once('/').unwrap_or(("general", rest));
-            g.vault_items.remove(&(uid, cat.to_owned(), key.to_owned()));
-            (200, json!({"deleted": true}))
+            let (raw_cat, raw_key) = rest.split_once('/').unwrap_or(("general", rest));
+            let cat = percent_decode(raw_cat);
+            let key = percent_decode(raw_key);
+            g.vault_items.remove(&(uid, cat.clone(), key.clone()));
+            (200, json!({"deleted": true, "category": cat, "item_key": key}))
         }
         ("POST", "/api/v1/user-vault/device-sync/request")
         | ("POST", "/api/v1/vault/device-sync/request") => {
@@ -2757,19 +4621,26 @@ fn route_api_request(
             rec.status = "denied".to_owned();
             (200, json!({"request_id": rec.request_id, "status": "denied"}))
         }
-        ("GET", p) | ("POST", p)
-            if p.starts_with("/api/v1/user-vault/device-sync/status")
-                || p.starts_with("/api/v1/vault/device-sync/status")
-                || p.starts_with("/api/v1/user-vault/device-sync/dsync_")
-                || p.starts_with("/api/v1/vault/device-sync/dsync_") =>
+        ("GET" | "POST", p)
+            if p == "/api/v1/user-vault/device-sync/status"
+                || p == "/api/v1/vault/device-sync/status"
+                || p.starts_with("/api/v1/user-vault/device-sync/status/")
+                || p.starts_with("/api/v1/vault/device-sync/status/")
+                || ((p.starts_with("/api/v1/user-vault/device-sync/")
+                    || p.starts_with("/api/v1/vault/device-sync/"))
+                    && !matches!(
+                        p.rsplit('/').next().unwrap_or(""),
+                        "pending" | "request" | "approve" | "deny" | "status"
+                    )) =>
         {
             let req_id = body
                 .get("request_id")
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| extract_query_param(query, "request_id"))
                 .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    p.rsplit('/').next().unwrap_or("").to_owned()
-                });
+                .unwrap_or_else(|| p.rsplit('/').next().unwrap_or("").to_owned());
             let g = state.lock().expect("state lock");
             let Some(rec) = g.device_syncs.get(&req_id) else {
                 return (404, json!({"error": "device_sync_not_found"}));
@@ -2787,6 +4658,403 @@ fn route_api_request(
                 }),
             )
         }
+        (_, p)
+            if matches_segment_prefix(p, "/api/v1/user-vault/obscura")
+                || matches_segment_prefix(p, "/api/v1/vault/obscura") =>
+        {
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "obscura": true,
+                    "path": path,
+                    "method": method,
+                    "timestamp_ms": ts
+                }),
+            )
+        }
+
+        // Canonical Agent runs & turn (compatible with gpui_telegram_client::AgentRunResponse)
+        ("POST", "/api/v1/agent/runs") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let session_id = body
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| caller_session.as_ref().map(|s| s.session_id.clone()))
+                .unwrap_or_else(|| format!("agent_sess_{seq}"));
+            let prompt = body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let response = format!("Completed agent run for: {prompt}");
+            (
+                200,
+                json!({
+                    "run_id": format!("run_{seq}"),
+                    "session_id": session_id,
+                    "user_id": uid,
+                    "status": "completed",
+                    "prompt": prompt,
+                    "response": response,
+                    "outputs": []
+                }),
+            )
+        }
+        ("POST", "/api/v1/agent/turn") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let session_id = body
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| caller_session.as_ref().map(|s| s.session_id.clone()))
+                .unwrap_or_else(|| format!("agent_sess_{seq}"));
+            let prompt = body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let response = format!("Executed turn for: {prompt}");
+            (
+                200,
+                json!({
+                    "turn_id": format!("turn_{seq}"),
+                    "session_id": session_id,
+                    "caller_id": uid,
+                    "status": "executed",
+                    "prompt": prompt,
+                    "response": response,
+                    "outputs": []
+                }),
+            )
+        }
+
+        // Canonical singular /api/v1/computer/* lease broker & action endpoints (gpui_telegram_server/src/server.rs:283-289)
+        ("POST", "/api/v1/computer/lease") | ("POST", "/api/v1/computer/lease/acquire") => {
+            let device_id = body
+                .get("device_id")
+                .or_else(|| body.get("node_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("default_device")
+                .to_owned();
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let entry = g
+                .computer_leases
+                .entry(device_id.clone())
+                .or_insert_with(|| ComputerLeaseRecord {
+                    lease_id: format!("lease_{seq}"),
+                    generation: 0,
+                    override_epoch: 0,
+                });
+            entry.generation += 1;
+            entry.lease_id = format!("lease_{seq}");
+            let lease_id = entry.lease_id.clone();
+            let generation = entry.generation;
+            let override_epoch = entry.override_epoch;
+            (
+                200,
+                json!({
+                    "lease_id": lease_id,
+                    "target_device_id": device_id,
+                    "device_id": device_id,
+                    "generation": generation,
+                    "override_epoch": override_epoch,
+                    "state": "active",
+                    "is_valid": true
+                }),
+            )
+        }
+        ("POST", "/api/v1/computer/lease/emergency_takeover") => {
+            let device_id = body
+                .get("device_id")
+                .or_else(|| body.get("node_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("default_device")
+                .to_owned();
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let entry = g
+                .computer_leases
+                .entry(device_id.clone())
+                .or_insert_with(|| ComputerLeaseRecord {
+                    lease_id: format!("lease_{seq}"),
+                    generation: 0,
+                    override_epoch: 0,
+                });
+            entry.generation += 1;
+            entry.override_epoch += 1;
+            entry.lease_id = format!("lease_takeover_{seq}");
+            let new_generation = entry.generation;
+            let override_epoch = entry.override_epoch;
+            (
+                200,
+                json!({
+                    "status": "emergency_takeover_executed",
+                    "action": "preempt_and_fence",
+                    "target_device_id": device_id,
+                    "new_generation": new_generation,
+                    "generation": new_generation,
+                    "override_epoch": override_epoch,
+                    "latency_sub_10ms": true,
+                    "elapsed_ms": 1
+                }),
+            )
+        }
+        ("POST", "/api/v1/computer/action") => {
+            let device_id = body
+                .get("device_id")
+                .or_else(|| body.get("node_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("default_device")
+                .to_owned();
+            let req_gen = body.get("generation").and_then(Value::as_u64);
+            let g = state.lock().expect("state lock");
+            if let Some(lease) = g.computer_leases.get(&device_id) {
+                if let Some(rg) = req_gen {
+                    if rg < lease.generation {
+                        return (
+                            403,
+                            json!({
+                                "error": "stale_generation",
+                                "current_generation": lease.generation
+                            }),
+                        );
+                    }
+                }
+                return (
+                    200,
+                    json!({
+                        "status": "action_executed",
+                        "generation": lease.generation,
+                        "lease_id": lease.lease_id,
+                        "target_device_id": device_id
+                    }),
+                );
+            }
+            (
+                200,
+                json!({
+                    "status": "action_executed",
+                    "generation": req_gen.unwrap_or(1),
+                    "lease_id": "lease_default",
+                    "target_device_id": device_id
+                }),
+            )
+        }
+
+        // Canonical search, WebRTC, Tasks, MCP, Talk & Magpie endpoints
+        ("GET", "/api/v1/search/messages") => {
+            let q = extract_query_param(query, "q").unwrap_or("");
+            let cid_filter =
+                extract_query_param(query, "chat_id").and_then(|s| s.parse::<i64>().ok());
+            let q_lower = q.to_ascii_lowercase();
+            let g = state.lock().expect("state lock");
+            let mut results = Vec::new();
+            for (&cid, msgs) in &g.chat_messages {
+                if cid_filter.is_some_and(|f| f != cid) {
+                    continue;
+                }
+                for m in msgs {
+                    if q_lower.is_empty() || m.text.to_ascii_lowercase().contains(&q_lower) {
+                        results.push(stored_message_to_json(m));
+                    }
+                }
+            }
+            let total = results.len();
+            (200, json!({"query": q, "results": results, "total": total}))
+        }
+        ("POST", "/api/v1/webrtc/call/invite") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let caller_id = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            let callee_id = body
+                .get("callee_id")
+                .or_else(|| body.get("peer_id"))
+                .cloned()
+                .unwrap_or_else(|| json!(0));
+            (
+                200,
+                json!({
+                    "call_id": format!("call_{seq}"),
+                    "caller_id": caller_id,
+                    "callee_id": callee_id,
+                    "status": "invited"
+                }),
+            )
+        }
+        ("POST", "/api/v1/webrtc/call/signal") => {
+            let g = state.lock().expect("state lock");
+            let uid = caller_session
+                .as_ref()
+                .map(|s| s.user_id)
+                .unwrap_or_else(|| g.default_user_id());
+            (
+                200,
+                json!({
+                    "user_id": uid,
+                    "signal": body,
+                    "status": "relayed"
+                }),
+            )
+        }
+        ("GET", "/api/v1/webrtc/turn_credentials") => (
+            200,
+            json!({
+                "urls": ["stun:stun.l.google.com:19302"],
+                "username": "ephemeral_fabushi_user",
+                "credential": "ephemeral_fabushi_credential",
+                "ttl_seconds": 43_200
+            }),
+        ),
+        ("GET", "/api/v1/tasks") => (
+            200,
+            json!({
+                "tasks": [],
+                "columns": ["inbox", "active", "review", "completed", "failed", "cancelled"],
+                "total": 0
+            }),
+        ),
+        ("POST", "/api/v1/tasks") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            let task_id = body
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("task_{seq}"));
+            let task_state = body
+                .get("initial_state")
+                .and_then(Value::as_str)
+                .unwrap_or("inbox");
+            (
+                200,
+                json!({
+                    "task_id": task_id,
+                    "state": task_state,
+                    "created": true
+                }),
+            )
+        }
+        ("POST", p) if p.starts_with("/api/v1/tasks/") && p.ends_with("/approve") => {
+            let task_id = p
+                .trim_start_matches("/api/v1/tasks/")
+                .trim_end_matches("/approve");
+            let approved = body
+                .get("approved")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let decision = body
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or(if approved { "approved" } else { "rejected" });
+            (
+                200,
+                json!({
+                    "task_id": task_id,
+                    "approved": approved,
+                    "decision": decision,
+                    "current_state": if approved { "active" } else { "cancelled" },
+                    "transition_success": true,
+                    "gate_id": format!("gate_{task_id}")
+                }),
+            )
+        }
+        ("GET", "/api/v1/mcp/servers") => (
+            200,
+            json!({"servers": [], "registered_tools_count": 0}),
+        ),
+        ("POST", "/api/v1/mcp/servers") => {
+            let server_id = body
+                .get("server_id")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp_srv_1");
+            (200, json!({"status": "registered", "server_id": server_id}))
+        }
+        ("GET", "/api/v1/mcp/tools") => (200, json!({"tools": [], "count": 0})),
+        ("POST", "/api/v1/mcp/call") => {
+            let Some(tool_name) = body
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return (400, json!({"error": "missing_tool_name"}));
+            };
+            (
+                200,
+                json!({
+                    "status": "executed",
+                    "tool_name": tool_name,
+                    "result": format!("executed:{tool_name}")
+                }),
+            )
+        }
+        ("POST", "/api/v1/mcp/permission/approve") => {
+            let Some(request_id) = body
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return (400, json!({"error": "missing_request_id"}));
+            };
+            let allow = body.get("allow").and_then(Value::as_bool).unwrap_or(true);
+            (
+                200,
+                json!({
+                    "status": if allow { "approved" } else { "rejected" },
+                    "request_id": request_id
+                }),
+            )
+        }
+        ("POST", "/api/v1/talk/session") => {
+            let mut g = state.lock().expect("state lock");
+            let seq = g.alloc_seq();
+            (
+                200,
+                json!({
+                    "session_id": format!("talk_{seq}"),
+                    "state": "listening",
+                    "generation": seq,
+                    "signal_seq": seq
+                }),
+            )
+        }
+        ("POST", "/api/v1/talk/barge_in") => (
+            200,
+            json!({
+                "status": "barge_in_handled",
+                "new_state": "listening",
+                "flushed_audio_chunks": 0,
+                "buffer_remaining": 0
+            }),
+        ),
+        ("POST", "/api/v1/talk/audio") => (
+            200,
+            json!({"status": "queued", "buffered_chunks": 1}),
+        ),
+        ("GET", "/api/v1/magpie/v1") | ("GET", "/api/v1/magpie/v1/models") => (
+            200,
+            json!({
+                "object": "list",
+                "data": [
+                    {"id": "gpt-4.1-mini", "object": "model", "owned_by": "magpie"}
+                ]
+            }),
+        ),
 
         // Updates check
         ("GET", "/api/v1/updates/check") => (
@@ -2798,36 +5066,12 @@ fn route_api_request(
             }),
         ),
 
-        // Explicit suite routes for remaining namespaces (all known prefixes explicitly enumerated)
+        // Explicit segment-bounded suite routes for the 37 canonical namespaces
+        // (explicitly EXCLUDING /api/v1/auth, /api/v1/user-vault, /api/v1/vault, /api/v1/sync, /api/v1/media!)
         (_, p)
-            if p.starts_with("/api/v1/chats/")
-                || p.starts_with("/api/v1/messages/")
-                || p.starts_with("/api/v1/folders")
-                || p.starts_with("/api/v1/contacts")
-                || p.starts_with("/api/v1/peers/")
-                || p.starts_with("/api/v1/blocked")
-                || p.starts_with("/api/v1/settings")
-                || p.starts_with("/api/v1/fabushi/")
-                || p.starts_with("/api/v1/agent/")
-                || p.starts_with("/api/v1/tasks")
-                || p.starts_with("/api/v1/magpie/v1/")
-                || p.starts_with("/api/v1/mcp/")
-                || p.starts_with("/api/v1/computers")
-                || p.starts_with("/api/v1/remote/")
-                || p.starts_with("/api/v1/tailnet")
-                || p.starts_with("/api/v1/miniapps")
-                || p.starts_with("/api/v1/stickers")
-                || p.starts_with("/api/v1/gifs")
-                || p.starts_with("/api/v1/stories")
-                || p.starts_with("/api/v1/calls")
-                || p.starts_with("/api/v1/webrtc")
-                || p.starts_with("/api/v1/talk")
-                || p.starts_with("/api/v1/search")
-                || p.starts_with("/api/v1/e2ee")
-                || p.starts_with("/api/v1/wallet")
-                || p.starts_with("/api/v1/actions")
-                || p.starts_with("/api/v1/devices")
-                || p.starts_with("/api/v1/push") =>
+            if ALLOWED_FALLBACK_NAMESPACES
+                .iter()
+                .any(|ns| matches_segment_prefix(p, ns)) =>
         {
             (
                 200,

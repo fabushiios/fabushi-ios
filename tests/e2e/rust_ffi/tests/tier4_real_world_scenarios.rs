@@ -97,7 +97,10 @@ fn tc_t4_scen_01_onboarding_split_key_v2_vault_first_chat_and_cold_restart() {
             .any(|i| i["item_key"] == "github:scen01")
     );
     let outbox = h.expect_ok("outbox.list", json!({"chat_id": cid}));
-    assert!(outbox["items"].is_array());
+    assert!(
+        outbox["items"].as_array().expect("outbox items").is_empty(),
+        "online message must not remain queued in outbox after delivery"
+    );
 }
 
 #[test]
@@ -654,9 +657,21 @@ fn tc_t4_scen_13_media_stories_stickers_instant_view_and_offline_fts5_search() {
     let story = h.expect_ok("stories.create", json!({"media_id": up["file_id"], "media_type": "photo", "caption": "24h story", "privacy": "contacts"}));
     let _ = h.expect_ok("stories.view", json!({"story_id": story["story_id"]}));
     let _ = h.expect_ok("stickers.install_set", json!({"set_id": "fabushi_pack_1"}));
+    let photo_msg = h.expect_ok(
+        "messages.send",
+        json!({
+            "chat_id": cid,
+            "content": {"type": "photo", "file_id": up["file_id"], "width": 800, "height": 600},
+            "client_nonce": 41300
+        }),
+    );
+    assert!(photo_msg["message_id"].as_i64().expect("photo message_id") > 0);
     let sm = h.expect_ok("chats.shared_media", json!({"chat_id": cid, "subtab": "media"}));
     assert_eq!(sm["subtab"], "media");
-    assert!(sm["items"].is_array());
+    assert!(
+        !sm["items"].as_array().expect("shared_media items").is_empty(),
+        "seeded photo message must appear in chats.shared_media media subtab"
+    );
     let _ = h.expect_ok("media.instant_view_fetch", json!({"url": format!("{}/iv/s13", h.server_url())}));
     let _ = h.expect_ok("messages.send", json!({"chat_id": cid, "text": "离线全文索引验证S13", "client_nonce": 41301}));
     let hist = h.expect_ok("messages.history", json!({"chat_id": cid, "limit": 10}));

@@ -134,7 +134,7 @@ Machine-readable lock: [`tests/e2e/feature_matrix.json`](tests/e2e/feature_matri
   - **Tier 2 (Boundary, Corner-Case & Fail-Closed)**: 34 × 5 = **170** Rust E2E tests (`tier2_auth_shell_messaging.rs`: 80, `tier2_agents_platform_hig.rs`: 90)
   - **Tier 3 (Pairwise Cross-Feature Interactions)**: **36** Rust E2E tests (`tier3_pairwise_combos.rs`, every `F01..F34` covered in >= 2 pairs with body-level RPC verification)
   - **Tier 4 (Real-World Multi-Feature Lifecycles)**: **18** Rust E2E tests (`tier4_real_world_scenarios.rs`, >= 4 distinct declared features genuinely exercised in every scenario)
-  - **Total Executable Production Rust E2E Tests**: **394** (>= 391 required) + **8** zero-`unsafe` CI self-validation, protocol-framing, 3-layer anti-stub, and baseline `8128951` negative-proof tests in `self_validate_antistub.rs`.
+  - **Total Executable Production Rust E2E Tests**: **394** (>= 391 required) + **11** zero-`unsafe` CI self-validation, protocol-framing, canonical-route/stateful-auth regression, 3-layer anti-stub, and baseline `8128951` negative-proof tests in `self_validate_antistub.rs`.
 
 ### 3.1 Honest Upstream Blocker & Planned Capability Ledger (7 Tracked IDs)
 
@@ -207,7 +207,7 @@ Workflow: [`.github/workflows/ios-e2e-suite.yml`](.github/workflows/ios-e2e-suit
      - `python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py`
      - `python3 tests/e2e/spec_coverage_check.py --strict --matrix tests/e2e/feature_matrix.json --report <path>`
      - Builds baseline `8128951` `source/host` (`libmahayana_app_host.so`) whenever `run_baseline_negative_proof == 'true'` (default on all `push`/`pull_request` runs -> 0 skipped steps)
-     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` (or `--skip-baseline-proof` only when explicitly disabled via `workflow_dispatch`), compiling all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, and running all 8 zero-`unsafe` `self_validate_antistub` tests
+     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` (or `--skip-baseline-proof` only when explicitly disabled via `workflow_dispatch`), compiling all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, and running all 11 zero-`unsafe` `self_validate_antistub` tests
      - Verifies `SHA256SUMS.txt` (`sha256sum -c`) and uploads evidence via `actions/upload-artifact@v7`.
    - **`macos-swift6-uitest-validate` (`macos-15`)**:
      - Fail-closed selection of `/Applications/Xcode_16.4.app` (configurable via `xcode_app` input)

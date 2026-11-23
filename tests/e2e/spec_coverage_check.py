@@ -224,14 +224,19 @@ FORBIDDEN_CODE_REGEXES: list[tuple[str, re.Pattern[str]]] = [
     ("unimplemented_macro", re.compile(r"\b" + "unimplem" + r"ented!\s*\(")),
 ]
 DISABLED_CFG_RE = re.compile(r"#\s*!?\s*\[\s*(?:cfg|cfg_attr)\s*\(")
+FORBIDDEN_TIER_SHOULD_PANIC_RE = re.compile(
+    r"#\s*!?\s*\[\s*(?:[A-Za-z0-9_]+::)*should_panic\b"
+)
 MUTANT_STUB_RE = re.compile(r"mutant[-_]stub", re.IGNORECASE)
 
 CHAR_LITERAL_RE = re.compile(
-    r"'(?:\\(?:[nrt0'\"\\]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]{1,6}\})|[^'\\\n])'"
+    r"'(?:\\(?:[nrt0'\"\\]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f][0-9A-Fa-f_]*\})|[^'\\\n])'"
 )
 TEST_ATTR_EXACT_RE = re.compile(r"^#\s*\[\s*(?:[A-Za-z0-9_]+::)*test\s*\]$")
 DISABLED_TEST_ATTR_RE = re.compile(
-    r"^#\s*\[\s*(?:(?:[A-Za-z0-9_]+::)*" + "ign" + r"ore\b|cfg\s*\(|cfg_attr\s*\()"
+    r"^#\s*\[\s*(?:(?:[A-Za-z0-9_]+::)*(?:"
+    + "ign"
+    + r"ore|should_panic)\b|cfg\s*\(|cfg_attr\s*\()"
 )
 FN_HEADER_RE = re.compile(r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(")
 CONNECT_PROD_CALL_RE = re.compile(r"\bconnect_production\s*\(\s*\)")
@@ -240,9 +245,6 @@ ASSERTION_CALL_RE = re.compile(
     r"assert!|"
     r"assert_eq!|"
     r"assert_ne!|"
-    r"expect_ok|"
-    r"expect_ok_with_meta|"
-    r"expect_ok_with_gen|"
     r"expect_err|"
     r"expect_err_with_gen|"
     r"verify_[a-z0-9_]+|"
@@ -250,6 +252,9 @@ ASSERTION_CALL_RE = re.compile(
     r"assert_not_hardcoded_localhost|"
     r"assert_dir_excludes_plaintext_secret"
     r")\s*\("
+)
+RPC_DISPATCH_SITE_RE = re.compile(
+    r"\.\s*(?:expect_ok|expect_ok_with_meta|expect_ok_with_gen|expect_err|expect_err_with_gen|dispatch|dispatch_with_gen)\s*\("
 )
 RPC_DISPATCH_CALL_RE = re.compile(
     r"\.\s*(?:expect_ok|expect_ok_with_meta|expect_ok_with_gen|expect_err|expect_err_with_gen|dispatch|dispatch_with_gen)"
@@ -468,6 +473,12 @@ def parse_rust_test_functions(
                         1 for ln in body_no_comments.splitlines() if ln.strip()
                     )
 
+                    dispatched_rpcs: list[str] = []
+                    for call_m in RPC_DISPATCH_SITE_RE.finditer(body_code_only):
+                        rpc_m = RPC_DISPATCH_CALL_RE.match(body_no_comments, call_m.start())
+                        if rpc_m:
+                            dispatched_rpcs.append(rpc_m.group(1))
+
                     if fn_name in tests:
                         parse_errors.append(f"duplicate Rust test function name `{fn_name}` in {path.name}")
                     tests[fn_name] = {
@@ -477,7 +488,7 @@ def parse_rust_test_functions(
                         "substantive_lines": substantive_lines,
                         "calls_connect_production": bool(CONNECT_PROD_CALL_RE.search(body_code_only)),
                         "has_assertion": bool(ASSERTION_CALL_RE.search(body_code_only)),
-                        "dispatched_rpcs": RPC_DISPATCH_CALL_RE.findall(body_no_comments),
+                        "dispatched_rpcs": dispatched_rpcs,
                     }
                     i = body_close + 1
                     continue
@@ -536,6 +547,12 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
         matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         errors.append(f"failed to parse feature matrix {matrix_path}: {exc}")
+        return {"ok": False, "strict": strict, "counts": {}, "errors": errors, "warnings": warnings}
+
+    if not isinstance(matrix, dict):
+        errors.append(
+            f"feature matrix {matrix_path} must be a JSON object, got {type(matrix).__name__}"
+        )
         return {"ok": False, "strict": strict, "counts": {}, "errors": errors, "warnings": warnings}
 
     infra_path = repo_root / "TEST_INFRA.md"
@@ -598,19 +615,19 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
     rust_tests_dir = repo_root / "tests/e2e/rust_ffi/tests"
     tier_files = sorted(rust_tests_dir.glob("tier*.rs"))
     all_tier_fns: dict[str, dict[str, Any]] = {}
-    all_tier_no_comments_parts: list[str] = []
 
     for tf in tier_files:
         if tf.name not in ALL_ALLOWED_TIER_FILES:
             record(f"UNEXPECTED tier test file outside allowed Tier 1-4 set: {tf.relative_to(repo_root)}")
         raw_text = tf.read_text(encoding="utf-8")
         no_comments, code_only = lex_rust_source(raw_text)
-        all_tier_no_comments_parts.append(no_comments)
 
         if MUTANT_STUB_RE.search(no_comments):
             record(f"FORBIDDEN mutant_stub reference found in production tier file: {tf.relative_to(repo_root)}")
         if DISABLED_CFG_RE.search(code_only):
             record(f"FORBIDDEN #[cfg(...)] / #[cfg_attr(...)] attribute found in production tier file: {tf.relative_to(repo_root)}")
+        if FORBIDDEN_TIER_SHOULD_PANIC_RE.search(code_only):
+            record(f"FORBIDDEN #[should_panic] attribute found in production tier file: {tf.relative_to(repo_root)}")
 
         parsed, parse_errs = parse_rust_test_functions(tf, no_comments, code_only)
         for pe in parse_errs:
@@ -620,11 +637,15 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                 record(f"duplicate Rust test function name across files: {fn_name}")
             all_tier_fns[fn_name] = meta
 
-    combined_tier_no_comments = "\n".join(all_tier_no_comments_parts)
+    dispatched_ns_counter: Counter[str] = Counter()
+    for meta in all_tier_fns.values():
+        for rpc in meta["dispatched_rpcs"]:
+            ns = rpc.split(".", 1)[0]
+            dispatched_ns_counter[ns] += 1
 
     rpc_counts: dict[str, int] = {}
     for ns in EXPECTED_RPC_NAMESPACES:
-        hits = len(re.findall(rf'"{re.escape(ns)}\.[A-Za-z0-9_.]+"', combined_tier_no_comments))
+        hits = dispatched_ns_counter.get(ns, 0)
         rpc_counts[ns] = hits
         if hits == 0:
             record(f"RPC namespace `{ns}.*` has 0 dispatches across Tier 1-4 Rust tests")

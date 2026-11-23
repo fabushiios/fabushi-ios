@@ -467,9 +467,12 @@ fn tc_t2_f20_04_denied_coding_permission_aborts_and_cancel_stops_turn() {
     );
     assert!(!denied.retryable);
 
-    let _ = h.cancel(turn_id);
     let cancelled = h.expect_ok("coding.turn_cancel", json!({"turn_id": turn_id}));
     assert_eq!(cancelled["cancelled"], true);
+    assert!(
+        !h.cancel(turn_id),
+        "completed/cancelled coding turn must no longer be active in FFI cancel registry"
+    );
 }
 
 #[test]
