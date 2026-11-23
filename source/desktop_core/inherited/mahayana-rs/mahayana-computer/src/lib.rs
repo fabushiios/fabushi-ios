@@ -473,14 +473,21 @@ pub fn capture_screen_observed() -> Result<(ComputerSnapshot, u64), ComputerErro
     let _lease = EXECUTION_LOCK
         .lock()
         .map_err(|_| ComputerError::Input("computer execution lock is poisoned".into()))?;
-    #[cfg(target_os = "macos")]
-    let snapshot = macos::capture_screen()?;
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let snapshot = portable::capture_screen()?;
+    // iOS target_os adaptation: keep snapshot binding scoped to desktop targets so iOS fails
+    // closed with ComputerError::Unavailable without an unbound `snapshot` identifier.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let snapshot = macos::capture_screen()?;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let snapshot = portable::capture_screen()?;
+        let generation = advance_snapshot_generation()?;
+        Ok((snapshot, generation))
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    return Err(ComputerError::Unavailable);
-    let generation = advance_snapshot_generation()?;
-    Ok((snapshot, generation))
+    {
+        Err(ComputerError::Unavailable)
+    }
 }
 
 pub fn capture_screen() -> Result<ComputerSnapshot, ComputerError> {

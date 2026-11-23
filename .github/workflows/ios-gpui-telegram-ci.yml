@@ -126,6 +126,10 @@ jobs:
           cache-on-failure: true
           shared-key: "ubuntu-m1a-desktop-core-v1"
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Compile all vendored mobile crate test targets (--no-run) & workspace libs
         env:
           GPUI_OFFLINE_TEST: "1"
@@ -151,26 +155,29 @@ jobs:
           GPUI_OFFLINE_TEST: "1"
         run: |
           set -euo pipefail
-          for pkg in \
-            gpui_telegram_core \
-            gpui_telegram_proto \
-            gpui_telegram_media \
-            gpui_telegram_webrtc \
-            gpui_telegram_agent \
-            gpui_telegram_coding \
-            magpie_gateway \
-            bot-browser \
-            fabushi_remote_engine \
-            fabushi_miniapp; do
-            echo "=== Testing crate: $pkg ==="
-            cargo test --manifest-path source/desktop_core/Cargo.toml -p "$pkg"
-          done
+          echo "=== Testing crate: gpui_telegram_core (process-isolated, -j 1 for 24-thread fence stress tests) ==="
+          cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast -j 1 \
+            -p gpui_telegram_core
+
+          echo "=== Testing 9 offline mobile crates (process-isolated nextest) ==="
+          cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
+            -p gpui_telegram_proto \
+            -p gpui_telegram_media \
+            -p gpui_telegram_webrtc \
+            -p gpui_telegram_agent \
+            -p gpui_telegram_coding \
+            -p magpie_gateway \
+            -p bot-browser \
+            -p fabushi_remote_engine \
+            -p fabushi_miniapp
 
           echo "=== Testing crate: fabushi_miniapp (--features server) ==="
-          cargo test --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server
+          cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
+            -p fabushi_miniapp --features server
 
           echo "=== Testing crate: gpui_telegram_client (--lib + 15 deterministic offline integration suites) ==="
-          cargo test --manifest-path source/desktop_core/Cargo.toml -p gpui_telegram_client \
+          cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
+            -p gpui_telegram_client \
             --lib \
             --test auth_client_tests \
             --test client_contract_and_sync_tests \
