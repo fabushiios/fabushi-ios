@@ -437,7 +437,11 @@ pub fn handle_fabushi(
             Ok(json!({
                 "valid": true,
                 "next_run": next_run.map(|d| d.to_rfc3339()),
-                "summary": summary,
+                "summary": {
+                    "scheduled_fires_next_7_days": summary.scheduled_fires_next_7_days,
+                    "fires_on_weekend": summary.fires_on_weekend,
+                    "fires_overnight": summary.fires_overnight,
+                },
             }))
         }
         "cronDelete" => {
@@ -785,8 +789,8 @@ pub fn handle_multi_agent(
             let ws = wss
                 .entry(chat_id)
                 .or_insert_with(|| SharedGroupWorkspace::new(chat_id));
-            let entry = if let Some(exp) = expected_revision {
-                ws.set_with_expected_revision(key, value, updated_by, exp)
+            let revision = if let Some(exp) = expected_revision {
+                ws.set_with_expected_revision(exp, key, value, updated_by)
                     .map_err(|e| HostError::conflict(e.to_string()))?
             } else {
                 ws.set(key, value, updated_by)
@@ -795,7 +799,7 @@ pub fn handle_multi_agent(
             let _ = host
                 .host_db
                 .kv_set("multi_agent_workspace", &chat_id.to_string(), &snap.to_string());
-            Ok(json!({ "entry": entry, "snapshot": snap }))
+            Ok(json!({ "revision": revision, "snapshot": snap }))
         }
         "workspaceGet" => {
             let chat_id = req_i64(params, "chat_id")?;
@@ -835,8 +839,14 @@ pub fn handle_multi_agent(
             Ok(json!({ "is_pass": is_explicit_pass_sentinel(text) }))
         }
         "issueCapabilityToken" => {
-            let subject = req_str(params, "subject")?.to_string();
-            let scope = req_str(params, "scope")?.to_string();
+            let agent_id = params
+                .get("agent_id")
+                .or_else(|| params.get("subject"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| HostError::invalid_arguments("Missing 'agent_id'"))?;
+            let chat_id = params.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let actions: Vec<String> = params
                 .get("allowed_actions")
                 .cloned()
@@ -851,14 +861,12 @@ pub fn handle_multi_agent(
                 .map_err(|e| HostError::crypto(format!("CSPRNG error: {e}")))?;
             let signing_key = SigningKey::from_bytes(&seed);
             let verifying_key: VerifyingKey = signing_key.verifying_key();
-            let now_ts = Utc::now().timestamp();
             let token = ScopedCapabilityToken::issue(
-                subject,
-                scope,
-                actions,
-                now_ts,
-                now_ts + ttl_secs,
                 &signing_key,
+                agent_id,
+                chat_id,
+                actions,
+                ttl_secs,
             );
             Ok(json!({
                 "token": token,
@@ -883,8 +891,12 @@ pub fn handle_multi_agent(
                 .get("now_ts")
                 .and_then(|v| v.as_i64())
                 .unwrap_or_else(|| Utc::now().timestamp());
-            let valid = if let Some(scope) = params.get("scope").and_then(|v| v.as_str()) {
-                token.verify_for_scope(&vk, now_ts, scope)
+            let valid = if let (Some(agent_id), Some(chat_id), Some(action_name)) = (
+                params.get("agent_id").and_then(|v| v.as_str()),
+                params.get("chat_id").and_then(|v| v.as_i64()),
+                params.get("action").and_then(|v| v.as_str()),
+            ) {
+                token.verify_for_scope(&vk, now_ts, agent_id, chat_id, action_name)
             } else {
                 token.verify(&vk, now_ts)
             };
@@ -919,8 +931,11 @@ pub fn handle_magpie(
         "resolvePresetEndpoints" => {
             let preset_id = req_str(params, "preset_id")?;
             let region = params.get("region").and_then(|v| v.as_str());
-            let custom_url = params.get("custom_url").and_then(|v| v.as_str());
-            let resolved = resolve_preset_endpoints(preset_id, region, custom_url)
+            let protocol: Option<magpie_gateway::ProtocolKind> = params
+                .get("protocol")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let resolved = resolve_preset_endpoints(preset_id, region, protocol)
                 .ok_or_else(|| HostError::not_found(format!("Unable to resolve preset '{preset_id}'")))?;
             to_val(resolved)
         }
@@ -1006,7 +1021,18 @@ pub fn handle_magpie(
                 now_ms,
             )
             .map_err(|e| HostError::new("routing_error", e.to_string(), false))?;
-            to_val(targets)
+            let serialized: Vec<Value> = targets
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "provider_id": t.provider_id,
+                        "model": t.model,
+                        "strategy": t.strategy,
+                        "reason": t.reason,
+                    })
+                })
+                .collect();
+            Ok(Value::Array(serialized))
         }
         "recordUsage" => {
             let target = req_str(params, "target")?;
@@ -1149,12 +1175,52 @@ pub fn handle_coding(
             Ok(json!({ "sent": true }))
         }
         "upsertThread" => {
-            let rec: ThreadRecord = parse_req(params)?;
+            let rec = ThreadRecord {
+                bot_user_id: req_i64(params, "bot_user_id")?,
+                chat_id: req_i64(params, "chat_id")?,
+                topic_id: params.get("topic_id").and_then(|v| v.as_i64()).unwrap_or(0),
+                thread_id: req_str(params, "thread_id")?.to_string(),
+                provider_session_id: params.get("provider_session_id").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                workspace_path: params.get("workspace_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                worktree_path: params.get("worktree_path").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                branch_name: params.get("branch_name").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                use_worktree: params.get("use_worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                active_model: params.get("active_model").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                permission_mode: params
+                    .get("permission_mode")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default(),
+                turn_count: params.get("turn_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                last_summary: params.get("last_summary").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                updated_at_ms: params
+                    .get("updated_at_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
+                bot_provider_kind: params
+                    .get("bot_provider_kind")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                bot_workspace_path: params.get("bot_workspace_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                bot_use_worktree: params.get("bot_use_worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                bot_active_model: params.get("bot_active_model").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                bot_permission_mode: params
+                    .get("bot_permission_mode")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+            };
             host.coding_store
                 .lock()
                 .upsert_thread(&rec)
                 .map_err(HostError::storage)?;
-            to_val(rec)
+            Ok(json!({
+                "thread_id": rec.thread_id,
+                "bot_user_id": rec.bot_user_id,
+                "chat_id": rec.chat_id,
+                "topic_id": rec.topic_id,
+                "turn_count": rec.turn_count,
+                "updated_at_ms": rec.updated_at_ms,
+            }))
         }
         "getThread" => {
             let bot_user_id = req_i64(params, "bot_user_id")?;
@@ -1166,28 +1232,80 @@ pub fn handle_coding(
                 .lock()
                 .get_thread(key)
                 .map_err(HostError::storage)?;
-            to_val(rec)
+            Ok(match rec {
+                Some(r) => json!({
+                    "bot_user_id": r.bot_user_id,
+                    "chat_id": r.chat_id,
+                    "topic_id": r.topic_id,
+                    "thread_id": r.thread_id,
+                    "provider_session_id": r.provider_session_id,
+                    "workspace_path": r.workspace_path,
+                    "worktree_path": r.worktree_path,
+                    "branch_name": r.branch_name,
+                    "use_worktree": r.use_worktree,
+                    "active_model": r.active_model,
+                    "permission_mode": r.permission_mode,
+                    "turn_count": r.turn_count,
+                    "last_summary": r.last_summary,
+                    "updated_at_ms": r.updated_at_ms,
+                }),
+                None => Value::Null,
+            })
         }
         "saveCheckpoint" => {
-            let cp: CheckpointRecord = parse_req(params)?;
+            let cp = CheckpointRecord {
+                thread_id: req_str(params, "thread_id")?.to_string(),
+                turn_idx: params.get("turn_idx").and_then(|v| v.as_u64()).unwrap_or(0),
+                before_ref: params.get("before_ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                after_ref: params.get("after_ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                diff_stat: params
+                    .get("diff_stat")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default(),
+                prompt_preview: params.get("prompt_preview").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                reply_preview: params.get("reply_preview").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                created_at_ms: params
+                    .get("created_at_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_else(|| Utc::now().timestamp_millis()),
+            };
             host.coding_store
                 .lock()
                 .save_checkpoint(&cp)
                 .map_err(HostError::storage)?;
-            to_val(cp)
+            Ok(json!({
+                "thread_id": cp.thread_id,
+                "turn_idx": cp.turn_idx,
+                "before_ref": cp.before_ref,
+                "after_ref": cp.after_ref,
+                "created_at_ms": cp.created_at_ms,
+            }))
         }
         "getCheckpoints" => {
-            let bot_user_id = req_i64(params, "bot_user_id")?;
-            let chat_id = req_i64(params, "chat_id")?;
-            let topic_id = params.get("topic_id").and_then(|v| v.as_i64());
+            let thread_id = req_str(params, "thread_id")?;
             let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-            let key = ThreadKey::new(bot_user_id, chat_id, topic_id);
             let cps = host
                 .coding_store
                 .lock()
-                .list_recent_checkpoints(key, limit)
+                .list_recent_checkpoints(thread_id, limit)
                 .map_err(HostError::storage)?;
-            to_val(cps)
+            let out: Vec<Value> = cps
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "thread_id": c.thread_id,
+                        "turn_idx": c.turn_idx,
+                        "before_ref": c.before_ref,
+                        "after_ref": c.after_ref,
+                        "diff_stat": c.diff_stat,
+                        "prompt_preview": c.prompt_preview,
+                        "reply_preview": c.reply_preview,
+                        "created_at_ms": c.created_at_ms,
+                    })
+                })
+                .collect();
+            Ok(Value::Array(out))
         }
         // Fail-closed local CLI execution on iOS
         "probeLocal" | "startLocalTurn" | "localControl" => {
@@ -1265,9 +1383,10 @@ pub fn handle_mcp(
         }
         "revokeGrant" => {
             let family_id = req_str(params, "family_id")?.to_string();
+            let fid_move = family_id.clone();
             host.run_cancellable(req_id, async move {
                 client
-                    .revoke_mcp_grant_async(&family_id)
+                    .revoke_mcp_grant_async(&fid_move)
                     .await
                     .map_err(HostError::from)
             })?;

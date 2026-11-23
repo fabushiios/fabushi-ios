@@ -209,7 +209,7 @@ pub fn handle_vault(
                 let password = req_str(params, "password")?;
                 let bundle = derive_split_key(password, &envelope.kdf_salt_b64, &envelope.kdf_params)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
-                bundle.vault_kek
+                bundle.vault_kek.clone()
             };
             let unlocked = UserVaultCrypto::unlock_with_split_key(user_id, &envelope, &kek)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
@@ -576,9 +576,10 @@ pub fn handle_computers(
         }
         "delete" => {
             let node_id = req_str(params, "node_id")?.to_string();
+            let nid_move = node_id.clone();
             host.run_cancellable(req_id, async move {
                 client
-                    .delete_computer_async(&node_id)
+                    .delete_computer_async(&nid_move)
                     .await
                     .map_err(HostError::from)
             })?;
@@ -1634,7 +1635,7 @@ pub fn handle_talk(
             let barge_in_triggered = vad.process_pcm_frame(&pcm);
             let silence_detected = vad.is_silence_detected();
             let tap_barge_in = {
-                host.ai_media_tap.on_incoming_pcm_frame(&pcm);
+                host.ai_media_tap.on_incoming_pcm_frame(&pcm, 48_000, 1);
                 host.ai_media_tap.trigger_vad_barge_in()
             };
             let mut flushed_chunks = 0usize;

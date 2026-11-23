@@ -475,8 +475,9 @@ pub fn handle_folders(
     match action {
         "list" => {
             if client.token().is_some() {
+                let c = std::sync::Arc::clone(&client);
                 let res = host.run_cancellable(req_id, async move {
-                    client.list_folders().await.map_err(HostError::from)
+                    c.list_folders().await.map_err(HostError::from)
                 })?;
                 client.local_store.set_folders(res.clone());
                 return to_val(res);
@@ -487,8 +488,9 @@ pub fn handle_folders(
             let folder: ChatFolderDto = parse_req(params)?;
             client.local_store.upsert_folder(folder.clone());
             if client.token().is_some() {
+                let c = std::sync::Arc::clone(&client);
                 let res = host.run_cancellable(req_id, async move {
-                    client.save_folder(&folder).await.map_err(HostError::from)
+                    c.save_folder(&folder).await.map_err(HostError::from)
                 })?;
                 client.local_store.upsert_folder(res.clone());
                 return to_val(res);
@@ -778,7 +780,7 @@ pub fn handle_messages(
                     silent: params.get("silent").and_then(|v| v.as_bool()).unwrap_or(false),
                     scheduled_at_ms: params.get("scheduled_at_ms").and_then(|v| v.as_i64()),
                     inline_keyboard: None,
-                    send_as_peer_id: params.get("send_as_peer_id").and_then(|v| v.as_i64()),
+                    send_as_peer_id: params.get("send_as_peer_id").and_then(|v| v.as_u64()),
                     skip_server_bot_reply: false,
                 };
                 let c = std::sync::Arc::clone(&client);
@@ -1198,7 +1200,7 @@ pub fn handle_e2ee(
             Ok(json!({
                 "x25519_pub_b64": b64_encode(&id.x25519_pub),
                 "ed25519_pub_b64": b64_encode(&id.ed25519_pub),
-                "registration_id": id.registration_id,
+                "device_id": client.device_id(),
             }))
         }
         "initAndPublishPrekeys" => {
@@ -1373,10 +1375,9 @@ pub fn handle_e2ee(
             let key_id = req_str(params, "key_id")?.to_string();
             let chat_id = req_i64(params, "chat_id")?;
             let sender_user_id = req_u64(params, "sender_user_id")?;
-            let sender_device_id = req_str(params, "sender_device_id")?;
-            let state = SenderKeyState::create_own(chat_id, sender_user_id, sender_device_id)
+            let sender_device_id = req_str(params, "sender_device_id")?.to_string();
+            let (state, dist) = SenderKeyState::create_own(chat_id, sender_user_id, sender_device_id)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
-            let dist = state.distribution_message();
             host.local_sender_keys.lock().insert(key_id.clone(), state);
             Ok(json!({ "key_id": key_id, "distribution": dist }))
         }
@@ -1891,13 +1892,14 @@ pub fn handle_stickers(
         }
         "installSet" => {
             let set_id = req_str(params, "set_id")?.to_string();
+            let sid_move = set_id.clone();
             let installed = params
                 .get("installed")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             host.run_cancellable(req_id, async move {
                 client
-                    .install_sticker_set(&set_id, installed)
+                    .install_sticker_set(&sid_move, installed)
                     .await
                     .map_err(HostError::from)
             })?;

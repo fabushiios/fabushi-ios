@@ -441,32 +441,22 @@ impl HostSqliteStore {
                  LIMIT ?2"
             };
             if let Ok(mut stmt) = conn.prepare(sql) {
+                fn map_fts_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSearchHit> {
+                    let score: f64 = row.get(5).unwrap_or(1.0);
+                    Ok(LocalSearchHit {
+                        message_id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        sender_id: row.get::<_, i64>(2)? as u64,
+                        timestamp_ms: row.get(3)?,
+                        body: row.get(4)?,
+                        score: (score.abs() as f32).max(0.01),
+                        engine: "sqlite_fts5".to_string(),
+                    })
+                }
                 let mapped = if let Some(cid) = chat_id {
-                    stmt.query_map(params![escaped, cid, limit_i64], |row| {
-                        let score: f64 = row.get(5).unwrap_or(1.0);
-                        Ok(LocalSearchHit {
-                            message_id: row.get(0)?,
-                            chat_id: row.get(1)?,
-                            sender_id: row.get::<_, i64>(2)? as u64,
-                            timestamp_ms: row.get(3)?,
-                            body: row.get(4)?,
-                            score: (score.abs() as f32).max(0.01),
-                            engine: "sqlite_fts5".to_string(),
-                        })
-                    })
+                    stmt.query_map(params![escaped, cid, limit_i64], map_fts_row)
                 } else {
-                    stmt.query_map(params![escaped, limit_i64], |row| {
-                        let score: f64 = row.get(5).unwrap_or(1.0);
-                        Ok(LocalSearchHit {
-                            message_id: row.get(0)?,
-                            chat_id: row.get(1)?,
-                            sender_id: row.get::<_, i64>(2)? as u64,
-                            timestamp_ms: row.get(3)?,
-                            body: row.get(4)?,
-                            score: (score.abs() as f32).max(0.01),
-                            engine: "sqlite_fts5".to_string(),
-                        })
-                    })
+                    stmt.query_map(params![escaped, limit_i64], map_fts_row)
                 };
                 if let Ok(rows) = mapped {
                     let mut hits = Vec::new();
