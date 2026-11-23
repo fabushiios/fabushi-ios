@@ -1406,7 +1406,7 @@ pub fn handle_e2ee(
         }
         "senderKeyDecrypt" => {
             let key_id = req_str(params, "key_id")?;
-            let ct: gpui_telegram_client::e2ee::GroupCiphertext = parse_req(
+            let ct: gpui_telegram_proto::e2ee::GroupCiphertext = parse_req(
                 params
                     .get("ciphertext")
                     .ok_or_else(|| HostError::invalid_arguments("Missing 'ciphertext'"))?,

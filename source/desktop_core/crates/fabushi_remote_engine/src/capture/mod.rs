@@ -361,12 +361,12 @@ fn capture_via_xcap(
     encode_rgba_image(img, format, display_index, seq)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct XcapCaptureBackend {
     seq: AtomicU64,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl XcapCaptureBackend {
     fn new() -> Self {
         Self {
@@ -375,7 +375,7 @@ impl XcapCaptureBackend {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ScreenCaptureBackend for XcapCaptureBackend {
     fn list_displays(&self) -> EngineResult<Vec<DisplayInfoDto>> {
         let monitors = xcap::Monitor::all()
@@ -408,6 +408,27 @@ impl ScreenCaptureBackend for XcapCaptureBackend {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+struct UnsupportedScreenCaptureBackend;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+impl ScreenCaptureBackend for UnsupportedScreenCaptureBackend {
+    fn list_displays(&self) -> EngineResult<Vec<DisplayInfoDto>> {
+        Ok(Vec::new())
+    }
+
+    fn capture_display(
+        &self,
+        _display_index: u32,
+        _format: CaptureFormat,
+    ) -> EngineResult<CapturedFrame> {
+        Err(RemoteEngineError::Unavailable(
+            "Local screen capture is unavailable on this platform; use ReplayKit Broadcast Upload Extension on iOS"
+                .to_string(),
+        ))
+    }
+}
+
 pub struct ScreenCaptureEngine {
     backend: Arc<dyn ScreenCaptureBackend>,
     cache: RwLock<HashMap<u32, CapturedFrame>>,
@@ -428,9 +449,13 @@ impl ScreenCaptureEngine {
         {
             Self::with_backend(Arc::new(macos_capture::MacOsCaptureBackend::new()))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             Self::with_backend(Arc::new(XcapCaptureBackend::new()))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Self::with_backend(Arc::new(UnsupportedScreenCaptureBackend))
         }
     }
 

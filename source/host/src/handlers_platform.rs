@@ -28,7 +28,8 @@ use gpui_telegram_proto::miniapp_contracts::{
 use gpui_telegram_proto::remote_control_contracts::{
     PowerActionKind, RemoteSessionDto,
 };
-use gpui_telegram_webrtc::calls::{CallsEmojiFingerprint, SignalingFrame};
+use gpui_telegram_webrtc::calls::CallsEmojiFingerprint;
+use gpui_telegram_webrtc::signaling::SignalingFrame;
 use gpui_telegram_webrtc::media::AiMediaTap;
 use gpui_telegram_agent::talk::TalkSessionState;
 use serde_json::{json, Value};

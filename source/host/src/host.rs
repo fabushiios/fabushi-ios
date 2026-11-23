@@ -359,8 +359,8 @@ impl FabushiAppHost {
                     }
                     Ok(ob_ev) = outbox_rx.recv() => {
                         let (ev_type, payload) = outbox_event_to_host_event(&ob_ev);
-                        let gen = generation_fence.current();
-                        event_queue.push(gen, &ev_type, payload.clone());
+                        let generation = generation_fence.current();
+                        event_queue.push(generation, &ev_type, payload.clone());
                         if let Some(sink) = event_sink.lock().as_ref() {
                             sink.emit(&ev_type, &payload.to_string());
                         }
@@ -368,7 +368,7 @@ impl FabushiAppHost {
                     _ = interval.tick() => {
                         let events = client.poll_events();
                         if !events.is_empty() {
-                            let gen = generation_fence.current();
+                            let generation = generation_fence.current();
                             for ev in events {
                                 if let gpui_telegram_client::client_dispatch::ClientDomainEvent::MessageAck { pts, .. } = &ev {
                                     let _ = pts;
@@ -382,7 +382,7 @@ impl FabushiAppHost {
                                         }
                                     }
                                 }
-                                event_queue.push(gen, &ev_type, payload.clone());
+                                event_queue.push(generation, &ev_type, payload.clone());
                                 if let Some(sink) = event_sink.lock().as_ref() {
                                     sink.emit(&ev_type, &payload.to_string());
                                 }
@@ -514,8 +514,8 @@ impl FabushiAppHost {
     }
 
     pub fn emit_event(&self, event_type: &str, payload: Value) {
-        let gen = self.current_generation();
-        self.event_queue.push(gen, event_type, payload.clone());
+        let generation = self.current_generation();
+        self.event_queue.push(generation, event_type, payload.clone());
         let sink_opt = self.event_sink.lock().clone();
         if let Some(sink) = sink_opt {
             sink.emit(event_type, &payload.to_string());

@@ -451,8 +451,8 @@ pub fn handle_session(
         }
         "clearSession" => {
             client.clear_session();
-            let gen = host.bump_generation();
-            Ok(json!({ "cleared": true, "generation": gen }))
+            let generation = host.bump_generation();
+            Ok(json!({ "cleared": true, "generation": generation }))
         }
         "switchAccount" => {
             let account_id = req_str(params, "account_id")?;

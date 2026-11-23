@@ -156,8 +156,8 @@ pub unsafe extern "C" fn fabushi_host_poll_events(
         }
         let host_ref = unsafe { &*(handle as *const FabushiAppHost) };
         let events = host_ref.poll_events(max_count, timeout_ms);
-        let gen = host_ref.current_generation();
-        let response = make_success_json("", gen, &json!({ "events": events }));
+        let generation = host_ref.current_generation();
+        let response = make_success_json("", generation, &json!({ "events": events }));
         string_to_c_ptr(response)
     }));
 
