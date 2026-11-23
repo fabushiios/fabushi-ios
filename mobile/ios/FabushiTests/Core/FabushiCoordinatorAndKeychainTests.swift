@@ -225,14 +225,11 @@ final class FabushiCoordinatorAndKeychainTests: XCTestCase, @unchecked Sendable 
         let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
 
         // (c-1) Concurrent start() calls must coalesce cleanly without double-init LockBusy
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for _ in 0..<4 {
-                group.addTask { @MainActor in
-                    try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
-                }
-            }
-            for try await _ in group {}
-        }
+        async let start1: Void = coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+        async let start2: Void = coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+        async let start3: Void = coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+        async let start4: Void = coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+        _ = try await (start1, start2, start3, start4)
         XCTAssertTrue(coordinator.isStarted)
         XCTAssertNil(coordinator.lastErrorMessage)
 
