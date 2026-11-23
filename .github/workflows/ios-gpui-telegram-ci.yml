@@ -465,6 +465,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          components: llvm-tools
 
       - uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -525,6 +526,10 @@ jobs:
       - name: Verify all 29 exported Mach-O C-ABI symbols and arm64 architecture on both staticlibs
         run: |
           set -euo pipefail
+          SYSROOT="$(rustc --print sysroot)"
+          HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+          LLVM_NM="$SYSROOT/lib/rustlib/$HOST_TRIPLE/bin/llvm-nm"
+          test -x "$LLVM_NM"
           REQUIRED_SYMBOLS=(
             _fabushi_host_create
             _fabushi_host_dispatch
@@ -560,7 +565,7 @@ jobs:
             echo "=== Inspecting $lib ==="
             test -s "$lib"
             lipo -info "$lib" | grep -q "arm64"
-            SYMBOLS="$(nm -gU "$lib")"
+            SYMBOLS="$("$LLVM_NM" -gU "$lib")"
             for sym in "${REQUIRED_SYMBOLS[@]}"; do
               if ! grep -Eq "[[:space:]]T[[:space:]]+${sym}$" <<< "$SYMBOLS"; then
                 echo "ERROR: Missing global text symbol ${sym} in ${lib}"
@@ -569,6 +574,60 @@ jobs:
             done
             echo "PASS: All ${#REQUIRED_SYMBOLS[@]} required Mach-O C-ABI symbols verified in ${lib}."
           done
+
+      - name: Verify Apple Xcode ld linkability against both iOS SDKs
+        run: |
+          set -euo pipefail
+          TMPDIR_LINK="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR_LINK"' EXIT
+          cat <<'EOF' > "$TMPDIR_LINK/link_check.c"
+          #include "mahayana_app_host.h"
+          int main(void) {
+            volatile void *syms[] = {
+              (void *)fabushi_host_create,
+              (void *)fabushi_host_dispatch,
+              (void *)fabushi_host_poll_events,
+              (void *)fabushi_host_cancel,
+              (void *)fabushi_host_destroy,
+              (void *)fabushi_host_free_string,
+              (void *)fabushi_host_last_error,
+              (void *)telegram_app_host_create,
+              (void *)telegram_app_host_create_test,
+              (void *)telegram_app_host_last_error,
+              (void *)telegram_app_host_dispatch,
+              (void *)telegram_app_host_dispatch_with_handle,
+              (void *)telegram_bridge_register_event_callback,
+              (void *)telegram_app_host_free_string,
+              (void *)telegram_app_host_destroy,
+              (void *)telegram_replay_window_create,
+              (void *)telegram_replay_window_check_and_add,
+              (void *)telegram_replay_window_destroy,
+              (void *)telegram_proto_max_packet_size,
+              (void *)mahayana_app_host_create,
+              (void *)mahayana_app_host_create_with_storage_passphrase,
+              (void *)mahayana_app_host_create_test,
+              (void *)mahayana_app_host_last_error,
+              (void *)mahayana_app_host_dispatch_with_handle,
+              (void *)mahayana_app_host_dispatch,
+              (void *)mahayana_app_host_free_string,
+              (void *)mahayana_app_host_destroy,
+              (void *)mahayana_cloud_agent_trace_rows,
+              (void *)mahayana_spreadsheet_parse_file
+            };
+            return syms[0] == 0 ? 1 : 0;
+          }
+          EOF
+          xcrun --sdk iphonesimulator clang -arch arm64 -mios-simulator-version-min=17.0 -std=c11 \
+            -I source/host/include "$TMPDIR_LINK/link_check.c" \
+            build/rust/iphonesimulator/libmahayana_app_host.a \
+            -framework Foundation -framework Security -framework CoreFoundation -framework SystemConfiguration \
+            -liconv -lresolv -lz -o "$TMPDIR_LINK/link_sim"
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -std=c11 \
+            -I source/host/include "$TMPDIR_LINK/link_check.c" \
+            build/rust/iphoneos/libmahayana_app_host.a \
+            -framework Foundation -framework Security -framework CoreFoundation -framework SystemConfiguration \
+            -liconv -lresolv -lz -o "$TMPDIR_LINK/link_ios"
+          echo "PASS: Apple Xcode ld linked all 29 C-ABI symbols cleanly for iphonesimulator & iphoneos."
 
       - name: Compute SHA-256 checksums for iOS staticlib artifacts
         run: |

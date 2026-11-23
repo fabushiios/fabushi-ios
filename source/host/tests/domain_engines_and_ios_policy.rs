@@ -543,6 +543,13 @@ fn test_real_multi_agent_governance_and_hermes_studio() {
         );
         assert_eq!(preempt["ok"], true);
         assert_eq!(preempt["result"]["preempted_agent"], "bot-alpha");
+        assert!(
+            preempt["result"]["preempted_nonce"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("trn_")
+        );
+        assert!(preempt["result"]["current_speaker"].is_null());
 
         // 3. Revision-fenced SharedGroupWorkspace optimistic lock
         let ws1 = dispatch(

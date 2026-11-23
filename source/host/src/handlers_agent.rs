@@ -680,11 +680,13 @@ pub fn handle_multi_agent(
             let q = queues
                 .entry(chat_id)
                 .or_insert_with(|| FloorControlQueue::new(30_000));
-            let preempted_agent = q.preempt_for_user_interruption();
+            let prev_speaker = q.current_speaker_id();
+            let preempted_nonce = q.preempt_for_user_interruption();
             let current = q.current_speaker_id();
             Ok(json!({
                 "chat_id": chat_id,
-                "preempted_agent": preempted_agent,
+                "preempted_agent": prev_speaker,
+                "preempted_nonce": preempted_nonce,
                 "current_speaker": current,
                 "queued_count": q.queued_count(),
             }))
