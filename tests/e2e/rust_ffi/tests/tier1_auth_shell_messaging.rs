@@ -57,6 +57,7 @@ fn register_default_user(h: &FabushiE2EHarness, username: &str) -> Value {
 #[test]
 fn tc_t1_f01_01_register_split_key_v2_no_plaintext_password() {
     let h = FabushiE2EHarness::connect_production();
+    let plaintext_pw = "PlaintextSecretPassword!";
     let salt = [0x11u8; 16];
     let verifier = [0x22u8; 32];
     verify_argon2id_params(65536, 3, 4, salt.len(), verifier.len()).expect("valid KDF");
@@ -65,6 +66,7 @@ fn tc_t1_f01_01_register_split_key_v2_no_plaintext_password() {
         "auth.register",
         json!({
             "username": "alice_v2",
+            "password": plaintext_pw,
             "first_name": "Alice",
             "device_name": "iPhone 16 Pro",
             "auth_version": 2,
@@ -73,20 +75,51 @@ fn tc_t1_f01_01_register_split_key_v2_no_plaintext_password() {
             "kdf_params": { "m_cost_kib": 65536, "t_cost": 3, "p_cost": 4 }
         }),
     );
-    assert!(res["user_id"].as_u64().unwrap_or(0) > 0);
-    assert!(!res["session_id"].as_str().unwrap_or("").is_empty());
-    assert!(!res["token"].as_str().unwrap_or("").is_empty());
+    assert!(res["user_id"].as_u64().expect("user_id") > 0);
+    assert!(!res["session_id"].as_str().expect("session_id").is_empty());
+    assert!(!res["token"].as_str().expect("token").is_empty());
     assert_eq!(res["auth_version"], 2);
-    assert!(h.server().request_count_for_path("/api/v1/auth/register") >= 1);
+
+    let mut inspected_register = 0usize;
     for req in h.server().recorded_requests() {
         if req.path == "/api/v1/auth/register" {
+            inspected_register += 1;
             let body_str = String::from_utf8_lossy(&req.body);
             assert!(
-                !body_str.contains("PlaintextSecretPassword!"),
+                !body_str.contains(plaintext_pw),
                 "Split-Key V2 registration must never transmit plaintext password"
+            );
+            let body_json: Value = serde_json::from_slice(&req.body)
+                .expect("recorded /api/v1/auth/register body must be valid JSON");
+            assert!(
+                body_json
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .is_empty(),
+                "Split-Key V2 HTTP register payload must not contain non-empty `password`"
+            );
+            assert!(
+                body_json
+                    .get("auth_verifier_b64")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty()),
+                "Split-Key V2 HTTP register payload must include non-empty `auth_verifier_b64`"
+            );
+            assert!(
+                body_json
+                    .get("auth_salt_b64")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty()),
+                "Split-Key V2 HTTP register payload must include non-empty `auth_salt_b64`"
             );
         }
     }
+    assert!(
+        inspected_register >= 1,
+        "must record at least one /api/v1/auth/register HTTP request"
+    );
+    assert_dir_excludes_plaintext_secret(h.app_data_dir(), plaintext_pw);
 }
 
 #[test]
@@ -851,14 +884,21 @@ fn tc_t1_f07_02_iphone_compact_tab_stack_sheet_all_5_panels() {
 fn tc_t1_f07_03_deep_link_route_targets_chat_and_increments_selection_revision() {
     let h = FabushiE2EHarness::connect_production();
     let s1 = h.expect_ok("settings.get_shell_state", json!({}));
-    let rev1 = s1["selection_revision"].as_u64().unwrap_or(0);
+    let rev1 = s1["selection_revision"]
+        .as_u64()
+        .expect("initial selection_revision");
 
     let nav = h.expect_ok(
         "actions.navigate",
         json!({"route": "chats", "chat_id": 101, "message_id": 55}),
     );
     assert_eq!(nav["active_panel"], "chats");
-    assert!(nav["selection_revision"].as_u64().unwrap_or(0) > rev1);
+    assert!(
+        nav["selection_revision"]
+            .as_u64()
+            .expect("nav selection_revision")
+            > rev1
+    );
 }
 
 #[test]
@@ -887,7 +927,14 @@ fn tc_t1_f07_05_shell_state_persists_across_cold_restart() {
     );
     h.restart_cold();
     let reloaded = h.expect_ok("settings.get_shell_state", json!({}));
-    assert!((reloaded["sidebar_width"].as_f64().unwrap_or(0.0) - 312.0).abs() < 0.01);
+    assert!(
+        (reloaded["sidebar_width"]
+            .as_f64()
+            .expect("persisted sidebar_width")
+            - 312.0)
+            .abs()
+            < 0.01
+    );
     assert_eq!(reloaded["inspector_open"], true);
 }
 
@@ -899,11 +946,20 @@ fn tc_t1_f07_05_shell_state_persists_across_cold_restart() {
 fn tc_t1_f08_01_compose_candidates_merges_humans_and_bots_deduplicated() {
     let h = FabushiE2EHarness::connect_production();
     let _ = register_default_user(&h, "compose_alice");
+    let _ = h.expect_ok(
+        "contacts.add",
+        json!({"username": "bot_friend_human", "first_name": "Bot", "last_name": "Friend"}),
+    );
+    let _ = h.expect_ok("chats.prestart_bot", json!({"bot_username": "compose_helper_bot"}));
     let res = h.expect_ok(
         "chats.compose_candidates",
         json!({"query": "bot", "include_bots": true}),
     );
     let candidates = res["candidates"].as_array().expect("candidates array");
+    assert!(
+        !candidates.is_empty(),
+        "compose_candidates must return non-empty seeded human/bot candidates"
+    );
     let unique_ids: std::collections::HashSet<u64> = candidates
         .iter()
         .filter_map(|c| c["user_id"].as_u64())
@@ -1080,7 +1136,7 @@ fn tc_t1_f09_02_folders_crud_and_scoped_chat_filtering() {
     assert!(
         !remaining["folders"]
             .as_array()
-            .unwrap_or(&vec![])
+            .expect("folders array")
             .iter()
             .any(|f| f["id"].as_i64() == Some(fid))
     );
@@ -1149,7 +1205,7 @@ fn tc_t1_f09_04_forum_topics_crud_lifecycle() {
     assert!(
         !list["topics"]
             .as_array()
-            .unwrap_or(&vec![])
+            .expect("topics array")
             .iter()
             .any(|t| t["topic_id"].as_i64() == Some(tid1))
     );
@@ -1190,7 +1246,19 @@ fn tc_t1_f09_05_invite_link_create_join_and_revoke() {
         json!({"chat_id": chat_id, "invite_id": invite_id}),
     );
     let invs = h.expect_ok("chats.invites.list", json!({"chat_id": chat_id}));
-    assert!(invs["invites"].is_array());
+    let invites = invs["invites"].as_array().expect("invites array");
+    assert!(
+        invites
+            .iter()
+            .all(|i| i["invite_id"].as_str() != Some(invite_id) || i["revoked"] == true),
+        "revoked invite must be marked revoked or omitted from active invites"
+    );
+    let rev_join_err = peer.expect_err(
+        "chats.join",
+        json!({"code": code}),
+        &["invalid_invite", "not_found"],
+    );
+    assert!(!rev_join_err.retryable);
 }
 
 // ============================================================================
@@ -1284,7 +1352,7 @@ fn tc_t1_f10_05_prestart_bot_virtual_then_start_bot_materializes_dm() {
     let _ = register_default_user(&h, "prestart_user");
     let before_count = h.expect_ok("chats.list", json!({}))["total"]
         .as_u64()
-        .unwrap_or(0);
+        .expect("before_count total");
 
     let preview = h.expect_ok("chats.prestart_bot", json!({"bot_username": "helper_bot"}));
     assert_eq!(preview["virtual"], true);
@@ -1299,8 +1367,13 @@ fn tc_t1_f10_05_prestart_bot_virtual_then_start_bot_materializes_dm() {
         json!({"bot_user_id": preview["bot_user_id"], "start_param": "welcome"}),
     );
     assert_eq!(started["chat_type"], 4);
-    assert!(started["chat_id"].as_i64().unwrap_or(0) > 0);
-    assert!(started["start_message_id"].as_i64().unwrap_or(0) > 0);
+    assert!(started["chat_id"].as_i64().expect("started chat_id") > 0);
+    assert!(
+        started["start_message_id"]
+            .as_i64()
+            .expect("start_message_id")
+            > 0
+    );
 }
 
 // ============================================================================
@@ -1382,7 +1455,8 @@ fn tc_t1_f11_03_ws_pts_gap_triggers_automatic_get_difference_backfill() {
         &json!({"kind": "new_message", "chat_id": cid, "message_id": 7005, "pts": 5, "text": "gap"})
             .to_string(),
     );
-    let _ = h.poll_events(16, 400);
+    let polled = h.poll_events(16, 400);
+    assert!(polled.ok);
     assert!(h.server().request_count_for_path("/api/v1/sync/get_difference") >= 1);
 }
 
@@ -1680,7 +1754,7 @@ fn tc_t1_f13_02_delete_pinned_message_emits_tombstone_and_unpins() {
     assert!(
         !pins_after["pinned_message_ids"]
             .as_array()
-            .unwrap_or(&vec![])
+            .expect("pinned_message_ids array")
             .iter()
             .any(|v| v.as_i64() == Some(mid))
     );
@@ -1749,8 +1823,12 @@ fn tc_t1_f13_04_toggle_reaction_advances_authoritative_pts() {
         "messages.react",
         json!({"chat_id": cid, "message_id": mid, "emoji": "🔥", "action": "toggle"}),
     );
-    assert!(r2["pts"].as_u64().unwrap_or(0) > pts1);
-    assert_eq!(r2["reactions"].get("🔥").and_then(Value::as_u64).unwrap_or(0), 0);
+    assert!(r2["pts"].as_u64().expect("r2 pts") > pts1);
+    assert!(r2["reactions"].is_object(), "reactions map must be an object");
+    assert_eq!(
+        r2["reactions"].get("🔥").and_then(Value::as_u64).unwrap_or(0),
+        0
+    );
 }
 
 #[test]
@@ -1956,7 +2034,13 @@ fn tc_t1_f15_03_commands_execute_status_and_model_returns_ui_effects() {
         json!({"command": "/model gpt-5", "chat_id": cid}),
     );
     assert_eq!(model["ok"], true);
-    assert!(model["ui_effects"].is_array());
+    assert!(
+        !model["ui_effects"]
+            .as_array()
+            .expect("ui_effects array")
+            .is_empty(),
+        "/model slash command must return non-empty ui_effects"
+    );
 }
 
 #[test]
@@ -2051,13 +2135,50 @@ fn tc_t1_f16_03_inspector_shared_media_isolates_all_5_subtabs() {
         .as_i64()
         .expect("cid");
 
-    for subtab in ["media", "files", "voice", "links", "music"] {
+    let wf = encode_waveform_5bit(&(0..100).map(|i| (i % 32) as u8).collect::<Vec<_>>());
+    let seeded: [(&str, Value); 5] = [
+        (
+            "media",
+            json!({"chat_id": cid, "content": {"type": "photo", "file_id": "cas_sub_photo", "width": 800, "height": 600}, "client_nonce": 45001}),
+        ),
+        (
+            "files",
+            json!({"chat_id": cid, "content": {"type": "document", "file_id": "cas_sub_doc", "file_name": "report.pdf", "mime_type": "application/pdf", "size_bytes": 1024}, "client_nonce": 45002}),
+        ),
+        (
+            "voice",
+            json!({"chat_id": cid, "content": {"type": "voice", "file_id": "cas_sub_voice", "duration_secs": 3, "waveform_b64": B64.encode(&wf)}, "client_nonce": 45003}),
+        ),
+        (
+            "links",
+            json!({"chat_id": cid, "text": "Docs at https://fabushi.test/v167", "client_nonce": 45004}),
+        ),
+        (
+            "music",
+            json!({"chat_id": cid, "content": {"type": "audio", "file_id": "cas_sub_music", "title": "Lotus Bell", "duration_secs": 120}, "client_nonce": 45005}),
+        ),
+    ];
+    let mut expected_ids = Vec::with_capacity(5);
+    for (subtab, payload) in seeded {
+        let mid = h.expect_ok("messages.send", payload)["message_id"]
+            .as_i64()
+            .expect("seeded message_id");
+        expected_ids.push((subtab, mid));
+    }
+
+    for (subtab, expected_mid) in expected_ids {
         let bucket = h.expect_ok(
             "chats.shared_media",
             json!({"chat_id": cid, "subtab": subtab, "limit": 20}),
         );
         assert_eq!(bucket["subtab"], subtab);
-        assert!(bucket["items"].is_array());
+        let items = bucket["items"].as_array().expect("shared_media items");
+        assert_eq!(
+            items.len(),
+            1,
+            "subtab `{subtab}` must isolate exactly its own 1 seeded item"
+        );
+        assert_eq!(items[0]["message_id"].as_i64(), Some(expected_mid));
     }
 }
 

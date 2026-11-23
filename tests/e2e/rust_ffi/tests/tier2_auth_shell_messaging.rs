@@ -160,15 +160,30 @@ fn tc_t2_f01_05_mid_session_http_401_invalidates_token_and_bumps_generation() {
         None,
         Some(1),
     );
-    let err = h.expect_err("chats.list", json!({}), &["unauthorized"]);
+    let err = h.expect_err("chats.list", json!({}), &["unauthorized", "session_revoked"]);
     assert!(!err.retryable);
 
     let g_after = h.expect_ok("generation.current", json!({}))["generation"]
         .as_u64()
         .expect("g_after");
-    assert!(g_after >= g_before);
+    assert!(
+        g_after > g_before,
+        "mid-session HTTP 401 must strictly bump generation (before={g_before}, after={g_after})"
+    );
+
     let polled = h.poll_events(16, 100);
     assert!(polled.ok);
+    assert!(
+        polled.events.iter().any(|e| matches!(
+            e.kind.as_str(),
+            "auth_expired" | "session_revoked" | "auth_state_changed"
+        )),
+        "mid-session HTTP 401 must emit auth_expired/session_revoked/auth_state_changed event"
+    );
+
+    // 1-shot 401 fault is already consumed; subsequent protected RPC MUST still fail closed locally.
+    let after_err = h.expect_err("chats.list", json!({}), &["unauthorized", "session_revoked"]);
+    assert!(!after_err.retryable);
 }
 
 // ============================================================================
@@ -586,6 +601,13 @@ fn tc_t2_f05_05_revoked_sibling_receives_401_and_session_revoked_event() {
     assert!(!err.retryable);
     let polled = sibling.poll_events(16, 100);
     assert!(polled.ok);
+    assert!(
+        polled.events.iter().any(|e| matches!(
+            e.kind.as_str(),
+            "session_revoked" | "auth_expired" | "auth_state_changed"
+        )),
+        "revoked sibling session must emit session_revoked/auth_expired/auth_state_changed event"
+    );
 }
 
 // ============================================================================
@@ -699,7 +721,9 @@ fn tc_t2_f06_05_auto_lock_idle_buckets_and_60s_boundary() {
 fn tc_t2_f07_01_hover_with_unchanged_selection_revision_does_not_hijack_panel() {
     let h = FabushiE2EHarness::connect_production();
     let s = h.expect_ok("actions.navigate", json!({"route": "settings"}));
-    let rev = s["selection_revision"].as_u64().unwrap_or(1);
+    let rev = s["selection_revision"]
+        .as_u64()
+        .expect("selection_revision");
 
     let hover = h.expect_ok(
         "actions.navigate",
@@ -942,12 +966,14 @@ fn tc_t2_f09_03_non_member_blocked_from_archive_pin_mute_and_topics() {
 fn tc_t2_f09_04_pinned_dialog_sort_order_is_100pct_deterministic() {
     let h = FabushiE2EHarness::connect_production();
     let _ = register_user(&h, "pin_stable_user");
+    let mut created_ids = Vec::with_capacity(3);
     for idx in 1..=3 {
         let cid = h.expect_ok("chats.create", json!({"chat_type": 1, "title": format!("Pin {idx}")}))
             ["chat_id"]
             .as_i64()
             .expect("cid");
         let _ = h.expect_ok("chats.pin_dialog", json!({"chat_id": cid, "pinned": true}));
+        created_ids.push(cid);
     }
     let baseline: Vec<i64> = h.expect_ok("chats.list", json!({}))["chats"]
         .as_array()
@@ -955,6 +981,10 @@ fn tc_t2_f09_04_pinned_dialog_sort_order_is_100pct_deterministic() {
         .iter()
         .filter_map(|c| c["chat_id"].as_i64())
         .collect();
+    assert_eq!(baseline.len(), 3, "all 3 pinned chats must be listed");
+    for cid in &created_ids {
+        assert!(baseline.contains(cid), "missing created pinned chat_id {cid}");
+    }
     for _ in 0..10 {
         let current: Vec<i64> = h.expect_ok("chats.list", json!({}))["chats"]
             .as_array()
@@ -1124,10 +1154,25 @@ fn tc_t2_f11_03_outbox_classifies_503_transient_vs_403_permanent() {
         "outbox.enqueue",
         json!({"chat_id": cid, "text": "Transient 503", "client_nonce": 78001}),
     );
+    let _ = h.expect_ok("outbox.flush", json!({"chat_id": cid}));
     let list_503 = h.expect_ok("outbox.list", json!({"chat_id": cid}));
-    if let Some(delay_ms) = list_503["items"][0]["backoff_ms"].as_u64() {
-        verify_outbox_backoff_bounds(0, delay_ms).expect("backoff in [250..30000]");
-    }
+    let item_503 = list_503["items"]
+        .as_array()
+        .expect("outbox items array")
+        .iter()
+        .find(|it| it["client_nonce"].as_u64() == Some(78001))
+        .expect("HTTP 503 item must remain in outbox awaiting retry");
+    assert_ne!(
+        item_503["status"], "failed_permanent",
+        "HTTP 503 must be classified as transient, never failed_permanent"
+    );
+    let retry_count = item_503["retry_count"].as_u64().expect("retry_count") as u32;
+    assert!(retry_count >= 1, "503 flush attempt must record retry_count >= 1");
+    let delay_ms = item_503["backoff_ms"]
+        .as_u64()
+        .expect("transient 503 outbox item must schedule concrete backoff_ms");
+    verify_outbox_backoff_bounds(retry_count.saturating_sub(1), delay_ms)
+        .expect("backoff_ms must lie within jittered [250..=30000]ms bounds");
 
     h.server().inject_http_status(
         &format!("/api/v1/chats/{cid}/messages"),
@@ -1338,11 +1383,24 @@ fn tc_t2_f13_01_pts_fenced_reaction_drops_stale_out_of_order_response() {
         "messages.react",
         json!({"chat_id": cid, "message_id": mid, "emoji": "👍", "action": "add", "pts_hint": 12}),
     );
+    let newer_pts = newer["pts"].as_u64().expect("newer reaction pts");
+    assert!(newer_pts > 0, "reaction add must return positive pts");
+    assert_eq!(newer["reactions"]["👍"].as_u64(), Some(1));
+
     let stale_applied = h.expect_ok(
         "messages.react",
         json!({"chat_id": cid, "message_id": mid, "emoji": "👍", "action": "remove", "pts_hint": 10, "simulate_out_of_order": true}),
     );
-    assert!(stale_applied["pts"].as_u64().unwrap_or(0) >= newer["pts"].as_u64().unwrap_or(0));
+    let after_pts = stale_applied["pts"].as_u64().expect("post-stale reaction pts");
+    assert!(
+        after_pts >= newer_pts,
+        "authoritative pts must never regress on stale response (newer={newer_pts}, after={after_pts})"
+    );
+    assert_eq!(
+        stale_applied["reactions"]["👍"].as_u64(),
+        Some(1),
+        "stale out-of-order remove must be dropped, preserving 👍 reaction count == 1"
+    );
 }
 
 #[test]
@@ -1436,8 +1494,14 @@ fn tc_t2_f13_05_ttl_clamps_to_365_days_and_export_limit_clamps_to_5000() {
     );
     assert_eq!(clamped["ttl_seconds"], 31_536_000);
 
+    let _ = h.expect_ok(
+        "messages.send",
+        json!({"chat_id": cid, "text": "Export clamp seed", "client_nonce": 82099}),
+    );
     let exported = h.expect_ok("chats.export", json!({"chat_id": cid, "limit": 99_999}));
-    assert!(exported["messages"].as_array().expect("messages").len() <= 5000);
+    assert_eq!(exported["effective_limit"], 5000);
+    let exported_msgs = exported["messages"].as_array().expect("messages");
+    assert!(!exported_msgs.is_empty() && exported_msgs.len() <= 5000);
 }
 
 // ============================================================================
@@ -1579,7 +1643,7 @@ fn tc_t2_f15_03_cross_chat_session_id_hijack_fails_403_forbidden() {
         json!({"command": "/status", "chat_id": ca}),
     )["session_id"]
         .as_str()
-        .unwrap_or("sess_a")
+        .expect("session_id")
         .to_owned();
 
     let err = h.expect_err(
@@ -1697,11 +1761,26 @@ fn tc_t2_f16_04_non_admin_member_ops_forbidden_and_invalid_role_400() {
 fn tc_t2_f16_05_add_member_candidates_exclude_zero_and_existing_members() {
     let h = FabushiE2EHarness::connect_production();
     let _ = register_user(&h, "cand_filter_user");
+    let keep = h.expect_ok(
+        "contacts.add",
+        json!({"username": "keep_user", "first_name": "Keep", "last_name": "User"}),
+    );
+    let keep_uid = keep["user_id"].as_u64().expect("keep_uid");
+    let excl = h.expect_ok(
+        "contacts.add",
+        json!({"username": "excl_user", "first_name": "Excl", "last_name": "User"}),
+    );
+    let excl_uid = excl["user_id"].as_u64().expect("excl_uid");
+
     let res = h.expect_ok(
         "chats.compose_candidates",
-        json!({"query": "", "include_bots": true, "exclude_user_ids": [2001]}),
+        json!({"query": "", "include_bots": true, "exclude_user_ids": [excl_uid]}),
     );
     let cands = res["candidates"].as_array().expect("candidates");
+    assert!(
+        cands.iter().any(|c| c["user_id"].as_u64() == Some(keep_uid)),
+        "non-excluded contact must appear in compose candidates"
+    );
     assert!(cands.iter().all(|c| c["user_id"].as_u64() != Some(0)));
-    assert!(cands.iter().all(|c| c["user_id"].as_u64() != Some(2001)));
+    assert!(cands.iter().all(|c| c["user_id"].as_u64() != Some(excl_uid)));
 }

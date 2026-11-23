@@ -26,6 +26,7 @@ pub const ENV_FABUSHI_HOST_LIB: &str = "FABUSHI_HOST_LIB";
 pub const ENV_FABUSHI_MUTANT_STUB_LIB: &str = "FABUSHI_MUTANT_STUB_LIB";
 pub const ENV_FABUSHI_BASELINE_HOST_LIB: &str = "FABUSHI_BASELINE_HOST_LIB";
 pub const ENV_FABUSHI_REQUIRE_BASELINE_PROOF: &str = "FABUSHI_REQUIRE_BASELINE_PROOF";
+pub const ENV_FABUSHI_ALLOW_SKIP_BASELINE_PROOF: &str = "FABUSHI_ALLOW_SKIP_BASELINE_PROOF";
 
 /// Secondary isolated host handle connected to the same `LoopbackServer` (for cross-device
 /// QR pairing, X25519 vault sync, E2EE 1:1/group ratchet, and session revocation tests).
@@ -37,6 +38,10 @@ pub struct SecondaryHostHandle {
 }
 
 impl SecondaryHostHandle {
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     pub fn dispatch(&self, method: &str, params: Value) -> Result<RpcResponse, String> {
         let current_gen = self.generation.load(Ordering::SeqCst);
         let acct = self.account_id.lock().ok().and_then(|g| g.clone());
@@ -55,9 +60,7 @@ impl SecondaryHostHandle {
             .ok_or_else(|| "secondary host destroyed".to_owned())?
             .dispatch_raw(&raw)?;
         let parsed = validate_envelope(&resp_raw, &id)?;
-        if parsed.generation > current_gen {
-            self.generation.store(parsed.generation, Ordering::SeqCst);
-        }
+        self.generation.fetch_max(parsed.generation, Ordering::SeqCst);
         Ok(parsed)
     }
 
@@ -81,9 +84,7 @@ impl SecondaryHostHandle {
             .expect("secondary FFI dispatch");
         let (resp, result) = validate_success_envelope(&resp_raw, &id)
             .unwrap_or_else(|e| panic!("secondary `{method}` failed: {e}"));
-        if resp.generation > current_gen {
-            self.generation.store(resp.generation, Ordering::SeqCst);
-        }
+        self.generation.fetch_max(resp.generation, Ordering::SeqCst);
         result
     }
 
@@ -105,8 +106,9 @@ impl SecondaryHostHandle {
             .expect("secondary host live")
             .dispatch_raw(&raw)
             .expect("secondary FFI dispatch");
-        let (_resp, err) = validate_error_envelope(&resp_raw, &id, allowed_codes)
+        let (resp, err) = validate_error_envelope(&resp_raw, &id, allowed_codes)
             .unwrap_or_else(|e| panic!("secondary `{method}` expected error: {e}"));
+        self.generation.fetch_max(resp.generation, Ordering::SeqCst);
         err
     }
 
@@ -117,8 +119,10 @@ impl SecondaryHostHandle {
             .expect("secondary host live")
             .poll_events_raw(max_count, timeout_ms)
             .expect("secondary poll_events");
-        serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("secondary poll_events invalid JSON ({e}): {raw}"))
+        let env: EventPollEnvelope = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("secondary poll_events invalid JSON ({e}): {raw}"));
+        self.generation.fetch_max(env.generation, Ordering::SeqCst);
+        env
     }
 }
 
@@ -147,7 +151,8 @@ pub struct FabushiE2EHarness {
 impl FabushiE2EHarness {
     /// Production opaque-box entrypoint required by ALL 394 Tier 1–4 tests.
     ///
-    /// Strictly reads `FABUSHI_HOST_LIB`, refuses any `mutant_stub` library path,
+    /// Strictly reads `FABUSHI_HOST_LIB`, refuses any `mutant_stub` library (via canonical path,
+    /// `fabushi_e2e_is_mutant_stub` sentinel symbol, and startup behavioral unknown-command probe),
     /// requires all 6 `fabushi_host_*` symbols, boots a real loopback server and temp dir,
     /// and FAILS CLOSED (panics) if any precondition is unmet. ZERO mock fallback!
     pub fn connect_production() -> Self {
@@ -157,12 +162,19 @@ impl FabushiE2EHarness {
     }
 
     pub fn try_connect_production() -> Result<Self, String> {
-        let raw_path = std::env::var(ENV_FABUSHI_HOST_LIB).map_err(|_| {
+        let raw_path = std::env::var(ENV_FABUSHI_HOST_LIB).ok();
+        Self::try_connect_production_from_path_opt(raw_path.as_deref())
+    }
+
+    /// Pure env-value parser and production loader enabling thread-safe fail-closed tests
+    /// without any `unsafe { std::env::set_var / remove_var }` process environment mutation.
+    pub fn try_connect_production_from_path_opt(raw_path: Option<&str>) -> Result<Self, String> {
+        let raw = raw_path.ok_or_else(|| {
             format!(
                 "{ENV_FABUSHI_HOST_LIB} is not set; production E2E tests require a real compiled libmahayana_app_host.{{so,dylib}} (zero mock fallback)"
             )
         })?;
-        let trimmed = raw_path.trim();
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(format!("{ENV_FABUSHI_HOST_LIB} is empty"));
         }
@@ -173,15 +185,17 @@ impl FabushiE2EHarness {
         let server = LoopbackServer::start()?;
         let temp_dir = TempDir::new()
             .map_err(|err| format!("failed to create isolated E2E TempDir: {err}"))?;
-        let config_json = build_host_config_json(temp_dir.path(), &server.base_url(), "iOS E2E Primary");
+        let config_json =
+            build_host_config_json(temp_dir.path(), &server.base_url(), "iOS E2E Primary");
         let client = FfiHostClient::load_production(lib_path, &config_json)?;
+        let initial_gen = client.initial_generation();
 
         Ok(Self {
             client: Some(client),
             lib_path: lib_path.to_path_buf(),
             server,
             temp_dir,
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(initial_gen),
             account_id: Mutex::new(None),
         })
     }
@@ -242,9 +256,7 @@ impl FabushiE2EHarness {
         let raw = serde_json::to_string(&req).map_err(|e| e.to_string())?;
         let resp_raw = self.client().dispatch_raw(&raw)?;
         let parsed = validate_envelope(&resp_raw, &id)?;
-        if parsed.generation > self.generation.load(Ordering::SeqCst) {
-            self.generation.store(parsed.generation, Ordering::SeqCst);
-        }
+        self.generation.fetch_max(parsed.generation, Ordering::SeqCst);
         Ok(parsed)
     }
 
@@ -275,10 +287,34 @@ impl FabushiE2EHarness {
             .unwrap_or_else(|e| panic!("FFI dispatch failed for `{method}`: {e}"));
         let (resp, result) = validate_success_envelope(&resp_raw, &id)
             .unwrap_or_else(|e| panic!("expected ok=true for `{method}`: {e}"));
-        if resp.generation > current_gen {
-            self.generation.store(resp.generation, Ordering::SeqCst);
-        }
+        self.generation.fetch_max(resp.generation, Ordering::SeqCst);
         (id, resp, result)
+    }
+
+    pub fn expect_ok_with_gen(
+        &self,
+        method: &str,
+        generation: u64,
+        account_id: Option<&str>,
+        params: Value,
+    ) -> Value {
+        let id = Uuid::new_v4().to_string();
+        let req = RpcRequest {
+            id: id.clone(),
+            method: method.to_owned(),
+            generation,
+            account_id: account_id.map(str::to_owned),
+            params,
+        };
+        let raw = serde_json::to_string(&req).expect("serialize RpcRequest");
+        let resp_raw = self
+            .client()
+            .dispatch_raw(&raw)
+            .unwrap_or_else(|e| panic!("FFI dispatch failed for `{method}`: {e}"));
+        let (resp, result) = validate_success_envelope(&resp_raw, &id)
+            .unwrap_or_else(|e| panic!("expected ok=true for `{method}`: {e}"));
+        self.generation.fetch_max(resp.generation, Ordering::SeqCst);
+        result
     }
 
     pub fn expect_err(&self, method: &str, params: Value, allowed_codes: &[&str]) -> RpcError {
@@ -308,8 +344,9 @@ impl FabushiE2EHarness {
             .client()
             .dispatch_raw(&raw)
             .unwrap_or_else(|e| panic!("FFI dispatch failed for `{method}`: {e}"));
-        let (_resp, err) = validate_error_envelope(&resp_raw, &id, allowed_codes)
+        let (resp, err) = validate_error_envelope(&resp_raw, &id, allowed_codes)
             .unwrap_or_else(|e| panic!("expected fail-closed error for `{method}`: {e}"));
+        self.generation.fetch_max(resp.generation, Ordering::SeqCst);
         err
     }
 
@@ -318,8 +355,10 @@ impl FabushiE2EHarness {
             .client()
             .poll_events_raw(max_count, timeout_ms)
             .unwrap_or_else(|e| panic!("fabushi_host_poll_events failed: {e}"));
-        serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("fabushi_host_poll_events invalid JSON ({e}): {raw}"))
+        let env: EventPollEnvelope = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("fabushi_host_poll_events invalid JSON ({e}): {raw}"));
+        self.generation.fetch_max(env.generation, Ordering::SeqCst);
+        env
     }
 
     pub fn cancel(&self, request_id: &str) -> bool {
@@ -331,25 +370,31 @@ impl FabushiE2EHarness {
     /// session / vault persistence across cold restart.
     pub fn restart_cold(&mut self) {
         let _ = self.client.take();
-        let config_json =
-            build_host_config_json(self.temp_dir.path(), &self.server.base_url(), "iOS E2E Primary");
+        let config_json = build_host_config_json(
+            self.temp_dir.path(),
+            &self.server.base_url(),
+            "iOS E2E Primary",
+        );
         let new_client = FfiHostClient::load_production(&self.lib_path, &config_json)
             .unwrap_or_else(|e| panic!("restart_cold failed to reload host: {e}"));
+        let next_gen = new_client.initial_generation();
         self.client = Some(new_client);
-        self.generation.store(1, Ordering::SeqCst);
+        self.generation.store(next_gen, Ordering::SeqCst);
     }
 
     /// Spawns a second isolated host instance connected to the SAME `LoopbackServer`
     /// for dual-device E2E flows (QR pairing, X25519 vault sync, E2EE ratchet, session revoke).
     pub fn spawn_secondary_host(&self, device_name: &str) -> SecondaryHostHandle {
         let temp_dir = TempDir::new().expect("create secondary TempDir");
-        let config_json = build_host_config_json(temp_dir.path(), &self.server.base_url(), device_name);
+        let config_json =
+            build_host_config_json(temp_dir.path(), &self.server.base_url(), device_name);
         let client = FfiHostClient::load_production(&self.lib_path, &config_json)
             .unwrap_or_else(|e| panic!("spawn_secondary_host failed: {e}"));
+        let initial_gen = client.initial_generation();
         SecondaryHostHandle {
             client: Some(client),
             _temp_dir: temp_dir,
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(initial_gen),
             account_id: Mutex::new(None),
         }
     }

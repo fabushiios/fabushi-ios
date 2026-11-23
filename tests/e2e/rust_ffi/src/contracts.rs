@@ -1031,6 +1031,9 @@ pub fn verify_voice_gesture(dx: f32, dy: f32, elapsed_secs: f32) -> &'static str
 }
 
 pub fn verify_sliding_replay_window_128(highest: &mut u64, bitmap: &mut u128, seq: u64) -> bool {
+    if seq == 0 {
+        return false;
+    }
     if *bitmap == 0 && *highest == 0 {
         *highest = seq;
         *bitmap = 1;

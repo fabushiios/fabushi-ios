@@ -73,13 +73,13 @@ fn tc_t1_f17_02_kanban_board_card_transitions_persist_across_cold_restart() {
         json!({"board_id": board_id, "title": "Ship Apple HIG", "column": "todo"}),
     );
     let card_id = card["card_id"].as_str().expect("card_id").to_owned();
-    let r1 = card["revision"].as_u64().unwrap_or(1);
+    let r1 = card["revision"].as_u64().expect("initial card revision");
 
     let moved = h.expect_ok(
         "fabushi.kanban_update_card",
         json!({"board_id": board_id, "card_id": card_id, "column": "in_progress"}),
     );
-    assert!(moved["revision"].as_u64().unwrap_or(0) > r1);
+    assert!(moved["revision"].as_u64().expect("moved card revision") > r1);
     let done = h.expect_ok(
         "fabushi.kanban_update_card",
         json!({"board_id": board_id, "card_id": card_id, "column": "done"}),
@@ -87,8 +87,24 @@ fn tc_t1_f17_02_kanban_board_card_transitions_persist_across_cold_restart() {
     assert_eq!(done["column"], "done");
 
     h.restart_cold();
-    let status = h.expect_ok("fabushi.get_status", json!({}));
-    assert!(status["status"].as_str().is_some());
+    let boards = h.expect_ok("fabushi.kanban_list_boards", json!({}));
+    let persisted_board = boards["boards"]
+        .as_array()
+        .expect("kanban boards array after cold restart")
+        .iter()
+        .find(|b| b["board_id"].as_str() == Some(board_id.as_str()))
+        .expect("kanban board must persist across cold restart");
+    assert_eq!(persisted_board["title"], "v1.6.7 Release");
+
+    let cards = h.expect_ok("fabushi.kanban_list_cards", json!({"board_id": board_id}));
+    let persisted_card = cards["cards"]
+        .as_array()
+        .expect("kanban cards array after cold restart")
+        .iter()
+        .find(|c| c["card_id"].as_str() == Some(card_id.as_str()))
+        .expect("kanban card must persist across cold restart");
+    assert_eq!(persisted_card["title"], "Ship Apple HIG");
+    assert_eq!(persisted_card["column"], "done");
 }
 
 #[test]
@@ -127,7 +143,8 @@ fn tc_t1_f17_04_bounded_memory_user_soul_honcho_and_quarantine_approve() {
         json!({"target": "memory", "content": "Prefer Apple HIG SwiftUI.\n§\nZero stubs."}),
     );
     assert_eq!(mem["max_chars"], 2200);
-    assert!(mem["char_count"].as_u64().unwrap_or(0) <= 2200);
+    let c = mem["char_count"].as_u64().expect("char_count");
+    assert!(c > 0 && c <= 2200);
 
     let usr = h.expect_ok(
         "fabushi.memory_put",
@@ -143,7 +160,13 @@ fn tc_t1_f17_04_bounded_memory_user_soul_honcho_and_quarantine_approve() {
         "fabushi.honcho_query",
         json!({"query": "Apple HIG", "peer_id": "self"}),
     );
-    assert!(honcho["entries"].is_array());
+    assert!(
+        !honcho["entries"]
+            .as_array()
+            .expect("honcho entries")
+            .is_empty(),
+        "honcho_query must return non-empty matching entries"
+    );
 
     let decided = h.expect_ok(
         "fabushi.memory_quarantine_decide",
@@ -262,6 +285,10 @@ fn tc_t1_f18_03_shared_group_workspace_cas_revision_and_event() {
 
     let poll = h.poll_events(16, 100);
     assert!(poll.ok);
+    assert!(
+        poll.events.iter().any(|e| e.kind.contains("workspace")),
+        "workspace_set must emit a workspace update event"
+    );
 }
 
 #[test]
@@ -331,8 +358,10 @@ fn tc_t1_f19_01_provider_upsert_and_probe_redacts_secret_key() {
     );
     let probe = h.expect_ok("magpie.provider_probe", json!({"id": "prov_loopback"}));
     assert_eq!(probe["reachable"], true);
-    let detail = probe["redacted_detail"].as_str().unwrap_or("");
-    assert!(!detail.contains(secret));
+    let detail = probe["redacted_detail"]
+        .as_str()
+        .expect("redacted_detail string");
+    assert!(!detail.is_empty() && !detail.contains(secret));
 }
 
 #[test]
@@ -477,9 +506,17 @@ fn tc_t1_f20_03_turn_start_polls_streaming_events_and_returns_unified_diff() {
 
     let polled = h.poll_events(16, 200);
     assert!(polled.ok);
+    assert!(
+        polled.events.iter().any(|e| e.kind.starts_with("coding_")),
+        "coding.turn_start must emit streaming coding_* events"
+    );
 
     let diff = h.expect_ok("coding.diff_get", json!({"turn_id": turn_id}));
-    assert!(diff["files"].is_array());
+    assert_eq!(diff["turn_id"].as_str(), Some(turn_id));
+    assert!(
+        !diff["files"].as_array().expect("diff files").is_empty(),
+        "coding.diff_get must return non-empty unified diff files"
+    );
 }
 
 #[test]
@@ -639,8 +676,23 @@ fn tc_t1_f21_05_grant_revoke_and_kill_switch_terminate_active_sessions() {
     let rev = h.expect_ok("mcp.grant_revoke", json!({"family_id": grant["family_id"]}));
     assert_eq!(rev["revoked"], true);
 
+    let _grant2 = h.expect_ok(
+        "mcp.oauth_approve",
+        json!({
+            "authorize_code_or_qr_id": "qr_mcp_03",
+            "approved_scopes": ["devices:read"],
+            "allowed_node_ids": ["node-alpha"],
+            "pkce_code_challenge": "challenge_3"
+        }),
+    );
     let killed = h.expect_ok("mcp.kill_switch", json!({"reason": "user_emergency"}));
-    assert!(killed["revoked_families"].is_u64());
+    assert!(
+        killed["revoked_families"]
+            .as_u64()
+            .expect("revoked_families")
+            >= 1,
+        "mcp.kill_switch must revoke at least 1 active grant family"
+    );
 }
 
 // ============================================================================
@@ -670,7 +722,7 @@ fn tc_t1_f22_01_cloud_sandbox_node_crud_and_policy_patch() {
     assert!(
         !list["nodes"]
             .as_array()
-            .unwrap_or(&vec![])
+            .expect("nodes array")
             .iter()
             .any(|n| n["node_id"].as_str() == Some(node_id))
     );
@@ -715,8 +767,12 @@ fn tc_t1_f22_03_two_concurrent_pty_sessions_isolated_without_crosstalk() {
 
     let r1 = h.expect_ok("remote.pty_read", json!({"pty_id": id1}));
     let r2 = h.expect_ok("remote.pty_read", json!({"pty_id": id2}));
-    assert!(!r1["output"].as_str().unwrap_or("").contains("PTY_TWO"));
-    assert!(!r2["output"].as_str().unwrap_or("").contains("PTY_ONE"));
+    let out1 = r1["output"].as_str().expect("PTY 1 output string");
+    let out2 = r2["output"].as_str().expect("PTY 2 output string");
+    assert!(out1.contains("PTY_ONE"), "PTY 1 must contain PTY_ONE, got: {out1:?}");
+    assert!(!out1.contains("PTY_TWO"), "PTY 1 must never leak PTY_TWO, got: {out1:?}");
+    assert!(out2.contains("PTY_TWO"), "PTY 2 must contain PTY_TWO, got: {out2:?}");
+    assert!(!out2.contains("PTY_ONE"), "PTY 2 must never leak PTY_ONE, got: {out2:?}");
 
     let _ = h.expect_ok("remote.pty_close", json!({"pty_id": id1}));
     let _ = h.expect_ok("remote.pty_close", json!({"pty_id": id2}));
@@ -941,7 +997,7 @@ fn tc_t1_f24_02_webmcp_register_and_invoke_tracks_monotonic_state_revision() {
     );
     let inst = launched["instance_id"].as_str().expect("instance_id");
     let nonce = launched["nonce"].as_str().expect("nonce");
-    let gen_val = launched["generation"].as_u64().unwrap_or(1);
+    let gen_val = launched["generation"].as_u64().expect("generation");
 
     let reg = h.expect_ok(
         "webmcp.register_tools",
@@ -994,7 +1050,7 @@ fn tc_t1_f24_02_webmcp_register_and_invoke_tracks_monotonic_state_revision() {
             "approved": true
         }),
     );
-    assert!(r2["state_revision"].as_u64().unwrap_or(0) > rev1);
+    assert!(r2["state_revision"].as_u64().expect("r2 state_revision") > rev1);
 }
 
 #[test]
@@ -1006,12 +1062,30 @@ fn tc_t1_f24_03_floating_pip_minimize_webmcp_mutation_and_inplace_restore() {
         json!({"bot_username": "dharma_bot", "short_name": "global_dharma"}),
     );
     let inst = launched["instance_id"].as_str().expect("instance_id");
+    let nonce = launched["nonce"].as_str().expect("nonce");
+    let gen_val = launched["generation"].as_u64().expect("generation");
+
+    let _ = h.expect_ok(
+        "webmcp.register_tools",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global_dharma",
+            "version": "1.6.7",
+            "digest": "sha256:abc123",
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
+            "tools": [{"name": "offline.practice.record", "mutating": true}]
+        }),
+    );
 
     let pip = h.expect_ok("miniapp.pip_minimize", json!({"instance_id": inst}));
     assert_eq!(pip["state"], "pip");
-    let rev_before = pip["preserved_revision"].as_u64().unwrap_or(0);
+    let rev_before = pip["preserved_revision"]
+        .as_u64()
+        .expect("pip_minimize preserved_revision");
 
-    let _ = h.expect_ok(
+    let inv = h.expect_ok(
         "webmcp.invoke",
         json!({
             "account_id": "acc_1",
@@ -1019,19 +1093,32 @@ fn tc_t1_f24_03_floating_pip_minimize_webmcp_mutation_and_inplace_restore() {
             "version": "1.6.7",
             "digest": "sha256:abc123",
             "instance_id": inst,
-            "nonce": launched["nonce"],
-            "generation": launched["generation"],
+            "nonce": nonce,
+            "generation": gen_val,
             "call_id": "call_pip_1",
             "tool": "offline.practice.record",
             "arguments": {"tag": "pip"},
             "approved": true
         }),
     );
+    let rev_after_mut = inv["state_revision"]
+        .as_u64()
+        .expect("webmcp.invoke state_revision");
+    assert!(
+        rev_after_mut > rev_before,
+        "mutating WebMCP call during PiP must strictly increment state_revision ({rev_before} -> {rev_after_mut})"
+    );
 
     let restored = h.expect_ok("miniapp.pip_restore", json!({"instance_id": inst}));
     assert_eq!(restored["state"], "expanded");
     assert_eq!(restored["instance_id"].as_str(), Some(inst));
-    assert!(restored["preserved_revision"].as_u64().unwrap_or(0) >= rev_before);
+    let rev_restored = restored["preserved_revision"]
+        .as_u64()
+        .expect("pip_restore preserved_revision");
+    assert!(
+        rev_restored >= rev_after_mut,
+        "pip_restore must preserve mutated revision (expected >= {rev_after_mut}, got {rev_restored})"
+    );
 }
 
 #[test]
@@ -1078,6 +1165,12 @@ fn tc_t1_f24_05_miniapp_storage_isolation_between_apps_and_uninstall_wipe() {
         "miniapp.storage_put",
         json!({"bot_username": "bot_a", "short_name": "app_a", "key": "secret_k", "value": "val_a"}),
     );
+    let own_before = h.expect_ok(
+        "miniapp.storage_get",
+        json!({"bot_username": "bot_a", "short_name": "app_a", "key": "secret_k"}),
+    );
+    assert_eq!(own_before["value"], "val_a");
+
     let other = h.expect_ok(
         "miniapp.storage_get",
         json!({"bot_username": "bot_b", "short_name": "app_b", "key": "secret_k"}),
@@ -1089,6 +1182,15 @@ fn tc_t1_f24_05_miniapp_storage_isolation_between_apps_and_uninstall_wipe() {
         json!({"bot_username": "bot_a", "short_name": "app_a"}),
     );
     assert_eq!(uninst["installed"], false);
+
+    let own_after = h.expect_ok(
+        "miniapp.storage_get",
+        json!({"bot_username": "bot_a", "short_name": "app_a", "key": "secret_k"}),
+    );
+    assert!(
+        own_after["value"].is_null(),
+        "miniapp.uninstall must wipe isolated storage for app_a"
+    );
 }
 
 // ============================================================================
@@ -1159,23 +1261,30 @@ fn tc_t1_f25_03_waveform_5bit_100_samples_exact_63_bytes_lossless() {
 #[test]
 fn tc_t1_f25_04_stickers_gifs_media_editor_and_instant_view() {
     let h = FabushiE2EHarness::connect_production();
-    let sets = h.expect_ok("stickers.list_sets", json!({}));
-    assert!(sets["sets"].is_array());
     let _ = h.expect_ok("stickers.install_set", json!({"set_id": "fabushi_pack_1"}));
+    let sets = h.expect_ok("stickers.list_sets", json!({}));
+    assert!(
+        sets["sets"]
+            .as_array()
+            .expect("sticker sets")
+            .iter()
+            .any(|s| s["set_id"] == "fabushi_pack_1" || s["id"] == "fabushi_pack_1"),
+        "installed sticker set fabushi_pack_1 must appear in stickers.list_sets"
+    );
     let gifs = h.expect_ok("stickers.search_gifs", json!({"query": "wave", "limit": 10}));
-    assert!(gifs["gifs"].is_array());
+    assert!(!gifs["gifs"].as_array().expect("gifs").is_empty());
 
     let edited = h.expect_ok(
         "media.edit_apply",
         json!({"file_id": "cas_photo_1", "rotate_deg": 90, "spoiler_blur": true}),
     );
-    assert!(!edited["edited_file_id"].as_str().unwrap_or("").is_empty());
+    assert!(!edited["edited_file_id"].as_str().expect("edited_file_id").is_empty());
 
     let iv = h.expect_ok(
         "media.instant_view_fetch",
         json!({"url": format!("{}/article/v167", h.server_url())}),
     );
-    assert!(iv["blocks"].is_array());
+    assert!(!iv["blocks"].as_array().expect("instant view blocks").is_empty());
 }
 
 #[test]
@@ -1186,17 +1295,17 @@ fn tc_t1_f25_05_stories_create_24h_ttl_list_view_and_delete() {
         json!({"media_id": "cas_story_1", "media_type": "photo", "caption": "Hello 24h", "privacy": "contacts"}),
     );
     let sid = created["story_id"].as_str().expect("story_id");
-    assert!(created["expires_at_ms"].as_i64().unwrap_or(0) > now_ms());
+    assert!(created["expires_at_ms"].as_i64().expect("expires_at_ms") > now_ms());
 
     let viewed = h.expect_ok("stories.view", json!({"story_id": sid}));
-    assert!(viewed["views_count"].as_u64().unwrap_or(0) >= 1);
+    assert!(viewed["views_count"].as_u64().expect("views_count") >= 1);
 
     let _ = h.expect_ok("stories.delete", json!({"story_id": sid}));
     let list = h.expect_ok("stories.list", json!({}));
     assert!(
         !list["stories"]
             .as_array()
-            .unwrap_or(&vec![])
+            .expect("stories array")
             .iter()
             .any(|s| s["story_id"].as_str() == Some(sid))
     );
@@ -1232,7 +1341,14 @@ fn tc_t1_f26_02_calls_history_and_post_call_rating_1_to_5() {
     let _ = h.expect_ok("calls.hangup", json!({"call_id": call_id}));
 
     let hist = h.expect_ok("calls.history", json!({}));
-    assert!(hist["calls"].is_array());
+    assert!(
+        hist["calls"]
+            .as_array()
+            .expect("calls history array")
+            .iter()
+            .any(|c| c["call_id"].as_str() == Some(call_id)),
+        "completed call must appear in calls.history"
+    );
     let rated = h.expect_ok(
         "calls.rate",
         json!({"call_id": call_id, "rating": 5, "feedback": "Crystal clear"}),
@@ -1325,21 +1441,28 @@ fn tc_t1_f27_01_tantivy_global_search_matches_english_and_cjk() {
 #[test]
 fn tc_t1_f27_02_hybrid_memory_search_with_entity_hint() {
     let h = FabushiE2EHarness::connect_production();
+    let _ = h.expect_ok(
+        "fabushi.memory_put",
+        json!({"target": "memory", "content": "FabushiTheme design system tokens"}),
+    );
     let res = h.expect_ok(
         "search.query",
         json!({"q": "design system", "category": "hybrid", "mode": "hybrid", "entity": "FabushiTheme"}),
     );
     assert_eq!(res["engine"], "hybrid");
-    assert!(res["results"].is_array());
+    assert!(
+        !res["results"].as_array().expect("hybrid results").is_empty(),
+        "hybrid search must return seeded FabushiTheme design system entry"
+    );
 }
 
 #[test]
 fn tc_t1_f27_03_catalog_search_spanning_bots_and_miniapps() {
     let h = FabushiE2EHarness::connect_production();
     let bots = h.expect_ok("search.query", json!({"q": "bot", "category": "bots"}));
-    assert!(bots["results"].is_array());
+    assert!(!bots["results"].as_array().expect("bots").is_empty());
     let apps = h.expect_ok("search.query", json!({"q": "dharma", "category": "miniapps"}));
-    assert!(apps["results"].is_array());
+    assert!(!apps["results"].as_array().expect("apps").is_empty());
 }
 
 #[test]
@@ -1481,7 +1604,7 @@ fn tc_t1_f28_05_sliding_replay_window_128_accepts_out_of_order_once() {
 fn tc_t1_f29_01_wallet_balance_topup_and_transactions_ledger() {
     let h = FabushiE2EHarness::connect_production();
     let init = h.expect_ok("wallet.balance", json!({}));
-    let b0 = init["stars_balance"].as_i64().unwrap_or(0);
+    let b0 = init["stars_balance"].as_i64().expect("initial stars_balance");
 
     let topped = h.expect_ok(
         "wallet.topup",
@@ -1533,7 +1656,17 @@ fn tc_t1_f29_04_storekit2_jws_verify_and_restore_purchases() {
     ));
 
     let restored = h.expect_ok("wallet.storekit_restore", json!({}));
-    assert!(restored.is_object());
+    assert!(
+        restored["restored_products"].is_array(),
+        "storekit_restore must return restored_products array"
+    );
+    assert!(
+        matches!(
+            restored["disposition"].as_str(),
+            Some("restored") | Some("no_purchases") | Some("server_blocked")
+        ),
+        "storekit_restore must report honest disposition"
+    );
 }
 
 #[test]
@@ -1575,7 +1708,13 @@ fn tc_t1_f30_01_actions_list_and_schema_expose_app_intents() {
 
     let schema = h.expect_ok("actions.schema", json!({"action_name": first_name}));
     assert_eq!(schema["action_name"].as_str(), Some(first_name));
-    assert!(schema["json_schema"].is_object());
+    let obj = schema["json_schema"]
+        .as_object()
+        .expect("json_schema object");
+    assert!(
+        obj.contains_key("type") || obj.contains_key("properties"),
+        "actions.schema must return concrete JSON schema object"
+    );
 }
 
 #[test]
@@ -1710,6 +1849,7 @@ fn tc_t1_f31_03_theme_geometry_and_liquid_glass_persist_across_restart() {
     assert_eq!(got["font_size_px"], 16);
     assert_eq!(got["bubble_radius_px"], 14);
     assert_eq!(got["ui_scale_pct"], 125);
+    assert_eq!(got["liquid_glass_enabled"], true);
 }
 
 #[test]
@@ -1791,7 +1931,9 @@ fn tc_t1_f32_03_settings_patch_persists_across_sections_and_restarts() {
     }
     h.restart_cold();
     let all = h.expect_ok("settings.get_all", json!({}));
+    assert_eq!(all["notifications"]["sound"], false);
     assert_eq!(all["global_ttl"]["ttl_seconds"], 86400);
+    assert_eq!(all["power_saving"]["disable_animations"], true);
 }
 
 #[test]
@@ -1969,6 +2111,14 @@ fn tc_t1_f34_05_poll_events_bounded_timeout_and_cancel_in_flight() {
     assert!(polled.events.len() <= 16);
     assert!(start.elapsed().as_millis() < 2_000);
 
-    let _cancelled = h.cancel("nonexistent_inflight_req_id");
-    assert!(h.expect_ok("generation.current", json!({}))["generation"].is_u64());
+    assert!(
+        !h.cancel("nonexistent_inflight_req_id"),
+        "cancelling nonexistent request_id must return false"
+    );
+    assert!(
+        h.expect_ok("generation.current", json!({}))["generation"]
+            .as_u64()
+            .expect("generation")
+            >= 1
+    );
 }

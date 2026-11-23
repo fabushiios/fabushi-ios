@@ -2,9 +2,12 @@
 //! (`PROJECT.md § Interface Contracts #1`) plus an isolated `LegacyHost8128951Probe` used
 //! exclusively by `tests/self_validate_antistub.rs` to prove negative detection of baseline `8128951`.
 
+use crate::contracts::validate_error_envelope;
 use libloading::Library;
+use serde_json::json;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
+use uuid::Uuid;
 
 pub const REQUIRED_HOST_SYMBOLS: [&str; 6] = [
     "fabushi_host_create",
@@ -15,6 +18,9 @@ pub const REQUIRED_HOST_SYMBOLS: [&str; 6] = [
     "fabushi_host_free_string",
 ];
 
+pub const MUTANT_STUB_SENTINEL_SYMBOL: &str = "fabushi_e2e_is_mutant_stub";
+pub const STARTUP_PROBE_UNKNOWN_METHOD: &str = "__fabushi_e2e_probe__.unknown_command_guard";
+
 pub type FabushiHostCreateFn = unsafe extern "C" fn(config_json: *const c_char) -> *mut c_void;
 pub type FabushiHostDispatchFn =
     unsafe extern "C" fn(handle: *mut c_void, request_json: *const c_char) -> *mut c_char;
@@ -24,6 +30,7 @@ pub type FabushiHostCancelFn =
     unsafe extern "C" fn(handle: *mut c_void, request_id: *const c_char) -> bool;
 pub type FabushiHostDestroyFn = unsafe extern "C" fn(handle: *mut c_void);
 pub type FabushiHostFreeStringFn = unsafe extern "C" fn(ptr: *mut c_char);
+pub type MutantStubSentinelFn = unsafe extern "C" fn() -> u32;
 
 type LegacyHostCreateTestFn = unsafe extern "C" fn(app_data_dir: *const c_char) -> *mut c_void;
 type LegacyHostDispatchWithHandleFn =
@@ -88,9 +95,21 @@ pub fn probe_required_symbols(lib_path: &Path) -> Result<Vec<&'static str>, Stri
     Ok(missing)
 }
 
-pub fn is_mutant_stub_path(lib_path: &Path) -> bool {
-    let lower = lib_path.to_string_lossy().to_ascii_lowercase();
+fn path_contains_mutant_marker(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
     lower.contains("mutant_stub") || lower.contains("mutant-stub")
+}
+
+pub fn is_mutant_stub_path(lib_path: &Path) -> bool {
+    if path_contains_mutant_marker(lib_path) {
+        return true;
+    }
+    if let Ok(canonical) = std::fs::canonicalize(lib_path) {
+        if path_contains_mutant_marker(&canonical) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Safe dynamic wrapper around the 6 canonical `fabushi_host_*` C-ABI symbols.
@@ -99,6 +118,7 @@ pub fn is_mutant_stub_path(lib_path: &Path) -> bool {
 /// is dropped by Rust, preventing `dlclose` while host worker threads are active.
 pub struct FfiHostClient {
     handle: *mut c_void,
+    initial_generation: u64,
     fn_dispatch: FabushiHostDispatchFn,
     fn_poll_events: FabushiHostPollEventsFn,
     fn_cancel: FabushiHostCancelFn,
@@ -113,7 +133,10 @@ unsafe impl Send for FfiHostClient {}
 unsafe impl Sync for FfiHostClient {}
 
 impl FfiHostClient {
-    /// Production loader: STRICTLY refuses `mutant_stub` paths and requires all 6 `fabushi_host_*` symbols.
+    /// Production loader with 3-layer fail-closed anti-stub gate:
+    /// 1. Canonicalized path check rejecting `mutant_stub`/`mutant-stub` (including symlinks).
+    /// 2. `dlsym` probe refusing any cdylib exporting `fabushi_e2e_is_mutant_stub` (even if copied/renamed).
+    /// 3. Startup behavioral probe verifying unknown methods fail closed with `unknown_command` + `retryable == false`.
     pub fn load_production(lib_path: &Path, config_json: &str) -> Result<Self, String> {
         if is_mutant_stub_path(lib_path) {
             return Err(format!(
@@ -121,25 +144,56 @@ impl FfiHostClient {
                 lib_path.display()
             ));
         }
-        Self::load_internal(lib_path, config_json)
+        let mut client = Self::load_internal(lib_path, config_json, true)?;
+        let authoritative_gen = client.verify_startup_antistub_probe()?;
+        client.initial_generation = authoritative_gen;
+        Ok(client)
     }
 
     /// Anti-stub oracle loader: strictly for `tests/self_validate_antistub.rs` to validate
     /// that our contract assertions catch synthetic `mutant_stub` defects.
     pub fn load_for_antistub_oracle(lib_path: &Path, config_json: &str) -> Result<Self, String> {
-        Self::load_internal(lib_path, config_json)
+        Self::load_internal(lib_path, config_json, false)
     }
 
-    fn load_internal(lib_path: &Path, config_json: &str) -> Result<Self, String> {
+    fn load_internal(
+        lib_path: &Path,
+        config_json: &str,
+        production_mode: bool,
+    ) -> Result<Self, String> {
         if !lib_path.exists() {
             return Err(format!(
                 "FAIL-CLOSED: host shared library does not exist at {}",
                 lib_path.display()
             ));
         }
+        let resolved_path =
+            std::fs::canonicalize(lib_path).unwrap_or_else(|_| lib_path.to_path_buf());
+        if production_mode && path_contains_mutant_marker(&resolved_path) {
+            return Err(format!(
+                "FAIL-CLOSED: connect_production() refuses mutant_stub library: {}",
+                resolved_path.display()
+            ));
+        }
+
         // SAFETY: Loading a native shared library from an explicitly verified path.
-        let library = unsafe { Library::new(lib_path) }
-            .map_err(|err| format!("failed to dlopen {}: {err}", lib_path.display()))?;
+        let library = unsafe { Library::new(&resolved_path) }
+            .map_err(|err| format!("failed to dlopen {}: {err}", resolved_path.display()))?;
+
+        if production_mode {
+            // SAFETY: Probing `dlsym` for the negative-oracle sentinel symbol without invoking it.
+            // Any cdylib exporting `fabushi_e2e_is_mutant_stub` is rejected immediately even if copied/renamed.
+            let has_sentinel =
+                unsafe { library.get::<MutantStubSentinelFn>(b"fabushi_e2e_is_mutant_stub\0") }
+                    .is_ok();
+            if has_sentinel {
+                return Err(format!(
+                    "FAIL-CLOSED: Refusing to load negative-oracle mutant_stub cdylib in production mode \
+                     (detected sentinel symbol `{MUTANT_STUB_SENTINEL_SYMBOL}` in {})",
+                    resolved_path.display()
+                ));
+            }
+        }
 
         // SAFETY: Resolving the 6 canonical C-ABI symbol signatures defined in PROJECT.md.
         let fn_create: FabushiHostCreateFn = unsafe {
@@ -181,12 +235,13 @@ impl FfiHostClient {
         if handle.is_null() {
             return Err(format!(
                 "fabushi_host_create returned NULL handle for {}",
-                lib_path.display()
+                resolved_path.display()
             ));
         }
 
         Ok(Self {
             handle,
+            initial_generation: 1,
             fn_dispatch,
             fn_poll_events,
             fn_cancel,
@@ -194,6 +249,75 @@ impl FfiHostClient {
             fn_free_string,
             _library: library,
         })
+    }
+
+    pub fn initial_generation(&self) -> u64 {
+        self.initial_generation
+    }
+
+    /// Startup fail-closed behavioral anti-stub gate.
+    ///
+    /// Dispatches a synthetic unknown method with random UUID suffix under
+    /// `__fabushi_e2e_probe__.unknown_command_guard` and asserts the host fails closed with:
+    /// - `ok == false`
+    /// - `error.code == "unknown_command"`
+    /// - `error.retryable == false`
+    /// - zero `"acknowledged"` stub token in the raw response
+    ///
+    /// Returns the host's authoritative `generation` (handles persisted `generation > 1` on `restart_cold()`
+    /// via a single bounded retry if attempt 0 receives fail-closed `stale_generation`).
+    pub fn verify_startup_antistub_probe(&self) -> Result<u64, String> {
+        let mut probe_gen = 1u64;
+        for attempt in 0..2 {
+            let probe_id = format!("e2e-antistub-probe-{}", Uuid::new_v4());
+            let probe_method = format!(
+                "{STARTUP_PROBE_UNKNOWN_METHOD}.{}",
+                Uuid::new_v4().simple()
+            );
+            let req = json!({
+                "id": probe_id,
+                "method": probe_method,
+                "generation": probe_gen,
+                "params": {}
+            });
+            let raw = self.dispatch_raw(&req.to_string()).map_err(|err| {
+                format!("FAIL-CLOSED: startup anti-stub probe dispatch failed: {err}")
+            })?;
+
+            if raw.to_ascii_lowercase().contains("\"acknowledged\"") {
+                return Err(format!(
+                    "FAIL-CLOSED: startup anti-stub probe detected fail-open `acknowledged` stub response: {raw}"
+                ));
+            }
+
+            // If a cold-restarted host persisted generation > 1 and checks generation before method dispatch,
+            // retry once at the host's authoritative generation.
+            if attempt == 0 {
+                if let Ok((resp, err)) =
+                    validate_error_envelope(&raw, &probe_id, &["stale_generation"])
+                {
+                    if !err.retryable && resp.generation > probe_gen {
+                        probe_gen = resp.generation;
+                        continue;
+                    }
+                }
+            }
+
+            let (resp, err) =
+                validate_error_envelope(&raw, &probe_id, &["unknown_command"]).map_err(|e| {
+                    format!(
+                        "FAIL-CLOSED: startup anti-stub probe failed for `{STARTUP_PROBE_UNKNOWN_METHOD}`: {e}"
+                    )
+                })?;
+
+            if err.retryable {
+                return Err(format!(
+                    "FAIL-CLOSED: startup anti-stub probe requires `unknown_command` error.retryable == false, got true (raw={raw})"
+                ));
+            }
+            return Ok(resp.generation.max(1));
+        }
+        Err("FAIL-CLOSED: startup anti-stub probe exhausted retry after stale_generation".to_owned())
     }
 
     pub fn dispatch_raw(&self, request_json: &str) -> Result<String, String> {

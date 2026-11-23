@@ -8,8 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use fabushi_e2e_ffi::FabushiE2EHarness;
 use fabushi_e2e_ffi::contracts::{
-    MAX_AUDIO_BUFFER_CHUNKS, MAX_VAULT_CIPHERTEXT_BYTES, compute_wcag_accent_fill,
-    validate_envelope, validate_error_envelope, verify_argon2id_params,
+    EventPollEnvelope, MAX_AUDIO_BUFFER_CHUNKS, MAX_VAULT_CIPHERTEXT_BYTES,
+    compute_wcag_accent_fill, validate_error_envelope, verify_argon2id_params,
     verify_config_4tier_cascade, verify_loop_budget_5_hops, verify_magpie_circuit_rest_ms,
     verify_mcp_audit_redaction, verify_sliding_replay_window_128, verify_talk_vad_bargein,
     verify_vault_size_cap, verify_wcag_accent_luma_guard,
@@ -238,32 +238,64 @@ fn tc_t2_f18_03_expired_floor_lease_preempted_and_late_nonce_rejected() {
 fn tc_t2_f18_04_floor_control_anti_starvation_under_50_direct_mention_burst() {
     let h = FabushiE2EHarness::connect_production();
     let t0 = now_ms();
-    let _ = h.expect_ok(
+    // 1. Occupy the floor FIRST so `bot_general_waiter` MUST enter the wait queue.
+    let initial = h.expect_ok(
         "multi_agent.floor_request",
-        json!({"chat_id": 513, "agent_id": "bot_general_waiter", "priority": "general_contribution", "now_ms": t0}),
+        json!({"chat_id": 513, "agent_id": "bot_initial_holder", "priority": "general_contribution", "now_ms": t0}),
     );
+    assert_eq!(initial["granted"], true);
+    let mut active_speaker = "bot_initial_holder".to_owned();
+    let mut active_nonce = initial["grant"]["nonce"]
+        .as_str()
+        .expect("initial grant nonce")
+        .to_owned();
+
+    // 2. Enqueue `bot_general_waiter` and prove it is queued (`granted == false`).
+    let waiter = h.expect_ok(
+        "multi_agent.floor_request",
+        json!({"chat_id": 513, "agent_id": "bot_general_waiter", "priority": "general_contribution", "now_ms": t0 + 10}),
+    );
+    assert_eq!(
+        waiter["granted"], false,
+        "bot_general_waiter must enter the wait queue behind bot_initial_holder"
+    );
+
+    // 3. Drive 50 `direct_mention` arrivals while releasing each active speaker in turn.
     let mut general_promoted = false;
-    for i in 1..=50 {
-        let r = h.expect_ok(
+    for i in 1..=50i64 {
+        let dm = h.expect_ok(
             "multi_agent.floor_request",
-            json!({"chat_id": 513, "agent_id": format!("bot_dm_{i}"), "priority": "direct_mention", "now_ms": t0 + i * 50}),
+            json!({"chat_id": 513, "agent_id": format!("bot_dm_{i}"), "priority": "direct_mention", "now_ms": t0 + 10 + i * 50}),
         );
-        if r["current_speaker"] == "bot_general_waiter" {
+        assert_eq!(
+            dm["granted"], false,
+            "direct_mention must queue while an active speaker holds the floor"
+        );
+
+        let rel = h.expect_ok(
+            "multi_agent.floor_release",
+            json!({"chat_id": 513, "agent_id": active_speaker, "nonce": active_nonce}),
+        );
+        assert_eq!(rel["released"], true);
+        let next_speaker = rel["next_speaker"]
+            .as_str()
+            .expect("releasing floor with queued agents must promote next_speaker");
+        if next_speaker == "bot_general_waiter" {
             general_promoted = true;
+            break;
         }
-        if let Some(nonce) = r["grant"]["nonce"].as_str() {
-            let speaker = r["current_speaker"].as_str().unwrap_or("");
-            let rel = h.expect_ok(
-                "multi_agent.floor_release",
-                json!({"chat_id": 513, "agent_id": speaker, "nonce": nonce}),
-            );
-            if rel["next_speaker"] == "bot_general_waiter" {
-                general_promoted = true;
-                break;
-            }
-        }
+        active_speaker = next_speaker.to_owned();
+        active_nonce = rel["next_grant"]["nonce"]
+            .as_str()
+            .or_else(|| rel["grant"]["nonce"].as_str())
+            .or_else(|| rel["next_nonce"].as_str())
+            .expect("promoted speaker must receive a valid floor grant nonce")
+            .to_owned();
     }
-    assert!(general_promoted, "queued general_contribution agent must never starve indefinitely");
+    assert!(
+        general_promoted,
+        "queued general_contribution agent must never starve under a 50 direct_mention burst"
+    );
 }
 
 #[test]
@@ -537,7 +569,7 @@ fn tc_t2_f21_04_revoked_grant_token_fails_closed_immediately() {
     let err = h.expect_err(
         "mcp.tool_invoke",
         json!({
-            "access_token": grant["access_token"].as_str().unwrap_or("tok_revoked"),
+            "access_token": grant["access_token"].as_str().expect("access_token"),
             "protocol_version": "2025-11-25",
             "tool_name": "list_devices",
             "arguments": {},
@@ -592,15 +624,25 @@ fn tc_t2_f22_01_emergency_takeover_under_10ms_preempts_stale_epoch_agent_input()
         "computers.lease_acquire",
         json!({"node_id": "node_dev_mac", "holder_kind": "ai_mcp"}),
     );
-    let old_epoch = lease["override_epoch"].as_u64().unwrap_or(0);
+    let old_epoch = lease["override_epoch"]
+        .as_u64()
+        .expect("lease override_epoch");
 
     let start = Instant::now();
     let takeover = h.expect_ok(
         "computers.emergency_takeover",
         json!({"node_id": "node_dev_mac", "holder_kind": "human"}),
     );
-    assert!(start.elapsed().as_millis() < 50 && takeover["elapsed_ms"].as_u64().unwrap_or(99) < 10);
-    assert!(takeover["override_epoch"].as_u64().unwrap_or(0) > old_epoch);
+    assert!(
+        start.elapsed().as_millis() < 50
+            && takeover["elapsed_ms"].as_u64().expect("elapsed_ms") < 10
+    );
+    assert!(
+        takeover["override_epoch"]
+            .as_u64()
+            .expect("takeover override_epoch")
+            > old_epoch
+    );
 
     let preempted = h.expect_err(
         "remote.input_send",
@@ -814,6 +856,33 @@ fn tc_t2_f24_01_launch_before_tos_and_tampered_init_data_hmac_fail_closed() {
 #[test]
 fn tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed() {
     let h = FabushiE2EHarness::connect_production();
+    let _ = h.expect_ok("miniapp.accept_tos", json!({"bot_id": "bot_dharma"}));
+    let launched = h.expect_ok(
+        "miniapp.launch",
+        json!({"bot_username": "dharma_bot", "short_name": "global_dharma"}),
+    );
+    let inst = launched["instance_id"].as_str().expect("instance_id");
+    let nonce = launched["nonce"].as_str().expect("nonce");
+    let gen_val = launched["generation"].as_u64().expect("generation");
+
+    let reg = h.expect_ok(
+        "webmcp.register_tools",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global_dharma",
+            "version": "1.6.7",
+            "digest": "sha256:abc123",
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
+            "tools": [
+                {"name": "offline.state.read", "mutating": false}
+            ]
+        }),
+    );
+    assert_eq!(reg["registered_count"], 1);
+
+    // 1. Mismatched 6-tuple session fence MUST fail closed.
     let e_fence = h.expect_err(
         "webmcp.invoke",
         json!({
@@ -821,7 +890,7 @@ fn tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed(
             "app_id": "global_dharma",
             "version": "1.6.7",
             "digest": "sha256:tampered",
-            "instance_id": "inst_1",
+            "instance_id": inst,
             "nonce": "wrong_nonce",
             "generation": 9999,
             "call_id": "call_bad_fence",
@@ -832,6 +901,24 @@ fn tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed(
     );
     assert!(!e_fence.retryable);
 
+    // 2. Establish a valid call_id on the LIVE session, then replay the exact same call_id.
+    let first = h.expect_ok(
+        "webmcp.invoke",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global_dharma",
+            "version": "1.6.7",
+            "digest": "sha256:abc123",
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
+            "call_id": "call_dup_replay",
+            "tool": "offline.state.read",
+            "arguments": {}
+        }),
+    );
+    assert_eq!(first["ok"], true);
+
     let e_dup = h.expect_err(
         "webmcp.invoke",
         json!({
@@ -839,15 +926,14 @@ fn tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed(
             "app_id": "global_dharma",
             "version": "1.6.7",
             "digest": "sha256:abc123",
-            "instance_id": "inst_dup",
-            "nonce": "nonce_dup",
-            "generation": h.current_generation(),
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
             "call_id": "call_dup_replay",
-            "simulate_duplicate_call_id": true,
             "tool": "offline.state.read",
             "arguments": {}
         }),
-        &["webmcp_duplicate_call_id", "webmcp_session_fence_mismatch"],
+        &["webmcp_duplicate_call_id"],
     );
     assert!(!e_dup.retryable);
 }
@@ -855,6 +941,40 @@ fn tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed(
 #[test]
 fn tc_t2_f24_03_unregistered_tool_schema_violation_and_unapproved_mutation_fail_closed() {
     let h = FabushiE2EHarness::connect_production();
+    let _ = h.expect_ok("miniapp.accept_tos", json!({"bot_id": "bot_dharma"}));
+    let launched = h.expect_ok(
+        "miniapp.launch",
+        json!({"bot_username": "dharma_bot", "short_name": "global_dharma"}),
+    );
+    let inst = launched["instance_id"].as_str().expect("instance_id");
+    let nonce = launched["nonce"].as_str().expect("nonce");
+    let gen_val = launched["generation"].as_u64().expect("generation");
+
+    let reg = h.expect_ok(
+        "webmcp.register_tools",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global_dharma",
+            "version": "1.6.7",
+            "digest": "sha256:abc123",
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
+            "tools": [
+                {
+                    "name": "offline.practice.record",
+                    "mutating": true,
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "tag": { "type": "string" } },
+                        "required": ["tag"]
+                    }
+                }
+            ]
+        }),
+    );
+    assert_eq!(reg["registered_count"], 1);
+
     for (tool, args, approved, expected) in [
         ("not.registered.tool", json!({}), true, "webmcp_tool_unregistered"),
         ("offline.practice.record", json!({"tag": 12345}), true, "webmcp_schema_mismatch"),
@@ -867,15 +987,15 @@ fn tc_t2_f24_03_unregistered_tool_schema_violation_and_unapproved_mutation_fail_
                 "app_id": "global_dharma",
                 "version": "1.6.7",
                 "digest": "sha256:abc123",
-                "instance_id": "inst_live",
-                "nonce": "nonce_live",
-                "generation": h.current_generation(),
+                "instance_id": inst,
+                "nonce": nonce,
+                "generation": gen_val,
                 "call_id": format!("call_{expected}"),
                 "tool": tool,
                 "arguments": args,
                 "approved": approved
             }),
-            &[expected, "webmcp_session_fence_mismatch"],
+            &[expected],
         );
         assert!(!err.retryable);
     }
@@ -901,14 +1021,45 @@ fn tc_t2_f24_04_tampered_offline_fabapp_package_fails_closed() {
 #[test]
 fn tc_t2_f24_05_protected_prayer_wheel_requires_entitlement_while_free_offline_works() {
     let h = FabushiE2EHarness::connect_production();
+    let pkg = b"GLOBAL_DHARMA_OFFLINE_PKG_T2_F24_05";
+    let digest = sha256_hex(pkg);
+    let verified = h.expect_ok(
+        "miniapp.verify_offline_package",
+        json!({
+            "package_id": "global-dharma",
+            "version": "1.6.7",
+            "sha256_digest": digest,
+            "ed25519_sig_b64": B64.encode([0x55u8; 64]),
+            "bytes_b64": B64.encode(pkg)
+        }),
+    );
+    assert_eq!(verified["verified"], true);
+
     h.server().set_offline(true);
+    let free = h.expect_ok(
+        "webmcp.invoke",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global-dharma",
+            "version": "1.6.7",
+            "digest": digest,
+            "instance_id": "inst_off",
+            "nonce": "nonce_off",
+            "generation": h.current_generation(),
+            "call_id": "call_free_offline",
+            "tool": "offline.state.read",
+            "arguments": {}
+        }),
+    );
+    assert_eq!(free["ok"], true);
+
     let err = h.expect_err(
         "webmcp.invoke",
         json!({
             "account_id": "acc_1",
             "app_id": "global-dharma",
             "version": "1.6.7",
-            "digest": "sha256:offline",
+            "digest": digest,
             "instance_id": "inst_off",
             "nonce": "nonce_off",
             "generation": h.current_generation(),
@@ -1010,15 +1161,21 @@ fn tc_t2_f25_05_story_ttl_clamped_1_to_48_hours_and_unknown_story_delete_404() {
         "stories.create",
         json!({"media_id": "m1", "media_type": "photo", "privacy": "contacts", "ttl_hours": 0}),
     );
-    let d_low = s_low["expires_at_ms"].as_i64().unwrap_or(0) - now;
-    assert!(d_low >= 3_500_000 && d_low <= 3_700_000);
+    let d_low = s_low["expires_at_ms"].as_i64().expect("s_low expires_at_ms") - now;
+    assert!(
+        (3_500_000..=3_700_000).contains(&d_low),
+        "ttl_hours=0 must clamp to 1h (~3_600_000ms), got {d_low}ms"
+    );
 
     let s_high = h.expect_ok(
         "stories.create",
         json!({"media_id": "m2", "media_type": "photo", "privacy": "contacts", "ttl_hours": 999}),
     );
-    let d_high = s_high["expires_at_ms"].as_i64().unwrap_or(0) - now;
-    assert!(d_high <= 173_000_000);
+    let d_high = s_high["expires_at_ms"].as_i64().expect("s_high expires_at_ms") - now;
+    assert!(
+        (172_500_000..=173_000_000).contains(&d_high),
+        "ttl_hours=999 must clamp to 48h (~172_800_000ms), got {d_high}ms"
+    );
 
     let e404 = h.expect_err("stories.delete", json!({"story_id": "story_none_999"}), &["story_not_found"]);
     assert!(!e404.retryable);
@@ -1039,7 +1196,9 @@ fn tc_t2_f26_01_talk_audio_buffer_never_exceeds_320_chunks_fifo() {
     let mut last_count = 0usize;
     for _ in 0..350 {
         let out = h.expect_ok("talk.audio_enqueue", json!({"session_id": sid, "chunk_b64": chunk}));
-        last_count = out["buffered_chunks"].as_u64().unwrap_or(0) as usize;
+        last_count = out["buffered_chunks"]
+            .as_u64()
+            .expect("buffered_chunks") as usize;
         assert!(last_count <= MAX_AUDIO_BUFFER_CHUNKS);
     }
     assert_eq!(last_count, MAX_AUDIO_BUFFER_CHUNKS);
@@ -1082,11 +1241,15 @@ fn tc_t2_f26_03_closed_talk_session_rejects_audio_enqueue() {
 #[test]
 fn tc_t2_f26_04_invalid_call_rating_0_or_6_and_unknown_call_id_rejected() {
     let h = FabushiE2EHarness::connect_production();
+    let call = h.expect_ok("calls.invite", json!({"peer_id": 2026, "kind": "audio"}));
+    let cid = call["call_id"].as_str().expect("call_id");
+    let _ = h.expect_ok("calls.hangup", json!({"call_id": cid}));
+
     for bad_rating in [0, 6] {
         let err = h.expect_err(
             "calls.rate",
-            json!({"call_id": "call_1", "rating": bad_rating}),
-            &["invalid_rating", "call_not_found"],
+            json!({"call_id": cid, "rating": bad_rating}),
+            &["invalid_rating"],
         );
         assert!(!err.retryable);
     }
@@ -1133,10 +1296,26 @@ fn tc_t2_f27_01_search_non_member_chat_scope_returns_forbidden() {
 #[test]
 fn tc_t2_f27_02_search_limit_clamped_1_to_100_and_empty_query_safe() {
     let h = FabushiE2EHarness::connect_production();
-    let r_zero = h.expect_ok("search.query", json!({"q": "hello", "limit": 0}));
-    assert!(r_zero["results"].as_array().expect("results").len() <= 1);
-    let r_big = h.expect_ok("search.query", json!({"q": "hello", "limit": 500}));
-    assert!(r_big["results"].as_array().expect("results").len() <= 100);
+    let cid = h.expect_ok("chats.create", json!({"chat_type": 1, "title": "ClampRoom"}))["chat_id"]
+        .as_i64()
+        .expect("cid");
+    let _ = h.expect_ok(
+        "messages.send",
+        json!({"chat_id": cid, "text": "clamp_tok_27 first", "client_nonce": 85010}),
+    );
+    let _ = h.expect_ok(
+        "messages.send",
+        json!({"chat_id": cid, "text": "clamp_tok_27 second", "client_nonce": 85011}),
+    );
+
+    let r_zero = h.expect_ok("search.query", json!({"q": "clamp_tok_27", "limit": 0}));
+    assert_eq!(r_zero["effective_limit"], 1);
+    assert_eq!(r_zero["results"].as_array().expect("results").len(), 1);
+
+    let r_big = h.expect_ok("search.query", json!({"q": "clamp_tok_27", "limit": 500}));
+    assert_eq!(r_big["effective_limit"], 100);
+    assert_eq!(r_big["results"].as_array().expect("results").len(), 2);
+
     let r_empty = h.expect_ok("search.query", json!({"q": ""}));
     assert_eq!(r_empty["results"].as_array().expect("results").len(), 0);
 }
@@ -1153,6 +1332,13 @@ fn tc_t2_f27_03_deleted_tombstone_and_expired_ttl_excluded_from_search() {
     )["message_id"]
         .as_i64()
         .expect("mid");
+
+    let before = h.expect_ok("search.query", json!({"q": "ephemeral_unique_marker_9988"}));
+    assert!(
+        before["total"].as_u64().expect("pre-delete search total") >= 1,
+        "marker must be indexed and searchable before deletion"
+    );
+
     let _ = h.expect_ok(
         "messages.delete",
         json!({"chat_id": cid, "message_ids": [mid], "revoke": true}),
@@ -1164,10 +1350,22 @@ fn tc_t2_f27_03_deleted_tombstone_and_expired_ttl_excluded_from_search() {
 #[test]
 fn tc_t2_f27_04_fts5_tantivy_operator_and_sql_injection_payloads_safely_escaped() {
     let h = FabushiE2EHarness::connect_production();
+    let cid = h.expect_ok("chats.create", json!({"chat_type": 1, "title": "SqliRoom"}))["chat_id"]
+        .as_i64()
+        .expect("cid");
+    let _ = h.expect_ok(
+        "messages.send",
+        json!({"chat_id": cid, "text": "intact_after_sqli_27", "client_nonce": 85020}),
+    );
     for payload in [r#""foo" OR (NOT *):^~"#, "'; DROP TABLE messages;--"] {
         let res = h.expect_ok("search.query", json!({"q": payload}));
         assert!(res["results"].is_array());
     }
+    let intact = h.expect_ok("search.query", json!({"q": "intact_after_sqli_27"}));
+    assert!(
+        intact["total"].as_u64().expect("intact search total") >= 1,
+        "messages table and search index must remain intact after SQLi payloads"
+    );
 }
 
 #[test]
@@ -1288,7 +1486,7 @@ fn tc_t2_f29_01_insufficient_balance_fails_atomically_preserving_balance() {
     let h = FabushiE2EHarness::connect_production();
     let b0 = h.expect_ok("wallet.balance", json!({}))["stars_balance"]
         .as_i64()
-        .unwrap_or(0);
+        .expect("stars_balance");
     let err = h.expect_err(
         "wallet.send_stars",
         json!({"to_user_id": 2222, "amount_stars": b0 + 10_000, "idempotency_key": "overdraft_1"}),
@@ -1428,8 +1626,13 @@ fn tc_t2_f30_05_push_token_unbound_on_logout_preventing_cross_account_leak() {
         "push.register_token",
         json!({"platform": "apns", "device_token": "abcdef0123456789abcdef0123456789", "device_id": "dev_push_iso", "environment": "sandbox"}),
     );
-    let _ = h.expect_ok("session.logout", json!({}));
+    let logout = h.expect_ok("session.logout", json!({}));
+    assert_eq!(
+        logout["push_unbound"], true,
+        "session.logout must unbind registered push token automatically"
+    );
     let status = h.expect_ok("push.unregister_token", json!({"platform": "apns", "device_id": "dev_push_iso"}));
+    assert_eq!(status["was_registered"], false);
     assert_eq!(status["registered"], false);
 }
 
@@ -1515,6 +1718,10 @@ fn tc_t2_f31_05_unsupported_locale_fails_closed_preserving_active_locale() {
     let _ = h.expect_ok("settings.locale_set", json!({"locale": "zh-Hans"}));
     let err = h.expect_err("settings.locale_set", json!({"locale": "xx-ZZ"}), &["unsupported_locale"]);
     assert!(!err.retryable);
+    assert_eq!(
+        h.expect_ok("settings.get_all", json!({}))["language"]["locale"],
+        "zh-Hans"
+    );
 }
 
 // ============================================================================
@@ -1656,9 +1863,10 @@ fn tc_t2_f33_04_ios_binary_self_update_strictly_forbidden() {
     let err = h.expect_err(
         "settings.install_binary_update",
         json!({"dmg_url": "https://example.com/Fabushi.dmg"}),
-        &["binary_self_update_forbidden_ios", "unknown_command"],
+        &["binary_self_update_forbidden_ios"],
     );
     assert!(!err.retryable);
+    assert!(!err.message.is_empty());
 }
 
 #[test]
@@ -1685,21 +1893,29 @@ fn tc_t2_f33_05_cli_equals_and_shorthand_beat_env_and_strip_trailing_slash() {
 #[test]
 fn tc_t2_f34_01_unknown_methods_across_namespaces_return_unknown_command_non_retryable() {
     let h = FabushiE2EHarness::connect_production();
-    for bogus in ["nonexistent.cmd", "fabushi.does_not_exist", ""] {
-        let err = h.expect_err(bogus, json!({}), &["unknown_command", "invalid_request"]);
+    for bogus in ["nonexistent.cmd", "fabushi.does_not_exist"] {
+        let err = h.expect_err(bogus, json!({}), &["unknown_command"]);
         assert!(!err.retryable);
     }
+    let empty_err = h.expect_err("", json!({}), &["unknown_command", "invalid_request"]);
+    assert!(!empty_err.retryable);
 }
 
 #[test]
 fn tc_t2_f34_02_catch_unwind_panic_isolation_preserves_usable_host_handle() {
     let h = FabushiE2EHarness::connect_production();
-    let err = h.expect_err("debug.trigger_panic", json!({}), &["host_panic", "unknown_command"]);
+    let err = h.expect_err("debug.trigger_panic", json!({}), &["host_panic"]);
+    assert!(!err.retryable);
     assert!(!err.message.is_empty());
 
     // Host handle MUST remain completely alive and usable after panic probe!
     let after = h.expect_ok("generation.current", json!({}));
-    assert!(after["generation"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        after["generation"]
+            .as_u64()
+            .expect("generation after panic recovery")
+            >= 1
+    );
 }
 
 #[test]
@@ -1735,13 +1951,31 @@ fn tc_t2_f34_04_null_pointers_invalid_utf8_and_truncated_json_fail_closed_safely
     assert!(!e_nr.retryable);
 
     let raw_utf8 = h.client().dispatch_invalid_utf8().expect("invalid utf8 JSON");
-    assert!(validate_envelope(&raw_utf8, "").is_ok());
+    let (_, e_utf8) = validate_error_envelope(
+        &raw_utf8,
+        "",
+        &["invalid_utf8", "invalid_json", "invalid_request"],
+    )
+    .expect("invalid_utf8 must fail closed with error envelope");
+    assert!(!e_utf8.retryable);
 
     let raw_trunc = h.dispatch_raw("{truncated_json").expect("truncated JSON");
     let (_, e_tr) = validate_error_envelope(&raw_trunc, "", &["invalid_json"]).expect("truncated invalid_json");
     assert!(!e_tr.retryable);
 
-    let _ = h.client().poll_events_null_handle();
+    let raw_null_poll = h
+        .client()
+        .poll_events_null_handle()
+        .expect("poll_events_null_handle must return JSON error envelope");
+    let null_poll: EventPollEnvelope = serde_json::from_str(&raw_null_poll)
+        .unwrap_or_else(|e| panic!("poll_events_null_handle invalid JSON ({e}): {raw_null_poll}"));
+    assert!(!null_poll.ok, "poll_events(NULL) must return ok=false");
+    let poll_err = null_poll
+        .error
+        .expect("poll_events(NULL) must include structured error object");
+    assert_eq!(poll_err.code, "invalid_handle");
+    assert!(!poll_err.retryable);
+
     assert!(!h.client().cancel_null_handle("req_1"));
     h.client().free_null_string();
 }
@@ -1749,16 +1983,31 @@ fn tc_t2_f34_04_null_pointers_invalid_utf8_and_truncated_json_fail_closed_safely
 #[test]
 fn tc_t2_f34_05_upstream_planned_ocrm_passport_and_ton_fail_closed_never_ok() {
     let h = FabushiE2EHarness::connect_production();
-    for (method, params) in [
-        ("channels.ocrm_discord_connect", json!({"token": "x"})),
-        ("settings.passport_upload", json!({"doc": "id"})),
-        ("wallet.ton_sign_tx", json!({"amount": 1})),
-    ] {
-        let err = h.expect_err(
-            method,
-            params,
-            &["upstream_planned", "unknown_command", "ton_signing_upstream_planned"],
-        );
+    let probes: [(&str, serde_json::Value, &[&str]); 4] = [
+        (
+            "channels.ocrm_discord_connect",
+            json!({"token": "x"}),
+            &["upstream_planned"],
+        ),
+        (
+            "channels.fbcp_d1_sync",
+            json!({"channel_id": "fbcp_1"}),
+            &["upstream_planned"],
+        ),
+        (
+            "settings.passport_upload",
+            json!({"doc": "id"}),
+            &["upstream_planned"],
+        ),
+        (
+            "wallet.ton_sign_tx",
+            json!({"amount": 1}),
+            &["ton_signing_upstream_planned", "upstream_planned"],
+        ),
+    ];
+    for (method, params, allowed_codes) in probes {
+        let err = h.expect_err(method, params, allowed_codes);
         assert!(!err.retryable);
+        assert!(!err.message.is_empty());
     }
 }

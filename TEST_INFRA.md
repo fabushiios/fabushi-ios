@@ -7,8 +7,8 @@
 - **100% Opaque-Box Architecture**:
   - `tests/e2e/rust_ffi/` is a standalone Rust Edition 2024 Cargo workspace with **zero Cargo path dependencies** on `source/host` or `source/desktop_core`.
   - Production tests dynamically `dlopen` the compiled native host library (`libmahayana_app_host.so` on Linux, `libmahayana_app_host.dylib` on macOS) via `libloading` using `FABUSHI_HOST_LIB`.
-  - Every single one of the **394** Tier 1–4 Rust E2E tests calls `FabushiE2EHarness::connect_production()`, which **fails closed** if `FABUSHI_HOST_LIB` is unset, missing, lacks any of the 6 canonical `fabushi_host_*` symbols, or points to `mutant_stub`. There is **zero mock fallback** in Tiers 1–4.
-  - `tests/e2e/rust_ffi/mutant_stub/` is strictly a negative-oracle `cdylib` used exclusively by `tests/self_validate_antistub.rs` to prove our contract assertions catch stub/facade defects (alongside an empirical negative proof against the actual compiled baseline `8128951` `libmahayana_app_host.so`).
+  - Every single one of the **394** Tier 1–4 Rust E2E tests calls `FabushiE2EHarness::connect_production()`, which enforces a **3-layer fail-closed anti-stub gate** (canonicalized path check, `fabushi_e2e_is_mutant_stub` sentinel symbol check via `dlsym`, and startup behavioral `unknown_command` probe) and fails closed if `FABUSHI_HOST_LIB` is unset, missing, or lacks any of the 6 canonical `fabushi_host_*` symbols. There is **zero mock fallback** in Tiers 1–4.
+  - `tests/e2e/rust_ffi/mutant_stub/` is strictly a negative-oracle `cdylib` exporting `fabushi_e2e_is_mutant_stub`, used exclusively by `tests/self_validate_antistub.rs` to prove our contract assertions catch stub/facade defects (alongside an empirical negative proof against the actual compiled baseline `8128951` `libmahayana_app_host.so`).
 
 ---
 
@@ -25,6 +25,15 @@ void   fabushi_host_destroy(void* handle);
 void   fabushi_host_free_string(char* ptr);
 ```
 
+**Negative-Oracle Sentinel Symbol (FORBIDDEN in Production Hosts)**:
+```c
+uint32_t fabushi_e2e_is_mutant_stub(void);
+```
+
+- **3-Layer Fail-Closed Production Anti-Stub Gate (`FfiHostClient::load_production` / `FabushiE2EHarness::connect_production`)**:
+  1. **Layer 1 (Canonicalized Path Check)**: Checks both raw path and `std::fs::canonicalize(lib_path)` for `mutant_stub` or `mutant-stub` (blocking symlinks and relative traversal bypasses before `dlopen`).
+  2. **Layer 2 (`dlsym` Sentinel Symbol Refusal)**: Probes `library.get(b"fabushi_e2e_is_mutant_stub\0")` BEFORE `fabushi_host_create` and immediately rejects any shared library exporting the negative-oracle sentinel even if copied or renamed to a neutral filename.
+  3. **Layer 3 (Startup Behavioral Anti-Stub Probe)**: Immediately dispatches synthetic unknown method `__fabushi_e2e_probe__.unknown_command_guard.<uuid>` and asserts `ok == false`, `error.code == "unknown_command"`, `error.retryable == false`, and zero `"acknowledged"` stub token before returning the handle to any test.
 - Every returned `char*` MUST be freed exclusively by calling `fabushi_host_free_string(ptr)` from the same loaded library (panic-safe RAII guard in `ffi_client.rs`, zero cross-allocator frees).
 - Strict lifetime drop ordering: `fabushi_host_destroy(handle)` completes before `libloading::Library` unmaps the shared library (`dlclose`) and before the ephemeral `LoopbackServer` or isolated `TempDir` (`app_data_dir`) drops.
 - Every C-ABI entrypoint MUST be wrapped in `std::panic::catch_unwind` (verified in both debug and release profiles; a panic returns `ok: false, error.code: "host_panic"` and leaves the host handle intact).
@@ -67,12 +76,12 @@ void   fabushi_host_free_string(char* ptr);
   1. Unrecognized `method` MUST return `ok: false, error.code: "unknown_command", error.retryable: false` — NEVER fail-open `{"status": "acknowledged"}`.
   2. Fresh unauthenticated `chats.list` MUST return `[]` (`total: 0`) — ZERO hardcoded `sample_chats` (`"Saved Messages"` id `100` / `"Fabushi Community"` id `200`).
   3. Default fallback `server_url` MUST be `"http://34.46.77.133:8080"` (`DEFAULT_SERVER_URL`) — ZERO hardcoded `"https://127.0.0.1:8443"`.
-  4. Requests with stale `generation < current_generation` MUST fail closed with `error.code: "stale_generation"` without mutating state or sending network traffic.
+  4. Requests with stale `generation < current_generation` MUST fail closed with `error.code: "stale_generation"` without mutating state or sending network traffic; harness generation synchronizes monotonically via atomic `fetch_max` across all success, error, and event-poll envelopes.
 
 ### 2.3 Ephemeral Real-Socket Loopback Protocol Server (`src/loopback_server.rs`)
 
-- Binds `std::net::TcpListener::bind("127.0.0.1:0")` per test with clean wake-on-drop shutdown.
-- Implements HTTP/1.1 stateful fixtures across all 34 features, **HTTP 206 Partial Content** & **HTTP 416 Range Not Satisfiable** byte-range streaming, deterministic fault injection (`401`/`403`/`404`/`409`/`429`/`503` + latency delays + offline simulation), recorded request auditing, and genuine **RFC 6455 WebSocket** framing with pure-Rust FIPS 180-4 SHA-1 `Sec-WebSocket-Accept` handshakes.
+- Binds `std::net::TcpListener::bind("127.0.0.1:0")` per test with clean wake-on-drop shutdown joining both the accept loop and per-connection worker threads.
+- Implements deadline-bounded multi-packet `Content-Length` and **RFC 9112 `Transfer-Encoding: chunked`** HTTP/1.1 body decoding (with `Expect: 100-continue`, 32 MiB cap returning `413`, and fail-closed `400` on truncated reads), real binary media upload SHA-256 hashing & CAS storage (`POST /api/v1/media/upload` + chunked resumable upload routes), unified **HTTP 206 Partial Content** & **HTTP 416 Range Not Satisfiable** retrieval, stateful shared backend tables across primary and secondary hosts (Bearer revocation `401`, Cloud 2FA challenges, QR pairing, chat invites, per-chat PTS journal, X25519 device sync), deterministic fault injection, strict **fail-closed `404`** on unrecognized routes, and buffered **RFC 6455 WebSocket** framing (strict client masking with `1002` Close, 4 MiB frame / 16 MiB message caps with `1009`, 16-bit/64-bit length decoding, fragmented message reassembly, interleaved Ping/Pong, zero 1-byte poll-timeout desync).
 
 ---
 
@@ -123,9 +132,20 @@ Machine-readable lock: [`tests/e2e/feature_matrix.json`](tests/e2e/feature_matri
 - **Tier Totals**:
   - **Tier 1 (Core Functional Happy Paths)**: 34 × 5 = **170** Rust E2E tests (`tier1_auth_shell_messaging.rs`: 80, `tier1_agents_platform_hig.rs`: 90)
   - **Tier 2 (Boundary, Corner-Case & Fail-Closed)**: 34 × 5 = **170** Rust E2E tests (`tier2_auth_shell_messaging.rs`: 80, `tier2_agents_platform_hig.rs`: 90)
-  - **Tier 3 (Pairwise Cross-Feature Interactions)**: **36** Rust E2E tests (`tier3_pairwise_combos.rs`, every `F01..F34` covered in >= 2 pairs)
-  - **Tier 4 (Real-World Multi-Feature Lifecycles)**: **18** Rust E2E tests (`tier4_real_world_scenarios.rs`, >= 4 features each)
-  - **Total Executable Production Rust E2E Tests**: **394** (>= 391 required) + **6** CI self-validation & baseline `8128951` negative-proof tests in `self_validate_antistub.rs`.
+  - **Tier 3 (Pairwise Cross-Feature Interactions)**: **36** Rust E2E tests (`tier3_pairwise_combos.rs`, every `F01..F34` covered in >= 2 pairs with body-level RPC verification)
+  - **Tier 4 (Real-World Multi-Feature Lifecycles)**: **18** Rust E2E tests (`tier4_real_world_scenarios.rs`, >= 4 distinct declared features genuinely exercised in every scenario)
+  - **Total Executable Production Rust E2E Tests**: **394** (>= 391 required) + **8** zero-`unsafe` CI self-validation, protocol-framing, 3-layer anti-stub, and baseline `8128951` negative-proof tests in `self_validate_antistub.rs`.
+
+### 3.1 Honest Upstream Blocker & Planned Capability Ledger (7 Tracked IDs)
+
+Locked in `tests/e2e/rust_ffi/src/contracts.rs` (`HONEST_TRACKED_CAPABILITY_IDS`) and verified via `settings.capability_ledger` (`verify_honest_capability_disposition`):
+1. `OCRM-001` (`upstream_planned`) — 141-adapter OpenClaw channel runtime
+2. `FBCP-001` (`upstream_planned`) — Fabushi Control Plane
+3. `TON_ONCHAIN_SIGNING` (`upstream_planned`) — TON on-chain signing
+4. `TELEGRAM_PASSPORT` (`upstream_planned`) — Telegram Passport
+5. `APNS_HTTP2_SERVER_DELIVERY` (`upstream_stub` / `server_blocked`) — Server `apns.rs` HTTP/2 delivery stub
+6. `WEBRTC_NAT_SFU_TRANSPORT` (`upstream_loopback_stub` / `server_blocked`) — LiveKit/WebRTC NAT/SFU media transport
+7. `STOREKIT_SERVER_BINDING` (`server_blocked`) — Apple App Store StoreKit 2 server binding
 
 ---
 
@@ -163,28 +183,40 @@ All new v1.6.7 XCUITests live under `mobile/ios/FabushiUITests/V167/**` (recursi
 - Rust `reqwest` / WebSocket transport uses POSIX sockets (exempt from Apple ATS), so `http://127.0.0.1:<port>` operates seamlessly in the Rust host.
 - Because `mobile/ios/project.yml:95-96` currently sets `NSAllowsArbitraryLoads: false` without `NSAllowsLocalNetworking: true`, **M1/M6 should add `NSAllowsLocalNetworking: true`** to `Info.plist` (`project.yml`) so native Swift `URLSession` / `WKWebView` / `AVPlayer` media/MiniApp loopback E2E runs on `http://127.0.0.1:<port>` succeed cleanly on iOS Simulator while preserving strict HTTPS enforcement for all remote hosts.
 
+### 4.4 Canonical V167 Per-Tier XCUITest Classes & CI Targeting
+Production simulator E2E targets ONLY the canonical v1.6.7 per-tier Swift 6 XCUITest classes under `mobile/ios/FabushiUITests/V167/` (never unfiltered `-only-testing:FabushiUITests`):
+- `tier1` -> `-only-testing:FabushiUITests/FabushiV167Tier1UITests`
+- `tier2` -> `-only-testing:FabushiUITests/FabushiV167Tier2UITests`
+- `tier3` -> `-only-testing:FabushiUITests/FabushiV167Tier3UITests`
+- `tier4` -> `-only-testing:FabushiUITests/FabushiV167Tier4UITests`
+
+Before executing `xcodebuild test-without-building`, CI enforces a fail-closed pre-flight guard verifying `mobile/ios/FabushiUITests/V167/` exists and defines each requested `FabushiV167Tier<1..4>UITests` class (refusing to fall back to legacy `FabushiUITests` or `GlobalDharmaJourneyUITests`), starts an ephemeral `127.0.0.1:0` loopback HTTP server, and exports `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, `TEST_RUNNER_FABUSHI_E2E_TIER`, and `TEST_RUNNER_FABUSHI_E2E_FORM_FACTOR`.
+
 ---
 
 ## 5. GitHub Actions CI Runner & CLI Usage
 
 Workflow: [`.github/workflows/ios-e2e-suite.yml`](.github/workflows/ios-e2e-suite.yml).
 
-### 5.1 Modes
+### 5.1 Modes & Caching
+- **Exact Checkout (`ref`)**: All 5 `actions/checkout@v5` steps explicitly check out `ref: ${{ github.event.pull_request.head.sha || github.sha }}` so both `push` and `pull_request` events match `git rev-parse HEAD == EXPECTED_HEAD`.
+- **Caching Strategy**: Combines `Swatinem/rust-cache@v2` (cross-run target dir caching for `tests/e2e/rust_ffi -> ../../../target/e2e`, `source/host -> ../../target/host`, and macOS `source/host -> ../../target`) with `mozilla-actions/sccache-action@v0.0.11` using local disk `SCCACHE_DIR=${RUNNER_TEMP}/sccache` (no GHA Cache v2 burst write throttling, 0 sccache write errors).
+- **Safe `runner.py` Path & Target-Dir Defaults**: `tests/e2e/runner.py` resolves all `--host-lib`, `--mutant-lib`, `--baseline-lib`, and `CARGO_TARGET_DIR` paths to canonical absolute paths via `.resolve()`, defaults `CARGO_TARGET_DIR` to `<repo_root>/target/e2e` (never creating `tests/e2e/rust_ffi/target/`), preserves existing `RUSTFLAGS` while adding `-D warnings`, and rejects both `mutant_stub` and `mutant-stub` (including symlinks).
 1. **`self-validate` Mode** (default on `feat/e2e-suite-v167` before M1 exports `fabushi_host_create`):
    - **`ubuntu-self-validate` (`ubuntu-latest`)**:
      - `python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py`
      - `python3 tests/e2e/spec_coverage_check.py --strict --matrix tests/e2e/feature_matrix.json --report <path>`
-     - Builds baseline `8128951` `source/host` (`libmahayana_app_host.so`)
-     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` (compiles all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, runs `self_validate_antistub` proving all 8 mutant defect modes AND real baseline `8128951` negative proof with `FABUSHI_REQUIRE_BASELINE_PROOF=1`)
+     - Builds baseline `8128951` `source/host` (`libmahayana_app_host.so`) whenever `run_baseline_negative_proof == 'true'` (default on all `push`/`pull_request` runs -> 0 skipped steps)
+     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` (or `--skip-baseline-proof` only when explicitly disabled via `workflow_dispatch`), compiling all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, and running all 8 zero-`unsafe` `self_validate_antistub` tests
      - Verifies `SHA256SUMS.txt` (`sha256sum -c`) and uploads evidence via `actions/upload-artifact@v7`.
    - **`macos-swift6-uitest-validate` (`macos-15`)**:
-     - Selects `/Applications/Xcode_16.4.app` (configurable via `xcode_app` input)
+     - Fail-closed selection of `/Applications/Xcode_16.4.app` (configurable via `xcode_app` input)
      - Runs runtime-matched simulator discovery verifying BOTH an available iPhone (`iPhone 16 Pro`/`iPhone 16`) AND iPad (`iPad Pro 13-inch (M4)`/`iPad Air 13-inch (M3)`)
      - Runs Swift 6 strict-concurrency `-typecheck` (`-swift-version 6 -strict-concurrency=complete -parse-as-library -module-name FabushiUITests`) over `mobile/ios/FabushiUITests/**/*.swift` against real `iphonesimulator` SDK
      - Verifies `SHA256SUMS.txt` (`shasum -a 256 -c`) and uploads evidence via `actions/upload-artifact@v7`.
 2. **`production` Mode** (auto-enabled once `fabushi_host_create` exists in `source/host/include/mahayana_app_host.h`, or via `workflow_dispatch` with `tier: tier1|tier2|tier3|tier4|all`):
    - **`production-rust-ffi-e2e` (`ubuntu-latest`)**: builds debug + release `libmahayana_app_host.so` (verifying `catch_unwind` in release too) and executes Tiers 1 -> 2 -> 3 -> 4 sequentially fail-fast via `tests/e2e/runner.py --mode production --tier <tier> --host-lib <path>`.
-   - **`production-macos-simulator-e2e` (`macos-15`)**: builds `scripts/build-mahayana-ios.sh iphonesimulator arm64`, runs `xcodegen generate`, `xcodebuild build-for-testing`, discovers & boots BOTH iPhone and iPad simulators, explicitly runs `xcrun simctl install` for BOTH `Fabushi.app` and `FabushiUITests-Runner.app` (preventing FrontBoard launch races), forwards `TEST_RUNNER_*`, executes Tiers 1 -> 2 -> 3 -> 4 sequentially via `xcodebuild test-without-building -xctestrun`, and uploads verified `.xcresult` + screenshots + `SHA256SUMS.txt`.
+   - **`production-macos-simulator-e2e` (`macos-15`)**: discovers runtime-matched iPhone & iPad simulators BEFORE building, caches `source/host -> ../../target` via `Swatinem/rust-cache@v2`, builds `scripts/build-mahayana-ios.sh iphonesimulator arm64`, runs `xcodegen generate`, runs `xcodebuild build-for-testing -destination "platform=iOS Simulator,id=$IPHONE_UDID" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES`, boots & installs `Fabushi.app` + `FabushiUITests-Runner.app` on BOTH iPhone and iPad simulators, launches an ephemeral `127.0.0.1:0` loopback HTTP server exporting `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, executes per-tier `-only-testing:FabushiUITests/FabushiV167Tier<N>UITests` sequentially via `xcodebuild test-without-building -xctestrun`, and uploads verified `.xcresult` + `SHA256SUMS.txt`.
 
 ### 5.2 CLI Examples (Executed Inside GitHub Actions Only)
 ```bash
@@ -194,12 +226,21 @@ python3 tests/e2e/spec_coverage_check.py --strict \
   --report "$EVIDENCE_DIR/coverage_report.json"
 
 # Self-validate harness + 394-test zero-warning compile + mutant_stub + baseline 8128951 proof
+CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/e2e" \
 python3 tests/e2e/runner.py \
   --mode self-validate \
   --baseline-lib "$GITHUB_WORKSPACE/target/host/debug/libmahayana_app_host.so" \
   --report "$EVIDENCE_DIR/runner_self_validate_report.json"
 
+# Self-validate harness post-M1 (explicitly skips baseline 8128951 negative proof)
+CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/e2e" \
+python3 tests/e2e/runner.py \
+  --mode self-validate \
+  --skip-baseline-proof \
+  --report "$EVIDENCE_DIR/runner_self_validate_report.json"
+
 # Production execution against M1-M6 real host library (fail-fast Tiers 1 -> 2 -> 3 -> 4)
+CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/e2e" \
 python3 tests/e2e/runner.py \
   --mode production \
   --tier all \

@@ -9,8 +9,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use fabushi_e2e_ffi::FabushiE2EHarness;
 use fabushi_e2e_ffi::contracts::{
     ImeEvent, ImeState, TotpAlgorithm, assert_no_sample_chats, encode_waveform_5bit,
-    extract_context_reference_badges, verify_26_settings_sections, verify_argon2id_params,
-    verify_controlled_banner_hex, verify_ime_commit_fence, verify_loop_budget_5_hops,
+    extract_context_reference_badges, verify_26_settings_sections, verify_29_toolsets,
+    verify_argon2id_params, verify_controlled_banner_hex,
+    verify_honest_capability_disposition, verify_ime_commit_fence, verify_loop_budget_5_hops,
     verify_mcp_audit_redaction, verify_rfc6238_totp, verify_sliding_replay_window_128,
     verify_talk_vad_bargein, verify_waveform_5bit_63bytes, verify_wcag_accent_luma_guard,
 };
@@ -134,11 +135,19 @@ fn tc_t3_pair_06_f03_x_f29_alipay_session_reconciles_stars_and_storekit_policy()
     let h = FabushiE2EHarness::connect_production();
     let started = h.expect_ok("auth.alipay.start", json!({"client_mode": "ios_oauth"}));
     let link = format!("fabushi://auth/alipay?state={}&auth_code=p06", started["state"].as_str().expect("s"));
-    let _ = h.expect_ok("auth.alipay.handle_deep_link", json!({"url": link, "expected_attempt_id": started["attempt_id"]}));
+    let done = h.expect_ok(
+        "auth.alipay.handle_deep_link",
+        json!({"url": link, "expected_attempt_id": started["attempt_id"]}),
+    );
+    assert_eq!(done["authenticated"], true);
     let bal = h.expect_ok("wallet.balance", json!({}));
-    assert!(bal["stars_balance"].is_i64());
+    assert!(bal["stars_balance"].as_i64().expect("stars_balance") >= 0);
     let sk = h.expect_ok("wallet.storekit_restore", json!({}));
-    assert!(sk.is_object());
+    assert!(sk["restored_products"].is_array());
+    assert!(matches!(
+        sk["disposition"].as_str(),
+        Some("restored") | Some("no_purchases") | Some("server_blocked")
+    ));
 }
 
 #[test]
@@ -198,7 +207,7 @@ fn tc_t3_pair_09_f06_x_f11_account_switch_bumps_generation_and_fences_late_pts_s
     let g_a = h.current_generation();
 
     let switched = h.expect_ok("session.switch_account", json!({"account_id": b["account_id"]}));
-    assert!(switched["generation"].as_u64().unwrap_or(0) > g_a);
+    assert!(switched["generation"].as_u64().expect("generation") > g_a);
 
     let stale = h.expect_err_with_gen(
         "sync.get_difference",
@@ -213,10 +222,20 @@ fn tc_t3_pair_09_f06_x_f11_account_switch_bumps_generation_and_fences_late_pts_s
 #[test]
 fn tc_t3_pair_10_f06_x_f34_multi_account_generation_bump_and_panic_isolation() {
     let h = FabushiE2EHarness::connect_production();
-    let g0 = h.expect_ok("generation.current", json!({}))["generation"].as_u64().expect("g0");
-    let _ = h.expect_ok("generation.bump", json!({"reason": "pair10"}));
-    let _ = h.expect_err("debug.trigger_panic", json!({}), &["host_panic", "unknown_command"]);
-    let stale = h.expect_err_with_gen("chats.list", g0, None, json!({}), &["stale_generation"]);
+    let acc1 = h.expect_ok("session.add_account", json!({"username": "p10_a", "display_name": "A", "token": "t10a"}));
+    let acc2 = h.expect_ok("session.add_account", json!({"username": "p10_b", "display_name": "B", "token": "t10b"}));
+    let _ = h.expect_ok("session.switch_account", json!({"account_id": acc1["account_id"]}));
+    let g0 = h.expect_ok("generation.current", json!({}))["generation"]
+        .as_u64()
+        .expect("g0");
+    let switched = h.expect_ok("session.switch_account", json!({"account_id": acc2["account_id"]}));
+    assert!(switched["generation"].as_u64().expect("switched generation") > g0);
+
+    let panic_err = h.expect_err("debug.trigger_panic", json!({}), &["host_panic"]);
+    assert!(!panic_err.retryable);
+    assert!(!panic_err.message.is_empty());
+
+    let stale = h.expect_err_with_gen("chats.list", g0, acc1["account_id"].as_str(), json!({}), &["stale_generation"]);
     assert!(!stale.retryable);
     let fresh = h.expect_ok("chats.list", json!({}));
     assert_no_sample_chats(&fresh).expect("no sample chats after panic recovery");
@@ -225,7 +244,8 @@ fn tc_t3_pair_10_f06_x_f34_multi_account_generation_bump_and_panic_isolation() {
 #[test]
 fn tc_t3_pair_11_f07_x_f31_adaptive_shell_propagates_themes_wcag_and_locale() {
     let h = FabushiE2EHarness::connect_production();
-    let _ = h.expect_ok("actions.navigate", json!({"route": "settings"}));
+    let nav = h.expect_ok("actions.navigate", json!({"route": "settings"}));
+    assert_eq!(nav["active_panel"], "settings");
     let theme = h.expect_ok("settings.theme_set", json!({"mode": "tinted", "accent_hex": "#FFFF00"}));
     verify_wcag_accent_luma_guard(
         "#FFFF00",
@@ -246,7 +266,9 @@ fn tc_t3_pair_12_f07_x_f32_unified_shell_traverses_26_settings_and_storage_stats
     let ids: Vec<String> = list["sections"].as_array().expect("s").iter().filter_map(|v| v["id"].as_str().map(str::to_owned)).collect();
     verify_26_settings_sections(&ids).expect("26 sections");
     let stats = h.expect_ok("settings.storage_stats", json!({}));
-    assert!(stats["total_bytes"].is_u64());
+    let cas = stats["cas_media_bytes"].as_u64().expect("cas_media_bytes");
+    let total = stats["total_bytes"].as_u64().expect("total_bytes");
+    assert!(total >= cas);
 }
 
 #[test]
@@ -276,15 +298,16 @@ fn tc_t3_pair_13_f08_x_f18_multi_select_bot_group_activates_floor_and_loop_budge
 #[test]
 fn tc_t3_pair_14_f08_x_f10_compose_excludes_blocked_peers_and_materializes_prestart_bot() {
     let h = FabushiE2EHarness::connect_production();
-    let _ = h.expect_ok("contacts.block", json!({"user_id": 3014}));
+    let allowed = h.expect_ok("contacts.add", json!({"username": "p14_allowed", "first_name": "Allowed"}));
+    let allowed_uid = allowed["user_id"].as_u64().expect("allowed_uid");
+    let blocked = h.expect_ok("contacts.add", json!({"username": "p14_blocked", "first_name": "Blocked"}));
+    let blocked_uid = blocked["user_id"].as_u64().expect("blocked_uid");
+
+    let _ = h.expect_ok("contacts.block", json!({"user_id": blocked_uid}));
     let cands = h.expect_ok("chats.compose_candidates", json!({"query": "", "include_bots": true}));
-    assert!(
-        !cands["candidates"]
-            .as_array()
-            .expect("candidates")
-            .iter()
-            .any(|c| c["user_id"].as_u64() == Some(3014))
-    );
+    let arr = cands["candidates"].as_array().expect("candidates");
+    assert!(arr.iter().any(|c| c["user_id"].as_u64() == Some(allowed_uid)));
+    assert!(!arr.iter().any(|c| c["user_id"].as_u64() == Some(blocked_uid)));
     let pre = h.expect_ok("chats.prestart_bot", json!({"bot_username": "helper_bot"}));
     let started = h.expect_ok("chats.start_bot", json!({"bot_user_id": pre["bot_user_id"]}));
     assert_eq!(started["chat_type"], 4);
@@ -297,12 +320,29 @@ fn tc_t3_pair_15_f09_x_f11_folders_pins_topics_survive_ws_disconnect_and_pts_cat
         .as_i64()
         .expect("cid");
     let _ = h.expect_ok("chats.pin_dialog", json!({"chat_id": cid, "pinned": true}));
-    let _ = h.expect_ok("topics.create", json!({"chat_id": cid, "title": "General"}));
-    let _ = h.expect_ok("folders.create", json!({"title": "PinnedForum", "included_chat_ids": [cid], "excluded_chat_ids": []}));
+    let topic = h.expect_ok("topics.create", json!({"chat_id": cid, "title": "General"}));
+    let tid = topic["topic_id"].as_i64().expect("topic_id");
+    let folder = h.expect_ok("folders.create", json!({"title": "PinnedForum", "included_chat_ids": [cid], "excluded_chat_ids": []}));
+    let fid = folder["id"].as_i64().expect("folder_id");
+    let _ = h.expect_ok("messages.send", json!({"chat_id": cid, "text": "pre-disconnect msg", "client_nonce": 15001}));
 
     h.server().drop_next_ws_connection();
     let diff = h.expect_ok("sync.get_difference", json!({"chat_id": cid, "pts": 0, "limit": 20}));
     assert_eq!(diff["snapshot_required"], false);
+    assert!(
+        h.expect_ok("folders.list", json!({}))["folders"]
+            .as_array()
+            .expect("folders")
+            .iter()
+            .any(|f| f["id"].as_i64() == Some(fid))
+    );
+    assert!(
+        h.expect_ok("topics.list", json!({"chat_id": cid}))["topics"]
+            .as_array()
+            .expect("topics")
+            .iter()
+            .any(|t| t["topic_id"].as_i64() == Some(tid))
+    );
 }
 
 #[test]
@@ -311,10 +351,11 @@ fn tc_t3_pair_16_f09_x_f27_folder_and_archive_scoped_search_respects_membership(
     let cid = h.expect_ok("chats.create", json!({"chat_type": 1, "title": "ArchivedRoom"}))["chat_id"]
         .as_i64()
         .expect("cid");
+    let _ = h.expect_ok("folders.create", json!({"title": "ArchiveSearchFolder", "included_chat_ids": [cid], "excluded_chat_ids": []}));
     let _ = h.expect_ok("messages.send", json!({"chat_id": cid, "text": "archive_search_token_16", "client_nonce": 16001}));
     let _ = h.expect_ok("chats.archive", json!({"chat_id": cid, "archived": true}));
     let found = h.expect_ok("search.query", json!({"q": "archive_search_token_16", "chat_id": cid}));
-    assert!(found["total"].as_u64().unwrap_or(0) >= 1);
+    assert!(found["total"].as_u64().expect("search total") >= 1);
 }
 
 #[test]
@@ -331,6 +372,23 @@ fn tc_t3_pair_17_f12_x_f13_transcript_updates_edit_tombstone_reaction_and_pin() 
     let _ = h.expect_ok("messages.pins.pin", json!({"chat_id": cid, "message_id": mid}));
     let del = h.expect_ok("messages.delete", json!({"chat_id": cid, "message_ids": [mid], "revoke": true}));
     assert_eq!(del["revoke"], true);
+
+    let pins = h.expect_ok("messages.pins.list", json!({"chat_id": cid}));
+    assert!(
+        !pins["pinned_message_ids"]
+            .as_array()
+            .expect("pinned_message_ids")
+            .iter()
+            .any(|v| v.as_i64() == Some(mid))
+    );
+    let hist = h.expect_ok("messages.history", json!({"chat_id": cid, "limit": 10}));
+    assert!(
+        hist["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .all(|m| m["message_id"].as_i64() != Some(mid) || m["deleted"] == true || m["revoked"] == true)
+    );
 }
 
 #[test]
@@ -351,7 +409,17 @@ fn tc_t3_pair_18_f12_x_f25_transcript_cards_render_cas_206_waveform_sticker_stor
         "messages.send",
         json!({"chat_id": cid, "content": {"type": "voice", "file_id": "p18_vid", "duration_secs": 3, "waveform_b64": B64.encode(&wf)}, "client_nonce": 18001}),
     );
-    assert!(sent["message_id"].as_i64().unwrap_or(0) > 0);
+    let mid = sent["message_id"].as_i64().expect("message_id");
+    assert!(mid > 0);
+    let hist = h.expect_ok("messages.history", json!({"chat_id": cid, "limit": 10}));
+    assert!(
+        hist["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|m| m["message_id"].as_i64() == Some(mid)),
+        "voice card message must roundtrip via messages.history"
+    );
 }
 
 #[test]
@@ -366,6 +434,14 @@ fn tc_t3_pair_19_f13_x_f27_revoke_tombstone_and_ttl_evict_from_tantivy_and_fts5(
     )["message_id"]
         .as_i64()
         .expect("mid");
+    let pre = h.expect_ok("search.query", json!({"q": "evict_token_pair19"}));
+    assert!(
+        pre["total"].as_u64().expect("pre-delete search total") >= 1,
+        "message must be indexed before deletion"
+    );
+    let ttl = h.expect_ok("chats.set_ttl", json!({"chat_id": cid, "ttl_seconds": 60}));
+    assert_eq!(ttl["ttl_seconds"], 60);
+
     let _ = h.expect_ok("messages.delete", json!({"chat_id": cid, "message_ids": [mid], "revoke": true}));
     let online = h.expect_ok("search.query", json!({"q": "evict_token_pair19"}));
     assert_eq!(online["total"], 0);
@@ -384,6 +460,11 @@ fn tc_t3_pair_20_f14_x_f15_cjk_ime_fence_protects_slash_autocomplete_and_context
 
     let badges = extract_context_reference_badges("/status @file:src/lib.rs @git:HEAD");
     assert_eq!(badges.len(), 2);
+    let extracted = h.expect_ok(
+        "fabushi.context.extract_badges",
+        json!({"text": "/status @file:src/lib.rs @git:HEAD"}),
+    );
+    assert_eq!(extracted["badges"].as_array().expect("badges").len(), 2);
     let cmds = h.expect_ok("fabushi.commands.list", json!({"prefix": "/stat"}));
     assert!(!cmds["commands"].as_array().expect("cmds").is_empty());
 }
@@ -398,13 +479,15 @@ fn tc_t3_pair_21_f14_x_f25_voice_gesture_encodes_63b_waveform_and_uploads_cas() 
     assert_eq!(done["waveform_bytes_len"], 63);
 
     let audio = vec![0x55u8; 4096];
+    let expected_sha = sha256_hex(&audio);
     let init = h.expect_ok(
         "media.upload_init",
-        json!({"filename": "voice.ogg", "mime_type": "audio/ogg", "total_size": audio.len(), "part_size": audio.len(), "expected_sha256": sha256_hex(&audio)}),
+        json!({"filename": "voice.ogg", "mime_type": "audio/ogg", "total_size": audio.len(), "part_size": audio.len(), "expected_sha256": expected_sha}),
     );
     let _ = h.expect_ok("media.upload_part", json!({"upload_id": init["upload_id"], "part_index": 0, "data_b64": B64.encode(&audio)}));
     let comp = h.expect_ok("media.upload_complete", json!({"upload_id": init["upload_id"]}));
-    assert!(!comp["file_id"].as_str().unwrap_or("").is_empty());
+    assert_eq!(comp["sha256"].as_str(), Some(expected_sha.as_str()));
+    assert!(!comp["file_id"].as_str().expect("file_id").is_empty());
 }
 
 #[test]
@@ -424,10 +507,11 @@ fn tc_t3_pair_22_f15_x_f17_slash_commands_mutate_persisted_agent_studio_state() 
 #[test]
 fn tc_t3_pair_23_f16_x_f20_muse_inspector_updates_coding_bot_and_probes_remote_host() {
     let h = FabushiE2EHarness::connect_production();
-    let _ = h.expect_ok(
+    let patched = h.expect_ok(
         "fabushi.bots.patch",
         json!({"bot_id": "coding_bot_1", "coding_workspace_path": "/srv/work/ios", "coding_permission_mode": "ask"}),
     );
+    assert_eq!(patched["coding_workspace_path"], "/srv/work/ios");
     let probe = h.expect_ok(
         "coding.probe_host",
         json!({"host_node_id": "node_dev_mac", "providers": ["claude", "codex", "acp"]}),
@@ -472,15 +556,52 @@ fn tc_t3_pair_25_f19_x_f33_magpie_probe_obeys_proxy_fail_closed_no_leak() {
 #[test]
 fn tc_t3_pair_26_f17_x_f21_agent_studio_enforces_official_mcp_scopes_and_audit() {
     let h = FabushiE2EHarness::connect_production();
+    // F17 — Agent Studio verifies 7 tabs, canonical 29 toolsets (including `mcp`), enables `mcp`, and issues value-bound approval.
+    let status = h.expect_ok("fabushi.get_status", json!({}));
+    assert_eq!(status["active_tabs"].as_array().expect("7 tabs").len(), 7);
+    let toolset_ids: Vec<String> = h.expect_ok("fabushi.list_toolsets", json!({}))["toolsets"]
+        .as_array()
+        .expect("toolsets")
+        .iter()
+        .filter_map(|t| t["id"].as_str().map(str::to_owned))
+        .collect();
+    verify_29_toolsets(&toolset_ids).expect("29 canonical toolsets including mcp");
+    let toggled = h.expect_ok(
+        "fabushi.set_toolsets",
+        json!({"toolsets": [{"id": "mcp", "enabled": true}]}),
+    );
+    assert!(toggled["enabled_count"].as_u64().expect("enabled_count") >= 1);
+    let appr = h.expect_ok(
+        "fabushi.approvals_decide",
+        json!({
+            "approval_id": "pair26_mcp_appr",
+            "decision": "approve_once",
+            "action": "mcp_tool_invoke",
+            "target": "keyboard_type",
+            "cwd": "/workspace",
+            "content_sha256": sha256_hex(b"keyboard_type:node-alpha")
+        }),
+    );
+    assert_eq!(appr["status"], "approved");
+
+    // F21 — Official OAuth 2.1 Remote MCP exposes >=27 tools, enforces scope & redacts audit entry <= 280 chars.
     let tools = h.expect_ok("mcp.tools_list", json!({}));
     assert!(tools["tools"].as_array().expect("tools").len() >= 27);
     let args = json!({"text": "StudioAuditSecret"});
-    let _ = h.expect_ok(
+    let invoked = h.expect_ok(
         "mcp.tool_invoke",
-        json!({"access_token": "tok_mcp_input_control", "protocol_version": "2025-11-25", "tool_name": "keyboard_type", "arguments": args, "node_id": "node-alpha"}),
+        json!({
+            "access_token": "tok_mcp_input_control",
+            "protocol_version": "2025-11-25",
+            "tool_name": "keyboard_type",
+            "arguments": args,
+            "node_id": "node-alpha"
+        }),
     );
+    assert_eq!(invoked["ok"], true);
     let audit = h.expect_ok("mcp.audit_list", json!({"limit": 5}));
-    verify_mcp_audit_redaction(&args, audit["entries"][0]["redacted_args"].as_str().expect("red")).expect("redacted");
+    verify_mcp_audit_redaction(&args, audit["entries"][0]["redacted_args"].as_str().expect("redacted_args"))
+        .expect("redacted");
 }
 
 #[test]
@@ -492,7 +613,7 @@ fn tc_t3_pair_27_f18_x_f20_multi_agent_coding_turn_with_workspace_cas_and_preemp
     );
     assert_eq!(w["revision"], 1);
     let turn = h.expect_ok("coding.turn_start", json!({"chat_id": 627, "bot_id": "coding_bot_1", "prompt": "Apply fix"}));
-    assert!(!turn["turn_id"].as_str().unwrap_or("").is_empty());
+    assert!(!turn["turn_id"].as_str().expect("turn_id").is_empty());
 
     let preempt = h.expect_ok(
         "multi_agent.floor_request",
@@ -518,6 +639,15 @@ fn tc_t3_pair_28_f19_x_f23_magpie_oauth_syncs_via_zero_knowledge_vault_never_loc
 #[test]
 fn tc_t3_pair_29_f21_x_f22_mcp_session_controlled_banner_and_sub_10ms_kill_switch() {
     let h = FabushiE2EHarness::connect_production();
+    let _grant = h.expect_ok(
+        "mcp.oauth_approve",
+        json!({
+            "authorize_code_or_qr_id": "qr_p29",
+            "approved_scopes": ["devices:read", "input:control"],
+            "allowed_node_ids": ["node_dev_mac"],
+            "pkce_code_challenge": "chal_p29"
+        }),
+    );
     let _ = h.expect_ok("computers.lease_acquire", json!({"node_id": "node_dev_mac", "holder_kind": "ai_mcp"}));
     let sess = h.expect_ok("remote.sessions_list", json!({}));
     verify_controlled_banner_hex(
@@ -528,9 +658,17 @@ fn tc_t3_pair_29_f21_x_f22_mcp_session_controlled_banner_and_sub_10ms_kill_switc
 
     let t0 = Instant::now();
     let tk = h.expect_ok("computers.emergency_takeover", json!({"node_id": "node_dev_mac", "holder_kind": "human"}));
-    assert!(t0.elapsed().as_millis() < 50 && tk["elapsed_ms"].as_u64().unwrap_or(99) < 10);
+    assert!(
+        t0.elapsed().as_millis() < 50
+            && tk["elapsed_ms"].as_u64().expect("elapsed_ms") < 10
+    );
     let killed = h.expect_ok("mcp.kill_switch", json!({"reason": "emergency_takeover"}));
-    assert!(killed["revoked_families"].is_u64());
+    assert!(
+        killed["revoked_families"]
+            .as_u64()
+            .expect("revoked_families")
+            >= 1
+    );
 }
 
 #[test]
@@ -538,8 +676,11 @@ fn tc_t3_pair_30_f22_x_f30_remote_deep_link_routes_and_reports_honest_apns_stub(
     let h = FabushiE2EHarness::connect_production();
     let routed = h.expect_ok("actions.route_url", json!({"url": "fabushi://remote/node_dev_mac"}));
     assert_eq!(routed["scheme"], "fabushi");
+    let _ = h.expect_ok("remote.assist_set_code", json!({"assist_code": "PAIR-3030"}));
+    let _ = h.expect_ok("remote.assist_allow", json!({"allowed": true}));
     let info = h.expect_ok("remote.assist_info", json!({}));
-    assert!(info.is_object());
+    assert_eq!(info["allowed"], true);
+    assert_eq!(info["assist_code"], "PAIR-3030");
     let push = h.expect_ok(
         "push.register_token",
         json!({"platform": "apns", "device_token": "0123456789abcdef0123456789abcdef", "device_id": "p30", "environment": "sandbox"}),
@@ -553,8 +694,29 @@ fn tc_t3_pair_31_f24_x_f17_hermes_agent_invokes_webmcp_during_floating_pip_resto
     let _ = h.expect_ok("miniapp.accept_tos", json!({"bot_id": "bot_dharma"}));
     let launch = h.expect_ok("miniapp.launch", json!({"bot_username": "dharma_bot", "short_name": "global_dharma"}));
     let inst = launch["instance_id"].as_str().expect("inst");
-    let _ = h.expect_ok("miniapp.pip_minimize", json!({"instance_id": inst}));
-    let _ = h.expect_ok("fabushi.get_status", json!({}));
+    let nonce = launch["nonce"].as_str().expect("nonce");
+    let gen_val = launch["generation"].as_u64().expect("generation");
+
+    let _ = h.expect_ok(
+        "webmcp.register_tools",
+        json!({
+            "account_id": "acc_1",
+            "app_id": "global_dharma",
+            "version": "1.6.7",
+            "digest": "sha256:abc123",
+            "instance_id": inst,
+            "nonce": nonce,
+            "generation": gen_val,
+            "tools": [{"name": "offline.practice.record", "mutating": true}]
+        }),
+    );
+
+    let pip = h.expect_ok("miniapp.pip_minimize", json!({"instance_id": inst}));
+    let rev_before = pip["preserved_revision"]
+        .as_u64()
+        .expect("pip_minimize preserved_revision");
+    let status = h.expect_ok("fabushi.get_status", json!({}));
+    assert_eq!(status["active_tabs"].as_array().expect("7 tabs").len(), 7);
     let inv = h.expect_ok(
         "webmcp.invoke",
         json!({
@@ -563,8 +725,8 @@ fn tc_t3_pair_31_f24_x_f17_hermes_agent_invokes_webmcp_during_floating_pip_resto
             "version": "1.6.7",
             "digest": "sha256:abc123",
             "instance_id": inst,
-            "nonce": launch["nonce"],
-            "generation": launch["generation"],
+            "nonce": nonce,
+            "generation": gen_val,
             "call_id": "p31_pip_call",
             "tool": "offline.practice.record",
             "arguments": {"tag": "agent_pip"},
@@ -572,9 +734,15 @@ fn tc_t3_pair_31_f24_x_f17_hermes_agent_invokes_webmcp_during_floating_pip_resto
         }),
     );
     let rev = inv["state_revision"].as_u64().expect("rev");
+    assert!(rev > rev_before);
     let restored = h.expect_ok("miniapp.pip_restore", json!({"instance_id": inst}));
     assert_eq!(restored["state"], "expanded");
-    assert!(restored["preserved_revision"].as_u64().unwrap_or(0) >= rev);
+    assert!(
+        restored["preserved_revision"]
+            .as_u64()
+            .expect("restored preserved_revision")
+            >= rev
+    );
 }
 
 #[test]
@@ -616,11 +784,13 @@ fn tc_t3_pair_32_f24_x_f29_global_dharma_offline_free_vs_paid_storekit_entitleme
         &["entitlement_required"],
     );
     assert!(!paid_err.retryable);
-    let _ = h.expect_err(
+    let sk_err = h.expect_err(
         "wallet.storekit_verify_jws",
         json!({"signed_transaction_jws": "offline_jws", "require_live_apple_binding": true}),
         &["storekit_server_binding_blocked", "network_unavailable"],
     );
+    assert!(!sk_err.message.is_empty());
+    assert!(!sk_err.retryable || sk_err.code == "network_unavailable");
 }
 
 #[test]
@@ -650,14 +820,19 @@ fn tc_t3_pair_34_f26_x_f34_calls_and_talk_mode_honest_governance_and_vad_bounds(
         inv["transport_capability"]["nat_sfu_status"].as_str(),
         Some("upstream_loopback_stub") | Some("livekit_ios")
     ));
+    let talk = h.expect_ok("talk.session_create", json!({}));
+    let sid = talk["session_id"].as_str().expect("talk session_id");
+    let loud: Vec<u8> = (0..320).flat_map(|_| 2400i16.to_le_bytes()).collect();
+    let mut barge_in = false;
+    for _ in 0..3 {
+        let out = h.expect_ok("talk.vad_frame", json!({"session_id": sid, "pcm_i16_b64": B64.encode(&loud)}));
+        barge_in = out["barge_in_triggered"].as_bool().unwrap_or(false);
+    }
+    assert!(barge_in);
     let ledger = h.expect_ok("settings.capability_ledger", json!({}));
-    assert!(
-        ledger["items"]
-            .as_array()
-            .expect("items")
-            .iter()
-            .any(|i| i["id"] == "WEBRTC_NAT_SFU_TRANSPORT")
-    );
+    let items = ledger["items"].as_array().expect("items");
+    verify_honest_capability_disposition(items).expect("honest capability disposition");
+    assert!(items.iter().any(|i| i["id"] == "WEBRTC_NAT_SFU_TRANSPORT"));
     assert_eq!(verify_talk_vad_bargein(3, 0, 0).unwrap(), (true, false));
 }
 
@@ -681,7 +856,7 @@ fn tc_t3_pair_35_f28_x_f11_e2ee_envelope_survives_offline_outbox_with_nonce_dedu
 
     h.server().set_offline(false);
     let flushed = h.expect_ok("outbox.flush", json!({"chat_id": cid}));
-    assert!(flushed["delivered_count"].as_u64().unwrap_or(0) >= 1);
+    assert!(flushed["delivered_count"].as_u64().expect("delivered_count") >= 1);
 }
 
 #[test]
@@ -699,4 +874,8 @@ fn tc_t3_pair_36_f31_x_f32_theme_wcag_and_locale_persist_across_real_storage_pur
     assert_eq!(purged["preserved_vault"], true);
     let after = h.expect_ok("settings.theme_get", json!({}));
     assert_eq!(after["mode"], "classic");
+    assert_eq!(
+        h.expect_ok("settings.get_all", json!({}))["language"]["locale"],
+        "zh-Hans"
+    );
 }
