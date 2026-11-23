@@ -737,10 +737,13 @@ jobs:
         run: |
           set -euo pipefail
           SDK_VER="$(xcrun --sdk iphonesimulator --show-sdk-version)"
-          UDID="$(xcrun simctl list devices available -j | python3 - "$SDK_VER" <<'PY'
+          SIM_JSON="${RUNNER_TEMP}/simctl-devices.json"
+          xcrun simctl list devices available -j > "$SIM_JSON"
+          UDID="$(python3 - "$SDK_VER" "$SIM_JSON" <<'PY'
           import json, sys
           sdk_tag = "iOS-" + sys.argv[1].replace(".", "-")
-          devices = json.load(sys.stdin)["devices"]
+          with open(sys.argv[2], encoding="utf-8") as fh:
+              devices = json.load(fh)["devices"]
           def pick(match_runtime):
               for rt, xs in sorted(devices.items()):
                   if not match_runtime(rt):
