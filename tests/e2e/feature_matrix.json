@@ -1,11 +1,22 @@
 {
-  "schema_version": "fabushi.ios.e2e.feature_matrix.v167",
+  "schema_version": "fabushi.ios.e2e.feature_matrix.v168",
   "upstream_authority": {
     "repo": "bhrumom/gpui-telegram",
     "branch": "main",
-    "commit": "6141456e2a1121b78a6cdcd5da2a6d24c9c37e15",
-    "root_tree": "836c181ac03585d0abc468f9d56a67a0dd20a9bf",
-    "release": "Fabushi v1.6.7"
+    "commit": "424aa33cf67a11a778da2dd3b8cca7ea35072b07",
+    "root_tree": "181a98ba298a49e64ae0ce5b6ac0160616134708",
+    "release": "Fabushi v1.6.8",
+    "release_tag": "v1.6.8",
+    "release_published_at": "2026-11-23T06:19:36Z",
+    "tracked_blobs": 11351,
+    "crates_blobs": 3063,
+    "inherited_blobs": 7713,
+    "gitlinks": 0
+  },
+  "target_ios_release": {
+    "repository": "fabushiios/fabushi-ios",
+    "marketing_version": "1.6.8",
+    "build_number": 35
   },
   "required_c_abi_symbols": [
     "fabushi_host_create",
@@ -953,7 +964,7 @@
     },
     {
       "id": "F31",
-      "name": "Apple HIG Design System (4 v1.6.7 Themes, WCAG >138 Guard, Liquid Glass, Dynamic Type, VoiceOver, zh-Hans/en)",
+      "name": "Apple HIG Design System (4 v1.6.8 Themes, WCAG >138 Guard, Liquid Glass, Dynamic Type, VoiceOver, zh-Hans/en)",
       "project_md_feature": "#8 Apple HIG Design System & Unified Adaptive Shell",
       "survey_2_ref": "survey_2 #31",
       "milestone": "M2",
@@ -961,7 +972,7 @@
       "ui_accessibility_namespaces": ["fabushi.settings", "fabushi.shell"],
       "upstream_status": "REAL SHIPPING",
       "boundary_vectors": [
-        "4 v1.6.7 themes: night (#0E0E0E), tinted (#181C22), day (#F5F5F5), classic",
+        "4 v1.6.8 themes: night (#0E0E0E), tinted (#181C22), day (#F5F5F5), classic",
         "WCAG accent guard: luma = 0.299r+0.587g+0.114b > 138.0 -> darken up to 36% toward #111111 (#FFFF00 -> #A9A906)",
         "font_size_px 12..=20, bubble_radius_px 6..=18, ui_scale_pct 50..=300",
         "live zh-Hans / en switch with zero key leaks"
@@ -1128,5 +1139,118 @@
     {"id": "TC-T4-SCEN-16", "features": ["F03", "F17", "F30", "F34"], "fn": "tc_t4_scen_16_action_bus_app_intents_deep_links_and_honest_apns_tracking"},
     {"id": "TC-T4-SCEN-17", "features": ["F01", "F11", "F32", "F33"], "fn": "tc_t4_scen_17_network_resilience_4_tier_cascade_proxy_no_leak_and_update_check"},
     {"id": "TC-T4-SCEN-18", "features": ["F06", "F26", "F29", "F30", "F34"], "fn": "tc_t4_scen_18_full_fail_closed_governance_panic_recovery_and_backlog_closure"}
-  ]
+  ],
+  "swift_uitest_suite": {
+    "root_dir": "mobile/ios/FabushiUITests/V167",
+    "xcode_target": "FabushiUITests",
+    "swift_version": "6.0",
+    "strict_concurrency": "complete",
+    "warnings_as_errors": true,
+    "loopback_server": "tests/e2e/simulator_loopback_server.py",
+    "minimum_counts": {
+      "tier1": 34,
+      "tier2": 16,
+      "tier3": 10,
+      "tier4": 8,
+      "total": 68
+    },
+    "tiers": {
+      "tier1": {
+        "class": "FabushiV167Tier1UITests",
+        "only_testing": "FabushiUITests/FabushiV167Tier1UITests",
+        "min_tests": 34,
+        "tests": [
+          {"id": "TC-UI-T1-F01", "method": "testT1_F01_passwordLoginRegistrationAndSplitKeyV2Bootstrap", "features": ["F01"], "ui_namespaces": ["fabushi.auth", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F02", "method": "testT1_F02_emailOTPAndPhoneSMSVerificationFlow", "features": ["F02"], "ui_namespaces": ["fabushi.auth", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F03", "method": "testT1_F03_alipayQRLoginAndOAuthDeepLinkCallback", "features": ["F03"], "ui_namespaces": ["fabushi.auth"]},
+          {"id": "TC-UI-T1-F04", "method": "testT1_F04_passkeysWebAuthnAndQRDevicePairing", "features": ["F04"], "ui_namespaces": ["fabushi.auth"]},
+          {"id": "TC-UI-T1-F05", "method": "testT1_F05_cloud2FAAndActiveDeviceSessionManagement", "features": ["F05"], "ui_namespaces": ["fabushi.auth", "fabushi.settings"]},
+          {"id": "TC-UI-T1-F06", "method": "testT1_F06_multiAccountSwitcherGenerationFenceAndPasscodeLock", "features": ["F06"], "ui_namespaces": ["fabushi.shell", "fabushi.auth"]},
+          {"id": "TC-UI-T1-F07", "method": "testT1_F07_unifiedAdaptiveShellCollapsedRailAndToastNonOverlap", "features": ["F07"], "ui_namespaces": ["fabushi.shell", "fabushi.composer"]},
+          {"id": "TC-UI-T1-F08", "method": "testT1_F08_grokBotMultiSelectComposeAndExternalBotControls", "features": ["F08"], "ui_namespaces": ["fabushi.compose", "fabushi.composer", "fabushi.chatlist"]},
+          {"id": "TC-UI-T1-F09", "method": "testT1_F09_unifiedChatListFoldersPinnedGridAndUnreadIndicators", "features": ["F09"], "ui_namespaces": ["fabushi.chatlist"]},
+          {"id": "TC-UI-T1-F10", "method": "testT1_F10_contactsPeerResolutionSendAsAndPrestartBot", "features": ["F10"], "ui_namespaces": ["fabushi.chatlist", "fabushi.stage", "fabushi.composer"]},
+          {"id": "TC-UI-T1-F11", "method": "testT1_F11_atomicPTSSyncAndOfflineOutboxReconnectDelivery", "features": ["F11"], "ui_namespaces": ["fabushi.shell", "fabushi.stage", "fabushi.composer"]},
+          {"id": "TC-UI-T1-F12", "method": "testT1_F12_virtualizedTranscriptGroupingAndCanonicalCards", "features": ["F12"], "ui_namespaces": ["fabushi.stage"]},
+          {"id": "TC-UI-T1-F13", "method": "testT1_F13_messageEditDeleteReactionAndPinLifecycle", "features": ["F13"], "ui_namespaces": ["fabushi.stage"]},
+          {"id": "TC-UI-T1-F14", "method": "testT1_F14_imeSafeCanonicalComposerDraftPersistenceAndVoiceGesture", "features": ["F14"], "ui_namespaces": ["fabushi.composer"]},
+          {"id": "TC-UI-T1-F15", "method": "testT1_F15_slashCommandPopoverAndContextReferenceBadges", "features": ["F15"], "ui_namespaces": ["fabushi.composer"]},
+          {"id": "TC-UI-T1-F16", "method": "testT1_F16_museContextInspectorThreeWayLayoutAndCopyFeedback", "features": ["F16"], "ui_namespaces": ["fabushi.inspector", "fabushi.stage"]},
+          {"id": "TC-UI-T1-F17", "method": "testT1_F17_hermesAgentRuntime29ToolsetsAnd7TabStudio", "features": ["F17"], "ui_namespaces": ["fabushi.studio", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F18", "method": "testT1_F18_multiAgentFloorControlWorkspaceAndHumanInterrupt", "features": ["F18"], "ui_namespaces": ["fabushi.stage", "fabushi.inspector", "fabushi.composer"]},
+          {"id": "TC-UI-T1-F19", "method": "testT1_F19_magpieAIGatewayRoutingPIIMaskingAndHealthProbe", "features": ["F19"], "ui_namespaces": ["fabushi.magpie", "fabushi.settings"]},
+          {"id": "TC-UI-T1-F20", "method": "testT1_F20_codingAgentsDiffCardCheckpointAndPRFlow", "features": ["F20"], "ui_namespaces": ["fabushi.stage", "fabushi.inspector"]},
+          {"id": "TC-UI-T1-F21", "method": "testT1_F21_officialMCPOAuth21GrantsAndRedactedAuditLog", "features": ["F21"], "ui_namespaces": ["fabushi.studio", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F22", "method": "testT1_F22_remoteComputerWorkbenchPTYControlledBannerAndTakeover", "features": ["F22"], "ui_namespaces": ["fabushi.remote", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F23", "method": "testT1_F23_zeroKnowledgeVaultUnlockAndRFC6238TOTPDisplay", "features": ["F23"], "ui_namespaces": ["fabushi.settings"]},
+          {"id": "TC-UI-T1-F24", "method": "testT1_F24_externalMiniAppToSWebMCPAndFloatingPiPRestore", "features": ["F24"], "ui_namespaces": ["fabushi.miniapp"]},
+          {"id": "TC-UI-T1-F25", "method": "testT1_F25_mediaCASWaveformStickersStoriesAndInstantView", "features": ["F25"], "ui_namespaces": ["fabushi.chatlist", "fabushi.stage", "fabushi.composer"]},
+          {"id": "TC-UI-T1-F26", "method": "testT1_F26_callsReplayKitScreenSharePickerAndTalkModeVADOrb", "features": ["F26"], "ui_namespaces": ["fabushi.call", "fabushi.stage"]},
+          {"id": "TC-UI-T1-F27", "method": "testT1_F27_unifiedSearchCJKQueryAndResultNavigation", "features": ["F27"], "ui_namespaces": ["fabushi.chatlist"]},
+          {"id": "TC-UI-T1-F28", "method": "testT1_F28_e2eeSecretChatAndSafetyNumberVerificationGrid", "features": ["F28"], "ui_namespaces": ["fabushi.stage", "fabushi.inspector"]},
+          {"id": "TC-UI-T1-F29", "method": "testT1_F29_economyStarsLedgerAndStoreKit2RestoreDisclosure", "features": ["F29"], "ui_namespaces": ["fabushi.settings"]},
+          {"id": "TC-UI-T1-F30", "method": "testT1_F30_actionBusDeepLinkRoutingAndAPNsStatusDisplay", "features": ["F30"], "ui_namespaces": ["fabushi.shell", "fabushi.stage", "fabushi.settings"]},
+          {"id": "TC-UI-T1-F31", "method": "testT1_F31_appleHIGDesignSystemThemesAndLocaleSwitch", "features": ["F31"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
+          {"id": "TC-UI-T1-F32", "method": "testT1_F32_full26SectionSettingsSearchAndRealStoragePurge", "features": ["F32"], "ui_namespaces": ["fabushi.settings"]},
+          {"id": "TC-UI-T1-F33", "method": "testT1_F33_networkProxyConfigurationProbeAndAppStoreUpdateCheck", "features": ["F33"], "ui_namespaces": ["fabushi.settings"]},
+          {"id": "TC-UI-T1-F34", "method": "testT1_F34_failClosedGovernanceAndHonestCapabilityLedgerUI", "features": ["F34"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]}
+        ]
+      },
+      "tier2": {
+        "class": "FabushiV167Tier2UITests",
+        "only_testing": "FabushiUITests/FabushiV167Tier2UITests",
+        "min_tests": 16,
+        "tests": [
+          {"id": "TC-UI-T2-01", "method": "testT2_01_F07_F14_F17_F31_F32_dynamicTypeAX5ZeroClippingAnd44ptTouchTargets", "features": ["F07", "F14", "F17", "F31", "F32"], "ui_namespaces": ["fabushi.shell", "fabushi.chatlist", "fabushi.composer", "fabushi.studio", "fabushi.settings"]},
+          {"id": "TC-UI-T2-02", "method": "testT2_02_F31_F32_voiceOverCompletenessAndZeroRawKeyLeaksAcross13Namespaces", "features": ["F31", "F32"], "ui_namespaces": ["fabushi.auth", "fabushi.shell", "fabushi.chatlist", "fabushi.stage", "fabushi.composer", "fabushi.inspector", "fabushi.studio", "fabushi.remote", "fabushi.settings"]},
+          {"id": "TC-UI-T2-03", "method": "testT2_03_F31_all4V168ThemesAndBrightCustomAccentWCAG138Guard", "features": ["F31"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
+          {"id": "TC-UI-T2-04", "method": "testT2_04_F31_zhHansAndEnLocalizationParityZeroUntranslatedKeyLeaks", "features": ["F31"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
+          {"id": "TC-UI-T2-05", "method": "testT2_05_F31_reduceMotionAndHighContrastDeterministicToggles", "features": ["F31"], "ui_namespaces": ["fabushi.settings"]},
+          {"id": "TC-UI-T2-06", "method": "testT2_06_F11_F33_offlineDisconnectRendersContentUnavailableViewAndRecovers", "features": ["F11", "F33"], "ui_namespaces": ["fabushi.shell", "fabushi.stage"]},
+          {"id": "TC-UI-T2-07", "method": "testT2_07_F07_F11_F19_serverHTTP500RendersInlineErrorOrProviderErrorCard", "features": ["F07", "F11", "F19"], "ui_namespaces": ["fabushi.shell", "fabushi.stage", "fabushi.composer"]},
+          {"id": "TC-UI-T2-08", "method": "testT2_08_F07_v168TwoLayerToastNonOverlapExplicitCloseAndChatSwitchClear", "features": ["F07"], "ui_namespaces": ["fabushi.shell", "fabushi.composer", "fabushi.chatlist"]},
+          {"id": "TC-UI-T2-09", "method": "testT2_09_F08_F14_v168GrokComposeIsolationAndCJKIMECommitSafety", "features": ["F08", "F14"], "ui_namespaces": ["fabushi.compose", "fabushi.composer", "fabushi.chatlist"]},
+          {"id": "TC-UI-T2-10", "method": "testT2_10_F01_F14_F33_emptyOversizedComposerAndInvalidServerURLInlineError", "features": ["F01", "F14", "F33"], "ui_namespaces": ["fabushi.auth", "fabushi.composer"]},
+          {"id": "TC-UI-T2-11", "method": "testT2_11_F06_F23_passcodeWrongPINLockoutAndBackgroundPrivacyBlur", "features": ["F06", "F23"], "ui_namespaces": ["fabushi.auth"]},
+          {"id": "TC-UI-T2-12", "method": "testT2_12_F16_v168ThreeWayInspectorIsolationAndCopiedFeedbackDismiss", "features": ["F16"], "ui_namespaces": ["fabushi.inspector", "fabushi.stage", "fabushi.chatlist"]},
+          {"id": "TC-UI-T2-13", "method": "testT2_13_F24_miniAppUnacceptedToSFailClosedAndWebMCPErrorBanner", "features": ["F24"], "ui_namespaces": ["fabushi.miniapp"]},
+          {"id": "TC-UI-T2-14", "method": "testT2_14_F22_v168RemoteHostPermissionDenialModalAndLocalHostUnsupported", "features": ["F22"], "ui_namespaces": ["fabushi.remote", "fabushi.shell"]},
+          {"id": "TC-UI-T2-15", "method": "testT2_15_F26_callsMicCameraReplayKitPermissionDenialAndBLK02Disclosure", "features": ["F26"], "ui_namespaces": ["fabushi.call", "fabushi.stage"]},
+          {"id": "TC-UI-T2-16", "method": "testT2_16_F09_F34_zeroOrphanedRoutesDeadControlsSampleChatsAndHonestLedger", "features": ["F09", "F34"], "ui_namespaces": ["fabushi.chatlist", "fabushi.shell", "fabushi.settings"]}
+        ]
+      },
+      "tier3": {
+        "class": "FabushiV167Tier3UITests",
+        "only_testing": "FabushiUITests/FabushiV167Tier3UITests",
+        "min_tests": 10,
+        "tests": [
+          {"id": "TC-UI-T3-01", "method": "testT3_01_F07_F16_F31_ipadThreeColumnSplitViewInspectorRotationDynamicTypeNight", "features": ["F07", "F16", "F31"], "ui_namespaces": ["fabushi.shell", "fabushi.stage", "fabushi.inspector"]},
+          {"id": "TC-UI-T3-02", "method": "testT3_02_F07_F16_F31_iphoneTabViewNavigationStackAndSheetInspector", "features": ["F07", "F16", "F31"], "ui_namespaces": ["fabushi.shell", "fabushi.stage", "fabushi.inspector"]},
+          {"id": "TC-UI-T3-03", "method": "testT3_03_F06_F11_F23_accountSwitchActiveSyncAndVaultLock", "features": ["F06", "F11", "F23"], "ui_namespaces": ["fabushi.shell", "fabushi.composer", "fabushi.settings"]},
+          {"id": "TC-UI-T3-04", "method": "testT3_04_F08_F18_grokMultiSelectComposeMultiAgentRoomAndFloorControl", "features": ["F08", "F18"], "ui_namespaces": ["fabushi.compose", "fabushi.composer", "fabushi.stage"]},
+          {"id": "TC-UI-T3-05", "method": "testT3_05_F15_F17_slashCommandToolApprovalDockAndStreamingAITurn", "features": ["F15", "F17"], "ui_namespaces": ["fabushi.composer", "fabushi.stage"]},
+          {"id": "TC-UI-T3-06", "method": "testT3_06_F24_F30_miniAppWebMCPFloatingPiPMinimizeRestoreAndBackgroundForeground", "features": ["F24", "F30"], "ui_namespaces": ["fabushi.miniapp"]},
+          {"id": "TC-UI-T3-07", "method": "testT3_07_F21_F22_remoteComputerWorkbenchPTYTakeoverControlledPillAndV168PermissionPrompt", "features": ["F21", "F22"], "ui_namespaces": ["fabushi.remote", "fabushi.shell"]},
+          {"id": "TC-UI-T3-08", "method": "testT3_08_F26_F28_callsAndTalkModeVADOrbBargeIn", "features": ["F26", "F28"], "ui_namespaces": ["fabushi.call", "fabushi.stage"]},
+          {"id": "TC-UI-T3-09", "method": "testT3_09_F19_F23_magpiePrivacyMaskingRoutingFallbackAndVaultOAuth", "features": ["F19", "F23"], "ui_namespaces": ["fabushi.magpie", "fabushi.settings"]},
+          {"id": "TC-UI-T3-10", "method": "testT3_10_F13_F27_F28_multiSelectForwardDeleteSearchAndE2EESafetyNumber", "features": ["F13", "F27", "F28"], "ui_namespaces": ["fabushi.stage", "fabushi.inspector"]}
+        ]
+      },
+      "tier4": {
+        "class": "FabushiV167Tier4UITests",
+        "only_testing": "FabushiUITests/FabushiV167Tier4UITests",
+        "min_tests": 8,
+        "tests": [
+          {"id": "TC-UI-T4-01", "method": "testT4_01_F01_F06_F11_F28_authSplitKeyV2MultiAccountMessagingAndE2EEJourney", "features": ["F01", "F06", "F11", "F28"], "ui_namespaces": ["fabushi.auth", "fabushi.shell", "fabushi.stage", "fabushi.composer", "fabushi.inspector"]},
+          {"id": "TC-UI-T4-02", "method": "testT4_02_F08_F15_F17_F18_grokMultiSelectBotTeamRoomSlashCommandAndApprovalJourney", "features": ["F08", "F15", "F17", "F18"], "ui_namespaces": ["fabushi.compose", "fabushi.composer", "fabushi.stage"]},
+          {"id": "TC-UI-T4-03", "method": "testT4_03_F17_F19_F20_F21_sevenTabHermesStudioMagpieAndCodingAgentDiffPRJourney", "features": ["F17", "F19", "F20", "F21"], "ui_namespaces": ["fabushi.studio", "fabushi.magpie", "fabushi.stage", "fabushi.settings"]},
+          {"id": "TC-UI-T4-04", "method": "testT4_04_F16_F22_F30_remoteComputerPTYEmergencyTakeoverAndV168ScreenPermissionJourney", "features": ["F16", "F22", "F30"], "ui_namespaces": ["fabushi.remote", "fabushi.shell"]},
+          {"id": "TC-UI-T4-05", "method": "testT4_05_F17_F24_F29_globalDharmaMiniAppLiveWebMCPFloatingPiPAndColdRestartDurability", "features": ["F17", "F24", "F29"], "ui_namespaces": ["fabushi.miniapp", "fabushi.shell"]},
+          {"id": "TC-UI-T4-06", "method": "testT4_06_F12_F26_F28_callsReplayKitAndTalkModeBargeInFullJourney", "features": ["F12", "F26", "F28"], "ui_namespaces": ["fabushi.call", "fabushi.stage"]},
+          {"id": "TC-UI-T4-07", "method": "testT4_07_F29_F32_F33_F34_full26SectionSettingsStoreKit2ProxyAndCapabilityLedgerJourney", "features": ["F29", "F32", "F33", "F34"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
+          {"id": "TC-UI-T4-08", "method": "testT4_08_F07_F31_F32_comprehensiveAppleHIGiPhoneIPadA11yLocale4ThemeAX5Audit", "features": ["F07", "F31", "F32"], "ui_namespaces": ["fabushi.shell", "fabushi.chatlist", "fabushi.composer"]}
+        ]
+      }
+    }
+  }
 }

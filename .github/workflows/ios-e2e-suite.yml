@@ -1,4 +1,4 @@
-name: iOS v1.6.7 Opaque-Box E2E Suite
+name: iOS v1.6.8 Opaque-Box E2E Suite
 
 on:
   push:
@@ -148,11 +148,18 @@ jobs:
             printf 'RUNNER_OS=%q\n' "ubuntu-latest"
           } > "$EVIDENCE_DIR/source.env"
 
-      - name: Python syntax compile and strict spec coverage check
+      - name: Python syntax compile, loopback self-test, and strict spec coverage check
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py
+          python3 -m py_compile \
+            tests/e2e/runner.py \
+            tests/e2e/spec_coverage_check.py \
+            tests/e2e/simulator_loopback_server.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py \
+            --self-test \
+            --report "$EVIDENCE_DIR/loopback_self_test_report.json" \
+            | tee "$EVIDENCE_DIR/simulator_loopback_self_test.log"
           python3 tests/e2e/spec_coverage_check.py \
             --strict \
             --matrix tests/e2e/feature_matrix.json \
@@ -435,13 +442,50 @@ jobs:
           print(json.dumps(payload, indent=2))
           PY
 
-      - name: Swift 6 strict-concurrency typecheck of FabushiUITests against iphonesimulator SDK
+      - name: Verify simulator_loopback_server.py on Darwin (macos-15)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py \
+            --self-test \
+            --report "$EVIDENCE_DIR/loopback_self_test_report.json" \
+            | tee "$EVIDENCE_DIR/simulator_loopback_self_test.log"
+
+      - name: Swift 6 strict-concurrency typecheck of FabushiUITests and fail-closed V167 -warnings-as-errors
         shell: bash
         run: |
           set -euo pipefail
           SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
           SIM_PLATFORM="$(xcrun --sdk iphonesimulator --show-sdk-platform-path)"
+          {
+            printf 'SIM_SDK=%q\n' "$SIM_SDK"
+            printf 'SIM_PLATFORM=%q\n' "$SIM_PLATFORM"
+          } >> "$EVIDENCE_DIR/source.env"
 
+          # Pass 2 (Fail-closed strict zero-warning Swift 6 check on V167/**)
+          test -d "mobile/ios/FabushiUITests/V167"
+          V167_FILES=()
+          while IFS= read -r file; do
+            V167_FILES+=("$file")
+          done < <(find mobile/ios/FabushiUITests/V167 -type f -name '*.swift' | LC_ALL=C sort)
+          test "${#V167_FILES[@]}" -gt 0
+          printf '%s\n' "${V167_FILES[@]}" > "$EVIDENCE_DIR/v167_uitest_files.txt"
+
+          xcrun --sdk iphonesimulator swiftc \
+            -typecheck \
+            -target arm64-apple-ios17.0-simulator \
+            -sdk "$SIM_SDK" \
+            -F "$SIM_PLATFORM/Developer/Library/Frameworks" \
+            -I "$SIM_PLATFORM/Developer/usr/lib" \
+            -L "$SIM_PLATFORM/Developer/usr/lib" \
+            -swift-version 6 \
+            -strict-concurrency=complete \
+            -warnings-as-errors \
+            -parse-as-library \
+            -module-name FabushiUITestsV167 \
+            "${V167_FILES[@]}"
+
+          # Pass 1 (Cross-file full FabushiUITests check proving zero collisions with preserved legacy suites)
           ALL_UITEST_FILES=()
           while IFS= read -r file; do
             ALL_UITEST_FILES+=("$file")
@@ -462,28 +506,8 @@ jobs:
             -module-name FabushiUITests \
             "${ALL_UITEST_FILES[@]}"
 
-          if [[ -d "mobile/ios/FabushiUITests/V167" ]]; then
-            V167_FILES=()
-            while IFS= read -r file; do
-              V167_FILES+=("$file")
-            done < <(find mobile/ios/FabushiUITests/V167 -type f -name '*.swift' | LC_ALL=C sort)
-            if [[ "${#V167_FILES[@]}" -gt 0 ]]; then
-              xcrun --sdk iphonesimulator swiftc \
-                -typecheck \
-                -target arm64-apple-ios17.0-simulator \
-                -sdk "$SIM_SDK" \
-                -F "$SIM_PLATFORM/Developer/Library/Frameworks" \
-                -I "$SIM_PLATFORM/Developer/usr/lib" \
-                -L "$SIM_PLATFORM/Developer/usr/lib" \
-                -swift-version 6 \
-                -strict-concurrency=complete \
-                -warnings-as-errors \
-                -parse-as-library \
-                -module-name FabushiUITestsV167 \
-                "${V167_FILES[@]}"
-            fi
-          fi
-          echo "Swift 6 typecheck PASS (${#ALL_UITEST_FILES[@]} files)" | tee "$EVIDENCE_DIR/swift6_typecheck.log"
+          echo "Swift 6 typecheck PASS (V167 strict -warnings-as-errors: ${#V167_FILES[@]} files; full FabushiUITests cross-file: ${#ALL_UITEST_FILES[@]} files)" \
+            | tee "$EVIDENCE_DIR/swift6_typecheck.log"
 
       - name: Generate and verify macOS evidence SHA256SUMS
         shell: bash
@@ -561,11 +585,18 @@ jobs:
             printf 'RUNNER_OS=%q\n' "ubuntu-latest"
           } > "$EVIDENCE_DIR/source.env"
 
-      - name: Run strict spec coverage check
+      - name: Run Python syntax check, loopback self-test, and strict spec coverage check
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py
+          python3 -m py_compile \
+            tests/e2e/runner.py \
+            tests/e2e/spec_coverage_check.py \
+            tests/e2e/simulator_loopback_server.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py \
+            --self-test \
+            --report "$EVIDENCE_DIR/loopback_self_test_report.json" \
+            | tee "$EVIDENCE_DIR/simulator_loopback_self_test.log"
           python3 tests/e2e/spec_coverage_check.py \
             --strict \
             --matrix tests/e2e/feature_matrix.json \
@@ -955,55 +986,59 @@ jobs:
             fi
           done
 
-          # Start ephemeral loopback HTTP server on 127.0.0.1:0 (shared with iOS Simulators on macOS)
-          # and export TEST_RUNNER_FABUSHI_E2E_SERVER_URL per TEST_INFRA.md §4.2.
+          # Start full stateful simulator loopback server on 127.0.0.1:0 (shared with iOS Simulators on macOS)
+          # with atomic --url-file / --port-file publication and export TEST_RUNNER_FABUSHI_E2E_SERVER_URL.
+          test -f tests/e2e/simulator_loopback_server.py
           LOOPBACK_URL_FILE="$EVIDENCE_DIR/loopback_server.url"
+          LOOPBACK_PORT_FILE="$EVIDENCE_DIR/loopback_server.port"
           LOOPBACK_LOG_FILE="$EVIDENCE_DIR/loopback_server.log"
-          rm -f "$LOOPBACK_URL_FILE"
-          python3 -u - "$LOOPBACK_URL_FILE" >"$LOOPBACK_LOG_FILE" 2>&1 <<'PY' &
-          import http.server
-          import json
-          import pathlib
-          import sys
+          rm -f "$LOOPBACK_URL_FILE" "$LOOPBACK_PORT_FILE"
 
-          url_file = pathlib.Path(sys.argv[1])
-
-          class E2ELoopbackHandler(http.server.BaseHTTPRequestHandler):
-              def do_GET(self):
-                  if self.path == "/healthz":
-                      body = json.dumps({"ok": True, "service": "fabushi-ios-e2e-loopback"}).encode("utf-8")
-                      self.send_response(200)
-                      self.send_header("Content-Type", "application/json")
-                      self.send_header("Content-Length", str(len(body)))
-                      self.end_headers()
-                      self.wfile.write(body)
-                      return
-                  body = json.dumps({"ok": False, "error": {"code": "not_found", "message": f"unknown route {self.path}", "retryable": False}}).encode("utf-8")
-                  self.send_response(404)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def log_message(self, fmt, *args):
-                  print(fmt % args, flush=True)
-
-          server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), E2ELoopbackHandler)
-          port = server.server_address[1]
-          url_file.write_text(f"http://127.0.0.1:{port}\n", encoding="utf-8")
-          server.serve_forever()
-          PY
+          PYTHONDONTWRITEBYTECODE=1 python3 -u tests/e2e/simulator_loopback_server.py \
+            --host 127.0.0.1 \
+            --port 0 \
+            --url-file "$LOOPBACK_URL_FILE" \
+            --port-file "$LOOPBACK_PORT_FILE" \
+            >"$LOOPBACK_LOG_FILE" 2>&1 &
           LOOPBACK_PID=$!
-          trap 'kill "$LOOPBACK_PID" 2>/dev/null || true; wait "$LOOPBACK_PID" 2>/dev/null || true' EXIT
+          cleanup_loopback() {
+            if kill -0 "$LOOPBACK_PID" 2>/dev/null; then
+              kill -TERM "$LOOPBACK_PID" 2>/dev/null || true
+              for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+                kill -0 "$LOOPBACK_PID" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -KILL "$LOOPBACK_PID" 2>/dev/null || true
+            fi
+            wait "$LOOPBACK_PID" 2>/dev/null || true
+          }
+          trap cleanup_loopback EXIT INT TERM
 
-          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-            if [[ -s "$LOOPBACK_URL_FILE" ]]; then
+          READY=0
+          for _ in $(seq 1 50); do
+            if [[ -s "$LOOPBACK_URL_FILE" && -s "$LOOPBACK_PORT_FILE" ]]; then
+              READY=1
               break
             fi
-            sleep 0.2
+            if ! kill -0 "$LOOPBACK_PID" 2>/dev/null; then
+              echo "ERROR: simulator_loopback_server.py exited prematurely:" >&2
+              cat "$LOOPBACK_LOG_FILE" >&2 || true
+              exit 1
+            fi
+            sleep 0.1
           done
-          test -s "$LOOPBACK_URL_FILE"
+          if [[ "$READY" -ne 1 ]]; then
+            echo "ERROR: Timed out waiting for atomic loopback URL/port files" >&2
+            cat "$LOOPBACK_LOG_FILE" >&2 || true
+            exit 1
+          fi
+
           LOOPBACK_URL="$(tr -d '\r\n' < "$LOOPBACK_URL_FILE")"
+          if [[ ! "$LOOPBACK_URL" =~ ^http://127\.0\.0\.1:[0-9]+$ ]]; then
+            echo "ERROR: Invalid loopback server URL: '$LOOPBACK_URL'" >&2
+            cat "$LOOPBACK_LOG_FILE" >&2 || true
+            exit 1
+          fi
           curl -fsS --max-time 5 "${LOOPBACK_URL}/healthz" >/dev/null
 
           export TEST_RUNNER_FABUSHI_E2E_SERVER_URL="$LOOPBACK_URL"

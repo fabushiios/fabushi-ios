@@ -271,8 +271,14 @@ fn self_validate_loopback_http_206_416_and_fault_injection() {
         Some(1),
     );
 
+    let login_payload = json!({
+        "username": "fault_probe",
+        "auth_verifier_b64": B64.encode([0x31u8; 32])
+    })
+    .to_string();
     let post_req = format!(
-        "POST /api/v1/auth/login HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        "POST /api/v1/auth/login HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{login_payload}",
+        login_payload.len()
     );
     let (st1, h1, _) = raw_http_request(addr, &post_req);
     assert_eq!(st1, 429);
@@ -2230,3 +2236,395 @@ fn self_validate_loopback_blocking2_alipay_ws_revocation_and_chat_idempotency() 
         );
     }
 }
+
+#[test]
+fn self_validate_loopback_hardening_non_ascii_utf8_prefix_safety() {
+    let server = LoopbackServer::start();
+    let addr = server.addr();
+
+    // Multi-byte UTF-8 straddling byte 7 (`全` at 5..8) and byte 8 (`球` at 7..10)
+    let req_utf8_7 = format!("GET /iv/a全b HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (st1, h1, b1) = raw_http_request(addr, &req_utf8_7);
+    assert_eq!(st1, 200);
+    assert!(h1.to_ascii_lowercase().contains("text/html"));
+    assert!(String::from_utf8_lossy(&b1).contains("a全b"));
+
+    let req_utf8_8 =
+        format!("GET /iv/全球法布施 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (st2, h2, b2) = raw_http_request(addr, &req_utf8_8);
+    assert_eq!(st2, 200);
+    assert!(h2.to_ascii_lowercase().contains("text/html"));
+    assert!(String::from_utf8_lossy(&b2).contains("全球法布施"));
+
+    // Raw invalid UTF-8 bytes in request target must not panic connection thread
+    let mut invalid_req = Vec::new();
+    invalid_req.extend_from_slice(b"GET /api/v1/\xFF\xFE\xFD HTTP/1.1\r\nHost: ");
+    invalid_req.extend_from_slice(addr.to_string().as_bytes());
+    invalid_req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    let (st_invalid, _, _) = raw_http_bytes(addr, &invalid_req);
+    assert_eq!(st_invalid, 404);
+
+    // Non-ASCII Authorization header straddling byte 7 (`测` at 6..9)
+    let non_ascii_auth = format!(
+        "GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nAuthorization: 令牌测试token\r\nConnection: close\r\n\r\n"
+    );
+    let (st_auth, _, _) = raw_http_request(addr, &non_ascii_auth);
+    assert_eq!(st_auth, 200);
+
+    // Uppercase absolute-form HTTP/HTTPS proxy targets and bare scheme targets
+    let abs_http = format!(
+        "GET HTTP://{addr}/api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    );
+    let (st_abs_http, _, _) = raw_http_request(addr, &abs_http);
+    assert_eq!(st_abs_http, 200);
+
+    let abs_https = format!(
+        "GET HTTPS://{addr}/api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    );
+    let (st_abs_https, _, _) = raw_http_request(addr, &abs_https);
+    assert_eq!(st_abs_https, 200);
+
+    let bare_http = format!("GET http:// HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (st_bare_http, _, _) = raw_http_request(addr, &bare_http);
+    assert_eq!(st_bare_http, 404);
+
+    let bare_https = format!("GET https:// HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (st_bare_https, _, _) = raw_http_request(addr, &bare_https);
+    assert_eq!(st_bare_https, 404);
+
+    // Confirm server remains healthy with zero mutex poisoning
+    let (st_health, _, health_json) = raw_json_request(addr, "GET", "/health", None, None);
+    assert_eq!(st_health, 200);
+    assert_eq!(health_json["ok"], true);
+}
+
+#[test]
+fn self_validate_loopback_hardening_percent_decoded_query_params() {
+    let server = LoopbackServer::start();
+    let addr = server.addr();
+
+    let unique_salt = B64.encode([0x9Au8; 16]);
+    let verifier = B64.encode([0x55u8; 32]);
+    let (st_reg, _, reg) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&json!({
+            "username": "alice@example.com",
+            "auth_version": 2,
+            "auth_salt_b64": unique_salt,
+            "auth_verifier_b64": verifier
+        })),
+    );
+    assert_eq!(st_reg, 200);
+    let tok = reg["token"].as_str().expect("token").to_owned();
+
+    // Percent-encoded `@` in identifier query param must resolve exact registered salt
+    let (st_kdf, _, kdf) = raw_json_request(
+        addr,
+        "GET",
+        "/api/v1/auth/kdf-params?identifier=alice%40example.com",
+        None,
+        None,
+    );
+    assert_eq!(st_kdf, 200);
+    assert_eq!(kdf["auth_salt_b64"].as_str(), Some(unique_salt.as_str()));
+
+    // Create chat and post CJK message, then search via percent-encoded UTF-8 query
+    let (st_chat, _, chat) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/chats",
+        Some(&tok),
+        Some(&json!({"title": "Dharma Search Room"})),
+    );
+    assert_eq!(st_chat, 200);
+    let cid = chat["chat_id"].as_i64().expect("chat_id");
+
+    let (st_msg, _, _) = raw_json_request(
+        addr,
+        "POST",
+        &format!("/api/v1/chats/{cid}/messages"),
+        Some(&tok),
+        Some(&json!({"text": "全球法布施 v1.6.8"})),
+    );
+    assert_eq!(st_msg, 200);
+
+    let (st_search, _, search) = raw_json_request(
+        addr,
+        "GET",
+        "/api/v1/search/messages?q=%E5%85%A8%E7%90%83%E6%B3%95",
+        Some(&tok),
+        None,
+    );
+    assert_eq!(st_search, 200);
+    assert_eq!(search["query"], "全球法布施");
+    assert_eq!(search["total"], 1);
+
+    // Percent-encoded whitespace `%20%20` trims to empty string
+    let (st_ws_q, _, ws_q) = raw_json_request(
+        addr,
+        "GET",
+        "/api/v1/search/messages?q=%20%20",
+        Some(&tok),
+        None,
+    );
+    assert_eq!(st_ws_q, 200);
+    assert_eq!(ws_q["query"], "");
+
+    // Percent-encoded `?token=` works before logout and is rejected after logout on HTTP + WS
+    let encoded_tok = tok.replace('_', "%5F");
+    let (st_me_ok, _, me_ok) = raw_json_request(
+        addr,
+        "GET",
+        &format!("/api/v1/auth/me?token={encoded_tok}"),
+        None,
+        None,
+    );
+    assert_eq!(st_me_ok, 200);
+    assert_eq!(me_ok["username"], "alice@example.com");
+
+    let (st_logout, _, _) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/logout",
+        Some(&tok),
+        Some(&json!({})),
+    );
+    assert_eq!(st_logout, 200);
+
+    let (st_me_revoked, _, me_revoked) = raw_json_request(
+        addr,
+        "GET",
+        &format!("/api/v1/auth/me?token={encoded_tok}"),
+        None,
+        None,
+    );
+    assert_eq!(st_me_revoked, 401);
+    assert_eq!(me_revoked["error"], "unauthorized");
+
+    let ws_revoked_req = format!(
+        "GET /api/v1/ws?token={encoded_tok} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    let (st_ws_revoked, _, _) = raw_http_request(addr, &ws_revoked_req);
+    assert_eq!(st_ws_revoked, 401);
+}
+
+#[test]
+fn self_validate_loopback_hardening_reject_empty_whitespace_unseeded_auth() {
+    let server = LoopbackServer::start();
+    let addr = server.addr();
+
+    // Unseeded POST /api/v1/auth/login with empty or whitespace-only credentials MUST fail closed with 401
+    for payload in [
+        json!({}),
+        json!({"username": "u_empty", "password": "", "auth_verifier_b64": ""}),
+        json!({"username": "u_ws", "password": "   ", "auth_verifier_b64": " \t "}),
+    ] {
+        let (st, _, resp) = raw_json_request(addr, "POST", "/api/v1/auth/login", None, Some(&payload));
+        assert_eq!(st, 401, "expected 401 for empty/ws login payload {payload}");
+        assert_eq!(resp["error"], "invalid_credentials");
+        assert!(resp.get("token").is_none());
+    }
+
+    // POST /api/v1/auth/register with missing/whitespace username or missing/whitespace credentials MUST fail closed with 400
+    for payload in [
+        json!({}),
+        json!({"username": "   ", "password": "ValidPassword1!"}),
+        json!({"username": "u_nocreds", "password": "", "auth_verifier_b64": "   "}),
+    ] {
+        let (st, _, resp) =
+            raw_json_request(addr, "POST", "/api/v1/auth/register", None, Some(&payload));
+        assert_eq!(st, 400, "expected 400 for invalid register payload {payload}");
+        assert!(resp.get("token").is_none());
+    }
+
+    // POST /api/v1/auth/phone/verify with omitted `code` MUST fail closed with 400 invalid_code
+    let (st_phone, _, phone_resp) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/phone/verify",
+        None,
+        Some(&json!({"phone": "+14155550199"})),
+    );
+    assert_eq!(st_phone, 400);
+    assert_eq!(phone_resp["error"], "invalid_code");
+
+    // Positive controls: valid unseeded login & valid register succeed with tokens
+    let (st_ok_login, _, ok_login) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(&json!({
+            "username": "valid_unseeded",
+            "auth_verifier_b64": B64.encode([0x44u8; 32])
+        })),
+    );
+    assert_eq!(st_ok_login, 200);
+    assert!(ok_login["token"].as_str().is_some());
+
+    let (st_ok_reg, _, ok_reg) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&json!({
+            "username": "valid_registered",
+            "auth_verifier_b64": B64.encode([0x45u8; 32])
+        })),
+    );
+    assert_eq!(st_ok_reg, 200);
+    assert!(ok_reg["token"].as_str().is_some());
+}
+
+#[test]
+fn self_validate_loopback_hardening_media_routes_enforce_token_revocation() {
+    let server = LoopbackServer::start();
+    let addr = server.addr();
+
+    let verifier = B64.encode([0x77u8; 32]);
+    let (st_reg, _, reg) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&json!({
+            "username": "media_owner",
+            "auth_version": 2,
+            "auth_verifier_b64": verifier,
+            "device_name": "Primary iPhone"
+        })),
+    );
+    assert_eq!(st_reg, 200);
+    let owner_tok = reg["token"].as_str().expect("owner token").to_owned();
+
+    let (st_sib, _, sib) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(&json!({
+            "username": "media_owner",
+            "auth_verifier_b64": verifier,
+            "device_name": "Sibling iPad"
+        })),
+    );
+    assert_eq!(st_sib, 200);
+    let sib_tok = sib["token"].as_str().expect("sibling token").to_owned();
+    let sib_sid = sib["session_id"].as_str().expect("sibling session_id").to_owned();
+
+    server.seed_media_blob("rev_blob", b"fabushi_v168_media_payload_bytes".to_vec());
+
+    let (st_init, _, init_resp) = raw_json_request(
+        addr,
+        "POST",
+        "/api/v1/media/upload/init",
+        Some(&owner_tok),
+        Some(&json!({"filename": "clip.bin", "total_size": 16, "part_size": 16})),
+    );
+    assert_eq!(st_init, 200);
+    let upl_id = init_resp["upload_id"].as_str().expect("upload_id").to_owned();
+
+    // Sibling token works before revocation
+    let pre_get = format!(
+        "GET /api/v1/media/blob/rev_blob HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nConnection: close\r\n\r\n"
+    );
+    let (st_pre_blob, _, _) = raw_http_request(addr, &pre_get);
+    assert_eq!(st_pre_blob, 200);
+
+    let (st_pre_stat, _, _) = raw_json_request(
+        addr,
+        "GET",
+        &format!("/api/v1/media/upload/{upl_id}/status"),
+        Some(&sib_tok),
+        None,
+    );
+    assert_eq!(st_pre_stat, 200);
+
+    // Owner revokes sibling session
+    let (st_rev, _, _) = raw_json_request(
+        addr,
+        "DELETE",
+        &format!("/api/v1/auth/sessions/{sib_sid}"),
+        Some(&owner_tok),
+        None,
+    );
+    assert_eq!(st_rev, 200);
+
+    // Revoked sibling token MUST get 401 across ALL media routes (binary, range, HEAD, query token, JSON, nonexistent)
+    let raw_media_checks = [
+        format!(
+            "POST /api/v1/media/upload HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd"
+        ),
+        format!(
+            "PUT /api/v1/media/upload/{upl_id}/part/0 HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd"
+        ),
+        format!(
+            "GET /api/v1/media/blob/rev_blob HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n"
+        ),
+        format!(
+            "GET /api/v1/media/stream/rev_blob?token={sib_tok} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        ),
+        format!(
+            "GET /api/v1/media/nonexistent_blob_xyz HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nConnection: close\r\n\r\n"
+        ),
+    ];
+    for req in &raw_media_checks {
+        let (st, _, raw_body) = raw_http_request(addr, req);
+        assert_eq!(st, 401, "expected 401 for revoked media request: {req}");
+        let v: Value = serde_json::from_slice(&raw_body).expect("401 json");
+        assert_eq!(v["error"], "unauthorized");
+        assert_eq!(v["message"], "session_revoked");
+    }
+
+    let head_revoked = format!(
+        "HEAD /api/v1/media/blob/rev_blob HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {sib_tok}\r\nConnection: close\r\n\r\n"
+    );
+    let (st_head, _, head_body) = raw_http_request(addr, &head_revoked);
+    assert_eq!(st_head, 401);
+    assert!(head_body.is_empty(), "HEAD 401 must have empty body");
+
+    for (method, path, payload) in [
+        (
+            "POST",
+            "/api/v1/media/upload/init".to_owned(),
+            Some(json!({"filename": "x.bin", "total_size": 8, "part_size": 8})),
+        ),
+        (
+            "GET",
+            format!("/api/v1/media/upload/{upl_id}/status"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/api/v1/media/upload/{upl_id}/complete"),
+            Some(json!({})),
+        ),
+        (
+            "POST",
+            "/api/v1/media/edit".to_owned(),
+            Some(json!({"media_id": "rev_blob"})),
+        ),
+        ("GET", "/api/v1/media/instant-view?url=/article/v168".to_owned(), None),
+    ] {
+        let (st, _, resp) = raw_json_request(addr, method, &path, Some(&sib_tok), payload.as_ref());
+        assert_eq!(st, 401, "expected 401 for revoked {method} {path}");
+        assert_eq!(resp["error"], "unauthorized");
+    }
+
+    // Active owner token and unauthenticated loopback fetch still succeed (200)
+    let owner_get = format!(
+        "GET /api/v1/media/blob/rev_blob HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {owner_tok}\r\nConnection: close\r\n\r\n"
+    );
+    let (st_owner, _, owner_body) = raw_http_request(addr, &owner_get);
+    assert_eq!(st_owner, 200);
+    assert_eq!(owner_body, b"fabushi_v168_media_payload_bytes");
+
+    let unauth_get =
+        format!("GET /api/v1/media/blob/rev_blob HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let (st_unauth, _, _) = raw_http_request(addr, &unauth_get);
+    assert_eq!(st_unauth, 200);
+}
+

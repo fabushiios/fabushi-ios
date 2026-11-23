@@ -1,13 +1,14 @@
-# Fabushi iOS `v1.6.7` — Opaque-Box 4-Tier E2E Testing Infrastructure (`TEST_INFRA.md`)
+# Fabushi iOS `v1.6.8` — Opaque-Box 4-Tier E2E Testing Infrastructure (`TEST_INFRA.md`)
 
 ## 1. Upstream Authority & Opaque-Box Philosophy
 
-- **Verified Live Upstream Authority**: `bhrumom/gpui-telegram` branch `main`, exact commit `6141456e2a1121b78a6cdcd5da2a6d24c9c37e15`, root tree `836c181ac03585d0abc468f9d56a67a0dd20a9bf`, release **`Fabushi v1.6.7`** (11,342 tracked blobs across `crates/**` and `inherited/**`).
-- **CI-Only Execution Policy (`AGENTS.md`)**: Every build, compilation, static validation, Rust FFI E2E test, Swift 6 typecheck, and iOS Simulator XCUITest run executes **exclusively in GitHub Actions (`ubuntu-latest` and `macos-15`)** — never locally on developer workstations or assistant containers.
+- **Verified Live Upstream Authority**: `bhrumom/gpui-telegram` branch `main`, exact commit `424aa33cf67a11a778da2dd3b8cca7ea35072b07`, root tree `181a98ba298a49e64ae0ce5b6ac0160616134708`, release **`Fabushi v1.6.8`** (`11,351` tracked blobs: `3,063` `crates/**` + `7,713` `inherited/**`, `0` gitlinks). Target iOS release: **`1.6.8` / build `35`**.
+- **CI-Only Execution Policy (`AGENTS.md`)**: Every build, compilation, static validation, Rust FFI E2E test, Python loopback self-test, Swift 6 typecheck, and iOS Simulator XCUITest run executes **exclusively in GitHub Actions (`ubuntu-latest` and `macos-15`)** — never locally on developer workstations or assistant containers.
 - **100% Opaque-Box Architecture**:
   - `tests/e2e/rust_ffi/` is a standalone Rust Edition 2024 Cargo workspace with **zero Cargo path dependencies** on `source/host` or `source/desktop_core`.
-  - Production tests dynamically `dlopen` the compiled native host library (`libmahayana_app_host.so` on Linux, `libmahayana_app_host.dylib` on macOS) via `libloading` using `FABUSHI_HOST_LIB`.
+  - Production Rust tests dynamically `dlopen` the compiled native host library (`libmahayana_app_host.so` on Linux, `libmahayana_app_host.dylib` on macOS) via `libloading` using `FABUSHI_HOST_LIB`.
   - Every single one of the **394** Tier 1–4 Rust E2E tests calls `FabushiE2EHarness::connect_production()`, which enforces a **3-layer fail-closed anti-stub gate** (canonicalized path check, `fabushi_e2e_is_mutant_stub` sentinel symbol check via `dlsym`, and startup behavioral `unknown_command` probe) and fails closed if `FABUSHI_HOST_LIB` is unset, missing, or lacks any of the 6 canonical `fabushi_host_*` symbols. There is **zero mock fallback** in Tiers 1–4.
+  - `mobile/ios/FabushiUITests/V167/**` provides **68** Swift 6.0 strict-concurrency (`-swift-version 6 -strict-concurrency=complete -warnings-as-errors`) opaque-box XCUITests importing ONLY `Foundation`, `UIKit`, and `XCTest` (**zero `@testable import Fabushi`**), backed by `tests/e2e/simulator_loopback_server.py`. Combined production E2E suite total: **394 Rust + 68 Swift = 462 executable E2E tests**.
   - `tests/e2e/rust_ffi/mutant_stub/` is strictly a negative-oracle `cdylib` exporting `fabushi_e2e_is_mutant_stub`, used exclusively by `tests/self_validate_antistub.rs` to prove our contract assertions catch stub/facade defects (alongside an empirical negative proof against the actual compiled baseline `8128951` `libmahayana_app_host.so`).
 
 ---
@@ -78,10 +79,17 @@ uint32_t fabushi_e2e_is_mutant_stub(void);
   3. Default fallback `server_url` MUST be `"http://34.46.77.133:8080"` (`DEFAULT_SERVER_URL`) — ZERO hardcoded `"https://127.0.0.1:8443"`.
   4. Requests with stale `generation < current_generation` MUST fail closed with `error.code: "stale_generation"` without mutating state or sending network traffic; harness generation synchronizes monotonically via atomic `fetch_max` across all success, error, and event-poll envelopes.
 
-### 2.3 Ephemeral Real-Socket Loopback Protocol Server (`src/loopback_server.rs`)
+### 2.3 Ephemeral Real-Socket Loopback Protocol Servers (`src/loopback_server.rs` & `tests/e2e/simulator_loopback_server.py`)
 
-- Binds `std::net::TcpListener::bind("127.0.0.1:0")` per test with clean wake-on-drop shutdown joining both the accept loop and per-connection worker threads.
-- Implements deadline-bounded multi-packet `Content-Length` and **RFC 9112 `Transfer-Encoding: chunked`** HTTP/1.1 body decoding (with `Expect: 100-continue`, 32 MiB cap returning `413`, and fail-closed `400` on truncated reads), real binary media upload SHA-256 hashing & CAS storage (`POST /api/v1/media/upload` + chunked resumable upload routes), unified **HTTP 206 Partial Content** & **HTTP 416 Range Not Satisfiable** retrieval, stateful shared backend tables across primary and secondary hosts (Bearer revocation `401`, Cloud 2FA challenges, QR pairing, chat invites, per-chat PTS journal, X25519 device sync), deterministic fault injection, strict **fail-closed `404`** on unrecognized routes, and buffered **RFC 6455 WebSocket** framing (strict client masking with `1002` Close, 4 MiB frame / 16 MiB message caps with `1009`, 16-bit/64-bit length decoding, fragmented message reassembly, interleaved Ping/Pong, zero 1-byte poll-timeout desync).
+- **Rust FFI Loopback Server (`tests/e2e/rust_ffi/src/loopback_server.rs`)**:
+  - Binds `std::net::TcpListener::bind("127.0.0.1:0")` per test with clean wake-on-drop shutdown joining both the accept loop and per-connection worker threads.
+  - Implements UTF-8 safe byte-slice prefix matching (`normalize_request_target`, `extract_bearer_token`), RFC 3986 percent-decoded query parameter extraction (`extract_query_param`), strict non-empty credential validation on `/api/v1/auth/{register,login,phone/verify}`, Bearer revocation (`401`) enforcement across ALL `/api/v1/media/*` routes (binary, range, HEAD, and JSON), deadline-bounded multi-packet `Content-Length` and **RFC 9112 `Transfer-Encoding: chunked`** decoding (with `Expect: 100-continue`, 32 MiB cap -> `413`, 64-trailer cap -> `400`), real binary media CAS SHA-256 storage + **HTTP 206/416**, stateful shared tables, strict **fail-closed `404`** on unrecognized/sibling routes, and buffered **RFC 6455 WebSocket** framing.
+- **iOS Simulator Loopback Server (`tests/e2e/simulator_loopback_server.py`)**:
+  - Standard-library only Python 3 `ThreadingHTTPServer` (`127.0.0.1:0`, HTTP/1.1, `Connection: close`, `Expect: 100-continue`, RFC 9112 chunked decoding, thread-safe `RLock` never held across `time.sleep`, deadlock-free `SIGTERM`/`SIGINT` shutdown).
+  - Publishes bound port/URL atomically (`mkstemp` + `fsync` + `os.replace`) via `--port-file` and `--url-file` strictly AFTER socket bind and listen.
+  - Mirrors all stateful `/api/v1/*` routes from `loopback_server.rs` (including all 4 hardening rules, `v1.6.8` remote node ScreenCaptureKit/Accessibility permission fields, MiniApps catalog, and fail-closed `404` catch-all).
+  - Exposes a typed `/__e2e__/*` control plane (`POST /__e2e__/reset`, `POST /__e2e__/seed`, `POST /__e2e__/fault`, `DELETE /__e2e__/fault`, `GET /__e2e__/state`) immune to `offline`/faults/delays and excluded from recorded requests, consumed by Swift 6 `FabushiLoopbackClient`.
+  - Provides `--self-test [--report <path>]` running **10 deterministic checks** in CI on both `ubuntu-latest` and `macos-15`.
 
 ---
 
@@ -130,11 +138,12 @@ Machine-readable lock: [`tests/e2e/feature_matrix.json`](tests/e2e/feature_matri
 | `F34` | Fail-Closed Governance, Anti-Stub C-ABI & Honest Backlog Ledger (`OCRM-001`, `FBCP-001`, `TON`, `Passport`) (#1/#34 / #34) | `generation.*`, `settings.*` | `fabushi.shell.*`, `fabushi.settings.*` | `REQUIREMENT-ONLY / PLANNED` | 5 | 5 |
 
 - **Tier Totals**:
-  - **Tier 1 (Core Functional Happy Paths)**: 34 × 5 = **170** Rust E2E tests (`tier1_auth_shell_messaging.rs`: 80, `tier1_agents_platform_hig.rs`: 90)
-  - **Tier 2 (Boundary, Corner-Case & Fail-Closed)**: 34 × 5 = **170** Rust E2E tests (`tier2_auth_shell_messaging.rs`: 80, `tier2_agents_platform_hig.rs`: 90)
-  - **Tier 3 (Pairwise Cross-Feature Interactions)**: **36** Rust E2E tests (`tier3_pairwise_combos.rs`, every `F01..F34` covered in >= 2 pairs with body-level RPC verification)
-  - **Tier 4 (Real-World Multi-Feature Lifecycles)**: **18** Rust E2E tests (`tier4_real_world_scenarios.rs`, >= 4 distinct declared features genuinely exercised in every scenario)
-  - **Total Executable Production Rust E2E Tests**: **394** (>= 391 required) + **11** zero-`unsafe` CI self-validation, protocol-framing, canonical-route/stateful-auth regression, 3-layer anti-stub, and baseline `8128951` negative-proof tests in `self_validate_antistub.rs`.
+  - **Rust FFI Tier 1 (Core Functional Happy Paths)**: 34 × 5 = **170** tests (`tier1_auth_shell_messaging.rs`: 80, `tier1_agents_platform_hig.rs`: 90)
+  - **Rust FFI Tier 2 (Boundary, Corner-Case & Fail-Closed)**: 34 × 5 = **170** tests (`tier2_auth_shell_messaging.rs`: 80, `tier2_agents_platform_hig.rs`: 90)
+  - **Rust FFI Tier 3 (Pairwise Cross-Feature Interactions)**: **36** tests (`tier3_pairwise_combos.rs`, every `F01..F34` covered in >= 2 pairs with body-level RPC verification)
+  - **Rust FFI Tier 4 (Real-World Multi-Feature Lifecycles)**: **18** tests (`tier4_real_world_scenarios.rs`, >= 4 distinct declared features genuinely exercised in every scenario)
+  - **Swift 6 V167 XCUITest Suite (`mobile/ios/FabushiUITests/V167/**`)**: **68** genuine opaque-box UI tests (`FabushiV167Tier1UITests`: **34** covering `F01..F34`, `FabushiV167Tier2UITests`: **16** Apple HIG/boundary/negative/`v1.6.8` polish, `FabushiV167Tier3UITests`: **10** adaptive iPhone/iPad cross-feature pairs, `FabushiV167Tier4UITests`: **8** full multi-screen user journeys)
+  - **Total Executable Production E2E Tests**: **394 Rust + 68 Swift = 462** executable E2E tests + **15** zero-`unsafe` Rust CI self-validation & hardening regression tests (`self_validate_antistub.rs`) + **10** Python `simulator_loopback_server.py --self-test` checks.
 
 ### 3.1 Honest Upstream Blocker & Planned Capability Ledger (7 Tracked IDs)
 
@@ -151,7 +160,7 @@ Locked in `tests/e2e/rust_ffi/src/contracts.rs` (`HONEST_TRACKED_CAPABILITY_IDS`
 
 ## 4. Standardized Opaque-Box `XCUIApplication` Launch Contract (Swift 6 / iOS 17+)
 
-All new v1.6.7 XCUITests live under `mobile/ios/FabushiUITests/V167/**` (recursively discovered by XcodeGen 2.46.0 with zero `project.yml` edits), import ONLY `Foundation` and `XCTest` (zero `@testable import Fabushi`), and use `@MainActor` `override func setUp() async throws` / `tearDown() async throws` for zero-warning Swift 6.0 strict-concurrency compliance.
+All `v1.6.8` XCUITests live under `mobile/ios/FabushiUITests/V167/**` (recursively discovered by XcodeGen 2.46.0 with zero `project.yml` edits), import ONLY `Foundation`, `UIKit`, and `XCTest` (**zero `@testable import Fabushi`**), declare top-level nonisolated `Codable & Sendable` loopback DTOs + `FabushiLoopbackClient`, and use `@MainActor` `override func setUp() async throws` / `tearDown() async throws` for zero-warning Swift 6.0 `-strict-concurrency=complete -warnings-as-errors` compliance.
 
 ### 4.1 Apple Native System Launch Arguments & Simulator Controls
 - **Localization**:
@@ -165,16 +174,16 @@ All new v1.6.7 XCUITests live under `mobile/ios/FabushiUITests/V167/**` (recursi
   - `xcrun simctl ui "$UDID" increase_contrast enabled|disabled`
 
 ### 4.2 Standardized Fabushi E2E Environment & CLI Arguments
-`xcodebuild test-without-building` forwards only shell variables prefixed with `TEST_RUNNER_` into `FabushiUITests-Runner.app` (`ProcessInfo.processInfo.environment["<NAME>"]`). The UI test harness propagates the following into `XCUIApplication.launchEnvironment` and `launchArguments`:
+`xcodebuild test-without-building` forwards only shell variables prefixed with `TEST_RUNNER_` into `FabushiUITests-Runner.app` (`ProcessInfo.processInfo.environment["<NAME>"]`). `FabushiE2EUITestCase` propagates the following into `XCUIApplication.launchEnvironment` and `launchArguments`:
 
 | Key / Flag | Purpose |
 |---|---|
 | `FABUSHI_UI_TEST_MODE=1` | Enables deterministic opaque-box E2E launch (disables onboarding animation delays; NEVER enables mocks or synthetic sample chats). |
 | `FABUSHI_FEATURE_HOST_TEST=0` | Explicitly disables legacy synthetic commerce / fake feature host. |
-| `FABUSHI_E2E_SERVER_URL=http://127.0.0.1:<port>` | Ephemeral loopback HTTP/WS server URL; simultaneously forwarded as `GPUI_TELEGRAM_SERVER_URL` and CLI args `["--server-url", "<url>"]` matching `gpui_telegram_client` Config Tiers 1 & 2. |
-| `FABUSHI_APP_DATA=<ephemeral-dir>` | Isolated per-test SQLite WAL / Tantivy / CAS directory. |
-| `FABUSHI_E2E_RESET_STATE=1` | Resets ephemeral local state on clean-start tests (omitted on cold-restart durability tests across `app.terminate()` + `app.launch()`). |
-| `FABUSHI_UI_THEME=night\|tinted\|day\|classic` | Selects one of the 4 `v1.6.7` themes on launch (`F31`). |
+| `FABUSHI_E2E_SERVER_URL=http://127.0.0.1:<port>` | Ephemeral loopback HTTP server URL (`tests/e2e/simulator_loopback_server.py`); simultaneously forwarded as `GPUI_TELEGRAM_SERVER_URL` and CLI args `["--server-url", "<url>"]` matching `gpui_telegram_client` Config Tiers 1 & 2. |
+| `FABUSHI_APP_DATA=<ephemeral-dir>` | Isolated per-test SQLite WAL / Tantivy / CAS directory (reused across `terminate()` + `launch()` when `resetState == false` for cold-restart durability). |
+| `FABUSHI_E2E_RESET_STATE=1` | Resets ephemeral local state on clean-start tests (omitted on cold-restart durability tests). |
+| `FABUSHI_UI_THEME=night\|tinted\|day\|classic` | Selects one of the 4 `v1.6.8` themes on launch (`F31`). |
 | `FABUSHI_UI_ACCENT_HEX=#RRGGBB` | Injects custom accent hex to verify WCAG `>138` luminance contrast darkening (`F31`). |
 | `FABUSHI_UI_REDUCE_MOTION=1` / `FABUSHI_UI_HIGH_CONTRAST=1` | Deterministic accessibility state toggles for Reduce Motion & High Contrast verification. |
 | `TEST_RUNNER_*` | CI shell prefix used by `xcodebuild` to pass runner configuration (`TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, `TEST_RUNNER_FABUSHI_E2E_TIER`, `TEST_RUNNER_FABUSHI_E2E_FORM_FACTOR`, `TEST_RUNNER_FABUSHI_E2E_SOURCE_SHA`). |
@@ -184,13 +193,15 @@ All new v1.6.7 XCUITests live under `mobile/ios/FabushiUITests/V167/**` (recursi
 - Because `mobile/ios/project.yml:95-96` currently sets `NSAllowsArbitraryLoads: false` without `NSAllowsLocalNetworking: true`, **M1/M6 should add `NSAllowsLocalNetworking: true`** to `Info.plist` (`project.yml`) so native Swift `URLSession` / `WKWebView` / `AVPlayer` media/MiniApp loopback E2E runs on `http://127.0.0.1:<port>` succeed cleanly on iOS Simulator while preserving strict HTTPS enforcement for all remote hosts.
 
 ### 4.4 Canonical V167 Per-Tier XCUITest Classes & CI Targeting
-Production simulator E2E targets ONLY the canonical v1.6.7 per-tier Swift 6 XCUITest classes under `mobile/ios/FabushiUITests/V167/` (never unfiltered `-only-testing:FabushiUITests`):
-- `tier1` -> `-only-testing:FabushiUITests/FabushiV167Tier1UITests`
-- `tier2` -> `-only-testing:FabushiUITests/FabushiV167Tier2UITests`
-- `tier3` -> `-only-testing:FabushiUITests/FabushiV167Tier3UITests`
-- `tier4` -> `-only-testing:FabushiUITests/FabushiV167Tier4UITests`
+Production simulator E2E targets ONLY the canonical per-tier Swift 6 XCUITest classes under `mobile/ios/FabushiUITests/V167/` (never unfiltered `-only-testing:FabushiUITests`):
+- `Support/FabushiAccessibilityIDs.swift` — all 13 `fabushi.*` accessibility namespaces + `v1.6.8` two-layer toast, compose isolation, 3-way inspector, remote permission modal, and ReplayKit screen-share IDs
+- `Support/FabushiE2EUITestCase.swift` — `@MainActor` base class (0 `test*` methods), nonisolated `FabushiLoopbackClient`, Apple HIG/A11y/touch-target/dead-control assertions, checkpoint screenshots, and `FABUSHI_E2E_STATE_BASE64=` evidence emitter
+- `tier1` -> `-only-testing:FabushiUITests/FabushiV167Tier1UITests` (**34** tests across `Tier1/FabushiV167Tier1UITests.swift` + `Tier1/FabushiV167Tier1UITests+AgentsAndPlatform.swift`)
+- `tier2` -> `-only-testing:FabushiUITests/FabushiV167Tier2UITests` (**16** Apple HIG / boundary / negative / `v1.6.8` tests)
+- `tier3` -> `-only-testing:FabushiUITests/FabushiV167Tier3UITests` (**10** adaptive iPhone/iPad cross-feature pairwise tests)
+- `tier4` -> `-only-testing:FabushiUITests/FabushiV167Tier4UITests` (**8** full multi-screen E2E user journeys)
 
-Before executing `xcodebuild test-without-building`, CI enforces a fail-closed pre-flight guard verifying `mobile/ios/FabushiUITests/V167/` exists and defines each requested `FabushiV167Tier<1..4>UITests` class (refusing to fall back to legacy `FabushiUITests` or `GlobalDharmaJourneyUITests`), starts an ephemeral `127.0.0.1:0` loopback HTTP server, and exports `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, `TEST_RUNNER_FABUSHI_E2E_TIER`, and `TEST_RUNNER_FABUSHI_E2E_FORM_FACTOR`.
+Before executing `xcodebuild test-without-building`, CI enforces a fail-closed pre-flight guard verifying `mobile/ios/FabushiUITests/V167/` exists and defines each requested `FabushiV167Tier<1..4>UITests` class (refusing to fall back to legacy `FabushiUITests` or `GlobalDharmaJourneyUITests`), starts `tests/e2e/simulator_loopback_server.py --host 127.0.0.1 --port 0 --url-file ... --port-file ...`, verifies `/healthz`, and exports `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, `TEST_RUNNER_FABUSHI_E2E_TIER`, and `TEST_RUNNER_FABUSHI_E2E_FORM_FACTOR`.
 
 ---
 
@@ -204,19 +215,21 @@ Workflow: [`.github/workflows/ios-e2e-suite.yml`](.github/workflows/ios-e2e-suit
 - **Safe `runner.py` Path & Target-Dir Defaults**: `tests/e2e/runner.py` resolves all `--host-lib`, `--mutant-lib`, `--baseline-lib`, and `CARGO_TARGET_DIR` paths to canonical absolute paths via `.resolve()`, defaults `CARGO_TARGET_DIR` to `<repo_root>/target/e2e` (never creating `tests/e2e/rust_ffi/target/`), preserves existing `RUSTFLAGS` while adding `-D warnings`, and rejects both `mutant_stub` and `mutant-stub` (including symlinks).
 1. **`self-validate` Mode** (default on `feat/e2e-suite-v167` before M1 exports `fabushi_host_create`):
    - **`ubuntu-self-validate` (`ubuntu-latest`)**:
-     - `python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py`
-     - `python3 tests/e2e/spec_coverage_check.py --strict --matrix tests/e2e/feature_matrix.json --report <path>`
+     - `python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py tests/e2e/simulator_loopback_server.py`
+     - `PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py --self-test --report "$EVIDENCE_DIR/loopback_self_test_report.json"`
+     - `python3 tests/e2e/spec_coverage_check.py --strict --matrix tests/e2e/feature_matrix.json --report <path>` (validates all 394 Rust tests + 68 Swift 6 V167 XCUITests + 13 UI namespaces + 34 features + `v1.6.8` authority lock + preserved legacy files)
      - Builds baseline `8128951` `source/host` (`libmahayana_app_host.so`) whenever `run_baseline_negative_proof == 'true'` (default on all `push`/`pull_request` runs -> 0 skipped steps)
-     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` (or `--skip-baseline-proof` only when explicitly disabled via `workflow_dispatch`), compiling all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, and running all 11 zero-`unsafe` `self_validate_antistub` tests
+     - Runs `tests/e2e/runner.py --mode self-validate --baseline-lib <path> --report <path>` compiling all 394 Tier 1–4 tests + `mutant_stub` under `RUSTFLAGS="-D warnings"`, and running all **15** zero-`unsafe` `self_validate_antistub` tests
      - Verifies `SHA256SUMS.txt` (`sha256sum -c`) and uploads evidence via `actions/upload-artifact@v7`.
    - **`macos-swift6-uitest-validate` (`macos-15`)**:
      - Fail-closed selection of `/Applications/Xcode_16.4.app` (configurable via `xcode_app` input)
      - Runs runtime-matched simulator discovery verifying BOTH an available iPhone (`iPhone 16 Pro`/`iPhone 16`) AND iPad (`iPad Pro 13-inch (M4)`/`iPad Air 13-inch (M3)`)
-     - Runs Swift 6 strict-concurrency `-typecheck` (`-swift-version 6 -strict-concurrency=complete -parse-as-library -module-name FabushiUITests`) over `mobile/ios/FabushiUITests/**/*.swift` against real `iphonesimulator` SDK
+     - Runs `PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py --self-test --report "$EVIDENCE_DIR/loopback_self_test_report.json"` verifying Darwin loopback socket parity
+     - Runs fail-closed Swift 6 strict-concurrency `-typecheck` in two passes: **Pass 1** cross-file check over ALL `mobile/ios/FabushiUITests/**/*.swift` (`-module-name FabushiUITests`) AND **Pass 2** strict fail-closed `-swift-version 6 -strict-concurrency=complete -warnings-as-errors` over `mobile/ios/FabushiUITests/V167/**/*.swift` (`-module-name FabushiUITestsV167`) against real `iphonesimulator` SDK
      - Verifies `SHA256SUMS.txt` (`shasum -a 256 -c`) and uploads evidence via `actions/upload-artifact@v7`.
 2. **`production` Mode** (auto-enabled once `fabushi_host_create` exists in `source/host/include/mahayana_app_host.h`, or via `workflow_dispatch` with `tier: tier1|tier2|tier3|tier4|all`):
-   - **`production-rust-ffi-e2e` (`ubuntu-latest`)**: builds debug + release `libmahayana_app_host.so` (verifying `catch_unwind` in release too) and executes Tiers 1 -> 2 -> 3 -> 4 sequentially fail-fast via `tests/e2e/runner.py --mode production --tier <tier> --host-lib <path>`.
-   - **`production-macos-simulator-e2e` (`macos-15`)**: discovers runtime-matched iPhone & iPad simulators BEFORE building, caches `source/host -> ../../target` via `Swatinem/rust-cache@v2`, builds `scripts/build-mahayana-ios.sh iphonesimulator arm64`, runs `xcodegen generate`, runs `xcodebuild build-for-testing -destination "platform=iOS Simulator,id=$IPHONE_UDID" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES`, boots & installs `Fabushi.app` + `FabushiUITests-Runner.app` on BOTH iPhone and iPad simulators, launches an ephemeral `127.0.0.1:0` loopback HTTP server exporting `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, executes per-tier `-only-testing:FabushiUITests/FabushiV167Tier<N>UITests` sequentially via `xcodebuild test-without-building -xctestrun`, and uploads verified `.xcresult` + `SHA256SUMS.txt`.
+   - **`production-rust-ffi-e2e` (`ubuntu-latest`)**: runs `py_compile`, `simulator_loopback_server.py --self-test`, `spec_coverage_check.py --strict`, builds debug + release `libmahayana_app_host.so` (verifying `catch_unwind` in release too), and executes Tiers 1 -> 2 -> 3 -> 4 sequentially fail-fast via `tests/e2e/runner.py --mode production --tier <tier> --host-lib <path>`.
+   - **`production-macos-simulator-e2e` (`macos-15`)**: discovers runtime-matched iPhone & iPad simulators BEFORE building, caches `source/host -> ../../target` via `Swatinem/rust-cache@v2`, builds `scripts/build-mahayana-ios.sh iphonesimulator arm64`, runs `xcodegen generate`, runs `xcodebuild build-for-testing -destination "platform=iOS Simulator,id=$IPHONE_UDID" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES`, boots & installs `Fabushi.app` + `FabushiUITests-Runner.app` on BOTH iPhone and iPad simulators, launches `tests/e2e/simulator_loopback_server.py --host 127.0.0.1 --port 0 --url-file ... --port-file ...` with graceful `SIGTERM` cleanup trap and exports `TEST_RUNNER_FABUSHI_E2E_SERVER_URL`, executes per-tier `-only-testing:FabushiUITests/FabushiV167Tier<N>UITests` sequentially via `xcodebuild test-without-building -xctestrun`, and uploads verified `.xcresult` + `SHA256SUMS.txt`.
 
 ### 5.2 CLI Examples (Executed Inside GitHub Actions Only)
 ```bash

@@ -661,12 +661,20 @@ fn matches_segment_prefix(path: &str, prefix: &str) -> bool {
 
 fn normalize_request_target(raw_target: &str) -> (String, String) {
     // Normalize RFC 9112 §3.2.2 absolute-form HTTP proxy targets (http://host[:port]/path?q).
-    let normalized = if raw_target.len() > 7
-        && (raw_target[..7].eq_ignore_ascii_case("http://")
-            || (raw_target.len() > 8 && raw_target[..8].eq_ignore_ascii_case("https://")))
-    {
-        let scheme_end = raw_target.find("://").unwrap_or(0);
-        let after_scheme = &raw_target[scheme_end + 3..];
+    let has_http = raw_target
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"http://"));
+    let has_https = raw_target
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"));
+    let normalized = if has_http || has_https {
+        let after_scheme = if has_https {
+            &raw_target[8..]
+        } else {
+            &raw_target[7..]
+        };
         let slash_pos = after_scheme.find('/');
         let query_pos = after_scheme.find('?');
         match (slash_pos, query_pos) {
@@ -1412,12 +1420,15 @@ fn parse_byte_range(header: &str, total: usize) -> Option<Result<(usize, usize),
     Some(Ok((start, end)))
 }
 
-fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+fn extract_query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            let trimmed = v.trim();
-            if k == key && !trimmed.is_empty() {
-                return Some(trimmed);
+            if k == key {
+                let decoded = percent_decode(v);
+                let trimmed = decoded.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
             }
         }
     }
@@ -1427,14 +1438,18 @@ fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 fn extract_bearer_token(req: &RecordedRequest) -> Option<String> {
     if let Some(auth) = req.headers.get("authorization") {
         let trimmed = auth.trim();
-        if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        if trimmed
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"bearer "))
+        {
             let tok = trimmed[7..].trim();
             if !tok.is_empty() {
                 return Some(tok.to_owned());
             }
         }
     }
-    extract_query_param(&req.query, "token").map(str::to_owned)
+    extract_query_param(&req.query, "token")
 }
 
 fn extract_media_bytes(req: &RecordedRequest) -> Vec<u8> {
@@ -1543,6 +1558,7 @@ fn is_protected_route(path: &str) -> bool {
         || matches_segment_prefix(path, "/api/v1/e2ee")
         || matches_segment_prefix(path, "/api/v1/push")
         || matches_segment_prefix(path, "/api/v1/stories")
+        || matches_segment_prefix(path, "/api/v1/media")
         || matches_segment_prefix(path, "/api/v1/ws")
 }
 
@@ -1720,6 +1736,29 @@ fn handle_connection(
             is_head,
         );
         return;
+    }
+
+    // Enforce Bearer revocation / invalidation on early binary & streaming /api/v1/media/* handlers.
+    if matches_segment_prefix(&req.path, "/api/v1/media") {
+        if let Some(tok) = extract_bearer_token(&req) {
+            let rejected = state
+                .lock()
+                .map(|g| g.is_token_rejected(&tok))
+                .unwrap_or(false);
+            if rejected {
+                let body =
+                    json!({"error": "unauthorized", "message": "session_revoked"}).to_string();
+                write_http_response_mode(
+                    &mut stream,
+                    401,
+                    "application/json",
+                    &[],
+                    body.as_bytes(),
+                    is_head,
+                );
+                return;
+            }
+        }
     }
 
     // Binary / raw media upload routes MUST execute before JSON-only parsing.
@@ -2099,11 +2138,19 @@ fn route_api_request(
         | ("GET" | "POST", "/api/v1/auth/kdf_params") => {
             let ident = extract_query_param(query, "identifier")
                 .or_else(|| extract_query_param(query, "username"))
-                .or_else(|| body.get("identifier").and_then(Value::as_str))
-                .or_else(|| body.get("username").and_then(Value::as_str));
+                .or_else(|| {
+                    body.get("identifier")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| {
+                    body.get("username")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
             let g = state.lock().expect("state lock");
             if let Some(name) = ident {
-                if let Some(uid) = g.username_to_id.get(name) {
+                if let Some(uid) = g.username_to_id.get(name.as_str()) {
                     if let Some(user) = g.users_by_id.get(uid) {
                         return (
                             200,
@@ -2139,14 +2186,40 @@ fn route_api_request(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            if let Some(ref uname) = username {
-                if g.username_to_id.contains_key(uname) {
-                    return (409, json!({"error": "user_already_exists"}));
-                }
+            let Some(uname) = username else {
+                return (
+                    400,
+                    json!({"error": "invalid_username", "message": "username is required"}),
+                );
+            };
+            if g.username_to_id.contains_key(&uname) {
+                return (409, json!({"error": "user_already_exists"}));
+            }
+            let auth_verifier_b64 = body
+                .get("auth_verifier_b64")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let password = if auth_verifier_b64.is_some() {
+                None
+            } else {
+                body.get("password")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned)
+            };
+            if auth_verifier_b64.is_none() && password.is_none() {
+                return (
+                    400,
+                    json!({
+                        "error": "invalid_credentials",
+                        "message": "password or auth_verifier_b64 is required"
+                    }),
+                );
             }
             g.next_user_id += 1;
             let uid = g.next_user_id;
-            let uname = username.unwrap_or_else(|| format!("user_{uid}"));
             let first_name = body
                 .get("first_name")
                 .and_then(Value::as_str)
@@ -2160,19 +2233,6 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| B64.encode([0x42u8; 16]));
-            let auth_verifier_b64 = body
-                .get("auth_verifier_b64")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            let password = if auth_verifier_b64.is_some() {
-                None
-            } else {
-                body.get("password")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-            };
             let vault_envelope = body.get("vault_envelope").cloned();
             let key_version = body
                 .get("key_version")
@@ -2252,11 +2312,12 @@ fn route_api_request(
                     let provided_v = body
                         .get("auth_verifier_b64")
                         .and_then(Value::as_str)
+                        .map(str::trim)
                         .filter(|s| !s.is_empty());
                     let provided_pw = body
                         .get("password")
                         .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty());
+                        .filter(|s| !s.trim().is_empty());
 
                     if let Some(ref expected_v) = user.auth_verifier_b64 {
                         if let Some(pv) = provided_v {
@@ -2324,14 +2385,11 @@ fn route_api_request(
                 }
             }
 
-            // Auto-provision user for unseeded login flows.
-            g.next_user_id += 1;
-            let uid = g.next_user_id;
-            let uname = username_opt.unwrap_or_else(|| format!("user_{uid}"));
-            let auth_version = body.get("auth_version").and_then(Value::as_i64).unwrap_or(2);
+            // Auto-provision user for unseeded login flows (strictly requires non-empty credentials).
             let auth_verifier_b64 = body
                 .get("auth_verifier_b64")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let password = if auth_verifier_b64.is_some() {
@@ -2339,9 +2397,19 @@ fn route_api_request(
             } else {
                 body.get("password")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.trim().is_empty())
                     .map(str::to_owned)
             };
+            if auth_verifier_b64.is_none() && password.is_none() {
+                return (
+                    401,
+                    json!({"error": "invalid_credentials", "message": "missing credentials"}),
+                );
+            }
+            g.next_user_id += 1;
+            let uid = g.next_user_id;
+            let uname = username_opt.unwrap_or_else(|| format!("user_{uid}"));
+            let auth_version = body.get("auth_version").and_then(Value::as_i64).unwrap_or(2);
             let user = UserRecord {
                 user_id: uid,
                 username: uname.clone(),
@@ -2422,10 +2490,11 @@ fn route_api_request(
             let current_pw = body
                 .get("current_password")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.trim().is_empty());
             let current_v = body
                 .get("current_auth_verifier_b64")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty());
             if let (Some(expected_pw), Some(provided_pw)) = (existing.password.as_deref(), current_pw)
             {
@@ -2445,12 +2514,14 @@ fn route_api_request(
                 .get("new_auth_salt_b64")
                 .or_else(|| body.get("auth_salt_b64"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let new_verifier = body
                 .get("new_auth_verifier_b64")
                 .or_else(|| body.get("auth_verifier_b64"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let new_kdf = body
@@ -2520,11 +2591,12 @@ fn route_api_request(
             let current_v = body
                 .get("current_auth_verifier_b64")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty());
             let current_pw = body
                 .get("current_password")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.trim().is_empty());
 
             if let Some(ref expected_v) = existing.auth_verifier_b64 {
                 if let Some(provided_v) = current_v {
@@ -2549,19 +2621,21 @@ fn route_api_request(
                 .get("new_auth_salt_b64")
                 .or_else(|| body.get("auth_salt_b64"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let new_verifier = body
                 .get("new_auth_verifier_b64")
                 .or_else(|| body.get("auth_verifier_b64"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
             let new_password = body
                 .get("new_password")
                 .or_else(|| body.get("password"))
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .map(str::to_owned);
             let new_kdf = body
                 .get("new_kdf_params")
@@ -3052,10 +3126,11 @@ fn route_api_request(
             let pair_token = body
                 .get("pair_token")
                 .and_then(Value::as_str)
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "pair_token"))
-                .unwrap_or("");
+                .unwrap_or_default();
             let g = state.lock().expect("state lock");
-            let Some(rec) = g.qr_pairs.get(pair_token) else {
+            let Some(rec) = g.qr_pairs.get(pair_token.as_str()) else {
                 return (404, json!({"error": "pair_token_not_found"}));
             };
             (
@@ -3181,11 +3256,16 @@ fn route_api_request(
         | ("POST", "/api/v1/auth/phone/verify-code")
         | ("POST", "/api/v1/auth/phone/verify_code")
         | ("POST", "/api/v1/auth/phone/login") => {
-            let code = body.get("code").and_then(Value::as_str).map(str::trim);
-            if let Some(c) = code {
-                if c.len() != 6 || !c.bytes().all(|b| b.is_ascii_digit()) {
-                    return (400, json!({"error": "invalid_code"}));
-                }
+            let Some(c) = body
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return (400, json!({"error": "invalid_code"}));
+            };
+            if c.len() != 6 || !c.bytes().all(|b| b.is_ascii_digit()) {
+                return (400, json!({"error": "invalid_code"}));
             }
             let hash_opt = body
                 .get("phone_code_hash")
@@ -3204,14 +3284,12 @@ fn route_api_request(
                 if ts > rec.expires_at_ms {
                     return (400, json!({"error": "code_expired"}));
                 }
-                if let Some(c) = code {
-                    if c != rec.expected_code {
-                        rec.attempts += 1;
-                        if rec.attempts >= 5 {
-                            return (400, json!({"error": "too_many_attempts"}));
-                        }
-                        return (400, json!({"error": "invalid_code"}));
+                if c != rec.expected_code {
+                    rec.attempts += 1;
+                    if rec.attempts >= 5 {
+                        return (400, json!({"error": "too_many_attempts"}));
                     }
+                    return (400, json!({"error": "invalid_code"}));
                 }
                 g.phone_challenges.remove(hash);
             }
@@ -3371,8 +3449,9 @@ fn route_api_request(
                 .or_else(|| {
                     body.get("username")
                         .and_then(Value::as_str)
+                        .map(str::to_owned)
                         .or_else(|| extract_query_param(query, "username"))
-                        .and_then(|uname| g.username_to_id.get(uname).copied())
+                        .and_then(|uname| g.username_to_id.get(uname.as_str()).copied())
                 })
                 .or_else(|| caller_session.as_ref().map(|s| s.user_id));
             let seq = g.alloc_seq();
@@ -3500,9 +3579,11 @@ fn route_api_request(
                 .get("attempt_id")
                 .and_then(Value::as_str)
                 .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "attempt_id"))
-                .unwrap_or("");
-            poll_alipay_attempt(state, attempt_id, ts)
+                .unwrap_or_default();
+            poll_alipay_attempt(state, &attempt_id, ts)
         }
         ("POST", "/api/v1/auth/alipay/cancel") => {
             let attempt_id = body
@@ -3540,6 +3621,7 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "state"));
             let Some(state_tok) = state_tok_opt else {
                 return (
@@ -3553,6 +3635,7 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "auth_code"))
                 .or_else(|| extract_query_param(query, "code"));
             let Some(auth_code) = auth_code_opt else {
@@ -3567,10 +3650,11 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "attempt_id"));
 
             let mut g = state.lock().expect("state lock");
-            let Some(attempt_id) = g.alipay_state_to_attempt.get(state_tok).cloned() else {
+            let Some(attempt_id) = g.alipay_state_to_attempt.get(state_tok.as_str()).cloned() else {
                 return (
                     400,
                     json!({"error": "oauth_state_mismatch", "message": "unknown oauth state"}),
@@ -3618,7 +3702,7 @@ fn route_api_request(
                 }
                 return (400, json!({"error": "oauth_expired", "status": "expired"}));
             }
-            if g.consumed_alipay_codes.contains(auth_code) {
+            if g.consumed_alipay_codes.contains(auth_code.as_str()) {
                 return (
                     400,
                     json!({
@@ -3628,7 +3712,7 @@ fn route_api_request(
                 );
             }
 
-            g.consumed_alipay_codes.insert(auth_code.to_owned());
+            g.consumed_alipay_codes.insert(auth_code);
             g.next_user_id += 1;
             let uid = g.next_user_id;
             g.ensure_user_by_id(uid);
@@ -4268,12 +4352,12 @@ fn route_api_request(
             let Some(session) = g.uploads.get(upload_id).cloned() else {
                 return (404, json!({"error": "upload_not_found"}));
             };
-            let expected_parts = if session.total_size == 0 {
-                0usize
+            let expected_parts: u64 = if session.total_size == 0 {
+                0
             } else {
-                session.total_size.div_ceil(session.part_size) as usize
+                session.total_size.div_ceil(session.part_size)
             };
-            if session.parts.len() < expected_parts {
+            if (session.parts.len() as u64) < expected_parts {
                 return (400, json!({"error": "missing_upload_parts"}));
             }
             let mut full = Vec::new();
@@ -4326,8 +4410,9 @@ fn route_api_request(
             let url = body
                 .get("url")
                 .and_then(Value::as_str)
+                .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "url"))
-                .unwrap_or("/article/v167");
+                .unwrap_or_else(|| "/article/v167".to_owned());
             (
                 200,
                 json!({
@@ -4391,7 +4476,7 @@ fn route_api_request(
                 .vault_items
                 .iter()
                 .filter(|((u, cat, _), _)| {
-                    *u == uid && cat_filter.is_none_or(|f| f == cat.as_str())
+                    *u == uid && cat_filter.as_deref().is_none_or(|f| f == cat.as_str())
                 })
                 .map(|(_, v)| v.clone())
                 .collect();
@@ -4638,8 +4723,8 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .or_else(|| extract_query_param(query, "request_id"))
                 .map(str::to_owned)
+                .or_else(|| extract_query_param(query, "request_id"))
                 .unwrap_or_else(|| p.rsplit('/').next().unwrap_or("").to_owned());
             let g = state.lock().expect("state lock");
             let Some(rec) = g.device_syncs.get(&req_id) else {
@@ -4856,7 +4941,7 @@ fn route_api_request(
 
         // Canonical search, WebRTC, Tasks, MCP, Talk & Magpie endpoints
         ("GET", "/api/v1/search/messages") => {
-            let q = extract_query_param(query, "q").unwrap_or("");
+            let q = extract_query_param(query, "q").unwrap_or_default();
             let cid_filter =
                 extract_query_param(query, "chat_id").and_then(|s| s.parse::<i64>().ok());
             let q_lower = q.to_ascii_lowercase();
