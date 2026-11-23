@@ -1,0 +1,20 @@
+[workspace]
+members = ["mutant_stub"]
+resolver = "3"
+
+[package]
+name = "fabushi_e2e_ffi"
+version = "1.6.7"
+edition = "2024"
+rust-version = "1.85"
+description = "Standalone opaque-box C-ABI FFI & loopback protocol E2E test suite for Fabushi iOS v1.6.7"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

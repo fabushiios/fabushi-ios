@@ -1,0 +1,865 @@
+name: iOS v1.6.7 Opaque-Box E2E Suite
+
+on:
+  push:
+    branches:
+      - feat/e2e-suite-v167
+      - main
+  pull_request:
+    branches:
+      - main
+      - "feat/**"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Execution mode: self-validate (fast E2E harness gate) or production tier1|tier2|tier3|tier4|all"
+        required: true
+        default: "self-validate"
+        type: choice
+        options:
+          - self-validate
+          - tier1
+          - tier2
+          - tier3
+          - tier4
+          - all
+      run_baseline_negative_proof:
+        description: "Build baseline 8128951 source/host cdylib and prove E2E contract gate fails closed against stubs"
+        required: false
+        default: true
+        type: boolean
+      xcode_app:
+        description: "Xcode bundle path on macos-15"
+        required: false
+        default: "/Applications/Xcode_16.4.app"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-e2e-suite-${{ github.ref }}-${{ inputs.tier || 'auto' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  detect-mode:
+    name: Detect E2E Execution Mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      tier: ${{ steps.resolve.outputs.tier }}
+      expected_head: ${{ steps.resolve.outputs.expected_head }}
+      run_baseline_negative_proof: ${{ steps.resolve.outputs.run_baseline_negative_proof }}
+      xcode_app: ${{ steps.resolve.outputs.xcode_app }}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Resolve execution mode and exact HEAD
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TIER: ${{ inputs.tier || '' }}
+          INPUT_BASELINE_PROOF: ${{ inputs.run_baseline_negative_proof }}
+          INPUT_XCODE_APP: ${{ inputs.xcode_app || '/Applications/Xcode_16.4.app' }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$INPUT_TIER" == "self-validate" || -z "$INPUT_TIER" ]]; then
+              MODE="self-validate"
+              TIER="self-validate"
+            else
+              MODE="production"
+              TIER="$INPUT_TIER"
+            fi
+          else
+            if [[ -f "source/host/include/mahayana_app_host.h" ]] && grep -q "fabushi_host_create" "source/host/include/mahayana_app_host.h"; then
+              MODE="production"
+              TIER="all"
+            else
+              MODE="self-validate"
+              TIER="self-validate"
+            fi
+          fi
+
+          BASELINE_FLAG="${INPUT_BASELINE_PROOF:-true}"
+          if [[ "$BASELINE_FLAG" != "false" ]]; then
+            BASELINE_FLAG="true"
+          fi
+
+          {
+            echo "mode=$MODE"
+            echo "tier=$TIER"
+            echo "expected_head=$ACTUAL_HEAD"
+            echo "run_baseline_negative_proof=$BASELINE_FLAG"
+            echo "xcode_app=$INPUT_XCODE_APP"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved mode=$MODE tier=$TIER expected_head=$ACTUAL_HEAD baseline_proof=$BASELINE_FLAG"
+
+  ubuntu-self-validate:
+    name: Ubuntu Rust FFI & Anti-Stub Self-Validate
+    needs: [detect-mode]
+    if: needs.detect-mode.outputs.mode == 'self-validate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_STRIP: debuginfo
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_TEST_STRIP: debuginfo
+      SCCACHE_GHA_ENABLED: "true"
+      EVIDENCE_DIR: ${{ runner.temp }}/e2e-ubuntu-evidence
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Verify exact HEAD and initialize evidence directory
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ needs.detect-mode.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+          TREE_SHA="$(git rev-parse HEAD^{tree})"
+          mkdir -p "$EVIDENCE_DIR"
+          cat > "$EVIDENCE_DIR/source.env" <<EOF
+          IOS_HEAD_SHA=$ACTUAL_HEAD
+          IOS_TREE_SHA=$TREE_SHA
+          RUN_ID=${GITHUB_RUN_ID}
+          RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT}
+          REPOSITORY=${GITHUB_REPOSITORY}
+          MODE=self-validate
+          RUNNER_OS=ubuntu-latest
+          EOF
+
+      - name: Python syntax compile and strict spec coverage check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py
+          python3 tests/e2e/spec_coverage_check.py \
+            --strict \
+            --matrix tests/e2e/feature_matrix.json \
+            --report "$EVIDENCE_DIR/coverage_report.json"
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable RUSTC_WRAPPER=sccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Cache Rust workspaces with isolated target dirs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-ubuntu24-v167
+          cache-on-failure: true
+          workspaces: |
+            tests/e2e/rust_ffi -> ../../../target/e2e
+            source/host -> ../../target/host
+
+      - name: Install minimal Linux system libraries for baseline host cdylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Languages=none
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libegl-dev \
+            libgbm-dev \
+            libdrm-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+
+      - name: Build baseline 8128951 source/host cdylib for negative proof
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/host
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path source/host/Cargo.toml
+          test -f "$CARGO_TARGET_DIR/debug/libmahayana_app_host.so"
+          ls -lh "$CARGO_TARGET_DIR/debug/libmahayana_app_host.so"
+
+      - name: Run E2E self-validate runner (394-test compile, mutant_stub, and 8128951 negative proof)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/e2e
+          RUN_BASELINE: ${{ needs.detect-mode.outputs.run_baseline_negative_proof }}
+        run: |
+          set -euo pipefail
+          BASELINE_SO="${GITHUB_WORKSPACE}/target/host/debug/libmahayana_app_host.so"
+          test -f "$BASELINE_SO"
+          python3 tests/e2e/runner.py \
+            --mode self-validate \
+            --baseline-lib "$BASELINE_SO" \
+            --report "$EVIDENCE_DIR/runner_self_validate_report.json"
+
+      - name: Record sccache stats and verify SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUSTC_VERSION=$(rustc --version)" >> "$EVIDENCE_DIR/source.env"
+          sccache --show-stats | tee "$EVIDENCE_DIR/sccache_stats.txt"
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = root / "SHA256SUMS.txt"
+          files = sorted(p for p in root.rglob("*") if p.is_file() and p != output)
+          if not files:
+              raise SystemExit(f"Evidence directory is empty: {root}")
+          with output.open("w", encoding="utf-8") as handle:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  rel = path.relative_to(root).as_posix()
+                  handle.write(f"{digest}  {rel}\n")
+          PY
+          (cd "$EVIDENCE_DIR" && sha256sum -c SHA256SUMS.txt)
+
+      - name: Upload Ubuntu E2E self-validate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fabushi-ios-e2e-ubuntu-${{ needs.detect-mode.outputs.expected_head }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-ubuntu-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-swift6-uitest-validate:
+    name: macOS Swift 6 UITests Typecheck & Dual-Simulator Probe
+    needs: [detect-mode]
+    if: needs.detect-mode.outputs.mode == 'self-validate'
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/e2e-macos-evidence
+      XCODE_APP: ${{ needs.detect-mode.outputs.xcode_app }}
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Verify exact HEAD, select Xcode, and initialize evidence
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ needs.detect-mode.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+          TREE_SHA="$(git rev-parse HEAD^{tree})"
+          if [[ -d "$XCODE_APP" ]]; then
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          XCODE_VER="$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          SWIFT_VER="$(swift --version | head -n 1)"
+          echo "Active Xcode: $XCODE_VER"
+          echo "Active Swift: $SWIFT_VER"
+          mkdir -p "$EVIDENCE_DIR"
+          cat > "$EVIDENCE_DIR/source.env" <<EOF
+          IOS_HEAD_SHA=$ACTUAL_HEAD
+          IOS_TREE_SHA=$TREE_SHA
+          RUN_ID=${GITHUB_RUN_ID}
+          RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT}
+          REPOSITORY=${GITHUB_REPOSITORY}
+          MODE=self-validate
+          RUNNER_OS=macos-15
+          XCODE_APP=$XCODE_APP
+          XCODE_VERSION=$XCODE_VER
+          SWIFT_VERSION=$SWIFT_VER
+          EOF
+
+      - name: Discover runtime-matched iPhone and iPad simulators
+        id: sims
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$EVIDENCE_DIR/simulators.json" "$EVIDENCE_DIR/source.env" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          sim_json_path, source_env_path = sys.argv[1], sys.argv[2]
+          RUNTIME_RE = re.compile(r"SimRuntime\.iOS-(\d+)-(\d+)(?:-(\d+))?$")
+          IPHONE_PREF = [
+              "iPhone 16 Pro",
+              "iPhone 16",
+              "iPhone 16 Pro Max",
+              "iPhone 17 Pro",
+              "iPhone 17",
+              "iPhone 15 Pro",
+              "iPhone 15",
+          ]
+          IPAD_PREF = [
+              "iPad Pro 13-inch (M4)",
+              "iPad Air 13-inch (M3)",
+              "iPad Pro 11-inch (M4)",
+              "iPad Air 11-inch (M3)",
+              "iPad Pro 13-inch (M5)",
+              "iPad Pro 11-inch (M5)",
+              "iPad (A16)",
+              "iPad (10th generation)",
+          ]
+
+          def parse_ver(text: str) -> tuple[int, int, int]:
+              parts = [int(p) for p in text.strip().split(".") if p.isdigit()]
+              while len(parts) < 3:
+                  parts.append(0)
+              return (parts[0], parts[1], parts[2])
+
+          def parse_rt(rt_id: str) -> tuple[int, int, int] | None:
+              m = RUNTIME_RE.search(rt_id)
+              if not m:
+                  return None
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+          def pick(cands, prefs, sdk_ver, kind):
+              same_major = [c for c in cands if c[0][0] == sdk_ver[0]]
+              if same_major:
+                  le = [c for c in same_major if c[0] <= sdk_ver]
+                  pool = le if le else same_major
+              else:
+                  pool = cands
+              if not pool:
+                  raise SystemExit(f"ERROR: No available {kind} simulator found")
+              best = max(c[0] for c in pool)
+              top = [c for c in pool if c[0] == best]
+              for pref in prefs:
+                  for _, rt_id, name, udid in top:
+                      if name == pref:
+                          return udid, name, rt_id
+              _, rt_id, name, udid = sorted(top, key=lambda x: x[2])[0]
+              return udid, name, rt_id
+
+          sdk_ver_str = subprocess.check_output(
+              ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"], text=True
+          ).strip()
+          sdk_ver = parse_ver(sdk_ver_str)
+          raw = subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"], text=True
+          )
+          devices = json.loads(raw).get("devices", {})
+          iphones, ipads = [], []
+          for rt_id, devs in devices.items():
+              rv = parse_rt(rt_id)
+              if rv is None:
+                  continue
+              for dev in devs:
+                  if dev.get("isAvailable") is not True:
+                      continue
+                  name = str(dev.get("name", ""))
+                  udid = str(dev.get("udid", ""))
+                  if not udid:
+                      continue
+                  if name.startswith("iPhone"):
+                      iphones.append((rv, rt_id, name, udid))
+                  elif name.startswith("iPad"):
+                      ipads.append((rv, rt_id, name, udid))
+
+          ip_udid, ip_name, ip_rt = pick(iphones, IPHONE_PREF, sdk_ver, "iPhone")
+          pd_udid, pd_name, pd_rt = pick(ipads, IPAD_PREF, sdk_ver, "iPad")
+          payload = {
+              "sdk_version": sdk_ver_str,
+              "iphone": {"udid": ip_udid, "name": ip_name, "runtime": ip_rt},
+              "ipad": {"udid": pd_udid, "name": pd_name, "runtime": pd_rt},
+          }
+          with open(sim_json_path, "w", encoding="utf-8") as fh:
+              json.dump(payload, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+
+          pairs = {
+              "SIM_SDK_VERSION": sdk_ver_str,
+              "IPHONE_SIM_UDID": ip_udid,
+              "IPHONE_SIM_NAME": ip_name,
+              "IPHONE_SIM_RUNTIME": ip_rt,
+              "IPAD_SIM_UDID": pd_udid,
+              "IPAD_SIM_NAME": pd_name,
+              "IPAD_SIM_RUNTIME": pd_rt,
+          }
+          with open(source_env_path, "a", encoding="utf-8") as fh:
+              for k, v in pairs.items():
+                  fh.write(f"{k}={v}\n")
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as fh:
+                  for k, v in pairs.items():
+                      fh.write(f"{k}={v}\n")
+          print(json.dumps(payload, indent=2))
+          PY
+
+      - name: Swift 6 strict-concurrency typecheck of FabushiUITests against iphonesimulator SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          SIM_PLATFORM="$(xcrun --sdk iphonesimulator --show-sdk-platform-path)"
+
+          ALL_UITEST_FILES=()
+          while IFS= read -r file; do
+            ALL_UITEST_FILES+=("$file")
+          done < <(find mobile/ios/FabushiUITests -type f -name '*.swift' | LC_ALL=C sort)
+          test "${#ALL_UITEST_FILES[@]}" -gt 0
+          printf '%s\n' "${ALL_UITEST_FILES[@]}" > "$EVIDENCE_DIR/uitest_files.txt"
+
+          xcrun --sdk iphonesimulator swiftc \
+            -typecheck \
+            -target arm64-apple-ios17.0-simulator \
+            -sdk "$SIM_SDK" \
+            -F "$SIM_PLATFORM/Developer/Library/Frameworks" \
+            -I "$SIM_PLATFORM/Developer/usr/lib" \
+            -L "$SIM_PLATFORM/Developer/usr/lib" \
+            -swift-version 6 \
+            -strict-concurrency=complete \
+            -parse-as-library \
+            -module-name FabushiUITests \
+            "${ALL_UITEST_FILES[@]}"
+
+          if [[ -d "mobile/ios/FabushiUITests/V167" ]]; then
+            V167_FILES=()
+            while IFS= read -r file; do
+              V167_FILES+=("$file")
+            done < <(find mobile/ios/FabushiUITests/V167 -type f -name '*.swift' | LC_ALL=C sort)
+            if [[ "${#V167_FILES[@]}" -gt 0 ]]; then
+              xcrun --sdk iphonesimulator swiftc \
+                -typecheck \
+                -target arm64-apple-ios17.0-simulator \
+                -sdk "$SIM_SDK" \
+                -F "$SIM_PLATFORM/Developer/Library/Frameworks" \
+                -I "$SIM_PLATFORM/Developer/usr/lib" \
+                -L "$SIM_PLATFORM/Developer/usr/lib" \
+                -swift-version 6 \
+                -strict-concurrency=complete \
+                -warnings-as-errors \
+                -parse-as-library \
+                -module-name FabushiUITestsV167 \
+                "${V167_FILES[@]}"
+            fi
+          fi
+          echo "Swift 6 typecheck PASS (${#ALL_UITEST_FILES[@]} files)" | tee "$EVIDENCE_DIR/swift6_typecheck.log"
+
+      - name: Generate and verify macOS evidence SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = root / "SHA256SUMS.txt"
+          files = sorted(p for p in root.rglob("*") if p.is_file() and p != output)
+          if not files:
+              raise SystemExit(f"Evidence directory is empty: {root}")
+          with output.open("w", encoding="utf-8") as handle:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  rel = path.relative_to(root).as_posix()
+                  handle.write(f"{digest}  {rel}\n")
+          PY
+          (cd "$EVIDENCE_DIR" && shasum -a 256 -c SHA256SUMS.txt)
+
+      - name: Upload macOS Swift 6 UITest validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fabushi-ios-e2e-macos-${{ needs.detect-mode.outputs.expected_head }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-macos-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  production-rust-ffi-e2e:
+    name: Production Ubuntu Rust FFI E2E (Tiers 1-4)
+    needs: [detect-mode]
+    if: needs.detect-mode.outputs.mode == 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      EVIDENCE_DIR: ${{ runner.temp }}/e2e-prod-ubuntu-evidence
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Verify exact HEAD and initialize evidence
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ needs.detect-mode.outputs.expected_head }}
+          TIER: ${{ needs.detect-mode.outputs.tier }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+          mkdir -p "$EVIDENCE_DIR"
+          cat > "$EVIDENCE_DIR/source.env" <<EOF
+          IOS_HEAD_SHA=$ACTUAL_HEAD
+          RUN_ID=${GITHUB_RUN_ID}
+          RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT}
+          MODE=production
+          TIER=$TIER
+          EOF
+
+      - name: Run strict spec coverage check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tests/e2e/runner.py tests/e2e/spec_coverage_check.py
+          python3 tests/e2e/spec_coverage_check.py \
+            --strict \
+            --matrix tests/e2e/feature_matrix.json \
+            --report "$EVIDENCE_DIR/coverage_report.json"
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable RUSTC_WRAPPER=sccache
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Cache Rust workspaces
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-prod-ubuntu24-v167
+          cache-on-failure: true
+          workspaces: |
+            tests/e2e/rust_ffi -> ../../../target/e2e
+            source/host -> ../../target/host
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Languages=none
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libegl-dev \
+            libgbm-dev \
+            libdrm-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxkbcommon-dev
+
+      - name: Build production source/host cdylib (debug and release)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/host
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path source/host/Cargo.toml
+          cargo build --manifest-path source/host/Cargo.toml --release
+          test -f "$CARGO_TARGET_DIR/debug/libmahayana_app_host.so"
+          test -f "$CARGO_TARGET_DIR/release/libmahayana_app_host.so"
+
+      - name: Execute sequential fail-fast production Rust FFI E2E tiers (debug + release catch_unwind)
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/e2e
+          TIER: ${{ needs.detect-mode.outputs.tier }}
+        run: |
+          set -euo pipefail
+          python3 tests/e2e/runner.py \
+            --mode production \
+            --tier "$TIER" \
+            --host-lib "${GITHUB_WORKSPACE}/target/host/debug/libmahayana_app_host.so" \
+            --report "$EVIDENCE_DIR/runner_prod_debug_report.json"
+
+          python3 tests/e2e/runner.py \
+            --mode production \
+            --tier "$TIER" \
+            --host-lib "${GITHUB_WORKSPACE}/target/host/release/libmahayana_app_host.so" \
+            --report "$EVIDENCE_DIR/runner_prod_release_report.json"
+
+      - name: Verify SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          sccache --show-stats | tee "$EVIDENCE_DIR/sccache_stats.txt"
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = root / "SHA256SUMS.txt"
+          files = sorted(p for p in root.rglob("*") if p.is_file() and p != output)
+          with output.open("w", encoding="utf-8") as handle:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  handle.write(f"{digest}  {path.relative_to(root).as_posix()}\n")
+          PY
+          (cd "$EVIDENCE_DIR" && sha256sum -c SHA256SUMS.txt)
+
+      - name: Upload production Ubuntu E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fabushi-ios-e2e-prod-ubuntu-${{ needs.detect-mode.outputs.expected_head }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-prod-ubuntu-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  production-macos-simulator-e2e:
+    name: Production macOS iPhone & iPad Simulator XCUITests (Tiers 1-4)
+    needs: [detect-mode, production-rust-ffi-e2e]
+    if: needs.detect-mode.outputs.mode == 'production'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      EVIDENCE_DIR: ${{ runner.temp }}/e2e-prod-macos-evidence
+      DERIVED_DATA: ${{ runner.temp }}/FabushiE2EDerivedData
+      XCODE_APP: ${{ needs.detect-mode.outputs.xcode_app }}
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Verify exact HEAD, select Xcode, and initialize evidence
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ needs.detect-mode.outputs.expected_head }}
+          TIER: ${{ needs.detect-mode.outputs.tier }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD="$(git rev-parse HEAD)"
+          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+          if [[ -d "$XCODE_APP" ]]; then
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          mkdir -p "$EVIDENCE_DIR"
+          cat > "$EVIDENCE_DIR/source.env" <<EOF
+          IOS_HEAD_SHA=$ACTUAL_HEAD
+          RUN_ID=${GITHUB_RUN_ID}
+          RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT}
+          MODE=production
+          TIER=$TIER
+          XCODE_APP=$XCODE_APP
+          EOF
+
+      - name: Setup Rust iOS simulator toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable RUSTC_WRAPPER=sccache
+        shell: bash
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
+      - name: Build static Rust host library for iphonesimulator arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-mahayana-ios.sh iphonesimulator arm64
+          test -f build/rust/iphonesimulator/libmahayana_app_host.a
+
+      - name: Install XcodeGen and generate Fabushi.xcodeproj
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          (cd mobile/ios && xcodegen generate)
+
+      - name: Build Fabushi app and FabushiUITests once (build-for-testing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build-for-testing \
+            -project mobile/ios/Fabushi.xcodeproj \
+            -scheme Fabushi \
+            -configuration Debug \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Discover, boot, and install app + UITests-Runner on BOTH iPhone and iPad simulators
+        id: sims
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$EVIDENCE_DIR/simulators.json" "$EVIDENCE_DIR/source.env" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          sim_json_path, source_env_path = sys.argv[1], sys.argv[2]
+          RUNTIME_RE = re.compile(r"SimRuntime\.iOS-(\d+)-(\d+)(?:-(\d+))?$")
+          IPHONE_PREF = ["iPhone 16 Pro", "iPhone 16", "iPhone 16 Pro Max", "iPhone 17 Pro", "iPhone 17"]
+          IPAD_PREF = ["iPad Pro 13-inch (M4)", "iPad Air 13-inch (M3)", "iPad Pro 11-inch (M4)", "iPad Pro 13-inch (M5)"]
+
+          def parse_ver(text: str) -> tuple[int, int, int]:
+              parts = [int(p) for p in text.strip().split(".") if p.isdigit()]
+              while len(parts) < 3:
+                  parts.append(0)
+              return (parts[0], parts[1], parts[2])
+
+          def parse_rt(rt_id: str) -> tuple[int, int, int] | None:
+              m = RUNTIME_RE.search(rt_id)
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+          def pick(cands, prefs, sdk_ver, kind):
+              same = [c for c in cands if c[0][0] == sdk_ver[0]]
+              pool = [c for c in same if c[0] <= sdk_ver] or same or cands
+              if not pool:
+                  raise SystemExit(f"No available {kind} simulator")
+              best = max(c[0] for c in pool)
+              top = [c for c in pool if c[0] == best]
+              for pref in prefs:
+                  for _, rt, name, udid in top:
+                      if name == pref:
+                          return udid, name, rt
+              _, rt, name, udid = sorted(top, key=lambda x: x[2])[0]
+              return udid, name, rt
+
+          sdk_ver = parse_ver(subprocess.check_output(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"], text=True))
+          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"], text=True)).get("devices", {})
+          iphones, ipads = [], []
+          for rt, devs in devices.items():
+              rv = parse_rt(rt)
+              if rv is None:
+                  continue
+              for d in devs:
+                  if d.get("isAvailable") is True and d.get("udid"):
+                      n = str(d.get("name", ""))
+                      if n.startswith("iPhone"):
+                          iphones.append((rv, rt, n, str(d["udid"])))
+                      elif n.startswith("iPad"):
+                          ipads.append((rv, rt, n, str(d["udid"])))
+
+          ip_u, ip_n, ip_r = pick(iphones, IPHONE_PREF, sdk_ver, "iPhone")
+          pd_u, pd_n, pd_r = pick(ipads, IPAD_PREF, sdk_ver, "iPad")
+          with open(sim_json_path, "w", encoding="utf-8") as fh:
+              json.dump({"iphone": {"udid": ip_u, "name": ip_n, "runtime": ip_r}, "ipad": {"udid": pd_u, "name": pd_n, "runtime": pd_r}}, fh, indent=2)
+          with open(source_env_path, "a", encoding="utf-8") as fh:
+              fh.write(f"IPHONE_SIM_UDID={ip_u}\nIPAD_SIM_UDID={pd_u}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"IPHONE_SIM_UDID={ip_u}\nIPAD_SIM_UDID={pd_u}\n")
+          PY
+
+          APP_BUNDLE="$(find "$DERIVED_DATA/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name 'Fabushi.app' | head -n 1)"
+          RUNNER_BUNDLE="$(find "$DERIVED_DATA/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name 'FabushiUITests-Runner.app' | head -n 1)"
+          test -d "$APP_BUNDLE"
+          test -d "$RUNNER_BUNDLE"
+
+          # shellcheck disable=SC1091
+          source "$EVIDENCE_DIR/source.env"
+          for UDID in "$IPHONE_SIM_UDID" "$IPAD_SIM_UDID"; do
+            xcrun simctl shutdown "$UDID" || true
+            xcrun simctl erase "$UDID"
+            xcrun simctl boot "$UDID"
+            xcrun simctl bootstatus "$UDID" -b
+            xcrun simctl install "$UDID" "$APP_BUNDLE"
+            xcrun simctl install "$UDID" "$RUNNER_BUNDLE"
+          done
+
+      - name: Run sequential Tiers 1-4 XCUITests on iPhone and iPad simulators
+        shell: bash
+        env:
+          TIER: ${{ needs.detect-mode.outputs.tier }}
+          IPHONE_UDID: ${{ steps.sims.outputs.IPHONE_SIM_UDID }}
+          IPAD_UDID: ${{ steps.sims.outputs.IPAD_SIM_UDID }}
+          TEST_RUNNER_FABUSHI_UI_TEST_MODE: "1"
+          TEST_RUNNER_FABUSHI_FEATURE_HOST_TEST: "0"
+          TEST_RUNNER_FABUSHI_E2E_SOURCE_SHA: ${{ needs.detect-mode.outputs.expected_head }}
+        run: |
+          set -euo pipefail
+          XCTESTRUN="$(find "$DERIVED_DATA/Build/Products" -maxdepth 1 -name '*.xctestrun' | head -n 1)"
+          test -f "$XCTESTRUN"
+
+          if [[ "$TIER" == "all" ]]; then
+            TIERS=(tier1 tier2 tier3 tier4)
+          else
+            TIERS=("$TIER")
+          fi
+
+          for T in "${TIERS[@]}"; do
+            for PAIR in "iphone:$IPHONE_UDID" "ipad:$IPAD_UDID"; do
+              FORM="${PAIR%%:*}"
+              UDID="${PAIR#*:}"
+              export TEST_RUNNER_FABUSHI_E2E_TIER="$T"
+              export TEST_RUNNER_FABUSHI_E2E_FORM_FACTOR="$FORM"
+              xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -only-testing:FabushiUITests \
+                -resultBundlePath "$EVIDENCE_DIR/${T}-${FORM}.xcresult"
+            done
+          done
+
+      - name: Shutdown simulators and verify SHA256SUMS
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for UDID in "${{ steps.sims.outputs.IPHONE_SIM_UDID }}" "${{ steps.sims.outputs.IPAD_SIM_UDID }}"; do
+            if [[ -n "$UDID" ]]; then
+              xcrun simctl shutdown "$UDID" || true
+            fi
+          done
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          output = root / "SHA256SUMS.txt"
+          files = sorted(p for p in root.rglob("*") if p.is_file() and p != output)
+          with output.open("w", encoding="utf-8") as handle:
+              for path in files:
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  handle.write(f"{digest}  {path.relative_to(root).as_posix()}\n")
+          PY
+          (cd "$EVIDENCE_DIR" && shasum -a 256 -c SHA256SUMS.txt)
+
+      - name: Upload production macOS simulator E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fabushi-ios-e2e-prod-macos-${{ needs.detect-mode.outputs.expected_head }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-prod-macos-evidence/
+          if-no-files-found: error
+          retention-days: 14

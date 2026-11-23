@@ -1,0 +1,1132 @@
+{
+  "schema_version": "fabushi.ios.e2e.feature_matrix.v167",
+  "upstream_authority": {
+    "repo": "bhrumom/gpui-telegram",
+    "branch": "main",
+    "commit": "6141456e2a1121b78a6cdcd5da2a6d24c9c37e15",
+    "root_tree": "836c181ac03585d0abc468f9d56a67a0dd20a9bf",
+    "release": "Fabushi v1.6.7"
+  },
+  "required_c_abi_symbols": [
+    "fabushi_host_create",
+    "fabushi_host_dispatch",
+    "fabushi_host_poll_events",
+    "fabushi_host_cancel",
+    "fabushi_host_destroy",
+    "fabushi_host_free_string"
+  ],
+  "required_rpc_namespaces": [
+    "auth",
+    "vault",
+    "session",
+    "chats",
+    "folders",
+    "topics",
+    "contacts",
+    "messages",
+    "sync",
+    "outbox",
+    "e2ee",
+    "search",
+    "media",
+    "stories",
+    "stickers",
+    "fabushi",
+    "multi_agent",
+    "magpie",
+    "coding",
+    "mcp",
+    "computers",
+    "remote",
+    "tailnet",
+    "miniapp",
+    "webmcp",
+    "calls",
+    "talk",
+    "wallet",
+    "settings",
+    "proxy",
+    "push",
+    "actions",
+    "generation"
+  ],
+  "required_ui_namespaces": [
+    "fabushi.auth",
+    "fabushi.shell",
+    "fabushi.chatlist",
+    "fabushi.compose",
+    "fabushi.stage",
+    "fabushi.composer",
+    "fabushi.inspector",
+    "fabushi.studio",
+    "fabushi.magpie",
+    "fabushi.remote",
+    "fabushi.miniapp",
+    "fabushi.call",
+    "fabushi.settings"
+  ],
+  "features": [
+    {
+      "id": "F01",
+      "name": "Password Login, Registration & Split-Key V2 Bootstrap",
+      "project_md_feature": "#2 Password Login, Registration & Split-Key V2 Bootstrap",
+      "survey_2_ref": "survey_2 #1",
+      "milestone": "M2",
+      "rpc_namespaces": ["auth", "vault", "session"],
+      "ui_accessibility_namespaces": ["fabushi.auth"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "username 1..=128 chars",
+        "password 1..=1024 bytes",
+        "Argon2id default m=65536 KiB, t=3, p=4; bounds m=1024..=1048576, t=1..=64, p=1..=16",
+        "auth_salt exact 16 bytes; auth_verifier 32..=128 bytes",
+        "zero plaintext password on disk or network in Split-Key V2"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F01-01", "fn": "tc_t1_f01_01_register_split_key_v2_no_plaintext_password"},
+        {"id": "TC-T1-F01-02", "fn": "tc_t1_f01_02_kdf_params_login_and_transparent_vault_unlock"},
+        {"id": "TC-T1-F01-03", "fn": "tc_t1_f01_03_legacy_v1_upgrade_to_split_key_v2"},
+        {"id": "TC-T1-F01-04", "fn": "tc_t1_f01_04_change_password_rotates_verifier_and_rewraps_vault"},
+        {"id": "TC-T1-F01-05", "fn": "tc_t1_f01_05_session_persists_across_cold_restart_without_plaintext_secret"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F01-01", "fn": "tc_t2_f01_01_username_and_password_length_boundaries_fail_closed"},
+        {"id": "TC-T2-F01-02", "fn": "tc_t2_f01_02_out_of_bounds_argon2id_kdf_params_rejected"},
+        {"id": "TC-T2-F01-03", "fn": "tc_t2_f01_03_malformed_salt_and_verifier_base64_and_size_rejected"},
+        {"id": "TC-T2-F01-04", "fn": "tc_t2_f01_04_duplicate_register_409_and_wrong_password_401"},
+        {"id": "TC-T2-F01-05", "fn": "tc_t2_f01_05_mid_session_http_401_invalidates_token_and_bumps_generation"}
+      ]
+    },
+    {
+      "id": "F02",
+      "name": "Email OTP Registration & Phone SMS Verification",
+      "project_md_feature": "#3 Email OTP & Phone SMS Verification",
+      "survey_2_ref": "survey_2 #2",
+      "milestone": "M2",
+      "rpc_namespaces": ["auth"],
+      "ui_accessibility_namespaces": ["fabushi.auth"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "6-digit ASCII OTP",
+        "60s resend cooldown (429 rate_limited)",
+        "email expiry 600s, phone expiry 300s",
+        "5 max attempts -> too_many_attempts",
+        "E.164 phone normalized length 7..=20 chars"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F02-01", "fn": "tc_t1_f02_01_email_send_code_returns_10m_expiry_and_60s_cooldown"},
+        {"id": "TC-T1-F02-02", "fn": "tc_t1_f02_02_email_register_with_6_digit_otp_authenticates"},
+        {"id": "TC-T1-F02-03", "fn": "tc_t1_f02_03_phone_send_code_normalizes_e164_and_returns_hash"},
+        {"id": "TC-T1-F02-04", "fn": "tc_t1_f02_04_phone_verify_with_matching_hash_issues_session"},
+        {"id": "TC-T1-F02-05", "fn": "tc_t1_f02_05_phone_verify_2fa_account_returns_challenge_without_token"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F02-01", "fn": "tc_t2_f02_01_malformed_email_and_out_of_range_phone_rejected"},
+        {"id": "TC-T2-F02-02", "fn": "tc_t2_f02_02_immediate_resend_within_60s_cooldown_returns_429_retryable"},
+        {"id": "TC-T2-F02-03", "fn": "tc_t2_f02_03_invalid_otp_formats_and_phone_code_hash_mismatch"},
+        {"id": "TC-T2-F02-04", "fn": "tc_t2_f02_04_five_wrong_phone_otp_attempts_exhaust_to_too_many_attempts"},
+        {"id": "TC-T2-F02-05", "fn": "tc_t2_f02_05_expired_otp_short_username_short_password_and_duplicate_email"}
+      ]
+    },
+    {
+      "id": "F03",
+      "name": "Alipay QR Login & Mobile OAuth Callback",
+      "project_md_feature": "#4 Alipay QR Login & Mobile OAuth Callback",
+      "survey_2_ref": "survey_2 #3",
+      "milestone": "M2",
+      "rpc_namespaces": ["auth"],
+      "ui_accessibility_namespaces": ["fabushi.auth"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "fabushi:// URL scheme",
+        "600s attempt TTL, 1000ms poll interval",
+        "fbs_* CSRF state token exact match",
+        "single-use code delivery"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F03-01", "fn": "tc_t1_f03_01_alipay_start_generates_attempt_qr_and_10m_ttl"},
+        {"id": "TC-T1-F03-02", "fn": "tc_t1_f03_02_alipay_poll_transitions_pending_to_confirmed_session"},
+        {"id": "TC-T1-F03-03", "fn": "tc_t1_f03_03_alipay_mobile_deep_link_exchanges_code_and_authenticates"},
+        {"id": "TC-T1-F03-04", "fn": "tc_t1_f03_04_alipay_cancel_stops_polling_cleanly"},
+        {"id": "TC-T1-F03-05", "fn": "tc_t1_f03_05_alipay_restart_mints_fresh_attempt_and_distinct_state"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F03-01", "fn": "tc_t2_f03_01_alipay_poll_unknown_attempt_returns_not_found"},
+        {"id": "TC-T2-F03-02", "fn": "tc_t2_f03_02_alipay_deep_link_csrf_state_mismatch_fails_closed"},
+        {"id": "TC-T2-F03-03", "fn": "tc_t2_f03_03_alipay_deep_link_rejects_wrong_schemes_and_missing_code"},
+        {"id": "TC-T2-F03-04", "fn": "tc_t2_f03_04_alipay_expired_qr_attempt_issues_zero_session"},
+        {"id": "TC-T2-F03-05", "fn": "tc_t2_f03_05_alipay_consumed_auth_code_replay_rejected"}
+      ]
+    },
+    {
+      "id": "F04",
+      "name": "Passkeys (WebAuthn/FIDO2) & QR Device Pairing",
+      "project_md_feature": "#5 Passkeys (WebAuthn/FIDO2) & QR Device Pairing",
+      "survey_2_ref": "survey_2 #4",
+      "milestone": "M2",
+      "rpc_namespaces": ["auth"],
+      "ui_accessibility_namespaces": ["fabushi.auth", "fabushi.settings"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "300s single-use WebAuthn challenge TTL",
+        "tg://login?token=pair_* 300s QR pair TTL",
+        "2FA enforcement on pair.verify"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F04-01", "fn": "tc_t1_f04_01_passkey_register_and_list_returns_credential"},
+        {"id": "TC-T1-F04-02", "fn": "tc_t1_f04_02_passkey_challenge_and_verify_passwordless_login"},
+        {"id": "TC-T1-F04-03", "fn": "tc_t1_f04_03_qr_pair_init_emits_pair_token_and_tg_login_url"},
+        {"id": "TC-T1-F04-04", "fn": "tc_t1_f04_04_qr_pair_primary_accept_confirms_secondary_poll"},
+        {"id": "TC-T1-F04-05", "fn": "tc_t1_f04_05_qr_pair_verify_with_2fa_cloud_password_succeeds"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F04-01", "fn": "tc_t2_f04_01_passkey_consumed_challenge_replay_rejected"},
+        {"id": "TC-T2-F04-02", "fn": "tc_t2_f04_02_passkey_empty_credential_or_unknown_key_rejected"},
+        {"id": "TC-T2-F04-03", "fn": "tc_t2_f04_03_pair_verify_before_primary_accept_returns_pair_not_confirmed"},
+        {"id": "TC-T2-F04-04", "fn": "tc_t2_f04_04_pair_double_accept_and_nonexistent_token_fail_closed"},
+        {"id": "TC-T2-F04-05", "fn": "tc_t2_f04_05_pair_verify_2fa_missing_cloud_password_fails_closed"}
+      ]
+    },
+    {
+      "id": "F05",
+      "name": "Cloud 2FA Password & Active Device Sessions",
+      "project_md_feature": "#6 Cloud 2FA Password & Active Device Sessions",
+      "survey_2_ref": "survey_2 #5",
+      "milestone": "M2",
+      "rpc_namespaces": ["auth", "session"],
+      "ui_accessibility_namespaces": ["fabushi.auth", "fabushi.settings"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "2FA password non-empty trimmed <= 1024 bytes",
+        "300s 2FA login challenge TTL",
+        "revoke_other_devices preserves is_current session"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F05-01", "fn": "tc_t1_f05_01_two_factor_set_and_status_reports_hint"},
+        {"id": "TC-T1-F05-02", "fn": "tc_t1_f05_02_login_2fa_challenge_verify_mints_session"},
+        {"id": "TC-T1-F05-03", "fn": "tc_t1_f05_03_two_factor_rotate_and_disable_roundtrip"},
+        {"id": "TC-T1-F05-04", "fn": "tc_t1_f05_04_session_list_devices_marks_single_current_device"},
+        {"id": "TC-T1-F05-05", "fn": "tc_t1_f05_05_session_revoke_single_and_revoke_others_preserves_current"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F05-01", "fn": "tc_t2_f05_01_two_factor_whitespace_or_oversized_password_rejected"},
+        {"id": "TC-T2-F05-02", "fn": "tc_t2_f05_02_two_factor_update_and_disable_reject_wrong_current_password"},
+        {"id": "TC-T2-F05-03", "fn": "tc_t2_f05_03_two_factor_verify_wrong_password_or_expired_challenge"},
+        {"id": "TC-T2-F05-04", "fn": "tc_t2_f05_04_session_revoke_unknown_or_foreign_session_returns_404"},
+        {"id": "TC-T2-F05-05", "fn": "tc_t2_f05_05_revoked_sibling_receives_401_and_session_revoked_event"}
+      ]
+    },
+    {
+      "id": "F06",
+      "name": "Multi-Account Switcher, Generation Fencing & Local Passcode/Biometric Lock",
+      "project_md_feature": "#7 Multi-Account Switcher & Local Passcode App Lock",
+      "survey_2_ref": "survey_2 #6",
+      "milestone": "M2",
+      "rpc_namespaces": ["session", "generation"],
+      "ui_accessibility_namespaces": ["fabushi.shell", "fabushi.auth", "fabushi.settings"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "3 standard / 6 Premium account cap",
+        "monotonic u64 generation fencing (stale_generation)",
+        "AutoLockTimeout buckets 0/60/300/3600/18000s",
+        "zero plaintext PIN stored on disk"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F06-01", "fn": "tc_t1_f06_01_add_three_accounts_with_distinct_db_namespaces"},
+        {"id": "TC-T1-F06-02", "fn": "tc_t1_f06_02_switch_account_bumps_generation_and_isolates_chats"},
+        {"id": "TC-T1-F06-03", "fn": "tc_t1_f06_03_generation_bump_monotonic_sequence"},
+        {"id": "TC-T1-F06-04", "fn": "tc_t1_f06_04_passcode_set_lock_now_and_unlock_transitions"},
+        {"id": "TC-T1-F06-05", "fn": "tc_t1_f06_05_biometric_unlock_and_logout_increments_generation"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F06-01", "fn": "tc_t2_f06_01_multi_account_cap_enforces_3_standard_and_6_premium"},
+        {"id": "TC-T2-F06-02", "fn": "tc_t2_f06_02_stale_generation_dispatch_fails_closed_without_mutation"},
+        {"id": "TC-T2-F06-03", "fn": "tc_t2_f06_03_locked_app_blocks_chats_and_messages_with_app_locked"},
+        {"id": "TC-T2-F06-04", "fn": "tc_t2_f06_04_wrong_pin_increments_bad_tries_and_never_stores_plaintext_pin"},
+        {"id": "TC-T2-F06-05", "fn": "tc_t2_f06_05_auto_lock_idle_buckets_and_60s_boundary"}
+      ]
+    },
+    {
+      "id": "F07",
+      "name": "Unified Adaptive Apple Shell (iPad 3-Col / iPhone TabView + NavigationStack + .sheet)",
+      "project_md_feature": "#8 Apple HIG Design System & Unified Adaptive Shell",
+      "survey_2_ref": "survey_2 #7",
+      "milestone": "M2",
+      "rpc_namespaces": ["settings", "session", "actions"],
+      "ui_accessibility_namespaces": ["fabushi.shell"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "iPad regular 3-col sidebar 240..360pt (default 288pt) + 320pt inspector",
+        "iPhone compact TabView + NavigationStack + .sheet",
+        "selection_revision hover fence",
+        "44x44pt Apple HIG touch target minimum"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F07-01", "fn": "tc_t1_f07_01_ipad_regular_3col_navigation_and_inspector_toggle"},
+        {"id": "TC-T1-F07-02", "fn": "tc_t1_f07_02_iphone_compact_tab_stack_sheet_all_5_panels"},
+        {"id": "TC-T1-F07-03", "fn": "tc_t1_f07_03_deep_link_route_targets_chat_and_increments_selection_revision"},
+        {"id": "TC-T1-F07-04", "fn": "tc_t1_f07_04_compose_mode_exits_cleanly_on_panel_switch"},
+        {"id": "TC-T1-F07-05", "fn": "tc_t1_f07_05_shell_state_persists_across_cold_restart"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F07-01", "fn": "tc_t2_f07_01_hover_with_unchanged_selection_revision_does_not_hijack_panel"},
+        {"id": "TC-T2-F07-02", "fn": "tc_t2_f07_02_sidebar_width_clamped_to_240_360_bounds"},
+        {"id": "TC-T2-F07-03", "fn": "tc_t2_f07_03_unknown_legacy_split_brain_routes_fail_closed"},
+        {"id": "TC-T2-F07-04", "fn": "tc_t2_f07_04_ws_disconnect_transitions_connection_status_banner"},
+        {"id": "TC-T2-F07-05", "fn": "tc_t2_f07_05_rapid_ipad_regular_compact_resize_preserves_active_chat_and_inspector"}
+      ]
+    },
+    {
+      "id": "F08",
+      "name": "Grok Bot Multi-Select Compose (To: Picker & Atomic DM/Group Creation)",
+      "project_md_feature": "#9 Grok Bot Multi-Select Compose (To: Picker)",
+      "survey_2_ref": "survey_2 #8",
+      "milestone": "M3",
+      "rpc_namespaces": ["chats"],
+      "ui_accessibility_namespaces": ["fabushi.compose"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "0 recipients rejected locally (empty_recipients)",
+        "group title max 255 chars",
+        "client_nonce idempotent group creation",
+        "single bot promotes chat_type=4 and reuses existing DM"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F08-01", "fn": "tc_t1_f08_01_compose_candidates_merges_humans_and_bots_deduplicated"},
+        {"id": "TC-T1-F08-02", "fn": "tc_t1_f08_02_compose_send_single_human_creates_dm_and_sends"},
+        {"id": "TC-T1-F08-03", "fn": "tc_t1_f08_03_compose_send_single_bot_promotes_and_reuses_dm"},
+        {"id": "TC-T1-F08-04", "fn": "tc_t1_f08_04_compose_send_multi_select_bot_group_autogenerates_title"},
+        {"id": "TC-T1-F08-05", "fn": "tc_t1_f08_05_compose_send_explicit_title_persists_in_chat_list"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F08-01", "fn": "tc_t2_f08_01_empty_recipients_rejected_without_network_call"},
+        {"id": "TC-T2-F08-02", "fn": "tc_t2_f08_02_group_title_exceeding_255_chars_rejected"},
+        {"id": "TC-T2-F08-03", "fn": "tc_t2_f08_03_duplicate_client_nonce_on_chats_create_is_idempotent"},
+        {"id": "TC-T2-F08-04", "fn": "tc_t2_f08_04_duplicate_member_ids_deduplicated_and_unknown_peer_404"},
+        {"id": "TC-T2-F08-05", "fn": "tc_t2_f08_05_server_503_during_compose_is_retryable_and_preserves_recovery"}
+      ]
+    },
+    {
+      "id": "F09",
+      "name": "Unified Chat List, Custom Folders, Archive, Pin, Mute & Forum Topics",
+      "project_md_feature": "#10 Unified Chat List, Folders, Archive, Pin, Mute & Forum Topics",
+      "survey_2_ref": "survey_2 #9",
+      "milestone": "M3",
+      "rpc_namespaces": ["chats", "folders", "topics"],
+      "ui_accessibility_namespaces": ["fabushi.chatlist"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "zero synthetic sample_chats on fresh account",
+        "chat types 0..=5 unified",
+        "deterministic pinned dialog sort (no tie-break flicker)",
+        "admin-only topics & invites (403 forbidden)"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F09-01", "fn": "tc_t1_f09_01_fresh_chat_list_empty_then_unifies_all_chat_types"},
+        {"id": "TC-T1-F09-02", "fn": "tc_t1_f09_02_folders_crud_and_scoped_chat_filtering"},
+        {"id": "TC-T1-F09-03", "fn": "tc_t1_f09_03_pin_archive_and_mute_state_ordering"},
+        {"id": "TC-T1-F09-04", "fn": "tc_t1_f09_04_forum_topics_crud_lifecycle"},
+        {"id": "TC-T1-F09-05", "fn": "tc_t1_f09_05_invite_link_create_join_and_revoke"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F09-01", "fn": "tc_t2_f09_01_whitespace_folder_title_and_unknown_folder_delete_rejected"},
+        {"id": "TC-T2-F09-02", "fn": "tc_t2_f09_02_non_admin_member_blocked_from_topics_and_invites"},
+        {"id": "TC-T2-F09-03", "fn": "tc_t2_f09_03_non_member_blocked_from_archive_pin_mute_and_topics"},
+        {"id": "TC-T2-F09-04", "fn": "tc_t2_f09_04_pinned_dialog_sort_order_is_100pct_deterministic"},
+        {"id": "TC-T2-F09-05", "fn": "tc_t2_f09_05_join_with_empty_or_revoked_invite_code_rejected"}
+      ]
+    },
+    {
+      "id": "F10",
+      "name": "Contacts, Peer Resolution, Blocklist, Send-As & Prestart Bot",
+      "project_md_feature": "#11 Contacts, Peer Resolution, Blocklist, Send-As & Prestart Bot",
+      "survey_2_ref": "survey_2 #10",
+      "milestone": "M3",
+      "rpc_namespaces": ["contacts", "chats"],
+      "ui_accessibility_namespaces": ["fabushi.chatlist", "fabushi.shell", "fabushi.composer", "fabushi.stage"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "BotFather / 机器人之父 normalization",
+        "bidirectional blocklist (403 user_is_blocked)",
+        "virtual prestart bot db_chat_id=null until start_bot"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F10-01", "fn": "tc_t1_f10_01_contacts_add_list_delete_roundtrip"},
+        {"id": "TC-T1-F10-02", "fn": "tc_t1_f10_02_resolve_peer_handles_username_phone_botfather_and_miniapp"},
+        {"id": "TC-T1-F10-03", "fn": "tc_t1_f10_03_block_list_unblock_restores_dm_sending"},
+        {"id": "TC-T1-F10-04", "fn": "tc_t1_f10_04_send_as_list_returns_self_default_and_owned_channel"},
+        {"id": "TC-T1-F10-05", "fn": "tc_t1_f10_05_prestart_bot_virtual_then_start_bot_materializes_dm"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F10-01", "fn": "tc_t2_f10_01_resolve_peer_empty_query_400_and_unknown_404"},
+        {"id": "TC-T2-F10-02", "fn": "tc_t2_f10_02_bidirectional_blocklist_blocks_dm_messages"},
+        {"id": "TC-T2-F10-03", "fn": "tc_t2_f10_03_send_as_non_member_forbidden_and_no_foreign_channels"},
+        {"id": "TC-T2-F10-04", "fn": "tc_t2_f10_04_contacts_add_require_existing_rejects_ghost_user"},
+        {"id": "TC-T2-F10-05", "fn": "tc_t2_f10_05_start_bot_called_twice_reuses_single_materialized_dm"}
+      ]
+    },
+    {
+      "id": "F11",
+      "name": "Atomic PTS/QTS Sync Engine, 24h client_nonce Dedup & Offline SQLite WAL Outbox",
+      "project_md_feature": "#12 Atomic PTS/QTS Sync, Nonce Dedup & Offline Outbox",
+      "survey_2_ref": "survey_2 #11",
+      "milestone": "M1/M3",
+      "rpc_namespaces": ["sync", "outbox", "messages"],
+      "ui_accessibility_namespaces": ["fabushi.shell", "fabushi.stage"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "monotonic contiguous PTS with snapshot_required when req.pts+1 < floor_pts",
+        "24h client_nonce dedup (1..=i64::MAX), 16-thread leader/follower",
+        "outbox backoff [250ms..30000ms], max_retries=10, 4xx permanent vs 5xx transient"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F11-01", "fn": "tc_t1_f11_01_sequential_sends_produce_contiguous_monotonic_pts"},
+        {"id": "TC-T1-F11-02", "fn": "tc_t1_f11_02_ws_realtime_pts_push_emits_new_message_event"},
+        {"id": "TC-T1-F11-03", "fn": "tc_t1_f11_03_ws_pts_gap_triggers_automatic_get_difference_backfill"},
+        {"id": "TC-T1-F11-04", "fn": "tc_t1_f11_04_offline_sqlite_wal_outbox_survives_cold_restart_and_flushes"},
+        {"id": "TC-T1-F11-05", "fn": "tc_t1_f11_05_ws_first_vs_http_first_reconciliation_collapses_duplicate"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F11-01", "fn": "tc_t2_f11_01_invalid_client_nonce_rejected_and_16_thread_concurrent_dedup"},
+        {"id": "TC-T2-F11-02", "fn": "tc_t2_f11_02_pts_journal_floor_overflow_triggers_snapshot_required"},
+        {"id": "TC-T2-F11-03", "fn": "tc_t2_f11_03_outbox_classifies_503_transient_vs_403_permanent"},
+        {"id": "TC-T2-F11-04", "fn": "tc_t2_f11_04_outbox_max_retries_10_exhaustion_emits_outbox_failed"},
+        {"id": "TC-T2-F11-05", "fn": "tc_t2_f11_05_conflicting_reply_and_invalid_topic_id_fail_before_outbox"}
+      ]
+    },
+    {
+      "id": "F12",
+      "name": "Virtualized Transcript, 900s Bubble Grouping & 11+ Canonical Message Cards",
+      "project_md_feature": "#13 Virtualized Transcript & 11+ Canonical Message Cards",
+      "survey_2_ref": "survey_2 #12",
+      "milestone": "M3",
+      "rpc_namespaces": ["messages"],
+      "ui_accessibility_namespaces": ["fabushi.stage"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "900s bubble grouping delta (4.0 inner vs 16.0 outer radius)",
+        "text 1..=4096 chars; UTF-16 entity bounds with surrogate-pair emoji",
+        "poll >= 2 options; 11+ canonical card variants"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F12-01", "fn": "tc_t1_f12_01_900s_bubble_grouping_attaches_within_15m_and_splits_at_901s"},
+        {"id": "TC-T1-F12-02", "fn": "tc_t1_f12_02_canonical_message_card_variants_roundtrip_losslessly"},
+        {"id": "TC-T1-F12-03", "fn": "tc_t1_f12_03_poll_create_vote_get_and_close_lifecycle"},
+        {"id": "TC-T1-F12-04", "fn": "tc_t1_f12_04_utf16_surrogate_pair_emoji_entity_bounds_roundtrip"},
+        {"id": "TC-T1-F12-05", "fn": "tc_t1_f12_05_paginated_history_120_messages_no_duplicates"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F12-01", "fn": "tc_t2_f12_01_text_length_boundary_4096_ok_vs_empty_and_4097_rejected"},
+        {"id": "TC-T2-F12-02", "fn": "tc_t2_f12_02_utf16_entity_overflow_on_emoji_string_rejected"},
+        {"id": "TC-T2-F12-03", "fn": "tc_t2_f12_03_intervening_service_message_splits_bubble_cluster"},
+        {"id": "TC-T2-F12-04", "fn": "tc_t2_f12_04_invalid_media_poll_todo_and_generative_card_fail_closed"},
+        {"id": "TC-T2-F12-05", "fn": "tc_t2_f12_05_non_member_history_request_fails_403_with_zero_cross_chat_leak"}
+      ]
+    },
+    {
+      "id": "F13",
+      "name": "Message Edit, Soft-Delete Tombstone, Forward, PTS-Fenced Reactions, Pins, TTL & Export",
+      "project_md_feature": "#14 Message Edit, Delete Tombstone, Forward, Reactions, Pins, TTL & Export",
+      "survey_2_ref": "survey_2 #13",
+      "milestone": "M3",
+      "rpc_namespaces": ["messages", "chats"],
+      "ui_accessibility_namespaces": ["fabushi.stage"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "PTS-fenced reactions drop stale out-of-order responses",
+        "revoke tombstone unpins pinned message",
+        "TTL clamped 0..=31536000s; export limit clamped 1..=5000"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F13-01", "fn": "tc_t1_f13_01_edit_message_preserves_id_advances_pts_and_sets_edited_at"},
+        {"id": "TC-T1-F13-02", "fn": "tc_t1_f13_02_delete_pinned_message_emits_tombstone_and_unpins"},
+        {"id": "TC-T1-F13-03", "fn": "tc_t1_f13_03_multi_forward_hides_sender_and_attaches_caption"},
+        {"id": "TC-T1-F13-04", "fn": "tc_t1_f13_04_toggle_reaction_advances_authoritative_pts"},
+        {"id": "TC-T1-F13-05", "fn": "tc_t1_f13_05_ttl_statistics_export_and_clear_history"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F13-01", "fn": "tc_t2_f13_01_pts_fenced_reaction_drops_stale_out_of_order_response"},
+        {"id": "TC-T2-F13-02", "fn": "tc_t2_f13_02_non_admin_member_cannot_edit_or_delete_peer_message"},
+        {"id": "TC-T2-F13-03", "fn": "tc_t2_f13_03_pinning_zero_or_deleted_message_and_non_admin_ttl_rejected"},
+        {"id": "TC-T2-F13-04", "fn": "tc_t2_f13_04_edit_empty_or_4097_text_and_empty_reaction_emoji_rejected"},
+        {"id": "TC-T2-F13-05", "fn": "tc_t2_f13_05_ttl_clamps_to_365_days_and_export_limit_clamps_to_5000"}
+      ]
+    },
+    {
+      "id": "F14",
+      "name": "IME-Safe Canonical Composer (CJK Commit Fence), Drafts, Formatting, Voice Gesture & Send Options",
+      "project_md_feature": "#15 IME-Safe Canonical Composer, Drafts, Formatting, Voice Gesture & Send Options",
+      "survey_2_ref": "survey_2 #14",
+      "milestone": "M3",
+      "rpc_namespaces": ["messages"],
+      "ui_accessibility_namespaces": ["fabushi.composer"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "80ms CJK IME commit fence (Idle/Composing/Committed)",
+        "voice gesture <0.5s discard, dx<-80 cancel, dy<-50 lock, 63B 5-bit waveform",
+        "future-only schedule_date_ms"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F14-01", "fn": "tc_t1_f14_01_cjk_ime_commit_fence_80ms_blocks_premature_send"},
+        {"id": "TC-T1-F14-02", "fn": "tc_t1_f14_02_per_chat_drafts_isolated_synced_and_deleted"},
+        {"id": "TC-T1-F14-03", "fn": "tc_t1_f14_03_formatting_bar_entities_preserved_in_history"},
+        {"id": "TC-T1-F14-04", "fn": "tc_t1_f14_04_voice_hold_slide_up_lock_and_63b_waveform_complete"},
+        {"id": "TC-T1-F14-05", "fn": "tc_t1_f14_05_silent_and_scheduled_send_options_persist"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F14-01", "fn": "tc_t2_f14_01_shift_enter_inserts_newline_and_empty_enter_never_sends"},
+        {"id": "TC-T2-F14-02", "fn": "tc_t2_f14_02_voice_tap_under_0_5s_and_slide_left_220_cancel_discard"},
+        {"id": "TC-T2-F14-03", "fn": "tc_t2_f14_03_draft_put_on_non_member_chat_returns_forbidden"},
+        {"id": "TC-T2-F14-04", "fn": "tc_t2_f14_04_past_schedule_date_rejected_fail_closed"},
+        {"id": "TC-T2-F14-05", "fn": "tc_t2_f14_05_failed_send_preserves_chat_draft_intact"}
+      ]
+    },
+    {
+      "id": "F15",
+      "name": "49+ Hermes/Fabushi Slash Commands & @ Context Reference Badges",
+      "project_md_feature": "#16 49+ Hermes/Fabushi Slash Commands & @ Context Badges",
+      "survey_2_ref": "survey_2 #15",
+      "milestone": "M3",
+      "rpc_namespaces": ["fabushi"],
+      "ui_accessibility_namespaces": ["fabushi.composer"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        ">= 49 commands (53 base + 8 aliases) across 8 categories",
+        "@file/@dir/@diff/@staged/@git:/@url badge extraction rejecting @filex/email@file.com",
+        "cross-chat session_id hijack returns 403 forbidden"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F15-01", "fn": "tc_t1_f15_01_commands_list_exposes_at_least_49_commands_across_8_categories"},
+        {"id": "TC-T1-F15-02", "fn": "tc_t1_f15_02_commands_prefix_filter_matches_compact_compress_computer"},
+        {"id": "TC-T1-F15-03", "fn": "tc_t1_f15_03_commands_execute_status_and_model_returns_ui_effects"},
+        {"id": "TC-T1-F15-04", "fn": "tc_t1_f15_04_commands_aliases_resolve_to_canonical_handlers"},
+        {"id": "TC-T1-F15-05", "fn": "tc_t1_f15_05_context_extract_badges_parses_all_4_badge_kinds_and_strips_punctuation"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F15-01", "fn": "tc_t2_f15_01_empty_slash_command_fails_with_invalid_command"},
+        {"id": "TC-T2-F15-02", "fn": "tc_t2_f15_02_unknown_slash_command_returns_structured_failure_not_fake_ok"},
+        {"id": "TC-T2-F15-03", "fn": "tc_t2_f15_03_cross_chat_session_id_hijack_fails_403_forbidden"},
+        {"id": "TC-T2-F15-04", "fn": "tc_t2_f15_04_non_member_chat_id_in_slash_command_fails_403"},
+        {"id": "TC-T2-F15-05", "fn": "tc_t2_f15_05_false_positive_at_tokens_never_extracted_as_badges"}
+      ]
+    },
+    {
+      "id": "F16",
+      "name": "Muse Context Inspector (Profile, Members, 5-Tab Shared Media, Bot/Computer/Coding Config)",
+      "project_md_feature": "#17 Muse Context Inspector",
+      "survey_2_ref": "survey_2 #16",
+      "milestone": "M3",
+      "rpc_namespaces": ["chats", "fabushi"],
+      "ui_accessibility_namespaces": ["fabushi.inspector"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "320pt drawer, 80pt hero avatar, 4 tabs, 5 shared media subtabs",
+        "non-owner bot patch & bind_computer returns 403 forbidden",
+        "BotFather non-patchable; AddMemberCandidate excludes user_id=0 and existing members"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F16-01", "fn": "tc_t1_f16_01_inspector_profile_aggregates_chat_and_bot_metadata"},
+        {"id": "TC-T1-F16-02", "fn": "tc_t1_f16_02_inspector_members_add_promote_and_remove"},
+        {"id": "TC-T1-F16-03", "fn": "tc_t1_f16_03_inspector_shared_media_isolates_all_5_subtabs"},
+        {"id": "TC-T1-F16-04", "fn": "tc_t1_f16_04_inspector_bot_config_patch_persists_coding_and_avatar_fields"},
+        {"id": "TC-T1-F16-05", "fn": "tc_t1_f16_05_inspector_bot_bind_and_unbind_computer_node"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F16-01", "fn": "tc_t2_f16_01_non_owner_cannot_patch_bot_or_bind_computer"},
+        {"id": "TC-T2-F16-02", "fn": "tc_t2_f16_02_patch_unknown_bot_or_botfather_returns_bot_not_found"},
+        {"id": "TC-T2-F16-03", "fn": "tc_t2_f16_03_shared_media_invalid_subtab_400_and_non_member_403"},
+        {"id": "TC-T2-F16-04", "fn": "tc_t2_f16_04_non_admin_member_ops_forbidden_and_invalid_role_400"},
+        {"id": "TC-T2-F16-05", "fn": "tc_t2_f16_05_add_member_candidates_exclude_zero_and_existing_members"}
+      ]
+    },
+    {
+      "id": "F17",
+      "name": "Unified Hermes/Fabushi Agent Runtime, 29 Toolsets & 7-Tab Agent Studio",
+      "project_md_feature": "#22 Unified Hermes/Fabushi Agent Runtime, 29 Toolsets & 7-Tab Agent Studio",
+      "survey_2_ref": "survey_2 #17",
+      "milestone": "M4",
+      "rpc_namespaces": ["fabushi"],
+      "ui_accessibility_namespaces": ["fabushi.studio"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "7 Studio tabs & exact 29 canonical ToolsetId values",
+        "MEMORY.md <= 2200 Unicode scalars, USER.md <= 1375 scalars",
+        "5-field Cron validation",
+        "Value-Bound Approvals 3600s TTL bound to (action, target, cwd, content_sha256)"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F17-01", "fn": "tc_t1_f17_01_studio_7_tabs_and_29_canonical_toolsets_toggle"},
+        {"id": "TC-T1-F17-02", "fn": "tc_t1_f17_02_kanban_board_card_transitions_persist_across_cold_restart"},
+        {"id": "TC-T1-F17-03", "fn": "tc_t1_f17_03_skill_md_upsert_approve_and_sha256_verify"},
+        {"id": "TC-T1-F17-04", "fn": "tc_t1_f17_04_bounded_memory_user_soul_honcho_and_quarantine_approve"},
+        {"id": "TC-T1-F17-05", "fn": "tc_t1_f17_05_five_field_cron_and_value_bound_approval_once"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F17-01", "fn": "tc_t2_f17_01_memory_2200_and_user_1375_unicode_scalar_boundaries"},
+        {"id": "TC-T2-F17-02", "fn": "tc_t2_f17_02_value_bound_approval_toctou_tampering_and_replay_fail_closed"},
+        {"id": "TC-T2-F17-03", "fn": "tc_t2_f17_03_expired_approval_and_deny_policy_fail_closed"},
+        {"id": "TC-T2-F17-04", "fn": "tc_t2_f17_04_malformed_4_field_6_field_and_out_of_range_cron_rejected"},
+        {"id": "TC-T2-F17-05", "fn": "tc_t2_f17_05_unknown_toolset_rejected_and_session_export_scrubs_secrets"}
+      ]
+    },
+    {
+      "id": "F18",
+      "name": "Multi-Agent Protocol (Floor Control, 5-Hop Loop Budget, Shared Workspace, Grok shouldReply)",
+      "project_md_feature": "#23 Multi-Agent Protocol",
+      "survey_2_ref": "survey_2 #18",
+      "milestone": "M4",
+      "rpc_namespaces": ["multi_agent"],
+      "ui_accessibility_namespaces": ["fabushi.stage", "fabushi.inspector"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "4 floor priorities (UserInterruption preempt) + anti-starvation fairness",
+        "DEFAULT_MAX_LOOP_HOPS = 5 (hop 6 fails loop_budget_exceeded)",
+        "SharedGroupWorkspace CAS revision fencing",
+        "Grok shouldReply wake_threshold=0.35, duplicate_threshold=0.85, [PASS]/<PASS/>/NO_REPLY"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F18-01", "fn": "tc_t1_f18_01_floor_control_priority_preemption_and_promotion"},
+        {"id": "TC-T1-F18-02", "fn": "tc_t1_f18_02_loop_budget_5_hops_succeed_then_human_resets"},
+        {"id": "TC-T1-F18-03", "fn": "tc_t1_f18_03_shared_group_workspace_cas_revision_and_event"},
+        {"id": "TC-T1-F18-04", "fn": "tc_t1_f18_04_reply_gate_stage1_wakes_explicit_mention_and_caps_unmentioned"},
+        {"id": "TC-T1-F18-05", "fn": "tc_t1_f18_05_reply_gate_stage2_passes_unique_and_suppresses_sentinels"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F18-01", "fn": "tc_t2_f18_01_sixth_bot_hop_exceeds_5_hop_loop_budget_with_causal_trace"},
+        {"id": "TC-T2-F18-02", "fn": "tc_t2_f18_02_shared_workspace_stale_expected_revision_conflicts_without_overwrite"},
+        {"id": "TC-T2-F18-03", "fn": "tc_t2_f18_03_expired_floor_lease_preempted_and_late_nonce_rejected"},
+        {"id": "TC-T2-F18-04", "fn": "tc_t2_f18_04_floor_control_anti_starvation_under_50_direct_mention_burst"},
+        {"id": "TC-T2-F18-05", "fn": "tc_t2_f18_05_reply_gate_rejects_near_duplicate_echo_and_zero_loop_budget"}
+      ]
+    },
+    {
+      "id": "F19",
+      "name": "Pure-Rust Magpie AI Provider Gateway, Routing Groups, Circuit Breakers, PII Masking & Vault OAuth Sync",
+      "project_md_feature": "#24 Pure-Rust Magpie AI Provider Gateway",
+      "survey_2_ref": "survey_2 #19",
+      "milestone": "M4",
+      "rpc_namespaces": ["magpie", "vault"],
+      "ui_accessibility_namespaces": ["fabushi.magpie", "fabushi.settings"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "8 routing strategies & 3 intent tiers",
+        "circuit rest: rate 5000ms..1800000ms, overload 30000ms, credit [30m,1h,2h,4h]",
+        "MaskingAction block/mask/warn + StreamingUnmasker",
+        "iOS sandbox delta: zero local ~/.claude scan (uses USER_VAULT_CATEGORY_AI_OAUTH)"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F19-01", "fn": "tc_t1_f19_01_provider_upsert_and_probe_redacts_secret_key"},
+        {"id": "TC-T1-F19-02", "fn": "tc_t1_f19_02_models_dev_catalog_fetch_and_cache_ttl"},
+        {"id": "TC-T1-F19-03", "fn": "tc_t1_f19_03_smart_routing_group_selects_member_with_intent_tiers"},
+        {"id": "TC-T1-F19-04", "fn": "tc_t1_f19_04_pii_masking_preview_and_streaming_unmasker_roundtrip"},
+        {"id": "TC-T1-F19-05", "fn": "tc_t1_f19_05_import_dotenv_deeplink_and_vault_oauth_sync"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F19-01", "fn": "tc_t2_f19_01_circuit_breaker_rate_overload_and_credit_rest_ladders"},
+        {"id": "TC-T2-F19-02", "fn": "tc_t2_f19_02_masking_block_aborts_outbound_and_preview_never_leaks_raw_secret"},
+        {"id": "TC-T2-F19-03", "fn": "tc_t2_f19_03_no_active_provider_and_all_seats_resting_fail_closed"},
+        {"id": "TC-T2-F19-04", "fn": "tc_t2_f19_04_malformed_dotenv_deeplink_and_unknown_strategy_rejected"},
+        {"id": "TC-T2-F19-05", "fn": "tc_t2_f19_05_ios_forbids_desktop_local_fs_subscription_scan"}
+      ]
+    },
+    {
+      "id": "F20",
+      "name": "Third-Party Coding Agents (Claude Code, Codex, ACP) Mobile Client",
+      "project_md_feature": "#25 Third-Party Coding Agents Mobile Client",
+      "survey_2_ref": "survey_2 #20",
+      "milestone": "M4",
+      "rpc_namespaces": ["coding"],
+      "ui_accessibility_namespaces": ["fabushi.stage", "fabushi.inspector", "fabushi.studio"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "3 drivers: claude, codex, acp",
+        "local iOS subprocess strictly forbidden (local_subprocess_forbidden_ios)",
+        "non-invasive worktree checkpoints & permission dock gating"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F20-01", "fn": "tc_t1_f20_01_probe_remote_coding_host_for_claude_codex_acp"},
+        {"id": "TC-T1-F20-02", "fn": "tc_t1_f20_02_botfather_nl_create_and_config_update"},
+        {"id": "TC-T1-F20-03", "fn": "tc_t1_f20_03_turn_start_polls_streaming_events_and_returns_unified_diff"},
+        {"id": "TC-T1-F20-04", "fn": "tc_t1_f20_04_checkpoint_list_and_non_invasive_restore"},
+        {"id": "TC-T1-F20-05", "fn": "tc_t1_f20_05_coding_permission_approve_and_create_pr"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F20-01", "fn": "tc_t2_f20_01_offline_coding_host_fails_retryable_and_preserves_history"},
+        {"id": "TC-T2-F20-02", "fn": "tc_t2_f20_02_missing_cli_binary_reported_truthfully_not_fabricated"},
+        {"id": "TC-T2-F20-03", "fn": "tc_t2_f20_03_ios_local_subprocess_execution_strictly_forbidden"},
+        {"id": "TC-T2-F20-04", "fn": "tc_t2_f20_04_denied_coding_permission_aborts_and_cancel_stops_turn"},
+        {"id": "TC-T2-F20-05", "fn": "tc_t2_f20_05_invalid_permission_mode_unknown_checkpoint_and_path_traversal_rejected"}
+      ]
+    },
+    {
+      "id": "F21",
+      "name": "Official OAuth 2.1 Remote MCP Server Grants, PKCE/QR Approval & 27-Tool Redacted Audit",
+      "project_md_feature": "#26 Official OAuth 2.1 Remote MCP Server Grants & Audit",
+      "survey_2_ref": "survey_2 #21",
+      "milestone": "M4",
+      "rpc_namespaces": ["mcp"],
+      "ui_accessibility_namespaces": ["fabushi.studio", "fabushi.settings"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "14 scopes across >= 27 official MCP tools",
+        "MCP protocol versions 2025-11-25 / 2025-06-18 / 2025-03-26",
+        "audit redaction of code/text/content/data/password & <= 280 char cap"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F21-01", "fn": "tc_t1_f21_01_oauth_discovery_and_dynamic_client_registration"},
+        {"id": "TC-T1-F21-02", "fn": "tc_t1_f21_02_qr_poll_oauth_approve_with_scopes_and_node_allowlist"},
+        {"id": "TC-T1-F21-03", "fn": "tc_t1_f21_03_tools_list_exposes_at_least_27_scoped_tools_and_invokes_allowed"},
+        {"id": "TC-T1-F21-04", "fn": "tc_t1_f21_04_mcp_audit_redacts_sensitive_fields_and_caps_280_chars"},
+        {"id": "TC-T1-F21-05", "fn": "tc_t1_f21_05_grant_revoke_and_kill_switch_terminate_active_sessions"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F21-01", "fn": "tc_t2_f21_01_insufficient_scope_blocks_power_action_and_audits"},
+        {"id": "TC-T2-F21-02", "fn": "tc_t2_f21_02_node_allowlist_blocks_unapproved_node_beta"},
+        {"id": "TC-T2-F21-03", "fn": "tc_t2_f21_03_pkce_verifier_mismatch_fails_closed"},
+        {"id": "TC-T2-F21-04", "fn": "tc_t2_f21_04_revoked_grant_token_fails_closed_immediately"},
+        {"id": "TC-T2-F21-05", "fn": "tc_t2_f21_05_audit_280_truncation_unknown_tool_and_unsupported_mcp_version"}
+      ]
+    },
+    {
+      "id": "F22",
+      "name": "UU-Remote Computer Workbench, Multi-Session PTY Terminal, Tailnet & <10ms Emergency Takeover",
+      "project_md_feature": "#27 UU-Remote Computer Workbench, PTY Terminal, Tailnet & Controlled Banner",
+      "survey_2_ref": "survey_2 #22",
+      "milestone": "M5",
+      "rpc_namespaces": ["computers", "remote", "tailnet"],
+      "ui_accessibility_namespaces": ["fabushi.remote"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "< 10ms local Emergency Takeover bumping USER_OVERRIDE_EPOCH",
+        "Controlled Banner hex: #1E6BFF human, #0F766E ai_mcp, #4338CA mixed",
+        "3 mouse modes: absolute, game_relative, cursor_lock",
+        "unattended host daemon unsupported on iOS"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F22-01", "fn": "tc_t1_f22_01_cloud_sandbox_node_crud_and_policy_patch"},
+        {"id": "TC-T1-F22-02", "fn": "tc_t1_f22_02_remote_stream_mouse_modes_display_privacy_and_file_transfer"},
+        {"id": "TC-T1-F22-03", "fn": "tc_t1_f22_03_two_concurrent_pty_sessions_isolated_without_crosstalk"},
+        {"id": "TC-T1-F22-04", "fn": "tc_t1_f22_04_remote_assist_and_tailnet_mesh_discovery"},
+        {"id": "TC-T1-F22-05", "fn": "tc_t1_f22_05_controlled_banner_variants_and_sub_10ms_emergency_takeover"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F22-01", "fn": "tc_t2_f22_01_emergency_takeover_under_10ms_preempts_stale_epoch_agent_input"},
+        {"id": "TC-T2-F22-02", "fn": "tc_t2_f22_02_offline_node_and_denied_power_action_fail_closed"},
+        {"id": "TC-T2-F22-03", "fn": "tc_t2_f22_03_invalid_assist_code_rejected_and_disconnect_all_clears_banner"},
+        {"id": "TC-T2-F22-04", "fn": "tc_t2_f22_04_file_conflict_policy_and_closed_pty_fail_cleanly"},
+        {"id": "TC-T2-F22-05", "fn": "tc_t2_f22_05_ios_rejects_unattended_host_daemon_launch"}
+      ]
+    },
+    {
+      "id": "F23",
+      "name": "Zero-Knowledge Split-Key V2 & X25519 Credential Vault + TOTP + Remote Obscura Browser",
+      "project_md_feature": "#21 Zero-Knowledge Split-Key V2 & X25519 Credential Vault + TOTP",
+      "survey_2_ref": "survey_2 #23",
+      "milestone": "M1/M2",
+      "rpc_namespaces": ["vault"],
+      "ui_accessibility_namespaces": ["fabushi.settings", "fabushi.auth"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "MAX_VAULT_CIPHERTEXT_BYTES = 24 MiB (25165824 B); MAX_VAULT_NONCE_BYTES = 128 B",
+        "item_key <= 128 ASCII chars, no '..' traversal; 3 categories password/browser_cookie/ai_oauth",
+        "RFC 6238 TOTP vectors: T=59 SHA1 -> 287082, SHA256 -> 46119246",
+        "600s X25519 device sync TTL; local Obscura sidecar unsupported on iOS"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F23-01", "fn": "tc_t1_f23_01_vault_envelope_put_get_argon2id_zero_plaintext_key"},
+        {"id": "TC-T1-F23-02", "fn": "tc_t1_f23_02_vault_items_crud_across_all_3_categories"},
+        {"id": "TC-T1-F23-03", "fn": "tc_t1_f23_03_x25519_cross_device_sync_request_approve_complete"},
+        {"id": "TC-T1-F23-04", "fn": "tc_t1_f23_04_rfc6238_totp_sha1_and_sha256_exact_vectors"},
+        {"id": "TC-T1-F23-05", "fn": "tc_t1_f23_05_remote_obscura_browser_session_on_desktop_host"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F23-01", "fn": "tc_t2_f23_01_invalid_vault_category_traversal_and_129_char_item_key_rejected"},
+        {"id": "TC-T2-F23-02", "fn": "tc_t2_f23_02_vault_24mib_plus_1_and_129b_nonce_and_bad_base64_rejected"},
+        {"id": "TC-T2-F23-03", "fn": "tc_t2_f23_03_vault_envelope_rejects_out_of_range_argon2id_and_15b_salt"},
+        {"id": "TC-T2-F23-04", "fn": "tc_t2_f23_04_denied_and_expired_x25519_device_sync_are_terminal"},
+        {"id": "TC-T2-F23-05", "fn": "tc_t2_f23_05_hotp_zero_period_10_digits_and_local_ios_obscura_rejected"}
+      ]
+    },
+    {
+      "id": "F24",
+      "name": "Telegram-Parity External Mini Apps, WebMCP Live Control, Floating PiP & Global Dharma",
+      "project_md_feature": "#28 Telegram-Parity External Mini Apps, WebMCP Live Control, Floating PiP & Global Dharma",
+      "survey_2_ref": "survey_2 #24",
+      "milestone": "M5",
+      "rpc_namespaces": ["miniapp", "webmcp"],
+      "ui_accessibility_namespaces": ["fabushi.miniapp"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "ToS acceptance gate before launch",
+        "6-tuple WebMCP session fence (account/app/version/digest/instance/nonce/generation)",
+        "Floating PiP in-place restore preserving state_revision",
+        "Global Dharma free offline tools vs entitlement-gated local.prayer-wheel.start"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F24-01", "fn": "tc_t1_f24_01_accept_tos_launch_validate_hmac_and_isolated_storage"},
+        {"id": "TC-T1-F24-02", "fn": "tc_t1_f24_02_webmcp_register_and_invoke_tracks_monotonic_state_revision"},
+        {"id": "TC-T1-F24-03", "fn": "tc_t1_f24_03_floating_pip_minimize_webmcp_mutation_and_inplace_restore"},
+        {"id": "TC-T1-F24-04", "fn": "tc_t1_f24_04_global_dharma_offline_fabapp_verify_and_free_tool_offline"},
+        {"id": "TC-T1-F24-05", "fn": "tc_t1_f24_05_miniapp_storage_isolation_between_apps_and_uninstall_wipe"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F24-01", "fn": "tc_t2_f24_01_launch_before_tos_and_tampered_init_data_hmac_fail_closed"},
+        {"id": "TC-T2-F24-02", "fn": "tc_t2_f24_02_webmcp_6_tuple_fence_mismatch_and_duplicate_call_id_fail_closed"},
+        {"id": "TC-T2-F24-03", "fn": "tc_t2_f24_03_unregistered_tool_schema_violation_and_unapproved_mutation_fail_closed"},
+        {"id": "TC-T2-F24-04", "fn": "tc_t2_f24_04_tampered_offline_fabapp_package_fails_closed"},
+        {"id": "TC-T2-F24-05", "fn": "tc_t2_f24_05_protected_prayer_wheel_requires_entitlement_while_free_offline_works"}
+      ]
+    },
+    {
+      "id": "F25",
+      "name": "Chunked Resumable Media CAS, HTTP 206 Streaming, 5-Bit 63B Waveform, Stickers, Stories & Instant View",
+      "project_md_feature": "#20 Chunked Media CAS, HTTP 206 Streaming, 5-Bit Voice, Lightbox, Editor, Stickers/GIFs, Stories & Instant View",
+      "survey_2_ref": "survey_2 #25",
+      "milestone": "M1/M3",
+      "rpc_namespaces": ["media", "stories", "stickers"],
+      "ui_accessibility_namespaces": ["fabushi.stage", "fabushi.composer"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "MAX_UPLOAD_SIZE_BYTES = 4 GiB, MAX_PART_SIZE = 16 MiB",
+        "HTTP 206 Partial Content & HTTP 416 Range Not Satisfiable",
+        "5-bit 100-bar waveform = exact 63 bytes, values 0..=31",
+        "Stories TTL clamped 1..=48h (default 24h)"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F25-01", "fn": "tc_t1_f25_01_chunked_resumable_cas_upload_deduplicates_sha256"},
+        {"id": "TC-T1-F25-02", "fn": "tc_t1_f25_02_http_206_byte_range_streaming_matches_original_bytes"},
+        {"id": "TC-T1-F25-03", "fn": "tc_t1_f25_03_waveform_5bit_100_samples_exact_63_bytes_lossless"},
+        {"id": "TC-T1-F25-04", "fn": "tc_t1_f25_04_stickers_gifs_media_editor_and_instant_view"},
+        {"id": "TC-T1-F25-05", "fn": "tc_t1_f25_05_stories_create_24h_ttl_list_view_and_delete"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F25-01", "fn": "tc_t2_f25_01_checksum_mismatch_and_missing_upload_parts_fail_closed"},
+        {"id": "TC-T2-F25-02", "fn": "tc_t2_f25_02_upload_size_over_4gib_and_invalid_part_size_rejected"},
+        {"id": "TC-T2-F25-03", "fn": "tc_t2_f25_03_http_416_range_not_satisfiable_and_404_media_not_found"},
+        {"id": "TC-T2-F25-04", "fn": "tc_t2_f25_04_waveform_empty_over_100_samples_and_values_over_31_clamped"},
+        {"id": "TC-T2-F25-05", "fn": "tc_t2_f25_05_story_ttl_clamped_1_to_48_hours_and_unknown_story_delete_404"}
+      ]
+    },
+    {
+      "id": "F26",
+      "name": "1:1 & Group Calls (LiveKitWebRTC/CallKit/ReplayKit) & Full-Duplex AI Talk Mode (<60ms VAD Barge-In)",
+      "project_md_feature": "#29 1:1 & Group Calls & Full-Duplex AI Talk Mode",
+      "survey_2_ref": "survey_2 #26",
+      "milestone": "M5",
+      "rpc_namespaces": ["calls", "talk"],
+      "ui_accessibility_namespaces": ["fabushi.call"],
+      "upstream_status": "PARTIAL / STUB",
+      "boundary_vectors": [
+        "TURN TTL 43200s; Call rating 1..=5; 4-emoji DTLS fingerprint",
+        "Talk Mode MAX_AUDIO_BUFFER_CHUNKS = 320 FIFO",
+        "VAD barge-in >= 3x20ms loud frames (<60ms); EOS >= 25x20ms silence (>=500ms)",
+        "honest upstream_loopback_stub WebRTC NAT/SFU tracking & no silent online ASR fallback"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F26-01", "fn": "tc_t1_f26_01_call_invite_signal_fingerprint_turn_43200s_and_hangup"},
+        {"id": "TC-T1-F26-02", "fn": "tc_t1_f26_02_calls_history_and_post_call_rating_1_to_5"},
+        {"id": "TC-T1-F26-03", "fn": "tc_t1_f26_03_talk_mode_session_fsm_and_audio_buffering"},
+        {"id": "TC-T1-F26-04", "fn": "tc_t1_f26_04_talk_mode_3x20ms_vad_barge_in_flushes_queue_under_60ms"},
+        {"id": "TC-T1-F26-05", "fn": "tc_t1_f26_05_talk_mode_25x20ms_silence_eos_and_resume_listening"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F26-01", "fn": "tc_t2_f26_01_talk_audio_buffer_never_exceeds_320_chunks_fifo"},
+        {"id": "TC-T2-F26-02", "fn": "tc_t2_f26_02_two_loud_frames_then_silence_must_not_trigger_false_barge_in"},
+        {"id": "TC-T2-F26-03", "fn": "tc_t2_f26_03_closed_talk_session_rejects_audio_enqueue"},
+        {"id": "TC-T2-F26-04", "fn": "tc_t2_f26_04_invalid_call_rating_0_or_6_and_unknown_call_id_rejected"},
+        {"id": "TC-T2-F26-05", "fn": "tc_t2_f26_05_offline_asr_no_silent_cloud_fallback_and_honest_webrtc_stub_flag"}
+      ]
+    },
+    {
+      "id": "F27",
+      "name": "Unified Tantivy Full-Text + Hybrid Memory + Bots/MiniApps Search & Offline FTS5 Fallback",
+      "project_md_feature": "#18 Unified Search",
+      "survey_2_ref": "survey_2 #27",
+      "milestone": "M1/M3",
+      "rpc_namespaces": ["search"],
+      "ui_accessibility_namespaces": ["fabushi.chatlist", "fabushi.stage"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "limit clamped 1..=100 (default 50)",
+        "CJK tokenization in Tantivy & offline SQLite FTS5",
+        "member-only chat scope (403 forbidden_chat_scope) & TTL/tombstone purge"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F27-01", "fn": "tc_t1_f27_01_tantivy_global_search_matches_english_and_cjk"},
+        {"id": "TC-T1-F27-02", "fn": "tc_t1_f27_02_hybrid_memory_search_with_entity_hint"},
+        {"id": "TC-T1-F27-03", "fn": "tc_t1_f27_03_catalog_search_spanning_bots_and_miniapps"},
+        {"id": "TC-T1-F27-04", "fn": "tc_t1_f27_04_in_chat_scoped_search_excludes_other_chats"},
+        {"id": "TC-T1-F27-05", "fn": "tc_t1_f27_05_offline_sqlite_fts5_fallback_when_server_unreachable"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F27-01", "fn": "tc_t2_f27_01_search_non_member_chat_scope_returns_forbidden"},
+        {"id": "TC-T2-F27-02", "fn": "tc_t2_f27_02_search_limit_clamped_1_to_100_and_empty_query_safe"},
+        {"id": "TC-T2-F27-03", "fn": "tc_t2_f27_03_deleted_tombstone_and_expired_ttl_excluded_from_search"},
+        {"id": "TC-T2-F27-04", "fn": "tc_t2_f27_04_fts5_tantivy_operator_and_sql_injection_payloads_safely_escaped"},
+        {"id": "TC-T2-F27-05", "fn": "tc_t2_f27_05_invalid_search_category_fails_closed"}
+      ]
+    },
+    {
+      "id": "F28",
+      "name": "E2EE Messaging (Double Ratchet 1:1, Sender Keys Group & 4-Emoji/QR Safety Numbers)",
+      "project_md_feature": "#19 E2EE Messaging",
+      "survey_2_ref": "survey_2 #28",
+      "milestone": "M1/M3",
+      "rpc_namespaces": ["e2ee"],
+      "ui_accessibility_namespaces": ["fabushi.inspector", "fabushi.stage"],
+      "upstream_status": "PARTIAL / STUB",
+      "boundary_vectors": [
+        "SPK_SIGN_DOMAIN = gpui-e2ee-spk-v1; 32B keys; 64B Ed25519 signature; device_id 1..=128",
+        "128-bit SlidingReplayWindow128 rejects duplicates & distance >= 128",
+        "symmetric 4-emoji + QR safety numbers"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F28-01", "fn": "tc_t1_f28_01_publish_signed_prekeys_and_consume_otpk"},
+        {"id": "TC-T1-F28-02", "fn": "tc_t1_f28_02_double_ratchet_1to1_encrypt_decrypt_advances_seq"},
+        {"id": "TC-T1-F28-03", "fn": "tc_t1_f28_03_group_sender_keys_distribution_and_decrypt"},
+        {"id": "TC-T1-F28-04", "fn": "tc_t1_f28_04_safety_number_4_emoji_and_qr_symmetric"},
+        {"id": "TC-T1-F28-05", "fn": "tc_t1_f28_05_sliding_replay_window_128_accepts_out_of_order_once"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F28-01", "fn": "tc_t2_f28_01_prekey_bad_signature_wrong_key_len_and_bad_device_id_rejected"},
+        {"id": "TC-T2-F28-02", "fn": "tc_t2_f28_02_replay_window_duplicate_and_distance_128_rejected"},
+        {"id": "TC-T2-F28-03", "fn": "tc_t2_f28_03_tampered_aead_ciphertext_fails_decryption_without_advancing_ratchet"},
+        {"id": "TC-T2-F28-04", "fn": "tc_t2_f28_04_revoked_device_excluded_and_fails_with_device_revoked"},
+        {"id": "TC-T2-F28-05", "fn": "tc_t2_f28_05_group_decrypt_without_sender_key_fails_closed"}
+      ]
+    },
+    {
+      "id": "F29",
+      "name": "Economy, Stars Ledger, Star Gifts, Premium Tiers, Redeem Codes & StoreKit 2 IAP/Restore",
+      "project_md_feature": "#31 Economy, Stars Ledger, Star Gifts, Premium & StoreKit 2",
+      "survey_2_ref": "survey_2 #29",
+      "milestone": "M5",
+      "rpc_namespaces": ["wallet"],
+      "ui_accessibility_namespaces": ["fabushi.settings"],
+      "upstream_status": "PARTIAL / STUB",
+      "boundary_vectors": [
+        "strictly positive amount_stars > 0; atomic debit/credit + idempotency_key",
+        "honest storekit_server_binding_blocked & ton_signing_upstream_planned dispositions"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F29-01", "fn": "tc_t1_f29_01_wallet_balance_topup_and_transactions_ledger"},
+        {"id": "TC-T1-F29-02", "fn": "tc_t1_f29_02_atomic_stars_gift_transfer_debits_sender_and_credits_peer"},
+        {"id": "TC-T1-F29-03", "fn": "tc_t1_f29_03_redeem_code_activates_premium_tier"},
+        {"id": "TC-T1-F29-04", "fn": "tc_t1_f29_04_storekit2_jws_verify_and_restore_purchases"},
+        {"id": "TC-T1-F29-05", "fn": "tc_t1_f29_05_wallet_idempotency_key_prevents_double_credit_and_double_debit"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F29-01", "fn": "tc_t2_f29_01_insufficient_balance_fails_atomically_preserving_balance"},
+        {"id": "TC-T2-F29-02", "fn": "tc_t2_f29_02_zero_negative_overflow_and_self_transfer_rejected"},
+        {"id": "TC-T2-F29-03", "fn": "tc_t2_f29_03_invalid_and_already_used_redeem_codes_rejected"},
+        {"id": "TC-T2-F29-04", "fn": "tc_t2_f29_04_unconfigured_storekit_server_binding_reports_honest_blocker"},
+        {"id": "TC-T2-F29-05", "fn": "tc_t2_f29_05_ton_onchain_signing_fails_closed_as_upstream_planned"}
+      ]
+    },
+    {
+      "id": "F30",
+      "name": "Action Bus, iOS App Intents / Siri Shortcuts, fabushi:// URLs & Push Token Registration",
+      "project_md_feature": "#33 Action Bus, App Intents / Siri Shortcuts & Push Registration",
+      "survey_2_ref": "survey_2 #30",
+      "milestone": "M5",
+      "rpc_namespaces": ["actions", "push"],
+      "ui_accessibility_namespaces": ["fabushi.shell", "fabushi.settings"],
+      "upstream_status": "PARTIAL / STUB",
+      "boundary_vectors": [
+        "strict fabushi:// scheme allowlist; HMAC approval gate",
+        "honest apns_delivery_capability=upstream_stub tracking (apns.rs HTTP/2 stub)"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F30-01", "fn": "tc_t1_f30_01_actions_list_and_schema_expose_app_intents"},
+        {"id": "TC-T1-F30-02", "fn": "tc_t1_f30_02_actions_invoke_low_risk_app_intent_completes"},
+        {"id": "TC-T1-F30-03", "fn": "tc_t1_f30_03_actions_approval_gated_executes_after_hmac_approval"},
+        {"id": "TC-T1-F30-04", "fn": "tc_t1_f30_04_route_canonical_fabushi_deep_links"},
+        {"id": "TC-T1-F30-05", "fn": "tc_t1_f30_05_push_register_unregister_honestly_reports_apns_upstream_stub"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F30-01", "fn": "tc_t2_f30_01_unknown_action_and_schema_violation_rejected"},
+        {"id": "TC-T2-F30-02", "fn": "tc_t2_f30_02_forged_hmac_on_approval_gate_fails_closed"},
+        {"id": "TC-T2-F30-03", "fn": "tc_t2_f30_03_untrusted_url_schemes_and_path_traversal_rejected"},
+        {"id": "TC-T2-F30-04", "fn": "tc_t2_f30_04_empty_or_non_hex_apns_push_token_rejected"},
+        {"id": "TC-T2-F30-05", "fn": "tc_t2_f30_05_push_token_unbound_on_logout_preventing_cross_account_leak"}
+      ]
+    },
+    {
+      "id": "F31",
+      "name": "Apple HIG Design System (4 v1.6.7 Themes, WCAG >138 Guard, Liquid Glass, Dynamic Type, VoiceOver, zh-Hans/en)",
+      "project_md_feature": "#8 Apple HIG Design System & Unified Adaptive Shell",
+      "survey_2_ref": "survey_2 #31",
+      "milestone": "M2",
+      "rpc_namespaces": ["settings"],
+      "ui_accessibility_namespaces": ["fabushi.settings", "fabushi.shell"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "4 v1.6.7 themes: night (#0E0E0E), tinted (#181C22), day (#F5F5F5), classic",
+        "WCAG accent guard: luma = 0.299r+0.587g+0.114b > 138.0 -> darken up to 36% toward #111111 (#FFFF00 -> #A9A906)",
+        "font_size_px 12..=20, bubble_radius_px 6..=18, ui_scale_pct 50..=300",
+        "live zh-Hans / en switch with zero key leaks"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F31-01", "fn": "tc_t1_f31_01_switch_all_4_v167_themes_returns_canonical_surface_tokens"},
+        {"id": "TC-T1-F31-02", "fn": "tc_t1_f31_02_wcag_accent_guard_keeps_blue_and_darkens_bright_yellow"},
+        {"id": "TC-T1-F31-03", "fn": "tc_t1_f31_03_theme_geometry_and_liquid_glass_persist_across_restart"},
+        {"id": "TC-T1-F31-04", "fn": "tc_t1_f31_04_accessibility_reduce_motion_high_contrast_and_dynamic_type"},
+        {"id": "TC-T1-F31-05", "fn": "tc_t1_f31_05_live_locale_switch_zh_hans_and_en"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F31-01", "fn": "tc_t2_f31_01_exact_wcag_138_luma_boundary_and_white_max_darken"},
+        {"id": "TC-T2-F31-02", "fn": "tc_t2_f31_02_font_size_bubble_radius_and_ui_scale_clamped_to_spec_ranges"},
+        {"id": "TC-T2-F31-03", "fn": "tc_t2_f31_03_invalid_theme_mode_fails_closed"},
+        {"id": "TC-T2-F31-04", "fn": "tc_t2_f31_04_malformed_accent_hex_fails_closed"},
+        {"id": "TC-T2-F31-05", "fn": "tc_t2_f31_05_unsupported_locale_fails_closed_preserving_active_locale"}
+      ]
+    },
+    {
+      "id": "F32",
+      "name": "Full 26-Section Apple Settings Suite (Search, Real CAS/SQLite Storage Metrics & Purge)",
+      "project_md_feature": "#30 Full 26-Section Apple Settings Suite",
+      "survey_2_ref": "survey_2 #32",
+      "milestone": "M5",
+      "rpc_namespaces": ["settings"],
+      "ui_accessibility_namespaces": ["fabushi.settings"],
+      "upstream_status": "PARTIAL / STUB",
+      "boundary_vectors": [
+        "exact 26 SettingsSectionType IDs",
+        "real CAS/SQLite storage byte accounting (zero fake 5GB / 50ms sleep purge)",
+        "refuses purging protected vault/messages_db targets"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F32-01", "fn": "tc_t1_f32_01_sections_list_returns_exact_26_canonical_sections"},
+        {"id": "TC-T1-F32-02", "fn": "tc_t1_f32_02_sections_search_matches_english_and_chinese_keywords"},
+        {"id": "TC-T1-F32-03", "fn": "tc_t1_f32_03_settings_patch_persists_across_sections_and_restarts"},
+        {"id": "TC-T1-F32-04", "fn": "tc_t1_f32_04_real_cas_storage_metrics_and_disk_purge_preserves_db"},
+        {"id": "TC-T1-F32-05", "fn": "tc_t1_f32_05_business_section_honestly_flags_partial_capability"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F32-01", "fn": "tc_t2_f32_01_unknown_settings_section_fails_closed"},
+        {"id": "TC-T2-F32-02", "fn": "tc_t2_f32_02_negative_global_ttl_rejected_preserving_prior_value"},
+        {"id": "TC-T2-F32-03", "fn": "tc_t2_f32_03_storage_purge_refuses_protected_vault_and_messages_db"},
+        {"id": "TC-T2-F32-04", "fn": "tc_t2_f32_04_empty_cache_purge_returns_zero_freed_bytes_without_fake_5gb"},
+        {"id": "TC-T2-F32-05", "fn": "tc_t2_f32_05_settings_search_no_matches_empty_and_rapid_patches_serialize"}
+      ]
+    },
+    {
+      "id": "F33",
+      "name": "Network, 4-Tier Config Cascade, Server URL, HTTP/SOCKS5/MTProto Proxy Probe & App Update Check",
+      "project_md_feature": "#32 Network, Proxy & App Update Check",
+      "survey_2_ref": "survey_2 #33",
+      "milestone": "M5",
+      "rpc_namespaces": ["proxy", "settings"],
+      "ui_accessibility_namespaces": ["fabushi.settings", "fabushi.auth"],
+      "upstream_status": "REAL SHIPPING",
+      "boundary_vectors": [
+        "4-tier cascade: CLI > GPUI_TELEGRAM_SERVER_URL > config.json > http://34.46.77.133:8080",
+        "proxy fallback_to_direct=false guarantees zero direct traffic leak",
+        "App Store Guideline 2.5.2: binary_self_update_allowed=false"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F33-01", "fn": "tc_t1_f33_01_four_tier_config_cascade_precedence_and_v167_default"},
+        {"id": "TC-T1-F33-02", "fn": "tc_t1_f33_02_http_proxy_configure_and_probe_reachable"},
+        {"id": "TC-T1-F33-03", "fn": "tc_t1_f33_03_socks5_proxy_set_get_and_clear_to_direct"},
+        {"id": "TC-T1-F33-04", "fn": "tc_t1_f33_04_mtproto_proxy_valid_32_hex_secret_persists"},
+        {"id": "TC-T1-F33-05", "fn": "tc_t1_f33_05_update_check_app_store_forbids_binary_self_update"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F33-01", "fn": "tc_t2_f33_01_unreachable_proxy_with_no_fallback_blocks_traffic_with_zero_direct_leak"},
+        {"id": "TC-T2-F33-02", "fn": "tc_t2_f33_02_malformed_server_urls_fail_closed"},
+        {"id": "TC-T2-F33-03", "fn": "tc_t2_f33_03_invalid_proxy_port_empty_host_and_non_hex_mtproto_secret_rejected"},
+        {"id": "TC-T2-F33-04", "fn": "tc_t2_f33_04_ios_binary_self_update_strictly_forbidden"},
+        {"id": "TC-T2-F33-05", "fn": "tc_t2_f33_05_cli_equals_and_shorthand_beat_env_and_strip_trailing_slash"}
+      ]
+    },
+    {
+      "id": "F34",
+      "name": "Fail-Closed Governance, Anti-Stub C-ABI Invariants & Honest Upstream Backlog Disposition",
+      "project_md_feature": "#1/#34 Authority Cutover, Anti-Stub C-ABI & Legacy/Planned Backlog Ledger",
+      "survey_2_ref": "survey_2 #34",
+      "milestone": "M1/M6",
+      "rpc_namespaces": ["generation", "settings"],
+      "ui_accessibility_namespaces": ["fabushi.shell", "fabushi.settings"],
+      "upstream_status": "REQUIREMENT-ONLY / PLANNED",
+      "boundary_vectors": [
+        "all 6 fabushi_host_* C-ABI symbols required",
+        "unknown_command fail-closed (never status:acknowledged)",
+        "catch_unwind panic isolation leaving handle alive",
+        "zero sample_chats, zero hardcoded 127.0.0.1:8443",
+        "honest upstream_planned/server_blocked tracking for OCRM-001, FBCP-001, TON, Passport, APNs, WebRTC SFU, StoreKit binding"
+      ],
+      "tier1_tests": [
+        {"id": "TC-T1-F34-01", "fn": "tc_t1_f34_01_all_6_c_abi_symbols_echo_id_and_generation"},
+        {"id": "TC-T1-F34-02", "fn": "tc_t1_f34_02_generation_current_and_bump_monotonic_dispatch"},
+        {"id": "TC-T1-F34-03", "fn": "tc_t1_f34_03_fresh_host_zero_sample_chats_and_zero_localhost_hardcode"},
+        {"id": "TC-T1-F34-04", "fn": "tc_t1_f34_04_capability_ledger_exposes_honest_upstream_planned_and_blocked"},
+        {"id": "TC-T1-F34-05", "fn": "tc_t1_f34_05_poll_events_bounded_timeout_and_cancel_in_flight"}
+      ],
+      "tier2_tests": [
+        {"id": "TC-T2-F34-01", "fn": "tc_t2_f34_01_unknown_methods_across_namespaces_return_unknown_command_non_retryable"},
+        {"id": "TC-T2-F34-02", "fn": "tc_t2_f34_02_catch_unwind_panic_isolation_preserves_usable_host_handle"},
+        {"id": "TC-T2-F34-03", "fn": "tc_t2_f34_03_stale_generation_fails_closed_with_zero_state_mutation"},
+        {"id": "TC-T2-F34-04", "fn": "tc_t2_f34_04_null_pointers_invalid_utf8_and_truncated_json_fail_closed_safely"},
+        {"id": "TC-T2-F34-05", "fn": "tc_t2_f34_05_upstream_planned_ocrm_passport_and_ton_fail_closed_never_ok"}
+      ]
+    }
+  ],
+  "tier3_pairwise_tests": [
+    {"id": "TC-T3-PAIR-01", "features": ["F01", "F23"], "fn": "tc_t3_pair_01_f01_x_f23_split_key_v2_login_unlocks_zero_knowledge_vault"},
+    {"id": "TC-T3-PAIR-02", "features": ["F01", "F33"], "fn": "tc_t3_pair_02_f01_x_f33_unreachable_proxy_blocks_login_without_direct_leak"},
+    {"id": "TC-T3-PAIR-03", "features": ["F02", "F05"], "fn": "tc_t3_pair_03_f02_x_f05_otp_registration_enables_cloud_2fa_and_lists_session"},
+    {"id": "TC-T3-PAIR-04", "features": ["F02", "F10"], "fn": "tc_t3_pair_04_f02_x_f10_otp_user_resolves_peer_adds_contact_and_blocks"},
+    {"id": "TC-T3-PAIR-05", "features": ["F03", "F30"], "fn": "tc_t3_pair_05_f03_x_f30_alipay_deep_link_routes_through_action_bus"},
+    {"id": "TC-T3-PAIR-06", "features": ["F03", "F29"], "fn": "tc_t3_pair_06_f03_x_f29_alipay_session_reconciles_stars_and_storekit_policy"},
+    {"id": "TC-T3-PAIR-07", "features": ["F04", "F05"], "fn": "tc_t3_pair_07_f04_x_f05_qr_paired_device_revocation_invalidates_session"},
+    {"id": "TC-T3-PAIR-08", "features": ["F04", "F23"], "fn": "tc_t3_pair_08_f04_x_f23_qr_paired_device_completes_x25519_vault_sync_and_totp"},
+    {"id": "TC-T3-PAIR-09", "features": ["F06", "F11"], "fn": "tc_t3_pair_09_f06_x_f11_account_switch_bumps_generation_and_fences_late_pts_sync"},
+    {"id": "TC-T3-PAIR-10", "features": ["F06", "F34"], "fn": "tc_t3_pair_10_f06_x_f34_multi_account_generation_bump_and_panic_isolation"},
+    {"id": "TC-T3-PAIR-11", "features": ["F07", "F31"], "fn": "tc_t3_pair_11_f07_x_f31_adaptive_shell_propagates_themes_wcag_and_locale"},
+    {"id": "TC-T3-PAIR-12", "features": ["F07", "F32"], "fn": "tc_t3_pair_12_f07_x_f32_unified_shell_traverses_26_settings_and_storage_stats"},
+    {"id": "TC-T3-PAIR-13", "features": ["F08", "F18"], "fn": "tc_t3_pair_13_f08_x_f18_multi_select_bot_group_activates_floor_and_loop_budget"},
+    {"id": "TC-T3-PAIR-14", "features": ["F08", "F10"], "fn": "tc_t3_pair_14_f08_x_f10_compose_excludes_blocked_peers_and_materializes_prestart_bot"},
+    {"id": "TC-T3-PAIR-15", "features": ["F09", "F11"], "fn": "tc_t3_pair_15_f09_x_f11_folders_pins_topics_survive_ws_disconnect_and_pts_catchup"},
+    {"id": "TC-T3-PAIR-16", "features": ["F09", "F27"], "fn": "tc_t3_pair_16_f09_x_f27_folder_and_archive_scoped_search_respects_membership"},
+    {"id": "TC-T3-PAIR-17", "features": ["F12", "F13"], "fn": "tc_t3_pair_17_f12_x_f13_transcript_updates_edit_tombstone_reaction_and_pin"},
+    {"id": "TC-T3-PAIR-18", "features": ["F12", "F25"], "fn": "tc_t3_pair_18_f12_x_f25_transcript_cards_render_cas_206_waveform_sticker_story_iv"},
+    {"id": "TC-T3-PAIR-19", "features": ["F13", "F27"], "fn": "tc_t3_pair_19_f13_x_f27_revoke_tombstone_and_ttl_evict_from_tantivy_and_fts5"},
+    {"id": "TC-T3-PAIR-20", "features": ["F14", "F15"], "fn": "tc_t3_pair_20_f14_x_f15_cjk_ime_fence_protects_slash_autocomplete_and_context_badges"},
+    {"id": "TC-T3-PAIR-21", "features": ["F14", "F25"], "fn": "tc_t3_pair_21_f14_x_f25_voice_gesture_encodes_63b_waveform_and_uploads_cas"},
+    {"id": "TC-T3-PAIR-22", "features": ["F15", "F17"], "fn": "tc_t3_pair_22_f15_x_f17_slash_commands_mutate_persisted_agent_studio_state"},
+    {"id": "TC-T3-PAIR-23", "features": ["F16", "F20"], "fn": "tc_t3_pair_23_f16_x_f20_muse_inspector_updates_coding_bot_and_probes_remote_host"},
+    {"id": "TC-T3-PAIR-24", "features": ["F16", "F22"], "fn": "tc_t3_pair_24_f16_x_f22_muse_inspector_binds_bot_computer_and_opens_pty"},
+    {"id": "TC-T3-PAIR-25", "features": ["F19", "F33"], "fn": "tc_t3_pair_25_f19_x_f33_magpie_probe_obeys_proxy_fail_closed_no_leak"},
+    {"id": "TC-T3-PAIR-26", "features": ["F17", "F21"], "fn": "tc_t3_pair_26_f17_x_f21_agent_studio_enforces_official_mcp_scopes_and_audit"},
+    {"id": "TC-T3-PAIR-27", "features": ["F18", "F20"], "fn": "tc_t3_pair_27_f18_x_f20_multi_agent_coding_turn_with_workspace_cas_and_preemption"},
+    {"id": "TC-T3-PAIR-28", "features": ["F19", "F23"], "fn": "tc_t3_pair_28_f19_x_f23_magpie_oauth_syncs_via_zero_knowledge_vault_never_local_fs"},
+    {"id": "TC-T3-PAIR-29", "features": ["F21", "F22"], "fn": "tc_t3_pair_29_f21_x_f22_mcp_session_controlled_banner_and_sub_10ms_kill_switch"},
+    {"id": "TC-T3-PAIR-30", "features": ["F22", "F30"], "fn": "tc_t3_pair_30_f22_x_f30_remote_deep_link_routes_and_reports_honest_apns_stub"},
+    {"id": "TC-T3-PAIR-31", "features": ["F24", "F17"], "fn": "tc_t3_pair_31_f24_x_f17_hermes_agent_invokes_webmcp_during_floating_pip_restore"},
+    {"id": "TC-T3-PAIR-32", "features": ["F24", "F29"], "fn": "tc_t3_pair_32_f24_x_f29_global_dharma_offline_free_vs_paid_storekit_entitlement"},
+    {"id": "TC-T3-PAIR-33", "features": ["F26", "F28"], "fn": "tc_t3_pair_33_f26_x_f28_call_4_emoji_dtls_fingerprint_and_e2ee_replay_window"},
+    {"id": "TC-T3-PAIR-34", "features": ["F26", "F34"], "fn": "tc_t3_pair_34_f26_x_f34_calls_and_talk_mode_honest_governance_and_vad_bounds"},
+    {"id": "TC-T3-PAIR-35", "features": ["F28", "F11"], "fn": "tc_t3_pair_35_f28_x_f11_e2ee_envelope_survives_offline_outbox_with_nonce_dedup"},
+    {"id": "TC-T3-PAIR-36", "features": ["F31", "F32"], "fn": "tc_t3_pair_36_f31_x_f32_theme_wcag_and_locale_persist_across_real_storage_purge"}
+  ],
+  "tier4_scenarios": [
+    {"id": "TC-T4-SCEN-01", "features": ["F01", "F02", "F07", "F11", "F23"], "fn": "tc_t4_scen_01_onboarding_split_key_v2_vault_first_chat_and_cold_restart"},
+    {"id": "TC-T4-SCEN-02", "features": ["F04", "F05", "F06", "F23"], "fn": "tc_t4_scen_02_cross_device_passkey_qr_pair_x25519_vault_and_rogue_revoke"},
+    {"id": "TC-T4-SCEN-03", "features": ["F06", "F09", "F11", "F31", "F34"], "fn": "tc_t4_scen_03_multi_account_isolation_stale_generation_and_idle_passcode_lock"},
+    {"id": "TC-T4-SCEN-04", "features": ["F08", "F10", "F12", "F15", "F18"], "fn": "tc_t4_scen_04_grok_multi_select_multi_agent_room_and_human_interruption"},
+    {"id": "TC-T4-SCEN-05", "features": ["F11", "F12", "F13", "F14", "F25", "F27"], "fn": "tc_t4_scen_05_offline_rich_messaging_cjk_ime_cas_206_and_ttl_purge"},
+    {"id": "TC-T4-SCEN-06", "features": ["F12", "F15", "F16", "F17"], "fn": "tc_t4_scen_06_full_7_tab_hermes_fabushi_agent_studio_lifecycle"},
+    {"id": "TC-T4-SCEN-07", "features": ["F17", "F19", "F23", "F33"], "fn": "tc_t4_scen_07_magpie_gateway_failover_pii_masking_and_vault_oauth_sync"},
+    {"id": "TC-T4-SCEN-08", "features": ["F12", "F16", "F18", "F20"], "fn": "tc_t4_scen_08_coding_agent_mobile_workflow_diff_checkpoint_and_pr"},
+    {"id": "TC-T4-SCEN-09", "features": ["F17", "F21", "F22", "F34"], "fn": "tc_t4_scen_09_official_mcp_oauth21_audit_redaction_and_sub_10ms_kill_switch"},
+    {"id": "TC-T4-SCEN-10", "features": ["F16", "F22", "F30", "F33"], "fn": "tc_t4_scen_10_uu_remote_workbench_multi_pty_tailnet_and_file_resume"},
+    {"id": "TC-T4-SCEN-11", "features": ["F17", "F24", "F29", "F34"], "fn": "tc_t4_scen_11_miniapp_tos_live_webmcp_pip_and_global_dharma_offline"},
+    {"id": "TC-T4-SCEN-12", "features": ["F11", "F12", "F26", "F28"], "fn": "tc_t4_scen_12_e2ee_ratchet_sender_keys_call_fingerprint_and_talk_vad_barge_in"},
+    {"id": "TC-T4-SCEN-13", "features": ["F09", "F12", "F16", "F25", "F27"], "fn": "tc_t4_scen_13_media_stories_stickers_instant_view_and_offline_fts5_search"},
+    {"id": "TC-T4-SCEN-14", "features": ["F03", "F29", "F32", "F34"], "fn": "tc_t4_scen_14_unified_commerce_stars_ledger_and_honest_storekit_ton_boundaries"},
+    {"id": "TC-T4-SCEN-15", "features": ["F07", "F25", "F31", "F32"], "fn": "tc_t4_scen_15_hig_4_themes_wcag_26_settings_and_real_storage_purge"},
+    {"id": "TC-T4-SCEN-16", "features": ["F03", "F17", "F30", "F34"], "fn": "tc_t4_scen_16_action_bus_app_intents_deep_links_and_honest_apns_tracking"},
+    {"id": "TC-T4-SCEN-17", "features": ["F01", "F11", "F32", "F33"], "fn": "tc_t4_scen_17_network_resilience_4_tier_cascade_proxy_no_leak_and_update_check"},
+    {"id": "TC-T4-SCEN-18", "features": ["F06", "F26", "F29", "F30", "F34"], "fn": "tc_t4_scen_18_full_fail_closed_governance_panic_recovery_and_backlog_closure"}
+  ]
+}

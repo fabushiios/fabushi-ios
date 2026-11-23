@@ -1,196 +1,283 @@
 #!/usr/bin/env python3
-"""
-tests/e2e/runner.py
-Master Python Test Orchestrator for Milestone 6 E2E Test Suite.
-Governed by:
-- TEST_INFRA.md §4.1 & §11
-- PROJECT.md
-- AGENTS.md
+"""CI-native opaque-box E2E test orchestrator for Fabushi iOS v1.6.7.
 
-Executes all 428 automated test specifications across Tiers 1-4:
-- Tier 1: Feature Coverage (185 tests)
-- Tier 2: Boundary & Corner Cases (185 tests)
-- Tier 3: Cross-Feature Interactions (38 tests)
-- Tier 4: Real-World Scenarios (20 tests)
-Total: 428 automated tests.
+Standard-library only. Designed to execute exclusively inside GitHub Actions CI
+(`ubuntu-latest` / `macos-15`). Zero hardcoded workstation paths, zero mocks in
+production mode.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
-import shutil
+import platform
 import subprocess
 import sys
 import time
+from pathlib import Path
+from typing import Any
+
+TIER_TEST_TARGETS: dict[str, list[str]] = {
+    "tier1": ["tier1_auth_shell_messaging", "tier1_agents_platform_hig"],
+    "tier2": ["tier2_auth_shell_messaging", "tier2_agents_platform_hig"],
+    "tier3": ["tier3_pairwise_combos"],
+    "tier4": ["tier4_real_world_scenarios"],
+}
 
 
-def find_repo_root() -> str:
-    # Check script directory ancestor first
-    script_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if os.path.exists(os.path.join(script_root, "source", "host", "Cargo.toml")):
-        return script_root
-    cwd = os.path.abspath(os.getcwd())
-    candidates = [
-        os.path.join(cwd, "fabushi-ios"),
-        cwd,
-        os.path.abspath(os.path.join(cwd, "..")),
-        "/Users/bhrum/Documents/ChatGPT/fabushi-ios",
+def shared_lib_ext() -> str:
+    sys_name = platform.system().lower()
+    if sys_name == "darwin":
+        return "dylib"
+    if sys_name == "windows":
+        return "dll"
+    return "so"
+
+
+def resolve_e2e_target_dir(repo_root: Path) -> Path:
+    env_dir = os.environ.get("CARGO_TARGET_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return repo_root / "tests/e2e/rust_ffi/target"
+
+
+def run_step(
+    name: str,
+    cmd: list[str],
+    cwd: Path,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    print(f"==> [{name}] {' '.join(cmd)}", flush=True)
+    t0 = time.monotonic()
+    proc = subprocess.run(cmd, cwd=str(cwd), env=env, check=False)
+    duration_s = round(time.monotonic() - t0, 3)
+
+    record = {
+        "name": name,
+        "command": cmd,
+        "exit_code": proc.returncode,
+        "duration_s": duration_s,
+        "ok": proc.returncode == 0,
+    }
+    print(f"<== [{name}] exit={proc.returncode} duration={duration_s}s", flush=True)
+    return record
+
+
+def run_self_validate(
+    repo_root: Path,
+    mutant_lib_arg: str,
+    baseline_lib_arg: str,
+    report_path: Path | None,
+) -> tuple[int, list[dict[str, Any]]]:
+    steps: list[dict[str, Any]] = []
+    manifest = str(repo_root / "tests/e2e/rust_ffi/Cargo.toml")
+    mutant_manifest = str(repo_root / "tests/e2e/rust_ffi/mutant_stub/Cargo.toml")
+
+    cov_report = (
+        str(report_path.parent / "runner_coverage_check.json")
+        if report_path is not None
+        else ""
+    )
+    cov_cmd = [
+        sys.executable,
+        str(repo_root / "tests/e2e/spec_coverage_check.py"),
+        "--strict",
+        "--matrix",
+        str(repo_root / "tests/e2e/feature_matrix.json"),
     ]
-    for c in candidates:
-        if os.path.isdir(c) and os.path.exists(os.path.join(c, "source", "host", "Cargo.toml")):
-            return c
-    return script_root
+    if cov_report:
+        cov_cmd.extend(["--report", cov_report])
 
+    s1 = run_step("spec_coverage_check", cov_cmd, repo_root)
+    steps.append(s1)
+    if not s1["ok"]:
+        return s1["exit_code"], steps
 
-def run_clean_build_garbage(repo_root: str) -> bool:
-    clean_script = os.path.join(repo_root, "scripts", "clean_build_garbage.py")
-    if not os.path.exists(clean_script):
-        print(f"[WARN] clean_build_garbage.py not found at {clean_script}")
-        return False
-    print(f"\n[Build Hygiene] Running {clean_script}...")
-    res = subprocess.run([sys.executable, clean_script], cwd=repo_root, capture_output=True, text=True)
-    if res.returncode == 0:
-        print(res.stdout.strip())
-        return True
+    strict_rust_env = {"RUSTFLAGS": "-D warnings"}
+
+    s2 = run_step(
+        "cargo_test_no_run_all_394_tests",
+        ["cargo", "test", "--manifest-path", manifest, "--no-run"],
+        repo_root,
+        extra_env=strict_rust_env,
+    )
+    steps.append(s2)
+    if not s2["ok"]:
+        return s2["exit_code"], steps
+
+    s3 = run_step(
+        "cargo_build_mutant_stub",
+        ["cargo", "build", "--manifest-path", mutant_manifest],
+        repo_root,
+        extra_env=strict_rust_env,
+    )
+    steps.append(s3)
+    if not s3["ok"]:
+        return s3["exit_code"], steps
+
+    ext = shared_lib_ext()
+    if mutant_lib_arg:
+        mutant_lib = Path(mutant_lib_arg)
     else:
-        print(f"[ERROR] clean_build_garbage failed with exit code {res.returncode}:\n{res.stderr}")
-        return False
-
-
-import glob
-
-def compile_swift_e2e_suite(repo_root: str, swift_file: str, binary_path: str, verbose: bool = False) -> bool:
-    os.makedirs(os.path.dirname(binary_path), exist_ok=True)
-
-    dylib_path = os.path.join(repo_root, "target", "debug", "libmahayana_app_host.dylib")
-    if not os.path.exists(dylib_path):
-        print("[Build] Building Rust mobile host library...")
-        cargo_res = subprocess.run(
-            ["cargo", "build", "--manifest-path", "source/host/Cargo.toml"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
+        mutant_lib = (
+            resolve_e2e_target_dir(repo_root)
+            / "debug"
+            / f"libfabushi_e2e_mutant_stub.{ext}"
         )
-        if cargo_res.returncode != 0:
-            print(f"[FATAL] Cargo build failed:\n{cargo_res.stderr}")
-            return False
+    if not mutant_lib.exists():
+        print(f"ERROR: mutant_stub cdylib not found at {mutant_lib}", file=sys.stderr)
+        return 2, steps
 
-    bridge_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Bridge/*.swift")))
-    replay_bridge = os.path.join(repo_root, "mobile/ios/Fabushi/Bridge/TelegramReplayWindow.swift")
-    if replay_bridge not in bridge_sources and os.path.exists(replay_bridge):
-        bridge_sources.append(replay_bridge)
-    conversation_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Conversation/*.swift")))
-    composer_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Composer/*.swift")))
-    media_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/MediaViewer/*.swift")))
-    profile_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Profile/*.swift")))
-    agent_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Agent/*.swift")))
-    calls_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Calls/*.swift")))
-    groups_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Groups/*.swift")))
-    settings_sources = sorted(glob.glob(os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Settings/*.swift")))
-    chats_sources = [os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Chats/ChatListViewModel.swift")]
-    shell_sources = [
-        os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Shell/TelegramTab.swift"),
-        os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Shell/TelegramTabNavigationCoordinator.swift"),
-        os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Shell/TabBarItemBadgeView.swift"),
-        os.path.join(repo_root, "mobile/ios/Fabushi/Presentation/Shell/TelegramTabBar.swift"),
-    ]
+    test_env = {
+        "RUSTFLAGS": "-D warnings",
+        "FABUSHI_MUTANT_STUB_LIB": str(mutant_lib),
+    }
+    baseline_lib = baseline_lib_arg or os.environ.get("FABUSHI_BASELINE_HOST_LIB", "").strip()
+    if baseline_lib:
+        baseline_path = Path(baseline_lib)
+        if not baseline_path.exists():
+            print(f"ERROR: baseline host library not found at {baseline_path}", file=sys.stderr)
+            return 2, steps
+        test_env["FABUSHI_BASELINE_HOST_LIB"] = str(baseline_path)
+        test_env["FABUSHI_REQUIRE_BASELINE_PROOF"] = "1"
 
-    all_sources = [
-        swift_file,
-        *bridge_sources,
-        *conversation_sources,
-        *composer_sources,
-        *media_sources,
-        *profile_sources,
-        *agent_sources,
-        *calls_sources,
-        *groups_sources,
-        *settings_sources,
-        *chats_sources,
-        *shell_sources,
-    ]
-
-    compile_cmd = [
-        "swiftc",
-        "-parse-as-library",
-        "-swift-version", "6",
-        "-strict-concurrency=complete",
-        "-import-objc-header", os.path.join(repo_root, "mobile/ios/Fabushi/Fabushi-Bridging-Header.h"),
-        "-I", os.path.join(repo_root, "source/host/include"),
-        "-Ltarget/debug",
-        "-lmahayana_app_host",
-        "-Xlinker", "-rpath", "-Xlinker", os.path.join(repo_root, "target/debug"),
-        *all_sources,
-        "-o",
-        binary_path,
-    ]
-    if verbose:
-        print(f"[Build] Compiling {len(all_sources)} Swift sources...")
-        print(f"[Build] Command: {' '.join(compile_cmd)}")
-    start_time = time.time()
-    res = subprocess.run(compile_cmd, cwd=repo_root, capture_output=True, text=True)
-    elapsed = time.time() - start_time
-    if res.returncode != 0:
-        print(f"[FATAL] Compilation failed (elapsed: {elapsed:.2f}s):\n{res.stderr}")
-        return False
-    if verbose:
-        print(f"[Build] Compilation successful in {elapsed:.2f}s")
-    return True
+    s4 = run_step(
+        "cargo_test_self_validate_antistub",
+        [
+            "cargo",
+            "test",
+            "--manifest-path",
+            manifest,
+            "--lib",
+            "--test",
+            "self_validate_antistub",
+            "--",
+            "--nocapture",
+        ],
+        repo_root,
+        extra_env=test_env,
+    )
+    steps.append(s4)
+    return (0 if s4["ok"] else s4["exit_code"]), steps
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Master E2E Test Suite Orchestrator")
-    parser.add_argument("--tier", choices=["1", "2", "3", "4", "all"], default="all", help="Target test tier to execute (default: all)")
-    parser.add_argument("--clean-after", action="store_true", help="Execute AGENTS.md clean_build_garbage.py post-test")
-    parser.add_argument("--filter", type=str, default=None, help="Filter test cases by ID or description substring")
-    parser.add_argument("--json-output", type=str, default=None, help="Path to write JSON test report")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+def run_production(
+    repo_root: Path,
+    tier: str,
+    host_lib_arg: str,
+) -> tuple[int, list[dict[str, Any]]]:
+    steps: list[dict[str, Any]] = []
+    host_lib_str = host_lib_arg or os.environ.get("FABUSHI_HOST_LIB", "").strip()
+    if not host_lib_str:
+        print(
+            "FAIL-CLOSED: production mode requires --host-lib or FABUSHI_HOST_LIB",
+            file=sys.stderr,
+        )
+        return 2, steps
 
+    host_lib = Path(host_lib_str)
+    if "mutant_stub" in host_lib.as_posix().lower():
+        print(
+            f"FAIL-CLOSED: production mode refuses mutant_stub library: {host_lib}",
+            file=sys.stderr,
+        )
+        return 2, steps
+    if not host_lib.exists():
+        print(f"FAIL-CLOSED: host library does not exist: {host_lib}", file=sys.stderr)
+        return 2, steps
+
+    ordered_tiers = ["tier1", "tier2", "tier3", "tier4"] if tier == "all" else [tier]
+    manifest = str(repo_root / "tests/e2e/rust_ffi/Cargo.toml")
+    prod_env = {
+        "FABUSHI_HOST_LIB": str(host_lib.resolve()),
+        "RUSTFLAGS": "-D warnings",
+    }
+
+    for current_tier in ordered_tiers:
+        for target in TIER_TEST_TARGETS[current_tier]:
+            step = run_step(
+                f"{current_tier}:{target}",
+                [
+                    "cargo",
+                    "test",
+                    "--manifest-path",
+                    manifest,
+                    "--test",
+                    target,
+                    "--",
+                    "--nocapture",
+                    "--test-threads=4",
+                ],
+                repo_root,
+                extra_env=prod_env,
+            )
+            steps.append(step)
+            if not step["ok"]:
+                return step["exit_code"], steps
+
+    return 0, steps
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fabushi iOS v1.6.7 Opaque-Box E2E Runner")
+    parser.add_argument(
+        "--mode",
+        required=True,
+        choices=["self-validate", "production"],
+        help="Execution mode: self-validate (harness/anti-stub gate) or production (real host Tiers 1-4)",
+    )
+    parser.add_argument(
+        "--tier",
+        default="all",
+        choices=["tier1", "tier2", "tier3", "tier4", "all"],
+        help="Tier to run in production mode (sequential fail-fast when 'all')",
+    )
+    parser.add_argument("--host-lib", default="", help="Path to real libmahayana_app_host.{so,dylib}")
+    parser.add_argument("--mutant-lib", default="", help="Optional override path to mutant_stub cdylib")
+    parser.add_argument("--baseline-lib", default="", help="Path to baseline 8128951 libmahayana_app_host.so")
+    parser.add_argument("--report", default="", help="Optional JSON execution report output path")
     args = parser.parse_args()
 
-    repo_root = find_repo_root()
-    swift_suite = os.path.join(repo_root, "tests", "e2e", "master_e2e_suite.swift")
-    if not os.path.exists(swift_suite):
-        print(f"[ERROR] Master E2E suite not found at {swift_suite}")
-        sys.exit(2)
+    repo_root = Path(__file__).resolve().parents[2]
+    report_path = Path(args.report) if args.report else None
+    t_start = time.monotonic()
 
-    target_bin = os.path.join(repo_root, "target", "e2e", "master_e2e_runner")
+    if args.mode == "self-validate":
+        exit_code, steps = run_self_validate(
+            repo_root,
+            mutant_lib_arg=args.mutant_lib,
+            baseline_lib_arg=args.baseline_lib,
+            report_path=report_path,
+        )
+    else:
+        exit_code, steps = run_production(
+            repo_root,
+            tier=args.tier,
+            host_lib_arg=args.host_lib,
+        )
 
-    print("================================================================================")
-    print(" MASTER E2E ORCHESTRATOR: Native iOS Telegram Client (fabushi-ios)")
-    print(f" Repository Root: {repo_root}")
-    print(f" Target Tier:     {args.tier}")
-    print(f" Clean After:     {args.clean_after}")
-    print("================================================================================")
+    summary = {
+        "mode": args.mode,
+        "tier": args.tier,
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "total_duration_s": round(time.monotonic() - t_start, 3),
+        "steps_executed": len(steps),
+        "steps_passed": sum(1 for s in steps if s["ok"]),
+        "steps": steps,
+    }
 
-    # Step 1: Compile master E2E suite
-    compile_ok = compile_swift_e2e_suite(repo_root, swift_suite, target_bin, verbose=args.verbose)
-    if not compile_ok:
-        sys.exit(2)
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    # Step 2: Execute compiled runner
-    cmd = [target_bin, "--tier", args.tier]
-    if args.filter:
-        cmd.extend(["--filter", args.filter])
-    if args.json_output:
-        cmd.extend(["--json", args.json_output])
-
-    print(f"[Execute] Running {target_bin} --tier {args.tier}...")
-    run_start = time.time()
-    proc = subprocess.run(cmd, cwd=repo_root, capture_output=False)
-    run_elapsed = time.time() - run_start
-
-    exit_code = proc.returncode
-
-    # Step 3: Run build hygiene if requested
-    if args.clean_after:
-        clean_ok = run_clean_build_garbage(repo_root)
-        if not clean_ok and exit_code == 0:
-            exit_code = 3
-
-    print(f"\n[Orchestrator] Completed in {run_elapsed:.2f}s with exit code {exit_code}")
-    sys.exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
