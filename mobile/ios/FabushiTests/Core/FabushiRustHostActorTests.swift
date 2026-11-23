@@ -296,7 +296,12 @@ final class FabushiRustHostActorTests: XCTestCase, @unchecked Sendable {
 
         // Wait deterministically until initialize() has entered the actor so shutdown() races
         // with or immediately follows initialization (never preceding it).
-        while !(await host.hasInFlightInitialization) && !(await host.isInitialized) {
+        for _ in 0..<2_000 {
+            let inFlight = await host.hasInFlightInitialization
+            let initialized = await host.isInitialized
+            if inFlight || initialized {
+                break
+            }
             await Task.yield()
         }
 
