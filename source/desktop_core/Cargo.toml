@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     # 11 Mobile-Compilable Pure-Rust Domain Crates vendored from
-    # bhrumom/gpui-telegram@6141456e2a1121b78a6cdcd5da2a6d24c9c37e15 (Fabushi v1.6.7)
+    # bhrumom/gpui-telegram@424aa33cf67a11a778da2dd3b8cca7ea35072b07 (Fabushi v1.6.8)
     # Note: crates/gpui_telegram_common has NO Cargo.toml upstream (only 1 legacy auth.rs file)
     # and is therefore excluded from Cargo workspace members.
     "crates/gpui_telegram_core",
@@ -31,7 +31,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.6.7"
+version = "1.6.8"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]

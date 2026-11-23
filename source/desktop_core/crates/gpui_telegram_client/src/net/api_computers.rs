@@ -521,26 +521,51 @@ fn headless_clipboard_slot() -> &'static parking_lot::RwLock<ClipboardPayloadDto
     })
 }
 
-async fn capture_screen_png_data_url(force_fallback: bool) -> (String, &'static str) {
+async fn capture_screen_png_data_url(force_fallback: bool) -> (String, &'static str, Option<String>) {
+    let mut capture_error: Option<(bool, String)> = None;
     if !force_fallback
         && !is_headless_or_unit_test()
         && std::env::var_os("GPUI_SKIP_NATIVE_SCREENCAPTURE").is_none()
     {
         let engine = shared_remote_engine();
         let display_idx = engine.display_privacy.active_display_index();
-        if let Ok(frame) = engine.capture.capture_screen(display_idx, CaptureFormat::Png) {
-            if frame.data.len() > 8
-                && (frame.data.starts_with(b"\x89PNG\r\n\x1a\n")
-                    || frame.data.starts_with(b"\xff\xd8\xff"))
+        let capture_res = tokio::task::spawn_blocking(move || {
+            engine.capture.capture_screen(display_idx, CaptureFormat::Png)
+        })
+        .await;
+
+        match capture_res {
+            Ok(Ok(frame))
+                if frame.data.len() > 8
+                    && (frame.data.starts_with(b"\x89PNG\r\n\x1a\n")
+                        || frame.data.starts_with(b"\xff\xd8\xff")) =>
             {
-                return (frame.to_data_url(), "fabushi_remote_engine");
+                return (frame.to_data_url(), "fabushi_remote_engine", None);
+            }
+            Ok(Ok(_)) => {
+                capture_error = Some((false, "screen capture returned an empty or invalid frame".to_string()));
+            }
+            Ok(Err(err)) => {
+                let is_perm = matches!(
+                    err,
+                    fabushi_remote_engine::RemoteEngineError::PermissionDenied(_)
+                );
+                capture_error = Some((is_perm, err.to_string()));
+            }
+            Err(join_err) => {
+                capture_error = Some((false, format!("screen capture worker join error: {join_err}")));
             }
         }
     }
 
     let png_bytes = generate_fallback_screen_png_bytes(160, 90);
     let b64 = encode_base64(&png_bytes);
-    (format!("data:image/png;base64,{}", b64), "fallback_png")
+    let data_url = format!("data:image/png;base64,{}", b64);
+    match capture_error {
+        Some((true, msg)) => (data_url, "fallback_png_permission_denied", Some(msg)),
+        Some((false, msg)) => (data_url, "fallback_png_error", Some(msg)),
+        None => (data_url, "fallback_png", None),
+    }
 }
 
 /// Executes a `RemoteComputerOp` directly on the local host machine via `fabushi_remote_engine`.
@@ -686,11 +711,14 @@ async fn execute_local_computer_op_inner(
             }
         },
         RemoteComputerOp::CaptureScreen => {
-            let (data_url, capture_mode) =
+            let (data_url, capture_mode, capture_err) =
                 capture_screen_png_data_url(force_fallback_capture).await;
             result.ok = true;
             result.exit_code = 0;
             result.stdout = format!("Captured screen frame ({})", capture_mode);
+            if let Some(err_msg) = capture_err {
+                result.stderr = err_msg;
+            }
             result.frame_data_url = Some(data_url);
         }
         RemoteComputerOp::GuiInput {

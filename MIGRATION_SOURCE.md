@@ -6,11 +6,11 @@ Machine authority: `manifests/desktop-main-authority.json`
 
 - Desktop repository: `bhrumom/gpui-telegram`
 - Desktop live branch: `main`
-- Desktop observed release at `2026-11-23`: `Fabushi v1.6.7` (`6141456e2a1121b78a6cdcd5da2a6d24c9c37e15`)
-- Desktop snapshot root tree: `836c181ac03585d0abc468f9d56a67a0dd20a9bf`
-- Desktop tracked inventory at this snapshot: `11,342` blobs (`3,056` `crates/**` across 18 directories + `7,713` `inherited/**` + `573` root/docs/scripts/tests/vendor), `0` gitlinks
+- Desktop observed release at `2026-11-23`: `Fabushi v1.6.8` (`424aa33cf67a11a778da2dd3b8cca7ea35072b07`)
+- Desktop snapshot root tree: `181a98ba298a49e64ae0ce5b6ac0160616134708`
+- Desktop tracked inventory at this snapshot: `11,351` blobs (`3,063` `crates/**` across 18 directories + `7,713` `inherited/**` + `575` root/docs/scripts/tests/vendor), `0` gitlinks
 - Target repository: `fabushiios/fabushi-ios` (historical redirects: `fabushi-ios/fabushi-ios`, `bhrumom/fabushi-ios`)
-- Target release: `Fabushi v1.6.7` (`MARKETING_VERSION: 1.6.7`, `CURRENT_PROJECT_VERSION: 35`)
+- Target release: `Fabushi v1.6.8` (`MARKETING_VERSION: 1.6.8`, `CURRENT_PROJECT_VERSION: 35`)
 
 Never parse this Markdown for an authoritative SHA. Each migration/validation/acceptance cycle reads the JSON machine lock and resolves the live Desktop main exact ref. A new main SHA requires rebaseline before current parity can be accepted, including selected source manifest, full tracked tree, dependency/owner-impact review, ledger and exact iOS evidence.
 

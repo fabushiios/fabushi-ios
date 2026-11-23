@@ -223,12 +223,6 @@ mod macos_capture {
             display_index: u32,
             format: CaptureFormat,
         ) -> EngineResult<CapturedFrame> {
-            if !unsafe { CGPreflightScreenCaptureAccess() } {
-                return Err(RemoteEngineError::PermissionDenied(
-                    "Screen Recording permission required in System Settings > Privacy & Security"
-                        .to_string(),
-                ));
-            }
             let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
             let ids = CGDisplay::active_displays().map_err(|err| {
                 RemoteEngineError::Other(format!("CGDisplay::active_displays failed: {err:?}"))
@@ -237,62 +231,114 @@ mod macos_capture {
                 RemoteEngineError::NotFound(format!("display index {display_index} not found"))
             })?;
 
-            // Fast zero-subprocess CGDisplay capture path with ImageIO hardware encoding
-            if matches!(format, CaptureFormat::Jpeg { .. } | CaptureFormat::Png) {
-                if let Some(image) = CGDisplay::new(id).image() {
-                    let width = image.width() as u32;
-                    let height = image.height() as u32;
-                    let data_ref = unsafe { CFDataCreateMutable(kCFAllocatorDefault, 0) };
-                    if !data_ref.is_null() {
-                        let (uti, mime) = match format {
-                            CaptureFormat::Png => ("public.png", "image/png"),
-                            _ => ("public.jpeg", "image/jpeg"),
-                        };
-                        let uti_cf = CFString::new(uti);
-                        let dest = unsafe {
-                            CGImageDestinationCreateWithData(
-                                data_ref,
-                                uti_cf.as_concrete_TypeRef(),
-                                1,
-                                ptr::null(),
-                            )
-                        };
-                        if !dest.is_null() {
-                            unsafe {
-                                CGImageDestinationAddImage(
-                                    dest,
-                                    image.as_ptr() as *mut c_void,
-                                    ptr::null(),
-                                );
-                            }
-                            let finalized = unsafe { CGImageDestinationFinalize(dest) };
-                            unsafe { CFRelease(dest as CFTypeRef) };
-                            if finalized != 0 {
-                                let cf_data =
-                                    unsafe { CFData::wrap_under_create_rule(data_ref as CFDataRef) };
-                                if !cf_data.is_empty() {
-                                    return Ok(CapturedFrame {
-                                        width,
-                                        height,
-                                        mime_type: mime.to_string(),
-                                        data: cf_data.bytes().to_vec(),
-                                        captured_at_ms: chrono::Utc::now().timestamp_millis(),
-                                        display_id: display_index,
-                                        seq,
-                                    });
-                                }
-                            } else {
-                                unsafe { CFRelease(data_ref as CFTypeRef) };
-                            }
-                        } else {
-                            unsafe { CFRelease(data_ref as CFTypeRef) };
+            // Primary path on macOS 14.0+ (Sequoia / macOS 26 / 27): native ScreenCaptureKit
+            // (`SCShareableContent` + `SCScreenshotManager`). We intentionally try SCK *before*
+            // consulting `CGPreflightScreenCaptureAccess()`, because `CGPreflight` can remain
+            // stale-cached `false` inside a running process even after Screen Recording is granted,
+            // and legacy `CGDisplayCreateImage` / `CGWindowListCreateImage` fail on macOS 15+.
+            match crate::macos_permissions::sck_capture_display(id, display_index, format, seq) {
+                Ok(frame) => return Ok(frame),
+                Err((code, err)) if code == crate::macos_permissions::STATUS_PERMISSION_DENIED => {
+                    return Err(err);
+                }
+                Err((code, _err)) if code == crate::macos_permissions::STATUS_UNAVAILABLE => {
+                    // macOS < 14.0 fallback below
+                }
+                Err((_code, sck_err)) => {
+                    // If CGPreflight also says denied, surface clear PermissionDenied rather than
+                    // letting legacy CGDisplayCreateImage fail with a vague error.
+                    if !unsafe { CGPreflightScreenCaptureAccess() } {
+                        return Err(RemoteEngineError::PermissionDenied(format!(
+                            "Screen Recording permission required in System Settings > Privacy & Security ({sck_err})"
+                        )));
+                    }
+                    // Otherwise try legacy CGDisplay / xcap fallback below; if those also fail,
+                    // surface the original SCK error if helpful.
+                    if matches!(format, CaptureFormat::Jpeg { .. } | CaptureFormat::Png) {
+                        if let Some(frame) = Self::capture_via_cg_display(id, display_index, format, seq) {
+                            return Ok(frame);
                         }
                     }
+                    return capture_via_xcap(display_index, format, seq).map_err(|xcap_err| {
+                        RemoteEngineError::Other(format!(
+                            "ScreenCaptureKit failed ({sck_err}); legacy capture fallback failed ({xcap_err})"
+                        ))
+                    });
                 }
             }
 
-            // Native ScreenCaptureKit fallback via xcap (zero subprocess)
+            if !unsafe { CGPreflightScreenCaptureAccess() } {
+                return Err(RemoteEngineError::PermissionDenied(
+                    "Screen Recording permission required in System Settings > Privacy & Security"
+                        .to_string(),
+                ));
+            }
+
+            // Legacy macOS 12–13 fast CGDisplay capture path with ImageIO hardware encoding
+            if matches!(format, CaptureFormat::Jpeg { .. } | CaptureFormat::Png) {
+                if let Some(frame) = Self::capture_via_cg_display(id, display_index, format, seq) {
+                    return Ok(frame);
+                }
+            }
+
+            // Legacy CoreGraphics window-list fallback via xcap
             capture_via_xcap(display_index, format, seq)
+        }
+    }
+
+    impl MacOsCaptureBackend {
+        fn capture_via_cg_display(
+            id: u32,
+            display_index: u32,
+            format: CaptureFormat,
+            seq: u64,
+        ) -> Option<CapturedFrame> {
+            let image = CGDisplay::new(id).image()?;
+            let width = image.width() as u32;
+            let height = image.height() as u32;
+            let data_ref = unsafe { CFDataCreateMutable(kCFAllocatorDefault, 0) };
+            if data_ref.is_null() {
+                return None;
+            }
+            let (uti, mime) = match format {
+                CaptureFormat::Png => ("public.png", "image/png"),
+                _ => ("public.jpeg", "image/jpeg"),
+            };
+            let uti_cf = CFString::new(uti);
+            let dest = unsafe {
+                CGImageDestinationCreateWithData(
+                    data_ref,
+                    uti_cf.as_concrete_TypeRef(),
+                    1,
+                    ptr::null(),
+                )
+            };
+            if dest.is_null() {
+                unsafe { CFRelease(data_ref as CFTypeRef) };
+                return None;
+            }
+            unsafe {
+                CGImageDestinationAddImage(dest, image.as_ptr() as *mut c_void, ptr::null());
+            }
+            let finalized = unsafe { CGImageDestinationFinalize(dest) };
+            unsafe { CFRelease(dest as CFTypeRef) };
+            if finalized == 0 {
+                unsafe { CFRelease(data_ref as CFTypeRef) };
+                return None;
+            }
+            let cf_data = unsafe { CFData::wrap_under_create_rule(data_ref as CFDataRef) };
+            if cf_data.is_empty() {
+                return None;
+            }
+            Some(CapturedFrame {
+                width,
+                height,
+                mime_type: mime.to_string(),
+                data: cf_data.bytes().to_vec(),
+                captured_at_ms: chrono::Utc::now().timestamp_millis(),
+                display_id: display_index,
+                seq,
+            })
         }
     }
 }
@@ -315,12 +361,12 @@ fn capture_via_xcap(
     encode_rgba_image(img, format, display_index, seq)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(not(target_os = "macos"))]
 struct XcapCaptureBackend {
     seq: AtomicU64,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(not(target_os = "macos"))]
 impl XcapCaptureBackend {
     fn new() -> Self {
         Self {
@@ -329,7 +375,7 @@ impl XcapCaptureBackend {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(not(target_os = "macos"))]
 impl ScreenCaptureBackend for XcapCaptureBackend {
     fn list_displays(&self) -> EngineResult<Vec<DisplayInfoDto>> {
         let monitors = xcap::Monitor::all()
@@ -362,28 +408,6 @@ impl ScreenCaptureBackend for XcapCaptureBackend {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-struct UnsupportedScreenCaptureBackend;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-impl ScreenCaptureBackend for UnsupportedScreenCaptureBackend {
-    fn list_displays(&self) -> EngineResult<Vec<DisplayInfoDto>> {
-        Err(RemoteEngineError::Unavailable(
-            "local desktop screen capture unavailable on iOS; use ReplayKit Broadcast Upload Extension".into(),
-        ))
-    }
-
-    fn capture_display(
-        &self,
-        _display_index: u32,
-        _format: CaptureFormat,
-    ) -> EngineResult<CapturedFrame> {
-        Err(RemoteEngineError::Unavailable(
-            "local desktop screen capture unavailable on iOS; use ReplayKit Broadcast Upload Extension".into(),
-        ))
-    }
-}
-
 pub struct ScreenCaptureEngine {
     backend: Arc<dyn ScreenCaptureBackend>,
     cache: RwLock<HashMap<u32, CapturedFrame>>,
@@ -404,13 +428,9 @@ impl ScreenCaptureEngine {
         {
             Self::with_backend(Arc::new(macos_capture::MacOsCaptureBackend::new()))
         }
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(not(target_os = "macos"))]
         {
             Self::with_backend(Arc::new(XcapCaptureBackend::new()))
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            Self::with_backend(Arc::new(UnsupportedScreenCaptureBackend))
         }
     }
 

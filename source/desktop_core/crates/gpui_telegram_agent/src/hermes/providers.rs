@@ -1714,7 +1714,19 @@ impl ProviderRouter {
 
     pub fn has_active_subscription(&self) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.subscriptions.iter().any(|s| s.active)
+        let has_backed_sub = guard.subscriptions.iter().any(|s| {
+            s.active
+                && guard.providers.get(&s.id).is_none_or(|p| p.enabled)
+                && (s.access_token.as_deref().is_some_and(|t| !t.trim().is_empty())
+                    || guard.synced_vertex_adcs.contains_key(&s.id)
+                    || guard.synced_codex_oauths.contains_key(&s.id)
+                    || guard.providers.get(&s.id).is_some_and(|p| {
+                        p.enabled && (!p.credentials.is_empty() || p.no_key_required)
+                    })
+                    || (!s.source_path.trim().is_empty()
+                        && std::path::Path::new(&s.source_path).is_file()))
+        });
+        has_backed_sub
             || guard.providers.values().any(|p| {
                 p.enabled
                     && p.is_subscription
@@ -2375,22 +2387,27 @@ impl ProviderRouter {
 
     pub fn find_best_available_subscription(&self) -> Option<String> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let is_enabled = |id: &str| guard.providers.get(id).is_none_or(|p| p.enabled);
 
         if let Some(sub) = guard
             .subscriptions
             .iter()
-            .find(|s| s.active && s.kind == SubscriptionKind::GoogleVertex)
+            .find(|s| s.active && is_enabled(&s.id) && s.kind == SubscriptionKind::GoogleVertex)
         {
             return Some(sub.id.clone());
         }
         if let Some(sub) = guard
             .subscriptions
             .iter()
-            .find(|s| s.active && s.kind == SubscriptionKind::CodexChatGpt)
+            .find(|s| s.active && is_enabled(&s.id) && s.kind == SubscriptionKind::CodexChatGpt)
         {
             return Some(sub.id.clone());
         }
-        if let Some(sub) = guard.subscriptions.iter().find(|s| s.active) {
+        if let Some(sub) = guard
+            .subscriptions
+            .iter()
+            .find(|s| s.active && is_enabled(&s.id))
+        {
             return Some(sub.id.clone());
         }
         if let Some(p) = guard.providers.values().find(|p| {
@@ -2412,7 +2429,7 @@ impl ProviderRouter {
         }) {
             return Some(p.id.clone());
         }
-        if let Some(sub) = guard.subscriptions.first() {
+        if let Some(sub) = guard.subscriptions.iter().find(|s| is_enabled(&s.id)) {
             return Some(sub.id.clone());
         }
 
@@ -9904,5 +9921,193 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
             .expect("vertex sse with id/retry lines must succeed");
         let _ = v_srv.join();
         assert_eq!(v_resp.content, "VERTEX_CTRL_OK");
+    }
+
+    #[test]
+    fn test_has_active_subscription_rejects_stripped_unbacked_account() {
+        let router = ProviderRouter::new();
+        {
+            let mut guard = router.inner.lock().unwrap();
+            guard.subscriptions.push(SubscriptionAccount {
+                id: "google_vertex:stripped".to_string(),
+                kind: SubscriptionKind::GoogleVertex,
+                label: "Stripped Vertex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::GeminiGenerateContent,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: None,
+                headers: Default::default(),
+            });
+            guard.subscriptions.push(SubscriptionAccount {
+                id: "codex:missing_file".to_string(),
+                kind: SubscriptionKind::CodexChatGpt,
+                label: "Missing File Codex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::CodexResponses,
+                default_model: None,
+                source_path: "/nonexistent/path/auth.json".to_string(),
+                expires_at_ms: None,
+                access_token: Some("   ".to_string()),
+                headers: Default::default(),
+            });
+        }
+
+        assert!(
+            !router.has_active_subscription(),
+            "Stripped or unbacked active SubscriptionAccount entries must not satisfy has_active_subscription"
+        );
+        assert!(
+            router.needs_provider_selection(),
+            "Router with only stripped subscriptions must still require provider selection"
+        );
+    }
+
+    #[test]
+    fn test_has_active_subscription_and_best_skip_disabled_provider_config() {
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+        let cred_file = tmp_dir.path().join("auth.json");
+        std::fs::write(&cred_file, r#"{"access_token":"file-tok"}"#).expect("write cred file");
+
+        let router = ProviderRouter::new();
+        {
+            let mut guard = router.inner.lock().unwrap();
+            let codex_id = "codex:disabled_user".to_string();
+            let vertex_id = "google_vertex:disabled_adc".to_string();
+            let file_id = "codex:disabled_file".to_string();
+
+            guard.subscriptions.push(SubscriptionAccount {
+                id: codex_id.clone(),
+                kind: SubscriptionKind::CodexChatGpt,
+                label: "Disabled Codex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::CodexResponses,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: Some("eyJ-live-token".to_string()),
+                headers: Default::default(),
+            });
+            guard.synced_codex_oauths.insert(
+                codex_id.clone(),
+                CodexOAuthCredentials {
+                    refresh_token: "rt-live".to_string(),
+                    client_id: None,
+                    token_url: None,
+                },
+            );
+            let mut codex_cfg = subscription_to_provider_config(&guard.subscriptions[0]);
+            codex_cfg.enabled = false;
+            guard.providers.insert(codex_id, codex_cfg);
+
+            guard.subscriptions.push(SubscriptionAccount {
+                id: vertex_id.clone(),
+                kind: SubscriptionKind::GoogleVertex,
+                label: "Disabled Vertex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::GeminiGenerateContent,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: None,
+                headers: Default::default(),
+            });
+            guard.synced_vertex_adcs.insert(
+                vertex_id.clone(),
+                VertexAdcCredentials {
+                    client_id: "cid".to_string(),
+                    client_secret: "csec".to_string(),
+                    refresh_token: "rt".to_string(),
+                    quota_project_id: Some("proj-1".to_string()),
+                    account: Some("proj-1".to_string()),
+                },
+            );
+            let mut vertex_cfg = subscription_to_provider_config(&guard.subscriptions[1]);
+            vertex_cfg.enabled = false;
+            guard.providers.insert(vertex_id, vertex_cfg);
+
+            guard.subscriptions.push(SubscriptionAccount {
+                id: file_id.clone(),
+                kind: SubscriptionKind::CodexChatGpt,
+                label: "Disabled File".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::CodexResponses,
+                default_model: None,
+                source_path: cred_file.to_string_lossy().to_string(),
+                expires_at_ms: None,
+                access_token: None,
+                headers: Default::default(),
+            });
+            let mut file_cfg = subscription_to_provider_config(&guard.subscriptions[2]);
+            file_cfg.enabled = false;
+            guard.providers.insert(file_id, file_cfg);
+        }
+
+        assert!(
+            !router.has_active_subscription(),
+            "Disabled ProviderConfig must prevent subscription from counting as active"
+        );
+        assert!(
+            router.needs_provider_selection(),
+            "Router with only disabled subscription providers must require provider selection"
+        );
+        assert_eq!(
+            router.find_best_available_subscription(),
+            None,
+            "find_best_available_subscription must skip disabled subscription providers"
+        );
+
+        // Now add an enabled subscription alongside the disabled ones
+        {
+            let mut guard = router.inner.lock().unwrap();
+            let enabled_id = "codex:enabled_user".to_string();
+            guard.subscriptions.push(SubscriptionAccount {
+                id: enabled_id.clone(),
+                kind: SubscriptionKind::CodexChatGpt,
+                label: "Enabled Codex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::CodexResponses,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: Some("eyJ-enabled".to_string()),
+                headers: Default::default(),
+            });
+            let mut enabled_cfg = subscription_to_provider_config(&guard.subscriptions[3]);
+            enabled_cfg.enabled = true;
+            guard.providers.insert(enabled_id, enabled_cfg);
+        }
+
+        assert!(router.has_active_subscription());
+        assert!(!router.needs_provider_selection());
+        assert_eq!(
+            router.find_best_available_subscription().as_deref(),
+            Some("codex:enabled_user")
+        );
     }
 }

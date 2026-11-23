@@ -13,6 +13,7 @@ pub mod error;
 pub mod file_transfer;
 pub mod input;
 pub mod ipc;
+pub mod macos_permissions;
 pub mod power;
 pub mod terminal;
 
