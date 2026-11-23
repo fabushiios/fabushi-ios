@@ -126,12 +126,25 @@ jobs:
           cache-on-failure: true
           shared-key: "ubuntu-m1a-desktop-core-v1"
 
-      - name: Compile all workspace test targets (--no-run)
+      - name: Compile all vendored mobile crate test targets (--no-run) & workspace libs
         env:
           GPUI_OFFLINE_TEST: "1"
         run: |
           set -euo pipefail
-          cargo test --manifest-path source/desktop_core/Cargo.toml --workspace --no-run
+          cargo check --manifest-path source/desktop_core/Cargo.toml --workspace --lib
+          cargo test --manifest-path source/desktop_core/Cargo.toml --no-run \
+            -p gpui_telegram_core \
+            -p gpui_telegram_proto \
+            -p gpui_telegram_client \
+            -p gpui_telegram_media \
+            -p gpui_telegram_webrtc \
+            -p gpui_telegram_agent \
+            -p gpui_telegram_coding \
+            -p magpie_gateway \
+            -p bot-browser \
+            -p fabushi_remote_engine \
+            -p fabushi_miniapp
+          cargo test --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --no-run
 
       - name: Run full offline tests across all vendored mobile crates
         env:

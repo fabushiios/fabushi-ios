@@ -11,8 +11,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-webrtc = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
@@ -24,3 +22,10 @@ rubato = { workspace = true }
 image = { workspace = true }
 fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
 mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
+
+# iOS target_os adaptation: webrtc 0.11 -> webrtc-util 0.9 -> nix 0.26.4 references macOS-only
+# libc::sockaddr_ctl/AF_SYS_CONTROL removed from iOS SDK in libc 0.2.191. On iOS, native
+# LiveKitWebRTC + CallKit + ReplayKit owns real-time peer transport while Rust keeps signaling/SFU/codecs.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+webrtc = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

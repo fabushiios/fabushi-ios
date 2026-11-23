@@ -4,13 +4,16 @@ use super::calls_controller_tgvoip::TgVoipEndpoint;
 use super::calls_controller_webrtc::{CallsControllerWebrtc, WebrtcSessionState};
 use super::calls_emoji_fingerprint::CallsEmojiFingerprint;
 use super::calls_instance::{CallSound, CallsInstance};
+#[cfg(not(target_os = "ios"))]
 use super::peer_transport::WebRtcPeerTransport;
 use crate::ice::TurnToken;
 use crate::signaling::{CallSession, CallState as SignalState, SignalingFrame};
 use gpui_telegram_core::types::UserId;
 use std::collections::VecDeque;
 use std::net::UdpSocket;
+#[cfg(not(target_os = "ios"))]
 use std::sync::Arc;
+#[cfg(not(target_os = "ios"))]
 use tokio::sync::Mutex;
 
 /// Pure-Rust SHA-256 digest (FIPS 180-4) for WebRTC DTLS fingerprint & 4-emoji verification.
@@ -118,6 +121,7 @@ pub struct WebRtcCallEngine {
     pub turn_tokens: Vec<TurnToken>,
     pub local_sdp: Option<String>,
     pub remote_sdp: Option<String>,
+    #[cfg(not(target_os = "ios"))]
     pub peer_transport: Option<Arc<Mutex<WebRtcPeerTransport>>>,
     outbound: VecDeque<SignalingFrame>,
     _local_udp: Option<UdpSocket>,
@@ -138,16 +142,19 @@ impl WebRtcCallEngine {
             turn_tokens,
             local_sdp: None,
             remote_sdp: None,
+            #[cfg(not(target_os = "ios"))]
             peer_transport: None,
             outbound: VecDeque::new(),
             _local_udp: UdpSocket::bind("0.0.0.0:0").ok(),
         }
     }
 
+    #[cfg(not(target_os = "ios"))]
     pub fn attach_peer_transport(&mut self, transport: WebRtcPeerTransport) {
         self.peer_transport = Some(Arc::new(Mutex::new(transport)));
     }
 
+    #[cfg(not(target_os = "ios"))]
     pub fn with_peer_transport(mut self, transport: WebRtcPeerTransport) -> Self {
         self.attach_peer_transport(transport);
         self
