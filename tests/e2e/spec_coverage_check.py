@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import io
 import json
 import re
 import sys
+import tokenize
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -87,9 +89,16 @@ ALLOWED_TIER_FILES: dict[str, set[str]] = {
 }
 ALL_ALLOWED_TIER_FILES = set().union(*ALLOWED_TIER_FILES.values())
 
+EXPECTED_SCHEMA_VERSION_V168 = "fabushi.ios.e2e.feature_matrix.v168"
+EXPECTED_UPSTREAM_REPO = "bhrumom/gpui-telegram"
+EXPECTED_UPSTREAM_BRANCH = "main"
 EXPECTED_UPSTREAM_COMMIT_V168 = "424aa33cf67a11a778da2dd3b8cca7ea35072b07"
 EXPECTED_UPSTREAM_TREE_V168 = "181a98ba298a49e64ae0ce5b6ac0160616134708"
 EXPECTED_UPSTREAM_RELEASE_V168 = "Fabushi v1.6.8"
+EXPECTED_UPSTREAM_TRACKED_BLOBS = 11351
+EXPECTED_UPSTREAM_CRATES_BLOBS = 3063
+EXPECTED_UPSTREAM_INHERITED_BLOBS = 7713
+EXPECTED_UPSTREAM_GITLINKS = 0
 EXPECTED_IOS_MARKETING_VERSION = "1.6.8"
 EXPECTED_IOS_BUILD_NUMBER = 35
 
@@ -280,8 +289,45 @@ RPC_DISPATCH_CALL_RE = re.compile(
 )
 
 SWIFT_TYPE_DECL_RE = re.compile(r"\b(class|extension)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+SWIFT_ENUM_DECL_RE = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)\b")
 SWIFT_FUNC_DECL_RE = re.compile(r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-SWIFT_FORBIDDEN_TEST_MODIFIER_RE = re.compile(r"\b(?:private|fileprivate|static|class)\b")
+SWIFT_DECL_MODIFIERS: frozenset[str] = frozenset(
+    {
+        "private",
+        "fileprivate",
+        "internal",
+        "package",
+        "public",
+        "open",
+        "final",
+        "static",
+        "class",
+        "override",
+        "required",
+        "convenience",
+        "dynamic",
+        "indirect",
+        "lazy",
+        "mutating",
+        "nonmutating",
+        "optional",
+        "nonisolated",
+        "isolated",
+        "distributed",
+        "async",
+        "actor",
+        "consuming",
+        "borrowing",
+        "sending",
+        "prefix",
+        "postfix",
+        "infix",
+    }
+)
+SWIFT_FORBIDDEN_TEST_MODIFIERS: frozenset[str] = frozenset(
+    {"private", "fileprivate", "static", "class"}
+)
+SWIFT_FORBIDDEN_TYPE_MODIFIERS: frozenset[str] = frozenset({"private", "fileprivate"})
 SWIFT_ASSERTION_CALL_RE = re.compile(
     r"\b(?:"
     r"XCTAssert(?:True|False|Equal|NotEqual|Nil|NotNil|GreaterThan|GreaterThanOrEqual|LessThan|LessThanOrEqual|ThrowsError|NoThrow)?|"
@@ -291,27 +337,99 @@ SWIFT_ASSERTION_CALL_RE = re.compile(
     r"require[A-Z][A-Za-z0-9_]*"
     r")\s*\("
 )
-SWIFT_FEATURE_TAG_RE = re.compile(r"(?<![A-Za-z0-9])(F(?:0[1-9]|[12][0-9]|3[0-4]))(?![0-9])")
+# Strict non-alphanumeric boundaries on BOTH sides: prevents `#F01ABC` / `F12px` false matches.
+SWIFT_FEATURE_TAG_RE = re.compile(
+    r"(?<![A-Za-z0-9])(F(?:0[1-9]|[12][0-9]|3[0-4]))(?![A-Za-z0-9])"
+)
+SWIFT_ACCESSIBILITY_REF_RE = re.compile(
+    r"\bFabushiAccessibilityIDs\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+SWIFT_STATIC_LET_STR_RE = re.compile(
+    r'\bstatic\s+let\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*String\s*)?=\s*"([^"\n]+)"'
+)
+SWIFT_UI_NS_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])("
+    + "|".join(re.escape(ns) for ns in EXPECTED_UI_NAMESPACES)
+    + r")\.[A-Za-z0-9_.]+"
+)
+SWIFT_SILENT_SKIP_WAIT_RE = re.compile(r"\bif\s+[^{}\n]*\bwaitForExistence\s*\(")
 
 SWIFT_FORBIDDEN_CODE_REGEXES: list[tuple[str, re.Pattern[str]]] = [
+    ("conditional_compilation_if", re.compile("#" + r"\s*(?:if|elseif)\b")),
     ("testable_import", re.compile(r"@test" + r"able\s+import\b")),
-    ("import_fabushi", re.compile(r"\bimport\s+Fabu" + r"shi\b")),
-    ("xctskip", re.compile(r"\b" + "XCT" + r"Skip(?:If|Unless)?\b")),
-    ("tautological_xctassert_true", re.compile(r"\bXCTAssert(?:True)?\s*\(\s*true\s*(?:,|\))")),
-    ("tautological_xctassert_false", re.compile(r"\bXCTAssertFalse\s*\(\s*false\s*(?:,|\))")),
     (
-        "tautological_xctassert_equal",
-        re.compile(r"\bXCTAssertEqual\s*\(\s*(true|false|\d+)\s*,\s*\1\s*(?:,|\))"),
+        "import_fabushi",
+        re.compile(
+            r"\bimport\s+(?:(?:typealias|struct|class|enum|protocol|let|var|func|actor)\s+)?Fabu"
+            + r"shi\b"
+        ),
     ),
-    ("sync_setup_teardown_with_error", re.compile(r"\bfunc\s+(?:setUpWithError|tearDownWithError)\s*\(")),
+    ("xctskip", re.compile(r"\b" + "XCT" + r"Skip(?:If|Unless)?\b")),
+    (
+        "tautological_xctassert_true",
+        re.compile(
+            r"\bXCTAssert(?:True)?\s*\(\s*\(*\s*"
+            r"(?:true|!\s*\(*\s*false\s*\)*|(\d+(?:\.\d+)?|true|false)\s*==\s*\1)"
+            r"\s*\)*\s*(?:,|\))"
+        ),
+    ),
+    (
+        "tautological_xctassert_false",
+        re.compile(
+            r"\bXCTAssertFalse\s*\(\s*\(*\s*"
+            r"(?:false|!\s*\(*\s*true\s*\)*|(\d+(?:\.\d+)?|true|false)\s*!=\s*\1)"
+            r"\s*\)*\s*(?:,|\))"
+        ),
+    ),
+    (
+        "tautological_xctassert_nil",
+        re.compile(r"\bXCTAssertNil\s*\(\s*\(*\s*nil\s*\)*\s*(?:,|\))"),
+    ),
+    (
+        "tautological_xctassert_notnil_literal",
+        re.compile(
+            r"\bXCTAssertNotNil\s*\(\s*\(*\s*(?:true|false|\d+(?:\.\d+)?)\s*\)*\s*(?:,|\))"
+        ),
+    ),
+    (
+        "sync_setup_teardown_with_error",
+        re.compile(r"\bfunc\s+(?:setUpWithError|tearDownWithError)\s*\("),
+    ),
     (
         "sync_override_setup_teardown",
-        re.compile(r"\boverride\s+func\s+(?:setUp|tearDown)\s*\(\s*\)\s*(?:throws\s*)?\{"),
+        re.compile(
+            r"\boverride\b(?:\s+(?:public|open|internal|package|fileprivate|private|class|static|final|dynamic|nonisolated))*"
+            r"\s+func\s+(?:setUp|tearDown)\s*\(\s*\)"
+            r"(?:\s+throws)?(?:\s*->\s*(?:Void|\(\s*\)))?\s*\{"
+        ),
     ),
-    ("nspredicate_block_or_closure", re.compile(r"\bNSPredicate\s*\(\s*block\s*:|\bNSPredicate\s*\{")),
-    ("runloop_current_run", re.compile(r"\bRunLoop\s*\.\s*current\s*\.\s*run\b|\bCFRunLoopRun\b")),
-    ("xctwaiter_sync_wait", re.compile(r"\bXCTWaiter\s*\.\s*wait\s*\(")),
+    (
+        "nspredicate_block_or_closure",
+        re.compile(r"\bNSPredicate(?:\s*\.\s*init)?\s*(?:\(\s*block\s*:|\{)"),
+    ),
+    (
+        "runloop_current_run",
+        re.compile(
+            r"\bRunLoop\s*\.\s*(?:current|main)\s*\.\s*run\b|\bCFRunLoopRun(?:InMode)?\b"
+        ),
+    ),
+    (
+        "xctwaiter_sync_wait",
+        re.compile(r"\bXCTWaiter(?:\s*\.\s*init)?\s*(?:\([^)]*\))?\s*\.\s*wait\s*\("),
+    ),
 ]
+
+SWIFT_ASSERT_CALL_SITE_RE = re.compile(
+    r"\b(XCTAssert(?:True)?|XCTAssertEqual|XCTAssertNotNil|XCTAssertGreaterThanOrEqual|XCTAssertLessThanOrEqual)\s*\("
+)
+SWIFT_STRING_LIT_RE = re.compile(r'^(?:"(?:\\.|[^"\\\n])*"|(#+)"[^"\n]*"\1)$')
+SWIFT_SIMPLE_LITERAL_OR_PATH_RE = re.compile(
+    r"^(?:true|false|nil|-?\d+(?:\.\d+)?|[A-Za-z_][A-Za-z0-9_.]*)$"
+)
+SWIFT_STRING_SELF_EQ_RE = re.compile(
+    r'^("(?:\\.|[^"\\\n])*"|(#+)"[^"\n]*"\2)\s*==\s*\1$'
+)
+SWIFT_ZERO_LIT_RE = re.compile(r"^0+(?:\.0+)?$")
 
 
 def lex_rust_source(source: str) -> tuple[str, str]:
@@ -654,7 +772,13 @@ def lex_swift_source(source: str) -> tuple[str, str, list[str]]:
                 hashes += 1
                 j += 1
             if j < n and source[j] == '"':
-                multiline = source[j : j + 3] == '"""'
+                multiline = False
+                if source[j : j + 3] == '"""':
+                    k = j + 3
+                    while k < n and source[k] in (" ", "\t"):
+                        k += 1
+                    if k < n and source[k] in ("\n", "\r"):
+                        multiline = True
                 open_len = 3 if multiline else 1
                 stop = j + open_len
                 for p in range(i, stop):
@@ -683,34 +807,312 @@ def lex_swift_source(source: str) -> tuple[str, str, list[str]]:
     return "".join(no_comments), "".join(code_only), string_literals
 
 
+def _match_balanced_backward(
+    text: str, close_idx: int, bound: int, open_ch: str, close_ch: str
+) -> int:
+    depth = 0
+    idx = close_idx
+    while idx >= bound:
+        ch = text[idx]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return idx
+        idx -= 1
+    return -1
+
+
+def _extract_swift_decl_modifiers(code_only: str, decl_idx: int, bound: int) -> list[str]:
+    """Walk backward across newlines from `func`/`class`/`extension` collecting attached modifiers."""
+    modifiers: list[str] = []
+    pos = decl_idx
+    while pos > bound:
+        while pos > bound and code_only[pos - 1].isspace():
+            pos -= 1
+        if pos <= bound:
+            break
+        ch = code_only[pos - 1]
+        if ch == ")":
+            open_p = _match_balanced_backward(code_only, pos - 1, bound, "(", ")")
+            if open_p == -1:
+                break
+            cur = open_p
+            while cur > bound and code_only[cur - 1].isspace():
+                cur -= 1
+            ident_end = cur
+            while cur > bound and (
+                code_only[cur - 1].isalnum() or code_only[cur - 1] in ("_", ".")
+            ):
+                cur -= 1
+            ident = code_only[cur:ident_end]
+            if cur > bound and code_only[cur - 1] == "@":
+                pos = cur - 1
+                continue
+            if ident in SWIFT_DECL_MODIFIERS and (cur == bound or code_only[cur - 1] != "."):
+                modifiers.append(ident)
+                pos = cur
+                continue
+            break
+        if ch.isalnum() or ch == "_":
+            ident_end = pos
+            cur = pos
+            while cur > bound and (code_only[cur - 1].isalnum() or code_only[cur - 1] == "_"):
+                cur -= 1
+            tok = code_only[cur:ident_end]
+            attr_cur = cur
+            while attr_cur > bound and (
+                code_only[attr_cur - 1].isalnum() or code_only[attr_cur - 1] in ("_", ".")
+            ):
+                attr_cur -= 1
+            if attr_cur > bound and code_only[attr_cur - 1] == "@":
+                pos = attr_cur - 1
+                continue
+            if cur > bound and code_only[cur - 1] == ".":
+                break
+            if tok in SWIFT_DECL_MODIFIERS:
+                modifiers.append(tok)
+                pos = cur
+                continue
+            break
+        break
+    modifiers.reverse()
+    return modifiers
+
+
+def _split_top_level_arg_spans(
+    code_only: str, inner_start: int, inner_end: int
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    arg_start = inner_start
+    for idx in range(inner_start, inner_end):
+        ch = code_only[idx]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            spans.append((arg_start, idx))
+            arg_start = idx + 1
+    spans.append((arg_start, inner_end))
+    return spans
+
+
+def _strip_balanced_outer_parens(expr: str) -> str:
+    s = expr.strip()
+    while len(s) >= 2 and s[0] == "(" and _match_balanced(s, 0, "(", ")") == len(s) - 1:
+        s = s[1:-1].strip()
+    return s
+
+
+def _find_swift_tautological_or_vacuous_asserts(
+    no_comments: str, code_only: str
+) -> list[tuple[str, int]]:
+    """Inspect Swift XCTAssert calls using balanced arg spans on both code_only and no_comments."""
+    hits: list[tuple[str, int]] = []
+    for m in SWIFT_ASSERT_CALL_SITE_RE.finditer(code_only):
+        call_name = m.group(1)
+        paren_open = m.end() - 1
+        paren_close = _match_balanced(code_only, paren_open, "(", ")")
+        if paren_close == -1:
+            continue
+        spans = _split_top_level_arg_spans(code_only, paren_open + 1, paren_close)
+        args_code = [_strip_balanced_outer_parens(code_only[s:e]) for s, e in spans]
+        args_nc = [_strip_balanced_outer_parens(no_comments[s:e]) for s, e in spans]
+        line_no = code_only.count("\n", 0, m.start()) + 1
+
+        if call_name == "XCTAssertEqual" and len(args_nc) >= 2:
+            lhs, rhs = args_nc[0], args_nc[1]
+            if lhs and lhs == rhs and (
+                SWIFT_STRING_LIT_RE.match(lhs)
+                or (SWIFT_SIMPLE_LITERAL_OR_PATH_RE.match(lhs) and "(" not in args_code[0])
+            ):
+                hits.append(("tautological_xctassert_equal", line_no))
+        elif call_name in ("XCTAssert", "XCTAssertTrue") and len(args_nc) >= 1:
+            if SWIFT_STRING_SELF_EQ_RE.match(args_nc[0]):
+                hits.append(("tautological_xctassert_true_string_eq", line_no))
+        elif call_name == "XCTAssertNotNil" and len(args_nc) >= 1:
+            if SWIFT_STRING_LIT_RE.match(args_nc[0]):
+                hits.append(("tautological_xctassert_notnil_string", line_no))
+        elif call_name == "XCTAssertGreaterThanOrEqual" and len(args_code) >= 2:
+            if SWIFT_ZERO_LIT_RE.match(args_code[1]):
+                hits.append(("vacuous_xctassert_ge_zero", line_no))
+        elif call_name == "XCTAssertLessThanOrEqual" and len(args_code) >= 2:
+            if SWIFT_ZERO_LIT_RE.match(args_code[0]):
+                hits.append(("vacuous_xctassert_zero_le", line_no))
+    return hits
+
+
+def _extract_accessibility_id_symbol_map(
+    lexed_files: list[tuple[Path, str, str, str, str, list[str]]]
+) -> dict[tuple[str, str], str]:
+    """Map (NestedEnumName, memberName) -> canonical `fabushi.<ns>` strictly for real element IDs."""
+    symbol_to_ns: dict[tuple[str, str], str] = {}
+    for _, _, _, no_comments, code_only, _ in lexed_files:
+        m_root = re.search(r"\benum\s+FabushiAccessibilityIDs\b", code_only)
+        if not m_root:
+            continue
+        root_open = code_only.find("{", m_root.end())
+        if root_open == -1:
+            continue
+        root_close = _match_balanced(code_only, root_open, "{", "}")
+        if root_close == -1:
+            continue
+        j = root_open + 1
+        depth = 1
+        while j < root_close:
+            ch = code_only[j]
+            if ch == "{":
+                depth += 1
+                j += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                j += 1
+                continue
+            if depth == 1:
+                m_enum = SWIFT_ENUM_DECL_RE.match(code_only, j)
+                if m_enum and (
+                    j == root_open + 1 or not (code_only[j - 1].isalnum() or code_only[j - 1] == "_")
+                ):
+                    enum_name = m_enum.group(1)
+                    e_open = code_only.find("{", m_enum.end(), root_close)
+                    if e_open == -1:
+                        j = m_enum.end()
+                        continue
+                    e_close = _match_balanced(code_only, e_open, "{", "}")
+                    if e_close == -1 or e_close >= root_close:
+                        break
+                    enum_nc = no_comments[e_open + 1 : e_close]
+                    for m_let in SWIFT_STATIC_LET_STR_RE.finditer(enum_nc):
+                        member_name = m_let.group(1)
+                        val = m_let.group(2)
+                        for ns in EXPECTED_UI_NAMESPACES:
+                            if val.startswith(f"{ns}."):
+                                symbol_to_ns[(enum_name, member_name)] = ns
+                                break
+                    j = e_close + 1
+                    continue
+            j += 1
+    return symbol_to_ns
+
+
+def _extract_swift_ui_ns_counts(
+    body_code: str, body_raw: str, id_symbol_to_ns: dict[tuple[str, str], str]
+) -> Counter[str]:
+    """Count UI namespace references inside a Swift method body (resolved symbolic IDs + literals)."""
+    counts: Counter[str] = Counter()
+    for m_ref in SWIFT_ACCESSIBILITY_REF_RE.finditer(body_code):
+        ns = id_symbol_to_ns.get((m_ref.group(1), m_ref.group(2)))
+        if ns:
+            counts[ns] += 1
+    _, _, body_literals = lex_swift_source(body_raw)
+    for lit in body_literals:
+        for m_lit in SWIFT_UI_NS_LITERAL_RE.finditer(lit):
+            counts[m_lit.group(1)] += 1
+    return counts
+
+
+def _strip_python_comments(source: str) -> str:
+    """Return Python source with `#` comment tokens stripped via stdlib tokenize."""
+    tokens: list[str] = []
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        tokens.append(tok.string)
+    return " ".join(tokens)
+
+
 def parse_swift_v167_files(
     v167_files: list[Path], repo_root: Path
-) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[str, int], list[str], list[str]]:
-    """Parse V167 Swift 6 XCUITest classes, extensions, and top-level `func test*` methods.
+) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[str, int], dict[str, int], list[str]]:
+    """Parse V167 Swift 6 XCUITest classes, extensions, helpers, and top-level `func test*` methods.
 
-    Returns (tier_methods_by_class, class_decl_counts, all_string_literals, parse_errors).
+    Returns (tier_methods_by_class, class_decl_counts, tier_ui_namespace_hits, parse_errors).
     """
     tier_methods: dict[str, dict[str, dict[str, Any]]] = {
         cls_name: {} for cls_name in SWIFT_CLASS_TO_TIER
     }
     class_decl_counts: dict[str, int] = {cls_name: 0 for cls_name in SWIFT_CLASS_TO_TIER}
-    all_string_literals: list[str] = []
+    tier_ui_namespace_hits: dict[str, int] = {ns: 0 for ns in EXPECTED_UI_NAMESPACES}
     parse_errors: list[str] = []
 
+    # Stage 1: Lex every V167 Swift file & run file-wide anti-pattern / tautology scans
+    lexed_files: list[tuple[Path, str, str, str, str, list[str]]] = []
     for sf in v167_files:
         rel = sf.relative_to(repo_root).as_posix()
         raw_text = sf.read_text(encoding="utf-8")
         no_comments, code_only, literals = lex_swift_source(raw_text)
-        all_string_literals.extend(literals)
+        lexed_files.append((sf, rel, raw_text, no_comments, code_only, literals))
 
         for label, regex in SWIFT_FORBIDDEN_CODE_REGEXES:
             if regex.search(code_only):
                 parse_errors.append(f"FORBIDDEN Swift 6 pattern `{label}` detected in {rel}")
+        for label, line_no in _find_swift_tautological_or_vacuous_asserts(no_comments, code_only):
+            parse_errors.append(f"FORBIDDEN Swift assertion `{label}` detected in {rel}:{line_no}")
 
+    # Stage 2: Resolve FabushiAccessibilityIDs symbol map & non-test helper namespace closure
+    id_symbol_to_ns = _extract_accessibility_id_symbol_map(lexed_files)
+    defined_id_nss = set(id_symbol_to_ns.values())
+    missing_catalog_nss = sorted(set(EXPECTED_UI_NAMESPACES) - defined_id_nss)
+    if missing_catalog_nss:
+        parse_errors.append(
+            f"FabushiAccessibilityIDs is missing real element IDs for namespaces: {missing_catalog_nss}"
+        )
+
+    base_helper_ns: dict[str, set[str]] = {}
+    base_helper_bodies: dict[str, str] = {}
+    tier_helper_ns: dict[str, dict[str, set[str]]] = {cls: {} for cls in SWIFT_CLASS_TO_TIER}
+    tier_helper_bodies: dict[str, dict[str, str]] = {cls: {} for cls in SWIFT_CLASS_TO_TIER}
+
+    def _collect_methods_in_body(
+        raw_text: str, no_comments: str, code_only: str, open_brace: int, close_brace: int
+    ) -> list[tuple[str, int, int, int, int, int]]:
+        found: list[tuple[str, int, int, int, int, int]] = []
+        j = open_brace + 1
+        inner_depth = 1
+        while j < close_brace:
+            ch_in = code_only[j]
+            if ch_in == "{":
+                inner_depth += 1
+                j += 1
+                continue
+            if ch_in == "}":
+                inner_depth -= 1
+                j += 1
+                continue
+            if inner_depth == 1:
+                m_fn = SWIFT_FUNC_DECL_RE.match(code_only, j)
+                if m_fn and (
+                    j == open_brace + 1
+                    or not (code_only[j - 1].isalnum() or code_only[j - 1] == "_")
+                ):
+                    fn_name = m_fn.group(1)
+                    paren_open = m_fn.end() - 1
+                    paren_close = _match_balanced(code_only, paren_open, "(", ")")
+                    if paren_close == -1:
+                        j = m_fn.end()
+                        continue
+                    body_open = code_only.find("{", paren_close + 1, close_brace)
+                    if body_open == -1:
+                        j = paren_close + 1
+                        continue
+                    body_close = _match_balanced(code_only, body_open, "{", "}")
+                    if body_close == -1 or body_close >= close_brace:
+                        break
+                    found.append((fn_name, j, paren_open, paren_close, body_open, body_close))
+                    j = body_close + 1
+                    continue
+            j += 1
+        return found
+
+    type_blocks: list[tuple[str, str, str, str, str, str, str, int, int, int]] = []
+    for _, rel, raw_text, no_comments, code_only, _ in lexed_files:
         n = len(code_only)
         i = 0
         brace_depth = 0
-
         while i < n:
             c = code_only[i]
             if c == "{":
@@ -721,7 +1123,6 @@ def parse_swift_v167_files(
                 brace_depth = max(0, brace_depth - 1)
                 i += 1
                 continue
-
             if brace_depth == 0:
                 m_type = SWIFT_TYPE_DECL_RE.match(code_only, i)
                 if m_type and (i == 0 or not (code_only[i - 1].isalnum() or code_only[i - 1] == "_")):
@@ -735,108 +1136,146 @@ def parse_swift_v167_files(
                     if close_brace == -1:
                         parse_errors.append(f"unclosed `{kind} {type_name}` body in {rel}")
                         break
-
-                    header_tail = code_only[m_type.end() : open_brace]
-                    if kind == "class" and type_name in class_decl_counts:
-                        class_decl_counts[type_name] += 1
-                        sup_m = re.search(r":\s*([A-Za-z_][A-Za-z0-9_]*)", header_tail)
-                        if not sup_m or sup_m.group(1) not in ALLOWED_SWIFT_BASE_CLASSES:
-                            parse_errors.append(
-                                f"Swift tier class `{type_name}` in {rel} must inherit from one of {sorted(ALLOWED_SWIFT_BASE_CLASSES)}"
-                            )
-
-                    track_tier_class = type_name in SWIFT_CLASS_TO_TIER
-                    forbid_tests_in_base = type_name in {"FabushiE2EUITestCase", "FabushiV167BaseUITestCase"}
-
-                    if track_tier_class or forbid_tests_in_base:
-                        j = open_brace + 1
-                        inner_depth = 1
-                        while j < close_brace:
-                            ch_in = code_only[j]
-                            if ch_in == "{":
-                                inner_depth += 1
-                                j += 1
-                                continue
-                            if ch_in == "}":
-                                inner_depth -= 1
-                                j += 1
-                                continue
-                            if inner_depth == 1:
-                                m_fn = SWIFT_FUNC_DECL_RE.match(code_only, j)
-                                if m_fn and (
-                                    j == open_brace + 1
-                                    or not (code_only[j - 1].isalnum() or code_only[j - 1] == "_")
-                                ):
-                                    fn_name = m_fn.group(1)
-                                    paren_open = m_fn.end() - 1
-                                    paren_close = _match_balanced(code_only, paren_open, "(", ")")
-                                    if paren_close == -1:
-                                        parse_errors.append(f"unclosed parameter list for `{fn_name}` in {rel}")
-                                        j = m_fn.end()
-                                        continue
-                                    body_open = code_only.find("{", paren_close + 1, close_brace)
-                                    if body_open == -1:
-                                        j = paren_close + 1
-                                        continue
-                                    body_close = _match_balanced(code_only, body_open, "{", "}")
-                                    if body_close == -1 or body_close >= close_brace:
-                                        parse_errors.append(f"unclosed body brace for `{fn_name}` in {rel}")
-                                        break
-
-                                    if fn_name.startswith("test"):
-                                        start_line = code_only.count("\n", 0, j) + 1
-                                        if forbid_tests_in_base:
-                                            parse_errors.append(
-                                                f"FORBIDDEN `func {fn_name}` inside base class `{type_name}` ({rel}:{start_line}); base class must declare 0 test methods"
-                                            )
-                                        else:
-                                            # Inspect declaration prefix on same statement for forbidden modifiers
-                                            stmt_start = max(
-                                                code_only.rfind("\n", open_brace + 1, j),
-                                                code_only.rfind(";", open_brace + 1, j),
-                                                open_brace,
-                                            )
-                                            prefix_slice = code_only[stmt_start + 1 : j]
-                                            if SWIFT_FORBIDDEN_TEST_MODIFIER_RE.search(prefix_slice):
-                                                parse_errors.append(
-                                                    f"FORBIDDEN visibility/static modifier on XCTest method `{type_name}.{fn_name}` ({rel}:{start_line})"
-                                                )
-                                            params_inner = code_only[paren_open + 1 : paren_close].strip()
-                                            if params_inner:
-                                                parse_errors.append(
-                                                    f"XCTest method `{type_name}.{fn_name}` ({rel}:{start_line}) must take empty `()` parameter list"
-                                                )
-                                            sig_tail = code_only[paren_close + 1 : body_open]
-                                            if "->" in sig_tail:
-                                                parse_errors.append(
-                                                    f"XCTest method `{type_name}.{fn_name}` ({rel}:{start_line}) must return Void (no `->`)"
-                                                )
-                                            body_code = code_only[body_open + 1 : body_close]
-                                            body_nc = no_comments[body_open + 1 : body_close]
-                                            sub_lines = sum(1 for ln in body_nc.splitlines() if ln.strip())
-                                            has_assert = bool(SWIFT_ASSERTION_CALL_RE.search(body_code))
-                                            feat_tags = set(SWIFT_FEATURE_TAG_RE.findall(fn_name))
-                                            feat_tags.update(SWIFT_FEATURE_TAG_RE.findall(body_nc))
-                                            if fn_name in tier_methods[type_name]:
-                                                parse_errors.append(
-                                                    f"duplicate Swift XCTest method `{type_name}.{fn_name}` in {rel}:{start_line}"
-                                                )
-                                            tier_methods[type_name][fn_name] = {
-                                                "file": rel,
-                                                "start_line": start_line,
-                                                "substantive_lines": sub_lines,
-                                                "has_assertion": has_assert,
-                                                "features": sorted(feat_tags),
-                                            }
-                                    j = body_close + 1
-                                    continue
-                            j += 1
-
+                    type_blocks.append(
+                        (rel, raw_text, no_comments, code_only, kind, type_name, code_only[m_type.end() : open_brace], i, open_brace, close_brace)
+                    )
+                    if type_name in {"FabushiE2EUITestCase", "FabushiV167BaseUITestCase"} or type_name in SWIFT_CLASS_TO_TIER:
+                        for fn_name, _, _, _, body_open, body_close in _collect_methods_in_body(
+                            raw_text, no_comments, code_only, open_brace, close_brace
+                        ):
+                            if not fn_name.startswith("test"):
+                                b_code = code_only[body_open + 1 : body_close]
+                                b_raw = raw_text[body_open + 1 : body_close]
+                                nss = set(_extract_swift_ui_ns_counts(b_code, b_raw, id_symbol_to_ns).keys())
+                                if type_name in SWIFT_CLASS_TO_TIER:
+                                    tier_helper_ns[type_name].setdefault(fn_name, set()).update(nss)
+                                    tier_helper_bodies[type_name][fn_name] = (
+                                        tier_helper_bodies[type_name].get(fn_name, "") + "\n" + b_code
+                                    )
+                                else:
+                                    base_helper_ns.setdefault(fn_name, set()).update(nss)
+                                    base_helper_bodies[fn_name] = (
+                                        base_helper_bodies.get(fn_name, "") + "\n" + b_code
+                                    )
                     i = close_brace + 1
                     continue
             i += 1
 
-    return tier_methods, class_decl_counts, all_string_literals, parse_errors
+    def _propagate_helpers(ns_map: dict[str, set[str]], body_map: dict[str, str]) -> None:
+        max_iters = len(ns_map) + 1
+        for _ in range(max_iters):
+            changed = False
+            for caller, body_c in body_map.items():
+                caller_set = ns_map.setdefault(caller, set())
+                for callee, callee_nss in ns_map.items():
+                    if callee == caller or not callee_nss:
+                        continue
+                    if not callee_nss.issubset(caller_set) and re.search(
+                        rf"\b{re.escape(callee)}\s*\(", body_c
+                    ):
+                        caller_set.update(callee_nss)
+                        changed = True
+            if not changed:
+                break
+
+    _propagate_helpers(base_helper_ns, base_helper_bodies)
+    combined_helpers_by_tier: dict[str, dict[str, set[str]]] = {}
+    for cls_name in SWIFT_CLASS_TO_TIER:
+        merged_ns = {k: set(v) for k, v in base_helper_ns.items()}
+        merged_bodies = dict(base_helper_bodies)
+        for k, v in tier_helper_ns[cls_name].items():
+            merged_ns.setdefault(k, set()).update(v)
+        for k, b in tier_helper_bodies[cls_name].items():
+            merged_bodies[k] = merged_bodies.get(k, "") + "\n" + b
+        _propagate_helpers(merged_ns, merged_bodies)
+        combined_helpers_by_tier[cls_name] = merged_ns
+
+    # Stage 3: Extract classes, extensions, and top-level `func test*()` methods
+    for rel, raw_text, no_comments, code_only, kind, type_name, header_tail, type_idx, open_brace, close_brace in type_blocks:
+        if kind == "class" and type_name in class_decl_counts:
+            class_decl_counts[type_name] += 1
+            sup_m = re.search(r":\s*([A-Za-z_][A-Za-z0-9_]*)", header_tail)
+            if not sup_m or sup_m.group(1) not in ALLOWED_SWIFT_BASE_CLASSES:
+                parse_errors.append(
+                    f"Swift tier class `{type_name}` in {rel} must inherit from one of {sorted(ALLOWED_SWIFT_BASE_CLASSES)}"
+                )
+
+        track_tier_class = type_name in SWIFT_CLASS_TO_TIER
+        forbid_tests_in_base = type_name in {"FabushiE2EUITestCase", "FabushiV167BaseUITestCase"}
+        if not (track_tier_class or forbid_tests_in_base):
+            continue
+
+        type_line = code_only.count("\n", 0, type_idx) + 1
+        type_mods = set(_extract_swift_decl_modifiers(code_only, type_idx, 0))
+        bad_type_mods = sorted(type_mods & SWIFT_FORBIDDEN_TYPE_MODIFIERS)
+        if bad_type_mods:
+            parse_errors.append(
+                f"FORBIDDEN visibility modifier {bad_type_mods} on `{kind} {type_name}` ({rel}:{type_line}); XCTest cannot discover private/fileprivate classes or extensions"
+            )
+
+        for fn_name, j, paren_open, paren_close, body_open, body_close in _collect_methods_in_body(
+            raw_text, no_comments, code_only, open_brace, close_brace
+        ):
+            if not fn_name.startswith("test"):
+                continue
+            start_line = code_only.count("\n", 0, j) + 1
+            if forbid_tests_in_base:
+                parse_errors.append(
+                    f"FORBIDDEN `func {fn_name}` inside base class `{type_name}` ({rel}:{start_line}); base class must declare 0 test methods"
+                )
+                continue
+
+            fn_mods = set(_extract_swift_decl_modifiers(code_only, j, open_brace + 1))
+            bad_fn_mods = sorted(fn_mods & SWIFT_FORBIDDEN_TEST_MODIFIERS)
+            if bad_fn_mods:
+                parse_errors.append(
+                    f"FORBIDDEN visibility/static modifier {bad_fn_mods} on XCTest method `{type_name}.{fn_name}` ({rel}:{start_line})"
+                )
+            params_inner = code_only[paren_open + 1 : paren_close].strip()
+            if params_inner:
+                parse_errors.append(
+                    f"XCTest method `{type_name}.{fn_name}` ({rel}:{start_line}) must take empty `()` parameter list"
+                )
+            sig_tail = code_only[paren_close + 1 : body_open]
+            if "->" in sig_tail:
+                parse_errors.append(
+                    f"XCTest method `{type_name}.{fn_name}` ({rel}:{start_line}) must return Void (no `->`)"
+                )
+
+            body_code = code_only[body_open + 1 : body_close]
+            body_nc = no_comments[body_open + 1 : body_close]
+            body_raw = raw_text[body_open + 1 : body_close]
+            sub_lines = sum(1 for ln in body_nc.splitlines() if ln.strip())
+            has_assert = bool(SWIFT_ASSERTION_CALL_RE.search(body_code))
+            if SWIFT_SILENT_SKIP_WAIT_RE.search(body_code):
+                parse_errors.append(
+                    f"FORBIDDEN silent-skip `if ...waitForExistence(...)` branch inside `{type_name}.{fn_name}` ({rel}:{start_line})"
+                )
+            name_features = sorted(set(SWIFT_FEATURE_TAG_RE.findall(fn_name)))
+            direct_ui_counts = _extract_swift_ui_ns_counts(body_code, body_raw, id_symbol_to_ns)
+            for ns_k, cnt_v in direct_ui_counts.items():
+                tier_ui_namespace_hits[ns_k] = tier_ui_namespace_hits.get(ns_k, 0) + cnt_v
+            effective_ui_ns = set(direct_ui_counts.keys())
+            for callee, callee_nss in combined_helpers_by_tier[type_name].items():
+                if callee_nss and re.search(rf"\b{re.escape(callee)}\s*\(", body_code):
+                    effective_ui_ns.update(callee_nss)
+
+            if fn_name in tier_methods[type_name]:
+                parse_errors.append(
+                    f"duplicate Swift XCTest method `{type_name}.{fn_name}` in {rel}:{start_line}"
+                )
+            tier_methods[type_name][fn_name] = {
+                "file": rel,
+                "start_line": start_line,
+                "substantive_lines": sub_lines,
+                "has_assertion": has_assert,
+                "features": name_features,
+                "direct_ui_ns_counts": dict(direct_ui_counts),
+                "direct_ui_namespaces": sorted(direct_ui_counts.keys()),
+                "effective_ui_namespaces": sorted(effective_ui_ns),
+            }
+
+    return tier_methods, class_decl_counts, tier_ui_namespace_hits, parse_errors
 
 
 def rpc_matches_feature(rpc: str, fid: str) -> bool:
@@ -1203,23 +1642,25 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                 if bad_dep in txt:
                     record(f"FORBIDDEN internal Cargo path dependency `{bad_dep}` in {rel}")
 
-    # 11. Zero .gitignore-trapped filenames or target/ under tests/e2e/
+    # 11. Zero .gitignore-trapped filenames, __pycache__/*.pyc, or target/ under tests/e2e/
     e2e_root = repo_root / "tests/e2e"
     for p in sorted(e2e_root.rglob("*")):
         rel = p.relative_to(e2e_root)
         if "target" in rel.parts:
             record(f"FORBIDDEN target/ directory inside tests/e2e/: {rel.as_posix()}")
+        if "__pycache__" in rel.parts or p.suffix == ".pyc":
+            record(f"FORBIDDEN Python bytecode artifact inside tests/e2e/: {rel.as_posix()}")
         if p.is_file():
             for pat in GITIGNORE_TRAPPED_PATTERNS:
                 if fnmatch.fnmatch(p.name, pat):
                     record(f"FORBIDDEN .gitignore-trapped filename under tests/e2e/: {rel.as_posix()}")
 
-    # 12. Verify preserved legacy files, simulator_loopback_server.py, and live v1.6.8 authority lock
+    # 12. Verify preserved legacy files (comment-stripped), simulator_loopback_server.py, and live v1.6.8 authority lock
     master_suite = e2e_root / "master_e2e_suite.swift"
     if not master_suite.exists():
         record("tests/e2e/master_e2e_suite.swift is missing (still required by mobile/ios/project.yml:146)")
     else:
-        ms_txt = master_suite.read_text(encoding="utf-8")
+        ms_nc, _, _ = lex_swift_source(master_suite.read_text(encoding="utf-8"))
         for req_tok in (
             "public enum MasterE2ERunner",
             "Tier1FeatureCoverageSuite",
@@ -1227,16 +1668,16 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
             "Tier3CrossFeatureSuite",
             "Tier4RealWorldScenariosSuite",
         ):
-            if req_tok not in ms_txt:
+            if req_tok not in ms_nc:
                 record(f"tests/e2e/master_e2e_suite.swift missing preserved symbol `{req_tok}`")
 
     global_dharma_path = repo_root / "mobile/ios/FabushiUITests/GlobalDharmaJourneyUITests.swift"
     if not global_dharma_path.exists():
         record("mobile/ios/FabushiUITests/GlobalDharmaJourneyUITests.swift is missing")
     else:
-        gd_txt = global_dharma_path.read_text(encoding="utf-8")
+        gd_nc, _, _ = lex_swift_source(global_dharma_path.read_text(encoding="utf-8"))
         required_host_flag = 'app.launchEnvironment["FABUSHI_FEATURE_HOST_TEST"] = "0"'
-        if required_host_flag not in gd_txt:
+        if required_host_flag not in gd_nc:
             record(
                 "GlobalDharmaJourneyUITests.swift missing required CI literal `app.launchEnvironment[\"FABUSHI_FEATURE_HOST_TEST\"] = \"0\"`"
             )
@@ -1246,27 +1687,54 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
             "testPrepareGlobalDharmaOfflineAcceptance",
             "testGlobalDharmaOfflineColdStartHostWebMcpAndPersistence",
         ):
-            if req_sym not in gd_txt:
+            if req_sym not in gd_nc:
                 record(f"GlobalDharmaJourneyUITests.swift missing preserved symbol `{req_sym}`")
 
     legacy_ui_path = repo_root / "mobile/ios/FabushiUITests/FabushiUITests.swift"
     if not legacy_ui_path.exists():
         record("mobile/ios/FabushiUITests/FabushiUITests.swift is missing")
     else:
-        if "class FabushiUITests" not in legacy_ui_path.read_text(encoding="utf-8"):
+        legacy_nc, _, _ = lex_swift_source(legacy_ui_path.read_text(encoding="utf-8"))
+        if "class FabushiUITests" not in legacy_nc:
             record("mobile/ios/FabushiUITests/FabushiUITests.swift missing `class FabushiUITests`")
 
     loopback_py = e2e_root / "simulator_loopback_server.py"
     if not loopback_py.exists():
         record("tests/e2e/simulator_loopback_server.py is missing")
     else:
-        lb_txt = loopback_py.read_text(encoding="utf-8")
-        for req_flag in ("--self-test", "--url-file", "--port-file", "/__e2e__/reset", "/__e2e__/seed", "/__e2e__/fault", "/__e2e__/state"):
-            if req_flag not in lb_txt:
+        try:
+            lb_nc = _strip_python_comments(loopback_py.read_text(encoding="utf-8"))
+        except tokenize.TokenError as exc:
+            record(f"tests/e2e/simulator_loopback_server.py failed Python tokenization: {exc}")
+            lb_nc = ""
+        for req_flag in (
+            "--self-test",
+            "--url-file",
+            "--port-file",
+            "/__e2e__/reset",
+            "/__e2e__/seed",
+            "/__e2e__/fault",
+            "/__e2e__/state",
+            "/api/v1/ws",
+            "Sec-WebSocket-Accept",
+        ):
+            if req_flag not in lb_nc:
                 record(f"tests/e2e/simulator_loopback_server.py missing required flag/route `{req_flag}`")
 
-    # Verify live Fabushi v1.6.8 authority lock in feature_matrix.json and TEST_INFRA.md
+    # Verify full live Fabushi v1.6.8 authority lock in feature_matrix.json and TEST_INFRA.md
+    if matrix.get("schema_version") != EXPECTED_SCHEMA_VERSION_V168:
+        record(
+            f"feature_matrix.json schema_version must be `{EXPECTED_SCHEMA_VERSION_V168}`, got `{matrix.get('schema_version')}`"
+        )
     auth_obj = matrix.get("upstream_authority", {})
+    if auth_obj.get("repo") != EXPECTED_UPSTREAM_REPO:
+        record(
+            f"feature_matrix.json upstream_authority.repo must be `{EXPECTED_UPSTREAM_REPO}`, got `{auth_obj.get('repo')}`"
+        )
+    if auth_obj.get("branch") != EXPECTED_UPSTREAM_BRANCH:
+        record(
+            f"feature_matrix.json upstream_authority.branch must be `{EXPECTED_UPSTREAM_BRANCH}`, got `{auth_obj.get('branch')}`"
+        )
     if auth_obj.get("commit") != EXPECTED_UPSTREAM_COMMIT_V168:
         record(
             f"feature_matrix.json upstream_authority.commit must be {EXPECTED_UPSTREAM_COMMIT_V168}, got {auth_obj.get('commit')}"
@@ -1279,8 +1747,23 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
         record(
             f"feature_matrix.json upstream_authority.release must be `{EXPECTED_UPSTREAM_RELEASE_V168}`, got `{auth_obj.get('release')}`"
         )
+    for blob_key, expected_val in (
+        ("tracked_blobs", EXPECTED_UPSTREAM_TRACKED_BLOBS),
+        ("crates_blobs", EXPECTED_UPSTREAM_CRATES_BLOBS),
+        ("inherited_blobs", EXPECTED_UPSTREAM_INHERITED_BLOBS),
+        ("gitlinks", EXPECTED_UPSTREAM_GITLINKS),
+    ):
+        actual_val = auth_obj.get(blob_key)
+        if type(actual_val) is not int or actual_val != expected_val:
+            record(
+                f"feature_matrix.json upstream_authority.{blob_key} must be exact int {expected_val}, got {actual_val!r}"
+            )
     ios_rel = matrix.get("target_ios_release", {})
-    if ios_rel.get("marketing_version") != EXPECTED_IOS_MARKETING_VERSION or ios_rel.get("build_number") != EXPECTED_IOS_BUILD_NUMBER:
+    if (
+        ios_rel.get("marketing_version") != EXPECTED_IOS_MARKETING_VERSION
+        or type(ios_rel.get("build_number")) is not int
+        or ios_rel.get("build_number") != EXPECTED_IOS_BUILD_NUMBER
+    ):
         record(
             f"feature_matrix.json target_ios_release must be {EXPECTED_IOS_MARKETING_VERSION} / build {EXPECTED_IOS_BUILD_NUMBER}, got {ios_rel}"
         )
@@ -1301,7 +1784,7 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
         if (e2e_root / legacy_removed).exists():
             record(f"Unreferenced legacy file still present: tests/e2e/{legacy_removed}")
 
-    # 13. Swift 6 V167 XCUITest suite validation (4 tier classes, >= 68 tests, 13 UI namespaces, 34 features, 1:1 matrix bijection)
+    # 13. Swift 6 V167 XCUITest suite validation (4 tier classes, >= 68 tests, 13 UI namespaces in Tier bodies, 34 features, 1:1 matrix bijection)
     swift_ui_namespace_hits: dict[str, int] = {ns: 0 for ns in EXPECTED_UI_NAMESPACES}
     swift_tier_counts: dict[str, int] = {t: 0 for t in EXPECTED_SWIFT_TIER_CLASSES}
     swift_tier_classes: dict[str, int] = {cls: 0 for cls in SWIFT_CLASS_TO_TIER}
@@ -1311,7 +1794,7 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
     if not swift_v167_root.exists() or not swift_v167_files:
         record("mobile/ios/FabushiUITests/V167/ is missing or contains 0 .swift files")
     else:
-        parsed_swift, cls_decls, swift_literals, swift_errs = parse_swift_v167_files(
+        parsed_swift, cls_decls, tier_ui_namespace_hits, swift_errs = parse_swift_v167_files(
             swift_v167_files, repo_root
         )
         for se in swift_errs:
@@ -1340,6 +1823,10 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                     record(
                         f"Swift test `{cls_name}.{fn_name}` ({meta['file']}:{meta['start_line']}) lacks a substantive assertion"
                     )
+                if not meta["direct_ui_namespaces"]:
+                    record(
+                        f"Swift test `{cls_name}.{fn_name}` ({meta['file']}:{meta['start_line']}) references 0 direct `fabushi.*` UI identifiers"
+                    )
                 swift_covered_features.update(meta["features"])
 
         if swift_total_tests < MIN_SWIFT_TOTAL_TESTS:
@@ -1348,12 +1835,11 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
             )
 
         for ui_ns in EXPECTED_UI_NAMESPACES:
-            pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(ui_ns)}(?:\.|$)")
-            hits = sum(1 for lit in swift_literals if pat.search(lit))
+            hits = tier_ui_namespace_hits.get(ui_ns, 0)
             swift_ui_namespace_hits[ui_ns] = hits
             if hits == 0:
                 record(
-                    f"Swift V167 UI suite has 0 string-literal references to required namespace `{ui_ns}`"
+                    f"Swift V167 Tier 1-4 test bodies have 0 UI identifier references to required namespace `{ui_ns}`"
                 )
 
         uncovered_swift_features = sorted(VALID_FEATURE_SET - swift_covered_features)
@@ -1362,7 +1848,7 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                 f"Swift V167 XCUITests omit required features: {uncovered_swift_features}"
             )
 
-        # Cross-check 1:1 bijection with feature_matrix.json `swift_uitest_suite`
+        # Cross-check 1:1 bijection + per-test features/ui_namespaces alignment with feature_matrix.json `swift_uitest_suite`
         swift_matrix = matrix.get("swift_uitest_suite")
         if not isinstance(swift_matrix, dict):
             record("feature_matrix.json missing `swift_uitest_suite` registration object")
@@ -1370,6 +1856,11 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
             tiers_obj = swift_matrix.get("tiers", {})
             seen_ui_ids: set[str] = set()
             valid_ui_ns_set = set(EXPECTED_UI_NAMESPACES)
+            feature_id_to_ui_ns = {
+                f["id"]: set(f.get("ui_namespaces", []))
+                for f in features
+                if isinstance(f, dict) and "id" in f
+            }
             for tier_key, (cls_name, min_count) in EXPECTED_SWIFT_TIER_CLASSES.items():
                 t_obj = tiers_obj.get(tier_key)
                 if not isinstance(t_obj, dict):
@@ -1405,8 +1896,36 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                         declared_methods.add(method)
                     if not feats or any(f not in VALID_FEATURE_SET for f in feats):
                         record(f"swift_uitest_suite `{uid}` has invalid features: {feats}")
+                    elif len(feats) != len(set(feats)):
+                        record(f"swift_uitest_suite `{uid}` contains duplicate features: {feats}")
                     if not nss or any(ns not in valid_ui_ns_set for ns in nss):
                         record(f"swift_uitest_suite `{uid}` has invalid ui_namespaces: {nss}")
+                    elif len(nss) != len(set(nss)):
+                        record(f"swift_uitest_suite `{uid}` contains duplicate ui_namespaces: {nss}")
+                    method_meta = parsed_swift.get(cls_name, {}).get(method)
+                    if method_meta is not None:
+                        actual_feats = set(method_meta["features"])
+                        declared_feats = set(feats)
+                        if declared_feats != actual_feats:
+                            record(
+                                f"swift_uitest_suite `{uid}` (`{cls_name}.{method}`) declares features {sorted(declared_feats)}, "
+                                f"but Swift test method tags are {sorted(actual_feats)}"
+                            )
+                        effective_nss = set(method_meta["effective_ui_namespaces"])
+                        missing_nss = sorted(set(nss) - effective_nss)
+                        if missing_nss:
+                            record(
+                                f"swift_uitest_suite `{uid}` (`{cls_name}.{method}`) declares ui_namespaces {missing_nss} "
+                                f"not exercised in Swift test body (direct={method_meta['direct_ui_namespaces']}, effective={method_meta['effective_ui_namespaces']})"
+                            )
+                        if tier_key == "tier1":
+                            for fid in feats:
+                                expected_feat_nss = feature_id_to_ui_ns.get(fid, set())
+                                if expected_feat_nss and not (effective_nss & expected_feat_nss):
+                                    record(
+                                        f"swift_uitest_suite Tier 1 `{uid}` (`{cls_name}.{method}`) covers `{fid}` "
+                                        f"but exercises none of its canonical UI namespaces {sorted(expected_feat_nss)} (exercised: {sorted(effective_nss)})"
+                                    )
                 missing_in_swift = sorted(declared_methods - actual_methods)
                 unregistered_in_matrix = sorted(actual_methods - declared_methods)
                 if missing_in_swift:

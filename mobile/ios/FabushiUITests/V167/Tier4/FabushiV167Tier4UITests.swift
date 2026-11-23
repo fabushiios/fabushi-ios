@@ -13,7 +13,6 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [
-                    FabushiLoopbackSeedUser(username: "t4_j1_primary"),
                     FabushiLoopbackSeedUser(username: "t4_j1_secondary"),
                 ],
                 chats: [
@@ -23,11 +22,32 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         )
         let application = try launchFabushi(FabushiE2ELaunchConfig(theme: "night", resetState: true))
         assertNoSampleChats(in: application)
-        signInIfNeeded(in: application, username: "t4_j1_primary", password: "FabushiV168!Pass")
 
-        tapControl(FabushiAccessibilityIDs.Shell.accountSwitcherButton, in: application)
+        // Register primary account through Split-Key V2 UI (zero plaintext password on wire)
+        tapControl(FabushiAccessibilityIDs.Auth.registerTabButton, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Auth.splitKeyBadge, in: application))
+        let regUserField = requireElement(FabushiAccessibilityIDs.Auth.usernameField, in: application)
+        replaceText(in: regUserField, with: "t4_j1_primary")
+        let regPassField = requireElement(FabushiAccessibilityIDs.Auth.passwordField, in: application)
+        replaceText(in: regPassField, with: "SplitKeyV2!Journey1")
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Auth.registerSubmitButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        _ = requireElement(FabushiAccessibilityIDs.Shell.root, in: application, timeout: 15)
+
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Shell.accountSwitcherButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let switcherSheet = requireElement(FabushiAccessibilityIDs.Shell.accountSwitcherSheet, in: application)
         assertWithinWindowBounds(switcherSheet, in: application)
+        dismissAccountSwitcherIfPresented(in: application)
         openShellTab(FabushiAccessibilityIDs.Shell.tabChats, in: application)
 
         openFirstChat(in: application)
@@ -45,8 +65,18 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         let safetyGrid = requireElement(FabushiAccessibilityIDs.Inspector.e2eeSafetyEmojiGrid, in: application)
         assertWithinWindowBounds(safetyGrid, in: application)
 
-        let state = try await client.fetchState()
-        XCTAssertGreaterThanOrEqual(state.counts.messages, 1, "T4_01 message must persist in loopback backend")
+        let authState = try await client.fetchState(pathPrefix: "/api/v1/auth")
+        let registerRequests = authState.recordedRequests.filter { $0.path == "/api/v1/auth/register" }
+        XCTAssertGreaterThanOrEqual(registerRequests.count, 1, "T4_01 must POST /api/v1/auth/register")
+        XCTAssertTrue(
+            registerRequests.contains(where: { $0.bodyPreview.contains("auth_verifier_b64") }),
+            "T4_01 Split-Key V2 registration must send derived auth_verifier_b64"
+        )
+        XCTAssertTrue(
+            registerRequests.allSatisfy { !$0.bodyPreview.contains("SplitKeyV2!Journey1") },
+            "T4_01 Split-Key V2 registration must never send plaintext password on the wire"
+        )
+        XCTAssertGreaterThanOrEqual(authState.counts.messages, 1, "T4_01 message must persist in loopback backend")
         recordCheckpoint("T4_01_auth_multiaccount_messaging_e2ee", passed: true, attachScreen: true)
     }
 
@@ -58,7 +88,7 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t4_j2_team")],
                 chats: [
-                    FabushiLoopbackSeedChat(chatId: 402, title: "@GrokAI", chatType: "bot", memberCount: 2),
+                    FabushiLoopbackSeedChat(chatId: 402, title: "@GrokBot", chatType: "bot", memberCount: 2),
                     FabushiLoopbackSeedChat(chatId: 403, title: "@HermesBot", chatType: "bot", memberCount: 2),
                 ]
             )
@@ -85,6 +115,10 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         let approveBtn = requireElement(FabushiAccessibilityIDs.Stage.toolApproveButton, in: application)
         assertMinimumTouchTarget44pt(approveBtn)
         approveBtn.tap()
+        XCTAssertTrue(
+            approvalDock.waitForNonExistence(timeout: 6),
+            "T4_02 approval dock must dismiss after approve"
+        )
 
         let floorBanner = requireElement(FabushiAccessibilityIDs.Stage.floorControlBanner, in: application, timeout: 10)
         assertVoiceOverReady(floorBanner)
@@ -98,7 +132,14 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t4_j3_studio")],
-                chats: [FabushiLoopbackSeedChat(chatId: 404, title: "@CodexAgent", chatType: "bot", memberCount: 2)]
+                chats: [FabushiLoopbackSeedChat(chatId: 404, title: "@CodexAgent", chatType: "bot", memberCount: 2)],
+                messages: [
+                    FabushiLoopbackSeedMessage(
+                        chatId: 404,
+                        text: "```diff\n--- a/Sources/Host.swift\n+++ b/Sources/Host.swift\n@@ -1,1 +1,1 @@\n-let v = \"1.6.7\"\n+let v = \"1.6.8\"\n```",
+                        messageType: "coding_diff"
+                    )
+                ]
             )
         )
         let application = try launchFabushi()
@@ -121,7 +162,17 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         let prBtn = requireElement(FabushiAccessibilityIDs.Studio.codingAgentCreatePRButton, in: application)
         assertMinimumTouchTarget44pt(prBtn)
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Studio.mcpGrantsButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        let mcpAudit = requireElement(FabushiAccessibilityIDs.Studio.mcpAuditLogList, in: application)
+        assertWithinWindowBounds(mcpAudit, in: application)
+
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionAIProviders, in: application)
         let magpieRoot = requireElement(FabushiAccessibilityIDs.Magpie.root, in: application)
         assertWithinWindowBounds(magpieRoot, in: application)
@@ -165,7 +216,16 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
             element(FabushiAccessibilityIDs.Remote.macosDragHudForbidden, in: application).exists,
             "T4_04 iOS remote controller must never render macOS AppKit drag-HUD"
         )
-        tapControl(FabushiAccessibilityIDs.Remote.permissionModalDismissButton, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Remote.permissionModalDismissButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        XCTAssertTrue(
+            permModal.waitForNonExistence(timeout: 5),
+            "T4_04 remote permission modal must dismiss cleanly"
+        )
 
         let pty = requireElement(FabushiAccessibilityIDs.Remote.ptyTerminal, in: application)
         assertWithinWindowBounds(pty, in: application)
@@ -173,8 +233,15 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         assertMinimumTouchTarget44pt(takeoverBtn)
         takeoverBtn.tap()
 
-        let state = try await client.fetchState(pathPrefix: "/api/v1/computer")
-        XCTAssertGreaterThanOrEqual(state.matchedRequestCount, 1, "T4_04 remote takeover must hit loopback server")
+        let state = try await client.fetchState(pathPrefix: "/api/v1/computer/")
+        let takeoverCalls = state.recordedRequests.filter {
+            $0.method == "POST" && $0.path.contains("emergency_takeover")
+        }
+        XCTAssertGreaterThanOrEqual(
+            takeoverCalls.count,
+            1,
+            "T4_04 remote takeover must POST /api/v1/computer/lease/emergency_takeover"
+        )
         recordCheckpoint("T4_04_remote_pty_takeover_v168_perm", passed: true, attachScreen: true)
     }
 
@@ -195,12 +262,24 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
 
         tapControl(FabushiAccessibilityIDs.MiniApp.launcherButton, in: firstLaunch)
         tapControl(FabushiAccessibilityIDs.MiniApp.globalDharmaCard, in: firstLaunch)
+        let tosModal = requireElement(FabushiAccessibilityIDs.MiniApp.tosModal, in: firstLaunch)
         tapControl(FabushiAccessibilityIDs.MiniApp.tosAcceptButton, in: firstLaunch)
+        XCTAssertTrue(
+            tosModal.waitForNonExistence(timeout: 5),
+            "T4_05 accepting Mini App ToS must dismiss tosModal"
+        )
 
         let webView = requireElement(FabushiAccessibilityIDs.MiniApp.webView, in: firstLaunch, timeout: 15)
         assertWithinWindowBounds(webView, in: firstLaunch)
         let webMcpBadge = requireElement(FabushiAccessibilityIDs.MiniApp.webMcpStatusBadge, in: firstLaunch)
         assertVoiceOverReady(webMcpBadge)
+
+        let tosState = try await client.fetchState(pathPrefix: "/api/v1/miniapps")
+        XCTAssertGreaterThanOrEqual(
+            tosState.matchedRequestCount,
+            1,
+            "T4_05 Mini App launch & ToS acceptance must reconcile with /api/v1/miniapps"
+        )
 
         let minBtn = requireElement(FabushiAccessibilityIDs.MiniApp.minimizePiPButton, in: firstLaunch)
         assertMinimumTouchTarget44pt(minBtn)
@@ -270,27 +349,26 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t4_j7_settings", password: "FabushiV168!Pass")
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionWalletStars, in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Settings.starsBalanceLabel, in: application))
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Settings.storeKitDisclosureBanner, in: application))
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionNetworkProxy, in: application)
         let probeBtn = requireElement(FabushiAccessibilityIDs.Settings.proxyProbeButton, in: application)
         assertMinimumTouchTarget44pt(probeBtn)
         probeBtn.tap()
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionDataStorage, in: application)
         let purgeBtn = requireElement(FabushiAccessibilityIDs.Settings.storagePurgeCacheButton, in: application)
         assertMinimumTouchTarget44pt(purgeBtn)
         purgeBtn.tap()
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionCapabilities, in: application)
-        let ledger = requireElement(FabushiAccessibilityIDs.Settings.capabilityLedgerList, in: application)
-        assertWithinWindowBounds(ledger, in: application)
+        assertCapabilityLedgerShowsCanonicalIDs(in: application)
         recordCheckpoint("T4_07_settings_26_storekit_proxy_ledger", passed: true)
     }
 
@@ -342,7 +420,9 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
                 assertWithinWindowBounds(requireElement(FabushiAccessibilityIDs.Shell.splitView, in: application), in: application)
                 setDeviceOrientation(.portrait)
             }
-            application.terminate()
+            if index < auditMatrix.count - 1 {
+                application.terminate()
+            }
         }
         recordCheckpoint("T4_08_comprehensive_apple_hig_audit", passed: true, attachScreen: true)
     }

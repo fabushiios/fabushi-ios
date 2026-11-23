@@ -2050,7 +2050,7 @@ fn tc_t1_f33_05_update_check_app_store_forbids_binary_self_update() {
         json!({"current_version": "1.6.6", "channel": "app_store"}),
     );
     assert_eq!(upd["update_available"], true);
-    assert_eq!(upd["latest_version"], "1.6.7");
+    assert_eq!(upd["latest_version"], "1.6.8");
     assert_eq!(upd["binary_self_update_allowed"], false);
 }
 
@@ -2096,7 +2096,7 @@ fn tc_t1_f34_04_capability_ledger_exposes_honest_upstream_planned_and_blocked() 
     let ledger = h.expect_ok("settings.capability_ledger", json!({}));
     assert_eq!(
         ledger["upstream_commit"],
-        "6141456e2a1121b78a6cdcd5da2a6d24c9c37e15"
+        "424aa33cf67a11a778da2dd3b8cca7ea35072b07"
     );
     let items: &[Value] = ledger["items"].as_array().expect("ledger items");
     verify_honest_capability_disposition(items).expect("honest capability disposition");

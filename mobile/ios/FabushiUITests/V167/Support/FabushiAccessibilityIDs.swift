@@ -68,6 +68,9 @@ enum FabushiAccessibilityIDs {
         static let stageSlot = "fabushi.shell.stageSlot"
         static let accountSwitcherButton = "fabushi.shell.accountSwitcherButton"
         static let accountSwitcherSheet = "fabushi.shell.accountSwitcherSheet"
+        static let accountSwitcherCloseButton = "fabushi.shell.accountSwitcherCloseButton"
+        static let accountSwitcherFirstRow = "fabushi.shell.accountSwitcher.row.0"
+        static let accountSwitcherSecondRow = "fabushi.shell.accountSwitcher.row.1"
         static let addAccountButton = "fabushi.shell.addAccountButton"
         static let connectionStatusPill = "fabushi.shell.connectionStatusPill"
         static let offlineUnavailableView = "fabushi.shell.offlineUnavailableView"
@@ -109,6 +112,7 @@ enum FabushiAccessibilityIDs {
         static let storiesStrip = "fabushi.chatlist.storiesStrip"
         static let firstRow = "fabushi.chatlist.row.0"
         static let secondRow = "fabushi.chatlist.row.1"
+        static let thirdRow = "fabushi.chatlist.row.2"
     }
 
     enum Compose {

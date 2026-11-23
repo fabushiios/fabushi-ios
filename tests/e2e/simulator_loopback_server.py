@@ -31,6 +31,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
+import struct
 from typing import Any
 
 MAX_HTTP_BODY_BYTES = 32 * 1024 * 1024
@@ -39,7 +41,26 @@ MAX_UPLOAD_TOTAL_SIZE = 4 * 1024 * 1024 * 1024
 MAX_UPLOAD_PART_SIZE = 16 * 1024 * 1024
 MAX_RECORDED_BODY_PREVIEW = 16 * 1024
 DEFAULT_SERVER_VERSION = "1.6.8"
-DEVICE_SYNC_CODE_DOMAIN_V1 = b"fabushi.vault.device_sync.code.v1"
+DEVICE_SYNC_CODE_DOMAIN_V1 = b"DEVICE_SYNC_CODE_DOMAIN_V1"
+WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+HTTP_SOCKET_TIMEOUT_SECS = 5.0
+WS_POLL_TIMEOUT_SECS = 0.05
+WS_FRAME_BODY_DEADLINE_SECS = 3.0
+MAX_WS_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024
+MAX_WS_MESSAGE_BYTES = 16 * 1024 * 1024
+
+CHAT_TYPE_STR_TO_INT: dict[str, int] = {
+    "private": 0,
+    "dm": 0,
+    "direct": 0,
+    "group": 1,
+    "supergroup": 2,
+    "forum": 2,
+    "channel": 3,
+    "bot": 4,
+    "saved": 5,
+    "saved_messages": 5,
+}
 
 ALLOWED_FALLBACK_NAMESPACES: frozenset[str] = frozenset(
     {
@@ -171,6 +192,115 @@ class PayloadTooLargeError(Exception):
     """Raised when incoming HTTP body exceeds MAX_HTTP_BODY_BYTES."""
 
 
+class ApiParamError(Exception):
+    """Raised on invalid API path/query/JSON numeric or structural parameters -> HTTP 400."""
+
+
+class _WsProtocolError(Exception):
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+
+
+class _WsClosedError(Exception):
+    """Raised when a WebSocket peer closes or times out mid-frame."""
+
+
+def _is_strict_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool)
+
+
+def _is_ascii_uint_str(val: str) -> bool:
+    return bool(val) and val.isascii() and val.isdigit()
+
+
+def _is_ascii_int_str(val: str) -> bool:
+    if not val or not val.isascii():
+        return False
+    if val[0] == "-":
+        return len(val) > 1 and val[1:].isdigit()
+    return val.isdigit()
+
+
+def _parse_strict_int(
+    val: Any,
+    *,
+    field: str = "value",
+    min_val: int | None = None,
+    max_val: int | None = None,
+) -> int:
+    if isinstance(val, bool):
+        raise ValueError(f"boolean not allowed for integer {field}")
+    parsed: int | None = None
+    if isinstance(val, int):
+        parsed = val
+    elif isinstance(val, str):
+        s = val.strip()
+        if s and (
+            (s[0] in ("-", "+") and len(s) > 1 and s[1:].isascii() and s[1:].isdigit())
+            or (s.isascii() and s.isdigit())
+        ):
+            parsed = int(s)
+    if parsed is None:
+        raise ValueError(f"invalid integer for {field}: {val!r}")
+    if min_val is not None and parsed < min_val:
+        raise ValueError(f"{field} must be >= {min_val}")
+    if max_val is not None and parsed > max_val:
+        raise ValueError(f"{field} must be <= {max_val}")
+    return parsed
+
+
+def parse_int_or_400(
+    val: Any,
+    *,
+    default: int | None = None,
+    field: str = "value",
+    min_val: int | None = None,
+    max_val: int | None = None,
+    allow_none: bool = False,
+) -> int:
+    if val is None:
+        if allow_none and default is not None:
+            return default
+        raise ApiParamError(f"missing or null integer for {field}")
+    try:
+        return _parse_strict_int(val, field=field, min_val=min_val, max_val=max_val)
+    except ValueError as exc:
+        raise ApiParamError(str(exc)) from exc
+
+
+def _opt_list(body: dict[str, Any], key: str) -> list[Any]:
+    if key not in body or body[key] is None:
+        return []
+    val = body[key]
+    if not isinstance(val, list):
+        raise ValueError(f"{key} must be a list")
+    return val
+
+
+def _normalize_chat_type(raw: Any, *, default: int) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ApiParamError("boolean not allowed for chat_type")
+    if isinstance(raw, int):
+        if 0 <= raw <= 5:
+            return raw
+        raise ApiParamError(f"chat_type integer out of range 0..=5: {raw}")
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if not s:
+            return default
+        if s in CHAT_TYPE_STR_TO_INT:
+            return CHAT_TYPE_STR_TO_INT[s]
+        if s.isascii() and s.isdigit():
+            n = int(s)
+            if 0 <= n <= 5:
+                return n
+    raise ApiParamError(f"invalid chat_type: {raw!r}")
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -187,13 +317,124 @@ def hex_sha256(data: bytes) -> str:
 def compute_device_sync_code(request_id: str, ephemeral_pub_b64: str) -> str:
     h = hashlib.sha256()
     h.update(DEVICE_SYNC_CODE_DOMAIN_V1)
-    h.update(b"|")
     h.update(request_id.encode("utf-8"))
-    h.update(b"|")
     h.update(ephemeral_pub_b64.encode("utf-8"))
     digest = h.digest()
     val = int.from_bytes(digest[:4], "big") % 1_000_000
     return f"{val:06d}"
+
+
+def compute_websocket_accept(sec_websocket_key: str) -> str:
+    material = (sec_websocket_key.strip() + WS_MAGIC_GUID).encode("ascii")
+    return base64.b64encode(hashlib.sha1(material).digest()).decode("ascii")
+
+
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> bytes:
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return raw
+    out = bytearray()
+    for ch in text:
+        ch_b = ch.encode("utf-8")
+        if len(out) + len(ch_b) > max_bytes:
+            break
+        out.extend(ch_b)
+    return bytes(out)
+
+
+def _write_ws_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
+    b0 = 0x80 | (opcode & 0x0F)
+    n = len(payload)
+    if n <= 125:
+        header = struct.pack("!BB", b0, n)
+    elif n <= 65535:
+        header = struct.pack("!BBH", b0, 126, n)
+    else:
+        header = struct.pack("!BBQ", b0, 127, n)
+    sock.sendall(header + payload)
+
+
+def _write_ws_close(sock: socket.socket, code: int, reason: str = "") -> None:
+    reason_bytes = _truncate_utf8_bytes(reason, 123)
+    _write_ws_frame(sock, 0x8, struct.pack("!H", code) + reason_bytes)
+
+
+class _WsConnReader:
+    """RFC 6455 incremental frame reader supporting buffered initial bytes and stop_event."""
+
+    def __init__(self, initial: bytes = b"") -> None:
+        self.buf = bytearray(initial)
+
+    def _ensure_bytes(
+        self, sock: socket.socket, needed: int, stop_event: threading.Event
+    ) -> None:
+        deadline = time.monotonic() + WS_FRAME_BODY_DEADLINE_SECS
+        while len(self.buf) < needed:
+            if stop_event.is_set():
+                raise _WsClosedError("server_stopping")
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise _WsClosedError("frame_body_timeout")
+            sock.settimeout(min(rem, 0.1))
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, socket.timeout):
+                continue
+            if chunk == b"":
+                raise _WsClosedError("eof")
+            self.buf.extend(chunk)
+
+    def read_frame(
+        self, sock: socket.socket, stop_event: threading.Event
+    ) -> tuple[bool, int, bytes] | None:
+        if not self.buf:
+            if stop_event.is_set():
+                raise _WsClosedError("server_stopping")
+            sock.settimeout(WS_POLL_TIMEOUT_SECS)
+            try:
+                chunk = sock.recv(4096)
+            except (TimeoutError, socket.timeout):
+                return None
+            if chunk == b"":
+                raise _WsClosedError("eof")
+            self.buf.extend(chunk)
+
+        self._ensure_bytes(sock, 2, stop_event)
+        b0, b1 = self.buf[0], self.buf[1]
+        fin = (b0 & 0x80) != 0
+        if (b0 & 0x70) != 0:
+            raise _WsProtocolError(1002, "non_zero_rsv")
+        opcode = b0 & 0x0F
+        if (b1 & 0x80) == 0:
+            raise _WsProtocolError(1002, "unmasked_client_frame")
+
+        len7 = b1 & 0x7F
+        if len7 <= 125:
+            offset, payload_len = 2, len7
+        elif len7 == 126:
+            self._ensure_bytes(sock, 4, stop_event)
+            offset = 4
+            payload_len = struct.unpack("!H", self.buf[2:4])[0]
+        else:
+            self._ensure_bytes(sock, 10, stop_event)
+            offset = 10
+            payload_len = struct.unpack("!Q", self.buf[2:10])[0]
+            if payload_len & (1 << 63):
+                raise _WsProtocolError(1002, "invalid_64bit_length_msb")
+
+        if (opcode & 0x08) != 0 and (not fin or payload_len > 125):
+            raise _WsProtocolError(1002, "invalid_control_frame")
+        if payload_len > MAX_WS_FRAME_PAYLOAD_BYTES:
+            raise _WsProtocolError(1009, "frame_too_large")
+
+        total = offset + 4 + payload_len
+        self._ensure_bytes(sock, total, stop_event)
+        mask = bytes(self.buf[offset : offset + 4])
+        payload = bytearray(self.buf[offset + 4 : total])
+        del self.buf[:total]
+        for i in range(len(payload)):
+            payload[i] ^= mask[i & 3]
+        return fin, opcode, bytes(payload)
 
 
 def matches_segment_prefix(path: str, prefix: str) -> bool:
@@ -289,17 +530,20 @@ def parse_byte_range(range_header: str, total_len: int) -> tuple[bool, int, int]
     left, right = spec.split("-", 1)
     left = left.strip()
     right = right.strip()
-    try:
-        if not left and right:
-            suffix = int(right)
-            if suffix <= 0:
-                return False, 0, 0
-            start = max(0, total_len - suffix)
-            return True, start, total_len - 1
-        start = int(left)
-        end = total_len - 1 if not right else int(right)
-    except ValueError:
+    if not left and right:
+        if not _is_ascii_uint_str(right):
+            return False, 0, 0
+        suffix = int(right)
+        if suffix <= 0:
+            return False, 0, 0
+        start = max(0, total_len - suffix)
+        return True, start, total_len - 1
+    if not _is_ascii_uint_str(left):
         return False, 0, 0
+    if right and not _is_ascii_uint_str(right):
+        return False, 0, 0
+    start = int(left)
+    end = total_len - 1 if not right else int(right)
     if start < 0 or end < start or start >= total_len:
         return False, 0, 0
     return True, start, min(end, total_len - 1)
@@ -335,6 +579,9 @@ class LoopbackState:
     def reset(self) -> None:
         with self.lock:
             self.offline: bool = False
+            self.drop_next_ws: bool = False
+            self.ws_push_queue: deque[str] = deque()
+            self.ws_received_frames: list[str] = []
             self.recorded: list[dict[str, Any]] = []
             self.faults: list[dict[str, Any]] = []
             self.delays: dict[str, int] = {}
@@ -391,7 +638,7 @@ class LoopbackState:
                 "user_id": uid,
                 "username": uname,
                 "first_name": uname,
-                "auth_version": 2,
+                "auth_version": 1,
                 "key_version": 1,
                 "password": None,
                 "auth_salt_b64": base64.b64encode(bytes([0x42] * 16)).decode("ascii"),
@@ -494,7 +741,7 @@ def _str_nonblank_raw(val: Any) -> str | None:
 
 
 def _format_stored_message(msg: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "message_id": msg["message_id"],
         "id": msg["message_id"],
         "chat_id": msg["chat_id"],
@@ -507,6 +754,13 @@ def _format_stored_message(msg: dict[str, Any]) -> dict[str, Any]:
         "delivery_status": "sent",
         "status": "sent",
     }
+    if msg.get("message_type") is not None:
+        out["message_type"] = msg["message_type"]
+    if msg.get("media_file_id") is not None:
+        out["media_file_id"] = msg["media_file_id"]
+    if msg.get("instant_view_url") is not None:
+        out["instant_view_url"] = msg["instant_view_url"]
+    return out
 
 
 def _poll_alipay_attempt(
@@ -518,6 +772,17 @@ def _poll_alipay_attempt(
             return 404, {"error": "oauth_attempt_not_found"}
         if rec["status"] == "cancelled":
             return 409, {"error": "oauth_cancelled", "status": "cancelled"}
+        if rec["status"] in ("confirmed", "consumed"):
+            return (
+                200,
+                {
+                    "attempt_id": rec["attempt_id"],
+                    "state": rec["state"],
+                    "status": "confirmed",
+                    "session": rec.get("issued_session"),
+                    "expires_at_ms": rec["expires_at_ms"],
+                },
+            )
         if rec["status"] == "expired" or ts > rec["expires_at_ms"]:
             rec["status"] = "expired"
             return 400, {"error": "oauth_expired", "status": "expired"}
@@ -528,6 +793,7 @@ def _poll_alipay_attempt(
                 "state": rec["state"],
                 "status": rec["status"],
                 "session": rec.get("issued_session"),
+                "poll_after_ms": 1000,
                 "expires_at_ms": rec["expires_at_ms"],
             },
         )
@@ -544,6 +810,7 @@ def _cancel_alipay_attempt(
             return 404, {"error": "oauth_attempt_not_found"}
         rec = state.alipay_attempts[resolved_id]
         rec["status"] = "cancelled"
+        rec["issued_session"] = None
         return (
             200,
             {
@@ -589,138 +856,177 @@ def handle_e2e_control(
 
     if method == "POST" and path == "/__e2e__/seed":
         with state.lock:
-            seeded_users: list[dict[str, Any]] = []
-            seeded_chats: list[dict[str, Any]] = []
-            seeded_messages: list[dict[str, Any]] = []
-            seeded_media_ids: list[str] = []
-            seeded_vault_count = 0
-            seeded_node_ids: list[str] = []
-            seeded_miniapp_ids: list[str] = []
+            # Stage & pre-validate EVERYTHING before mutating ANY state field
+            staged_users: list[dict[str, Any]] = []
+            staged_chats: list[dict[str, Any]] = []
+            staged_messages: list[dict[str, Any]] = []
+            staged_media: list[tuple[str, bytes]] = []
+            staged_vault: list[tuple[int | None, str, str, dict[str, Any]]] = []
+            staged_floors: dict[int, int] = {}
+            staged_nodes: list[dict[str, Any]] = []
+            staged_miniapps: list[dict[str, Any]] = []
+            staged_ws_push: list[str] = []
+            staged_alipay_confirm: dict[str, Any] | None = None
+            staged_alipay_expire: str | None = None
 
             try:
-                for u_spec in body.get("users", []):
+                for u_spec in _opt_list(body, "users"):
                     if not isinstance(u_spec, dict):
                         raise ValueError("users[] entries must be objects")
                     uname = _str_nonempty_trim(u_spec.get("username"))
                     if not uname:
                         raise ValueError("users[].username must be non-empty")
-                    uid = state.username_to_id.get(uname)
-                    if uid is None:
-                        state.next_user_id += 1
-                        uid = state.next_user_id
                     first_name = _str_nonempty_trim(u_spec.get("first_name")) or uname
-                    auth_version = int(u_spec.get("auth_version", 2))
-                    auth_salt_b64 = _str_nonempty_trim(
-                        u_spec.get("auth_salt_b64")
-                    ) or base64.b64encode(bytes([0x42] * 16)).decode("ascii")
                     auth_verifier_b64 = _str_nonempty_trim(u_spec.get("auth_verifier_b64"))
                     password = (
                         None
                         if auth_verifier_b64 is not None
                         else _str_nonblank_raw(u_spec.get("password"))
                     )
-                    user = {
-                        "user_id": uid,
-                        "username": uname,
-                        "first_name": first_name,
-                        "auth_version": auth_version,
-                        "key_version": int(u_spec.get("key_version", 1)),
-                        "password": password,
-                        "auth_salt_b64": auth_salt_b64,
-                        "auth_verifier_b64": auth_verifier_b64,
-                        "kdf_params": u_spec.get(
-                            "kdf_params",
-                            {"m_cost_kib": 65536, "t_cost": 3, "p_cost": 4},
-                        ),
-                        "vault_envelope": u_spec.get("vault_envelope"),
-                        "two_factor_password": _str_nonblank_raw(
-                            u_spec.get("two_factor_password")
-                        ),
-                        "two_factor_hint": _str_nonempty_trim(
-                            u_spec.get("two_factor_hint")
-                        ),
-                        "two_factor_recovery_email": _str_nonempty_trim(
-                            u_spec.get("two_factor_recovery_email")
-                        ),
-                    }
-                    state.username_to_id[uname] = uid
-                    state.users_by_id[uid] = user
-                    sid = None
-                    tok = None
-                    if u_spec.get("mint_session", True):
-                        dev_name = (
-                            _str_nonempty_trim(u_spec.get("device_name"))
-                            or "iOS Simulator"
+                    raw_av = u_spec.get("auth_version")
+                    if auth_verifier_b64 is not None:
+                        auth_version = (
+                            _parse_strict_int(raw_av, field="users[].auth_version", min_val=1)
+                            if raw_av is not None
+                            else 2
                         )
-                        sess = state.mint_session(uid, dev_name, ts)
-                        sid = sess["session_id"]
-                        tok = sess["token"]
-                    seeded_users.append(
+                    else:
+                        if raw_av is not None:
+                            _parse_strict_int(raw_av, field="users[].auth_version", min_val=1)
+                        auth_version = 1
+                    raw_kv = u_spec.get("key_version")
+                    key_version = (
+                        _parse_strict_int(raw_kv, field="users[].key_version", min_val=1)
+                        if raw_kv is not None
+                        else 1
+                    )
+                    auth_salt_b64 = _str_nonempty_trim(
+                        u_spec.get("auth_salt_b64")
+                    ) or base64.b64encode(bytes([0x42] * 16)).decode("ascii")
+                    mint_session = u_spec.get("mint_session", True)
+                    if mint_session is None:
+                        mint_session = True
+                    if not isinstance(mint_session, bool):
+                        raise ValueError("users[].mint_session must be boolean")
+                    kdf_params = u_spec.get("kdf_params")
+                    if kdf_params is None:
+                        kdf_params = {"m_cost_kib": 65536, "t_cost": 3, "p_cost": 4}
+                    elif not isinstance(kdf_params, dict):
+                        raise ValueError("users[].kdf_params must be an object")
+                    staged_users.append(
                         {
-                            "user_id": uid,
                             "username": uname,
-                            "session_id": sid,
-                            "token": tok,
+                            "first_name": first_name,
+                            "auth_version": auth_version,
+                            "key_version": key_version,
+                            "password": password,
+                            "auth_salt_b64": auth_salt_b64,
+                            "auth_verifier_b64": auth_verifier_b64,
+                            "kdf_params": kdf_params,
+                            "vault_envelope": u_spec.get("vault_envelope"),
+                            "two_factor_password": _str_nonblank_raw(
+                                u_spec.get("two_factor_password")
+                            ),
+                            "two_factor_hint": _str_nonempty_trim(
+                                u_spec.get("two_factor_hint")
+                            ),
+                            "two_factor_recovery_email": _str_nonempty_trim(
+                                u_spec.get("two_factor_recovery_email")
+                            ),
+                            "mint_session": mint_session,
+                            "device_name": _str_nonempty_trim(u_spec.get("device_name"))
+                            or "iOS Simulator",
                         }
                     )
 
-                for c_spec in body.get("chats", []):
+                for c_spec in _opt_list(body, "chats"):
                     if not isinstance(c_spec, dict):
                         raise ValueError("chats[] entries must be objects")
                     title = _str_nonempty_trim(c_spec.get("title"))
                     if not title:
                         raise ValueError("chats[].title must be non-empty")
-                    if c_spec.get("chat_id") is not None:
-                        cid = int(c_spec["chat_id"])
-                        if cid >= state.next_chat_id:
-                            state.next_chat_id = cid + 1
-                    else:
-                        state.next_chat_id += 1
-                        cid = state.next_chat_id
-                    chat_type = _str_nonempty_trim(c_spec.get("chat_type")) or "group"
-                    member_count = int(c_spec.get("member_count", 2))
-                    state.chats[cid] = {
-                        "id": cid,
-                        "chat_id": cid,
-                        "title": title,
-                        "chat_type": chat_type,
-                        "member_count": member_count,
-                        "is_group": chat_type in ("group", "supergroup", "channel"),
-                    }
-                    state.chat_messages.setdefault(cid, [])
-                    state.chat_pts.setdefault(cid, 0)
-                    seeded_chats.append({"chat_id": cid, "title": title})
+                    cid_opt = (
+                        _parse_strict_int(c_spec["chat_id"], field="chats[].chat_id")
+                        if c_spec.get("chat_id") is not None
+                        else None
+                    )
+                    chat_type = _normalize_chat_type(c_spec.get("chat_type"), default=1)
+                    raw_mc = c_spec.get("member_count")
+                    member_count = (
+                        _parse_strict_int(raw_mc, field="chats[].member_count", min_val=0)
+                        if raw_mc is not None
+                        else 2
+                    )
+                    pinned = c_spec.get("pinned")
+                    if pinned is not None and not isinstance(pinned, bool):
+                        raise ValueError("chats[].pinned must be boolean")
+                    unread_count = (
+                        _parse_strict_int(
+                            c_spec["unread_count"], field="chats[].unread_count", min_val=0
+                        )
+                        if c_spec.get("unread_count") is not None
+                        else None
+                    )
+                    is_unread_marked = c_spec.get("is_unread_marked")
+                    if is_unread_marked is not None and not isinstance(is_unread_marked, bool):
+                        raise ValueError("chats[].is_unread_marked must be boolean")
+                    bot_started = c_spec.get("bot_started")
+                    if bot_started is not None and not isinstance(bot_started, bool):
+                        raise ValueError("chats[].bot_started must be boolean")
+                    staged_chats.append(
+                        {
+                            "chat_id": cid_opt,
+                            "title": title,
+                            "chat_type": chat_type,
+                            "member_count": member_count,
+                            "pinned": pinned,
+                            "unread_count": unread_count,
+                            "is_unread_marked": is_unread_marked,
+                            "bot_started": bot_started,
+                        }
+                    )
 
-                for m_spec in body.get("messages", []):
+                for m_spec in _opt_list(body, "messages"):
                     if not isinstance(m_spec, dict):
                         raise ValueError("messages[] entries must be objects")
-                    cid = int(m_spec.get("chat_id", 1))
+                    cid = (
+                        _parse_strict_int(m_spec["chat_id"], field="messages[].chat_id")
+                        if m_spec.get("chat_id") is not None
+                        else 1
+                    )
                     text = m_spec.get("text")
                     if text is None:
                         text = m_spec.get("content", "")
                     if not isinstance(text, str):
                         raise ValueError("messages[].text must be a string")
-                    mid = state.next_msg_id
-                    state.next_msg_id += 1
-                    pts = state.chat_pts.get(cid, 0) + 1
-                    state.chat_pts[cid] = pts
-                    msg = {
-                        "message_id": mid,
-                        "chat_id": cid,
-                        "pts": pts,
-                        "text": text,
-                        "client_nonce": m_spec.get("client_nonce"),
-                        "sender_id": int(
-                            m_spec.get("sender_id", state.default_user_id())
-                        ),
-                        "timestamp_ms": ts,
-                    }
-                    state.chat_messages.setdefault(cid, []).append(msg)
-                    seeded_messages.append(
-                        {"message_id": mid, "chat_id": cid, "pts": pts}
+                    client_nonce = (
+                        _parse_strict_int(
+                            m_spec["client_nonce"], field="messages[].client_nonce"
+                        )
+                        if m_spec.get("client_nonce") is not None
+                        else None
+                    )
+                    sender_id_opt = (
+                        _parse_strict_int(m_spec["sender_id"], field="messages[].sender_id")
+                        if m_spec.get("sender_id") is not None
+                        else None
+                    )
+                    message_type = _str_nonempty_trim(m_spec.get("message_type"))
+                    media_file_id = _str_nonempty_trim(m_spec.get("media_file_id"))
+                    instant_view_url = _str_nonempty_trim(m_spec.get("instant_view_url"))
+                    staged_messages.append(
+                        {
+                            "chat_id": cid,
+                            "text": text,
+                            "client_nonce": client_nonce,
+                            "sender_id": sender_id_opt,
+                            "message_type": message_type,
+                            "media_file_id": media_file_id,
+                            "instant_view_url": instant_view_url,
+                        }
                     )
 
-                for b_spec in body.get("media_blobs", []):
+                for b_spec in _opt_list(body, "media_blobs"):
                     if not isinstance(b_spec, dict):
                         raise ValueError("media_blobs[] entries must be objects")
                     fid = _str_nonempty_trim(b_spec.get("file_id"))
@@ -730,95 +1036,299 @@ def handle_e2e_control(
                             "media_blobs[] requires file_id and base64 data_b64"
                         )
                     raw = base64.b64decode(data_b64.encode("ascii"))
-                    state.media_blobs[fid] = raw
-                    seeded_media_ids.append(fid)
+                    staged_media.append((fid, raw))
 
-                for v_spec in body.get("vault_items", []):
+                for v_spec in _opt_list(body, "vault_items"):
                     if not isinstance(v_spec, dict):
                         raise ValueError("vault_items[] entries must be objects")
-                    uid = int(v_spec.get("user_id", state.default_user_id()))
+                    uid_opt = (
+                        _parse_strict_int(v_spec["user_id"], field="vault_items[].user_id")
+                        if v_spec.get("user_id") is not None
+                        else None
+                    )
                     cat = _str_nonempty_trim(v_spec.get("category")) or "general"
                     key = _str_nonempty_trim(v_spec.get("item_key"))
                     if not key:
                         raise ValueError("vault_items[].item_key must be non-empty")
-                    state.vault_items[(uid, cat, key)] = dict(v_spec)
-                    seeded_vault_count += 1
+                    staged_vault.append((uid_opt, cat, key, dict(v_spec)))
 
-                if "journal_floors" in body:
+                if "journal_floors" in body and body["journal_floors"] is not None:
                     jf = body["journal_floors"]
                     if not isinstance(jf, dict):
                         raise ValueError("journal_floors must be an object")
                     for k, v in jf.items():
-                        state.journal_floors[int(k)] = int(v)
+                        fk = _parse_strict_int(k, field="journal_floors key")
+                        fv = _parse_strict_int(v, field="journal_floors value", min_val=0)
+                        staged_floors[fk] = fv
 
-                for n_spec in body.get("remote_nodes", []):
+                for n_spec in _opt_list(body, "remote_nodes"):
                     if not isinstance(n_spec, dict):
                         raise ValueError("remote_nodes[] entries must be objects")
                     did = _str_nonempty_trim(n_spec.get("device_id"))
                     if not did:
                         raise ValueError("remote_nodes[].device_id must be non-empty")
-                    node = {
-                        "device_id": did,
-                        "name": _str_nonempty_trim(n_spec.get("name")) or did,
-                        "online": bool(n_spec.get("online", True)),
-                        "is_current_device": bool(
-                            n_spec.get("is_current_device", False)
-                        ),
-                        "screen_capture_permission": str(
-                            n_spec.get("screen_capture_permission", "granted_active")
-                        ),
-                        "accessibility_drag_permission": str(
-                            n_spec.get("accessibility_drag_permission", "granted_active")
-                        ),
-                    }
-                    state.remote_nodes[did] = node
-                    seeded_node_ids.append(did)
+                    online_val = n_spec.get("online", True)
+                    if not isinstance(online_val, bool):
+                        raise ValueError("remote_nodes[].online must be boolean")
+                    is_cur_val = n_spec.get("is_current_device", False)
+                    if not isinstance(is_cur_val, bool):
+                        raise ValueError("remote_nodes[].is_current_device must be boolean")
+                    staged_nodes.append(
+                        {
+                            "device_id": did,
+                            "name": _str_nonempty_trim(n_spec.get("name")) or did,
+                            "online": online_val,
+                            "is_current_device": is_cur_val,
+                            "screen_capture_permission": str(
+                                n_spec.get("screen_capture_permission", "granted_active")
+                            ),
+                            "accessibility_drag_permission": str(
+                                n_spec.get("accessibility_drag_permission", "granted_active")
+                            ),
+                        }
+                    )
 
-                for app_spec in body.get("miniapps", []):
+                for app_spec in _opt_list(body, "miniapps"):
                     if not isinstance(app_spec, dict):
                         raise ValueError("miniapps[] entries must be objects")
                     aid = _str_nonempty_trim(app_spec.get("app_id"))
                     if not aid:
                         raise ValueError("miniapps[].app_id must be non-empty")
-                    state.miniapps[aid] = {
-                        "app_id": aid,
-                        "title": _str_nonempty_trim(app_spec.get("title")) or aid,
-                        "tos_accepted": bool(app_spec.get("tos_accepted", False)),
-                        "webmcp_enabled": bool(app_spec.get("webmcp_enabled", True)),
-                    }
-                    seeded_miniapp_ids.append(aid)
+                    tos_val = app_spec.get("tos_accepted", False)
+                    if not isinstance(tos_val, bool):
+                        raise ValueError("miniapps[].tos_accepted must be boolean")
+                    wmcp_val = app_spec.get("webmcp_enabled", True)
+                    if not isinstance(wmcp_val, bool):
+                        raise ValueError("miniapps[].webmcp_enabled must be boolean")
+                    staged_miniapps.append(
+                        {
+                            "app_id": aid,
+                            "title": _str_nonempty_trim(app_spec.get("title")) or aid,
+                            "tos_accepted": tos_val,
+                            "webmcp_enabled": wmcp_val,
+                        }
+                    )
+
+                for frame_item in _opt_list(body, "ws_push_frames"):
+                    if not isinstance(frame_item, str):
+                        raise ValueError("ws_push_frames[] entries must be strings")
+                    staged_ws_push.append(frame_item)
 
                 if "alipay_confirm" in body and body["alipay_confirm"] is not None:
                     ac = body["alipay_confirm"]
                     if not isinstance(ac, dict):
                         raise ValueError("alipay_confirm must be an object")
                     aid = _str_nonempty_trim(ac.get("attempt_id"))
-                    if not aid or aid not in state.alipay_attempts:
-                        raise ValueError("alipay_confirm.attempt_id not found")
-                    rec = state.alipay_attempts[aid]
-                    uid = int(ac.get("user_id", state.default_user_id()))
-                    sess = state.mint_session(uid, "iOS Alipay Seeded", ts)
-                    rec["status"] = "confirmed"
-                    rec["issued_session"] = {
-                        "user_id": uid,
-                        "session_id": ac.get("session_id") or sess["session_id"],
-                        "token": ac.get("token") or sess["token"],
-                        "expires_at": ms_to_rfc3339(sess["expires_at_ms"]),
-                        "expires_at_ms": sess["expires_at_ms"],
+                    if not aid:
+                        raise ValueError("alipay_confirm.attempt_id must be non-empty")
+                    ac_uid_opt = (
+                        _parse_strict_int(ac["user_id"], field="alipay_confirm.user_id")
+                        if ac.get("user_id") is not None
+                        else None
+                    )
+                    staged_alipay_confirm = {
+                        "attempt_id": aid,
+                        "user_id": ac_uid_opt,
+                        "session_id": _str_nonempty_trim(ac.get("session_id")),
+                        "token": _str_nonempty_trim(ac.get("token")),
                     }
 
                 if "alipay_expire" in body and body["alipay_expire"] is not None:
                     exp_id = _str_nonempty_trim(body["alipay_expire"])
                     if not exp_id or exp_id not in state.alipay_attempts:
                         raise ValueError("alipay_expire attempt_id not found")
-                    state.alipay_attempts[exp_id]["status"] = "expired"
-                    state.alipay_attempts[exp_id]["expires_at_ms"] = ts - 1000
-            except (ValueError, TypeError, binascii.Error) as exc:
+                    staged_alipay_expire = exp_id
+            except (ValueError, TypeError, ApiParamError, binascii.Error) as exc:
                 return 400, {
                     "ok": False,
                     "error": "invalid_seed_payload",
                     "message": str(exc),
                 }
+
+            # All validation succeeded — commit atomically
+            seeded_users: list[dict[str, Any]] = []
+            seeded_chats: list[dict[str, Any]] = []
+            seeded_messages: list[dict[str, Any]] = []
+            seeded_media_ids: list[str] = []
+            seeded_vault_count = 0
+            seeded_node_ids: list[str] = []
+            seeded_miniapp_ids: list[str] = []
+
+            for su in staged_users:
+                uname = su["username"]
+                uid = state.username_to_id.get(uname)
+                if uid is None:
+                    state.next_user_id += 1
+                    uid = state.next_user_id
+                user = {
+                    "user_id": uid,
+                    "username": uname,
+                    "first_name": su["first_name"],
+                    "auth_version": su["auth_version"],
+                    "key_version": su["key_version"],
+                    "password": su["password"],
+                    "auth_salt_b64": su["auth_salt_b64"],
+                    "auth_verifier_b64": su["auth_verifier_b64"],
+                    "kdf_params": su["kdf_params"],
+                    "vault_envelope": su["vault_envelope"],
+                    "two_factor_password": su["two_factor_password"],
+                    "two_factor_hint": su["two_factor_hint"],
+                    "two_factor_recovery_email": su["two_factor_recovery_email"],
+                }
+                state.username_to_id[uname] = uid
+                state.users_by_id[uid] = user
+                sid = None
+                tok = None
+                if su["mint_session"]:
+                    sess = state.mint_session(uid, su["device_name"], ts)
+                    sid = sess["session_id"]
+                    tok = sess["token"]
+                seeded_users.append(
+                    {
+                        "user_id": uid,
+                        "username": uname,
+                        "session_id": sid,
+                        "token": tok,
+                    }
+                )
+
+            for sc in staged_chats:
+                if sc["chat_id"] is not None:
+                    cid = sc["chat_id"]
+                    if cid >= state.next_chat_id:
+                        state.next_chat_id = cid + 1
+                else:
+                    state.next_chat_id += 1
+                    cid = state.next_chat_id
+                chat_obj: dict[str, Any] = {
+                    "id": cid,
+                    "chat_id": cid,
+                    "title": sc["title"],
+                    "chat_type": sc["chat_type"],
+                    "member_count": sc["member_count"],
+                    "is_group": sc["chat_type"] in (1, 2, 3),
+                }
+                if sc["pinned"] is not None:
+                    chat_obj["pinned"] = sc["pinned"]
+                if sc["unread_count"] is not None:
+                    chat_obj["unread_count"] = sc["unread_count"]
+                if sc["is_unread_marked"] is not None:
+                    chat_obj["is_unread_marked"] = sc["is_unread_marked"]
+                if sc["bot_started"] is not None:
+                    chat_obj["bot_started"] = sc["bot_started"]
+                state.chats[cid] = chat_obj
+                state.chat_messages.setdefault(cid, [])
+                state.chat_pts.setdefault(cid, 0)
+                seeded_chats.append({"chat_id": cid, "title": sc["title"]})
+
+            for sm in staged_messages:
+                cid = sm["chat_id"]
+                mid = state.next_msg_id
+                state.next_msg_id += 1
+                pts = state.chat_pts.get(cid, 0) + 1
+                state.chat_pts[cid] = pts
+                sender_id = (
+                    sm["sender_id"]
+                    if sm["sender_id"] is not None
+                    else state.default_user_id()
+                )
+                msg: dict[str, Any] = {
+                    "message_id": mid,
+                    "chat_id": cid,
+                    "pts": pts,
+                    "text": sm["text"],
+                    "client_nonce": sm["client_nonce"],
+                    "sender_id": sender_id,
+                    "timestamp_ms": ts,
+                }
+                if sm["message_type"] is not None:
+                    msg["message_type"] = sm["message_type"]
+                if sm["media_file_id"] is not None:
+                    msg["media_file_id"] = sm["media_file_id"]
+                if sm["instant_view_url"] is not None:
+                    msg["instant_view_url"] = sm["instant_view_url"]
+                state.chat_messages.setdefault(cid, []).append(msg)
+                seeded_messages.append({"message_id": mid, "chat_id": cid, "pts": pts})
+
+            for fid, raw in staged_media:
+                state.media_blobs[fid] = raw
+                seeded_media_ids.append(fid)
+
+            for uid_opt, cat, key, v_copy in staged_vault:
+                uid = uid_opt if uid_opt is not None else state.default_user_id()
+                state.vault_items[(uid, cat, key)] = v_copy
+                seeded_vault_count += 1
+
+            for fk, fv in staged_floors.items():
+                state.journal_floors[fk] = fv
+
+            for node in staged_nodes:
+                state.remote_nodes[node["device_id"]] = node
+                seeded_node_ids.append(node["device_id"])
+
+            for app_obj in staged_miniapps:
+                state.miniapps[app_obj["app_id"]] = app_obj
+                seeded_miniapp_ids.append(app_obj["app_id"])
+
+            if staged_ws_push:
+                state.ws_push_queue.extend(staged_ws_push)
+
+            if staged_alipay_confirm is not None:
+                aid = staged_alipay_confirm["attempt_id"]
+                rec = state.alipay_attempts.get(aid)
+                if rec is None:
+                    st_tok = f"fbs_{aid}"
+                    rec = {
+                        "attempt_id": aid,
+                        "state": st_tok,
+                        "status": "pending",
+                        "issued_session": None,
+                        "expires_at_ms": ts + 600_000,
+                    }
+                    state.alipay_attempts[aid] = rec
+                    state.alipay_state_to_attempt[st_tok] = aid
+                uid = (
+                    staged_alipay_confirm["user_id"]
+                    if staged_alipay_confirm["user_id"] is not None
+                    else state.default_user_id()
+                )
+                state.ensure_user_by_id(uid)
+                custom_tok = staged_alipay_confirm["token"]
+                custom_sid = staged_alipay_confirm["session_id"]
+                if custom_tok is not None:
+                    seq = state.alloc_seq()
+                    sid = custom_sid or f"sess_{uid}_{seq}"
+                    sess = {
+                        "session_id": sid,
+                        "user_id": uid,
+                        "token": custom_tok,
+                        "device_name": "iOS Alipay Seeded",
+                        "created_at_ms": ts,
+                        "expires_at_ms": ts + 86_400_000,
+                        "revoked": False,
+                    }
+                    state.revoked_tokens.discard(custom_tok)
+                    state.sessions_by_token[custom_tok] = sess
+                    state.session_id_to_token[sid] = custom_tok
+                else:
+                    sess = state.mint_session(uid, "iOS Alipay Seeded", ts)
+                    if custom_sid is not None:
+                        old_sid = sess["session_id"]
+                        state.session_id_to_token.pop(old_sid, None)
+                        sess["session_id"] = custom_sid
+                        state.session_id_to_token[custom_sid] = sess["token"]
+                rec["status"] = "confirmed"
+                rec["issued_session"] = {
+                    "user_id": uid,
+                    "session_id": sess["session_id"],
+                    "token": sess["token"],
+                    "expires_at": ms_to_rfc3339(sess["expires_at_ms"]),
+                    "expires_at_ms": sess["expires_at_ms"],
+                }
+
+            if staged_alipay_expire is not None:
+                state.alipay_attempts[staged_alipay_expire]["status"] = "expired"
+                state.alipay_attempts[staged_alipay_expire]["expires_at_ms"] = ts - 1000
 
             return (
                 200,
@@ -841,6 +1351,7 @@ def handle_e2e_control(
             state.faults.clear()
             state.delays.clear()
             state.offline = False
+            state.drop_next_ws = False
             return (
                 200,
                 {
@@ -852,59 +1363,111 @@ def handle_e2e_control(
             )
 
     if method == "POST" and path == "/__e2e__/fault":
-        with state.lock:
-            try:
-                if body.get("clear") is True:
-                    state.faults.clear()
-                    state.delays.clear()
-                    state.offline = False
-                if "offline" in body and body["offline"] is not None:
-                    if not isinstance(body["offline"], bool):
-                        raise ValueError("offline must be boolean")
-                    state.offline = body["offline"]
-                fault_entries: list[dict[str, Any]] = []
-                if "http_fault" in body and body["http_fault"] is not None:
-                    fault_entries.append(body["http_fault"])
-                if "http_faults" in body and body["http_faults"] is not None:
-                    if not isinstance(body["http_faults"], list):
-                        raise ValueError("http_faults must be a list")
-                    fault_entries.extend(body["http_faults"])
-                for f in fault_entries:
-                    if not isinstance(f, dict):
-                        raise ValueError("http_fault entry must be an object")
-                    prefix = _str_nonempty_trim(f.get("path_prefix"))
-                    status = f.get("status")
-                    if not prefix or not isinstance(status, int) or status < 100 or status > 599:
-                        raise ValueError(
-                            "http_fault requires non-empty path_prefix and valid integer status"
-                        )
-                    state.faults.append(
-                        {
-                            "path_prefix": prefix,
-                            "method": _str_nonempty_trim(f.get("method")),
-                            "status": status,
-                            "body": f.get("body", {"error": f"injected_http_{status}"}),
-                            "retry_after_ms": f.get("retry_after_ms"),
-                            "remaining_hits": f.get("remaining_hits"),
-                        }
+        # Atomic pre-validation strictly BEFORE acquiring lock or mutating ANY state
+        try:
+            clear_flag: bool = False
+            if "clear" in body and body["clear"] is not None:
+                if not isinstance(body["clear"], bool):
+                    raise ValueError("clear must be boolean")
+                clear_flag = body["clear"]
+
+            offline_opt: bool | None = None
+            if "offline" in body and body["offline"] is not None:
+                if not isinstance(body["offline"], bool):
+                    raise ValueError("offline must be boolean")
+                offline_opt = body["offline"]
+
+            drop_next_ws_opt: bool | None = None
+            if "drop_next_ws" in body and body["drop_next_ws"] is not None:
+                if not isinstance(body["drop_next_ws"], bool):
+                    raise ValueError("drop_next_ws must be boolean")
+                drop_next_ws_opt = body["drop_next_ws"]
+
+            raw_fault_entries: list[Any] = []
+            if "http_fault" in body and body["http_fault"] is not None:
+                raw_fault_entries.append(body["http_fault"])
+            if "http_faults" in body and body["http_faults"] is not None:
+                if not isinstance(body["http_faults"], list):
+                    raise ValueError("http_faults must be a list")
+                raw_fault_entries.extend(body["http_faults"])
+
+            staged_faults: list[dict[str, Any]] = []
+            for f in raw_fault_entries:
+                if not isinstance(f, dict):
+                    raise ValueError("http_fault entry must be an object")
+                prefix = _str_nonempty_trim(f.get("path_prefix"))
+                if not prefix:
+                    raise ValueError("http_fault requires non-empty path_prefix")
+                status = f.get("status")
+                if not _is_strict_int(status) or status < 200 or status > 599 or status in (204, 304):
+                    raise ValueError(
+                        "http_fault requires valid integer status in 200..599 excluding 204/304"
                     )
-                if "delay" in body and body["delay"] is not None:
-                    d = body["delay"]
-                    if not isinstance(d, dict):
-                        raise ValueError("delay must be an object")
-                    prefix = _str_nonempty_trim(d.get("path_prefix"))
-                    delay_ms = d.get("delay_ms")
-                    if not prefix or not isinstance(delay_ms, int) or delay_ms < 0:
-                        raise ValueError(
-                            "delay requires non-empty path_prefix and non-negative delay_ms"
-                        )
-                    state.delays[prefix] = delay_ms
-            except (ValueError, TypeError) as exc:
-                return 400, {
-                    "ok": False,
-                    "error": "invalid_fault_payload",
-                    "message": str(exc),
-                }
+                f_method: str | None = None
+                if "method" in f and f["method"] is not None:
+                    f_method_trim = _str_nonempty_trim(f["method"])
+                    if not f_method_trim:
+                        raise ValueError("http_fault.method must be a non-empty string")
+                    f_method = f_method_trim.upper()
+                retry_after_ms = f.get("retry_after_ms")
+                if retry_after_ms is not None and (
+                    not _is_strict_int(retry_after_ms) or retry_after_ms < 0
+                ):
+                    raise ValueError("http_fault.retry_after_ms must be a non-negative integer")
+                remaining_hits = f.get("remaining_hits")
+                if remaining_hits is not None and (
+                    not _is_strict_int(remaining_hits) or remaining_hits < 0
+                ):
+                    raise ValueError("http_fault.remaining_hits must be a non-negative integer")
+                f_body = f.get("body")
+                if f_body is None:
+                    f_body = {"error": f"injected_http_{status}"}
+                elif not isinstance(f_body, dict):
+                    raise ValueError("http_fault.body must be an object")
+                staged_faults.append(
+                    {
+                        "path_prefix": prefix,
+                        "method": f_method,
+                        "status": status,
+                        "body": f_body,
+                        "retry_after_ms": retry_after_ms,
+                        "remaining_hits": remaining_hits,
+                    }
+                )
+
+            staged_delay: tuple[str, int] | None = None
+            if "delay" in body and body["delay"] is not None:
+                d = body["delay"]
+                if not isinstance(d, dict):
+                    raise ValueError("delay must be an object")
+                d_prefix = _str_nonempty_trim(d.get("path_prefix"))
+                delay_ms = d.get("delay_ms")
+                if not d_prefix or not _is_strict_int(delay_ms) or delay_ms < 0:
+                    raise ValueError(
+                        "delay requires non-empty path_prefix and non-negative integer delay_ms"
+                    )
+                staged_delay = (d_prefix, delay_ms)
+        except (ValueError, TypeError) as exc:
+            return 400, {
+                "ok": False,
+                "error": "invalid_fault_payload",
+                "message": str(exc),
+            }
+
+        with state.lock:
+            if clear_flag:
+                state.faults.clear()
+                state.delays.clear()
+                state.offline = False
+                state.drop_next_ws = False
+            if offline_opt is not None:
+                state.offline = offline_opt
+            if drop_next_ws_opt is not None:
+                state.drop_next_ws = drop_next_ws_opt
+            if staged_faults:
+                state.faults.extend(staged_faults)
+            if staged_delay is not None:
+                state.delays[staged_delay[0]] = staged_delay[1]
 
             active_faults = sum(
                 1
@@ -979,6 +1542,7 @@ def handle_e2e_control(
                     },
                     "chat_ids": sorted(state.chats.keys()),
                     "active_session_ids": sorted(active_sessions),
+                    "ws_received_frames": list(state.ws_received_frames),
                 },
             )
 
@@ -1037,25 +1601,27 @@ def route_api_request(
             200,
             {
                 "issuer": "http://127.0.0.1",
-                "authorization_endpoint": "/api/v1/oauth/authorize",
-                "token_endpoint": "/api/v1/oauth/token",
+                "authorization_endpoint": "/api/v1/mcp/oauth/authorize",
+                "token_endpoint": "/api/v1/mcp/oauth/token",
+                "registration_endpoint": "/api/v1/mcp/oauth/register",
                 "mcp_protocol_version": "2025-11-25",
+                "supported_mcp_versions": ["2025-11-25"],
                 "code_challenge_methods_supported": ["S256"],
                 "scopes_supported": [
-                    "messages:read",
-                    "messages:write",
-                    "chats:read",
-                    "chats:write",
-                    "contacts:read",
-                    "media:read",
-                    "media:write",
-                    "search:read",
-                    "agent:run",
+                    "mcp:read",
+                    "mcp:write",
                     "mcp:tools",
-                    "computers:read",
-                    "computers:control",
-                    "miniapp:read",
-                    "miniapp:invoke",
+                    "mcp:resources",
+                    "mcp:prompts",
+                    "mcp:tasks",
+                    "mcp:sampling",
+                    "mcp:roots",
+                    "mcp:notifications",
+                    "mcp:elicitation",
+                    "mcp:computer",
+                    "mcp:agent",
+                    "mcp:vault",
+                    "mcp:audit",
                 ],
             },
         )
@@ -1076,14 +1642,19 @@ def route_api_request(
                 uid = state.username_to_id[ident]
                 user = state.users_by_id.get(uid)
                 if user is not None:
+                    effective_auth_version = (
+                        user["auth_version"]
+                        if user["auth_verifier_b64"] is not None
+                        else 1
+                    )
                     return (
                         200,
                         {
-                            "auth_version": user["auth_version"],
+                            "auth_version": effective_auth_version,
                             "key_version": user["key_version"],
                             "kdf_alg": (
                                 "split_key_v2"
-                                if user["auth_version"] >= 2
+                                if effective_auth_version >= 2
                                 else "legacy_v1"
                             ),
                             "auth_salt_b64": user["auth_salt_b64"],
@@ -1123,24 +1694,33 @@ def route_api_request(
                         "message": "password or auth_verifier_b64 is required",
                     },
                 )
+            raw_av = body.get("auth_version")
+            if auth_verifier_b64 is not None:
+                auth_version = (
+                    parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                    if raw_av is not None
+                    else 2
+                )
+            else:
+                if raw_av is not None:
+                    parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                auth_version = 1
+            vault_envelope = body.get("vault_envelope")
+            default_kv = (
+                vault_envelope.get("key_version", 1)
+                if isinstance(vault_envelope, dict)
+                else 1
+            )
+            if "key_version" in body:
+                key_version = parse_int_or_400(body["key_version"], field="key_version", min_val=1)
+            else:
+                key_version = parse_int_or_400(default_kv, field="vault_envelope.key_version", min_val=1)
             state.next_user_id += 1
             uid = state.next_user_id
             first_name = _str_nonempty_trim(body.get("first_name")) or uname
-            auth_version = int(body.get("auth_version", 2))
             auth_salt_b64 = _str_nonempty_trim(
                 body.get("auth_salt_b64")
             ) or base64.b64encode(bytes([0x42] * 16)).decode("ascii")
-            vault_envelope = body.get("vault_envelope")
-            key_version = int(
-                body.get(
-                    "key_version",
-                    (
-                        vault_envelope.get("key_version", 1)
-                        if isinstance(vault_envelope, dict)
-                        else 1
-                    ),
-                )
-            )
             kdf_params = body.get(
                 "kdf_params", {"m_cost_kib": 65536, "t_cost": 3, "p_cost": 4}
             )
@@ -1251,10 +1831,20 @@ def route_api_request(
                     401,
                     {"error": "invalid_credentials", "message": "missing credentials"},
                 )
+            raw_av = body.get("auth_version")
+            if provided_v is not None:
+                auth_version = (
+                    parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                    if raw_av is not None
+                    else 2
+                )
+            else:
+                if raw_av is not None:
+                    parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                auth_version = 1
             state.next_user_id += 1
             uid = state.next_user_id
             uname = uname_opt or f"user_{uid}"
-            auth_version = int(body.get("auth_version", 2))
             password = None if provided_v is not None else provided_pw
             state.users_by_id[uid] = {
                 "user_id": uid,
@@ -1326,13 +1916,18 @@ def route_api_request(
         with state.lock:
             uid = caller_session["user_id"] if caller_session else state.default_user_id()
             user = state.ensure_user_by_id(uid)
+            has_cur_pw = "current_password" in body and body["current_password"] is not None
+            has_cur_v = (
+                "current_auth_verifier_b64" in body
+                and body["current_auth_verifier_b64"] is not None
+            )
             cur_pw = _str_nonblank_raw(body.get("current_password"))
             cur_v = _str_nonempty_trim(body.get("current_auth_verifier_b64"))
-            if user["password"] is not None and cur_pw is not None and cur_pw != user["password"]:
+            if user["password"] is not None and has_cur_pw and cur_pw != user["password"]:
                 return 401, {"error": "invalid_credentials"}
             if (
                 user["auth_verifier_b64"] is not None
-                and cur_v is not None
+                and has_cur_v
                 and cur_v != user["auth_verifier_b64"]
             ):
                 return 401, {"error": "invalid_credentials"}
@@ -1342,6 +1937,17 @@ def route_api_request(
             new_v = _str_nonempty_trim(
                 body.get("new_auth_verifier_b64") or body.get("auth_verifier_b64")
             )
+            raw_av = body.get("auth_version")
+            parsed_av = (
+                parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                if raw_av is not None
+                else None
+            )
+            parsed_kv = (
+                parse_int_or_400(body["key_version"], field="key_version", min_val=1)
+                if "key_version" in body and body["key_version"] is not None
+                else None
+            )
             if new_salt:
                 user["auth_salt_b64"] = new_salt
             if new_v:
@@ -1350,9 +1956,12 @@ def route_api_request(
             new_env = body.get("rewrapped_vault_envelope") or body.get("vault_envelope")
             if new_env is not None:
                 user["vault_envelope"] = new_env
-            user["auth_version"] = int(body.get("auth_version", 2))
-            if body.get("key_version") is not None:
-                user["key_version"] = int(body["key_version"])
+            if user["auth_verifier_b64"] is not None:
+                user["auth_version"] = parsed_av if parsed_av is not None else 2
+            else:
+                user["auth_version"] = 1
+            if parsed_kv is not None:
+                user["key_version"] = parsed_kv
             gen_num = state.alloc_seq()
             return (
                 200,
@@ -1397,19 +2006,31 @@ def route_api_request(
             new_pw = _str_nonblank_raw(body.get("new_password") or body.get("password"))
             if new_v is None and new_pw is None:
                 return 400, {"error": "invalid_params", "message": "missing new credential"}
+            raw_av = body.get("auth_version")
+            parsed_av = (
+                parse_int_or_400(raw_av, field="auth_version", min_val=1)
+                if raw_av is not None
+                else None
+            )
+            next_kv = (
+                parse_int_or_400(body["key_version"], field="key_version", min_val=1)
+                if "key_version" in body and body["key_version"] is not None
+                else user["key_version"] + 1
+            )
             if new_salt:
                 user["auth_salt_b64"] = new_salt
             if new_v is not None:
                 user["auth_verifier_b64"] = new_v
                 user["password"] = None
-                user["auth_version"] = int(body.get("auth_version", 2))
+                user["auth_version"] = parsed_av if parsed_av is not None else 2
             else:
                 user["password"] = new_pw
                 user["auth_verifier_b64"] = None
+                user["auth_version"] = 1
             new_env = body.get("rewrapped_vault_envelope") or body.get("vault_envelope")
             if new_env is not None:
                 user["vault_envelope"] = new_env
-            user["key_version"] = int(body.get("key_version", user["key_version"] + 1))
+            user["key_version"] = next_kv
 
             old_tokens = []
             for sess in state.sessions_by_token.values():
@@ -1547,8 +2168,9 @@ def route_api_request(
         "/api/v1/auth/2fa/set",
         "/api/v1/auth/two-factor/set",
     ):
-        new_pw = body.get("new_password") if "new_password" in body else body.get("password")
-        if not isinstance(new_pw, str) or not new_pw or len(new_pw) > 1024:
+        raw_pw = body.get("new_password") if "new_password" in body else body.get("password")
+        new_pw = raw_pw.strip() if isinstance(raw_pw, str) else ""
+        if not new_pw or len(new_pw.encode("utf-8")) > 1024:
             return 400, {"error": "invalid_password"}
         with state.lock:
             uid = caller_session["user_id"] if caller_session else state.default_user_id()
@@ -1594,6 +2216,8 @@ def route_api_request(
     ):
         chal = _str_nonempty_trim(body.get("challenge_token"))
         pw = body.get("cloud_password") if "cloud_password" in body else body.get("password")
+        if not isinstance(pw, str) or not pw.strip():
+            return 401, {"error": "invalid_cloud_password"}
         with state.lock:
             rec = state.two_factor_challenges.get(chal or "")
             if rec is None:
@@ -1601,7 +2225,8 @@ def route_api_request(
             if ts > rec["expires_at_ms"]:
                 return 401, {"error": "challenge_expired"}
             user = state.ensure_user_by_id(rec["user_id"])
-            if user["two_factor_password"] != pw:
+            expected_pw = user.get("two_factor_password")
+            if expected_pw is None or expected_pw != pw:
                 return 401, {"error": "invalid_cloud_password"}
             state.two_factor_challenges.pop(chal, None)
             dev = _str_nonempty_trim(body.get("device_name")) or rec["device_name"]
@@ -1624,7 +2249,7 @@ def route_api_request(
             seq = state.alloc_seq()
             tok = f"pair_{seq}_{uuid.uuid4().hex[:8]}"
             exp = ts + 300_000
-            qr_url = f"fabushi://pair?token={tok}"
+            qr_url = f"tg://login?token={tok}"
             state.qr_pairs[tok] = {
                 "pair_token": tok,
                 "device_name": _str_nonempty_trim(body.get("device_name")) or "Paired iOS",
@@ -1648,7 +2273,7 @@ def route_api_request(
         tok = _str_nonempty_trim(body.get("pair_token")) or ""
         with state.lock:
             rec = state.qr_pairs.get(tok)
-            if rec is None or ts > rec["expires_at_ms"]:
+            if rec is None or rec["status"] != "pending" or ts > rec["expires_at_ms"]:
                 return 400, {"error": "invalid_or_expired_pair_token"}
             uid = caller_session["user_id"] if caller_session else state.default_user_id()
             user = state.ensure_user_by_id(uid)
@@ -1706,7 +2331,7 @@ def route_api_request(
                 if not pw:
                     return 401, {"error": "two_factor_required"}
                 user = state.ensure_user_by_id(uid)
-                if user["two_factor_password"] != pw:
+                if user.get("two_factor_password") is None or user["two_factor_password"] != pw:
                     return 401, {"error": "invalid_cloud_password"}
             sess_json = rec["issued_session"]
             if sess_json is None:
@@ -1802,7 +2427,7 @@ def route_api_request(
         "/api/v1/auth/phone/login",
     ):
         code = _str_nonempty_trim(body.get("code"))
-        if not code or len(code) != 6 or not code.isdigit():
+        if not code or len(code) != 6 or not _is_ascii_uint_str(code):
             return 400, {"error": "invalid_code"}
         pch = _str_nonempty_trim(body.get("phone_code_hash"))
         with state.lock:
@@ -1922,7 +2547,9 @@ def route_api_request(
         "/api/v1/auth/passkeys/challenge",
     ):
         with state.lock:
-            uid = body.get("user_id")
+            uid: int | None = None
+            if "user_id" in body and body["user_id"] is not None:
+                uid = parse_int_or_400(body["user_id"], field="user_id")
             if uid is None:
                 uname = _str_nonempty_trim(body.get("username")) or extract_query_param(
                     query, "username"
@@ -2119,16 +2746,23 @@ def route_api_request(
                 resp["deduplicated"] = True
                 return 200, resp
 
+            chat_type = _normalize_chat_type(body.get("chat_type"), default=0)
+            if isinstance(body.get("member_ids"), list):
+                unique_members: set[str] = {str(uid)}
+                for m in body["member_ids"]:
+                    unique_members.add(str(m))
+                member_count = len(unique_members)
+            elif isinstance(body.get("recipients"), list):
+                unique_members = {str(uid)}
+                for m in body["recipients"]:
+                    val = m.get("user_id", m) if isinstance(m, dict) else m
+                    unique_members.add(str(val))
+                member_count = len(unique_members)
+            else:
+                member_count = 2
             state.next_chat_id += 1
             cid = state.next_chat_id
             title = _str_nonempty_trim(body.get("title")) or f"Chat {cid}"
-            chat_type = _str_nonempty_trim(body.get("chat_type")) or "group"
-            raw_members = body.get("member_ids") or body.get("recipients") or []
-            unique_members: set[str] = {str(uid)}
-            if isinstance(raw_members, list):
-                for m in raw_members:
-                    unique_members.add(str(m))
-            member_count = max(len(unique_members), 1)
             chat = {
                 "id": cid,
                 "chat_id": cid,
@@ -2136,7 +2770,7 @@ def route_api_request(
                 "chat_type": chat_type,
                 "member_count": member_count,
                 "creator_id": uid,
-                "is_group": chat_type in ("group", "supergroup", "channel"),
+                "is_group": chat_type in (1, 2, 3),
             }
             state.chats[cid] = chat
             state.chat_messages.setdefault(cid, [])
@@ -2151,31 +2785,45 @@ def route_api_request(
         code = _str_nonempty_trim(body.get("code")) or ""
         with state.lock:
             inv = state.chat_invites.get(code)
-            if inv is None or inv["revoked"] or (
+            if inv is None:
+                return 404, {"error": "invalid_invite"}
+            if inv["revoked"] or (
                 inv["max_uses"] is not None and inv["uses"] >= inv["max_uses"]
             ):
-                return 404, {"error": "invalid_invite"}
+                return 400, {"error": "invalid_invite"}
             inv["uses"] += 1
+            chat_obj = state.chats.get(inv["chat_id"])
+            if chat_obj is not None:
+                chat_obj["member_count"] = int(chat_obj.get("member_count", 0)) + 1
             return 200, {"chat_id": inv["chat_id"], "joined": True}
 
     if path.startswith("/api/v1/chats/") and path.endswith("/invites"):
         cid_str = path[len("/api/v1/chats/") : -len("/invites")]
-        try:
-            cid = int(cid_str)
-        except ValueError:
+        if not _is_ascii_int_str(cid_str):
             return 404, {"error": "not_found"}
+        cid = int(cid_str)
         with state.lock:
             if method == "POST":
+                raw_max = (
+                    body["max_uses"]
+                    if "max_uses" in body and body["max_uses"] is not None
+                    else body.get("usage_limit")
+                )
+                max_uses_int = (
+                    parse_int_or_400(raw_max, field="max_uses", min_val=0)
+                    if raw_max is not None
+                    else None
+                )
                 seq = state.alloc_seq()
                 inv_id = f"inv_{cid}_{seq}"
                 code = f"join_{cid}_{seq}"
-                max_uses = body.get("max_uses") or body.get("usage_limit")
                 inv = {
                     "invite_id": inv_id,
                     "chat_id": cid,
                     "code": code,
                     "url": f"https://fabushi.app/+{code}",
-                    "max_uses": int(max_uses) if max_uses is not None else None,
+                    "max_uses": max_uses_int,
+                    "usage_limit": max_uses_int,
                     "uses": 0,
                     "revoked": False,
                 }
@@ -2195,19 +2843,23 @@ def route_api_request(
         rest = path[len("/api/v1/chats/") :]
         _, inv_part = rest.split("/invites/", 1)
         inv_id = inv_part[:-len("/revoke")] if inv_part.endswith("/revoke") else inv_part
-        with state.lock:
-            inv = state.chat_invites.get(inv_id)
-            if inv is None:
-                return 404, {"error": "invite_not_found"}
-            inv["revoked"] = True
-            return 200, {"revoked": True, "invite_id": inv["invite_id"]}
+        if method in ("DELETE", "POST"):
+            with state.lock:
+                inv = state.chat_invites.get(inv_id)
+                if inv is None:
+                    return 404, {"error": "invite_not_found"}
+                inv["revoked"] = True
+                return 200, {"revoked": True, "invite_id": inv["invite_id"]}
+        if method == "GET":
+            with state.lock:
+                inv = state.chat_invites.get(inv_id)
+                if inv is None:
+                    return 404, {"error": "invite_not_found"}
+                return 200, dict(inv)
 
     if method == "GET" and path.startswith("/api/v1/chats/") and path.endswith("/topics"):
         cid_str = path[len("/api/v1/chats/") : -len("/topics")]
-        try:
-            cid = int(cid_str)
-        except ValueError:
-            cid = 1
+        cid = parse_int_or_400(cid_str, field="chat_id")
         return 200, {"chat_id": cid, "topics": []}
 
     # Messages send/history/edit/delete/reaction/read
@@ -2216,15 +2868,21 @@ def route_api_request(
         or (path.startswith("/api/v1/chats/") and path.endswith("/messages"))
     ):
         if path.startswith("/api/v1/chats/"):
-            cid = int(path[len("/api/v1/chats/") : -len("/messages")])
+            cid = parse_int_or_400(
+                path[len("/api/v1/chats/") : -len("/messages")], field="chat_id"
+            )
         else:
-            cid = int(body.get("chat_id", 1))
+            cid = (
+                parse_int_or_400(body["chat_id"], field="chat_id")
+                if "chat_id" in body
+                else 1
+            )
         text = body.get("text")
         if text is None:
             text = body.get("content", "")
         text_str = str(text)
         nonce = body.get("client_nonce")
-        nonce_int = int(nonce) if isinstance(nonce, int) and not isinstance(nonce, bool) else None
+        nonce_int = int(nonce) if _is_strict_int(nonce) else None
         with state.lock:
             if nonce_int is not None and (cid, nonce_int) in state.chat_nonce_map:
                 existing_mid = state.chat_nonce_map[(cid, nonce_int)]
@@ -2255,10 +2913,12 @@ def route_api_request(
         or (path.startswith("/api/v1/chats/") and path.endswith("/messages"))
     ):
         if path.startswith("/api/v1/chats/"):
-            cid = int(path[len("/api/v1/chats/") : -len("/messages")])
+            cid = parse_int_or_400(
+                path[len("/api/v1/chats/") : -len("/messages")], field="chat_id"
+            )
         else:
             cid_s = extract_query_param(query, "chat_id")
-            cid = int(cid_s) if cid_s and cid_s.lstrip("-").isdigit() else 1
+            cid = int(cid_s) if cid_s and _is_ascii_int_str(cid_s) else 1
         with state.lock:
             msgs = [_format_stored_message(m) for m in state.chat_messages.get(cid, [])]
             return (
@@ -2273,7 +2933,7 @@ def route_api_request(
 
     if method == "GET" and path.startswith("/api/v1/chats/") and "/" not in path[len("/api/v1/chats/") :]:
         cid_str = path[len("/api/v1/chats/") :]
-        if cid_str.lstrip("-").isdigit():
+        if _is_ascii_int_str(cid_str):
             cid = int(cid_str)
             with state.lock:
                 chat = state.chats.get(cid)
@@ -2282,8 +2942,12 @@ def route_api_request(
                 return 200, dict(chat)
 
     if method == "POST" and path == "/api/v1/messages/edit":
-        cid = int(body.get("chat_id", 1))
-        mid = int(body.get("message_id", 0))
+        cid = parse_int_or_400(body["chat_id"], field="chat_id") if "chat_id" in body else 1
+        mid = (
+            parse_int_or_400(body["message_id"], field="message_id")
+            if "message_id" in body
+            else 0
+        )
         new_text = str(body.get("text", ""))
         with state.lock:
             pts = state.chat_pts.get(cid, 0) + 1
@@ -2306,9 +2970,15 @@ def route_api_request(
             )
 
     if method == "POST" and path == "/api/v1/messages/delete":
-        cid = int(body.get("chat_id", 1))
+        cid = parse_int_or_400(body["chat_id"], field="chat_id") if "chat_id" in body else 1
         revoke = bool(body.get("revoke", False))
-        ids = {int(x) for x in body.get("message_ids", [])}
+        if "message_ids" in body:
+            raw_ids = body["message_ids"]
+            if not isinstance(raw_ids, list):
+                raise ApiParamError("message_ids must be a list")
+            ids = {parse_int_or_400(x, field="message_ids[]") for x in raw_ids}
+        else:
+            ids = set()
         with state.lock:
             pts = state.chat_pts.get(cid, 0) + 1
             state.chat_pts[cid] = pts
@@ -2328,14 +2998,14 @@ def route_api_request(
             )
 
     if method == "POST" and path == "/api/v1/messages/reaction":
-        cid = int(body.get("chat_id", 1))
+        cid = parse_int_or_400(body["chat_id"], field="chat_id") if "chat_id" in body else 1
         with state.lock:
             pts = state.chat_pts.get(cid, 0) + 1
             state.chat_pts[cid] = pts
             return 200, {"ok": True, "success": True, "pts": pts, "status": "reaction_updated"}
 
     if method == "POST" and path == "/api/v1/messages/read":
-        cid = int(body.get("chat_id", 1))
+        cid = parse_int_or_400(body["chat_id"], field="chat_id") if "chat_id" in body else 1
         with state.lock:
             pts = state.chat_pts.get(cid, 0) + 1
             state.chat_pts[cid] = pts
@@ -2349,9 +3019,18 @@ def route_api_request(
         cid_q = extract_query_param(query, "chat_id")
         pts_q = extract_query_param(query, "pts")
         lim_q = extract_query_param(query, "limit")
-        cid = int(body.get("chat_id", int(cid_q) if cid_q and cid_q.lstrip("-").isdigit() else 1))
-        req_pts = int(body.get("pts", int(pts_q) if pts_q and pts_q.isdigit() else 0))
-        limit = max(1, int(body.get("limit", int(lim_q) if lim_q and lim_q.isdigit() else 100)))
+        if "chat_id" in body:
+            cid = parse_int_or_400(body["chat_id"], field="chat_id")
+        else:
+            cid = int(cid_q) if cid_q and _is_ascii_int_str(cid_q) else 1
+        if "pts" in body:
+            req_pts = parse_int_or_400(body["pts"], field="pts")
+        else:
+            req_pts = int(pts_q) if pts_q and _is_ascii_uint_str(pts_q) else 0
+        if "limit" in body:
+            limit = max(1, parse_int_or_400(body["limit"], field="limit"))
+        else:
+            limit = max(1, int(lim_q) if lim_q and _is_ascii_uint_str(lim_q) else 100)
         with state.lock:
             floor = state.journal_floors.get(cid, 1)
             cur_pts = max(state.chat_pts.get(cid, 0), max(0, floor - 1))
@@ -2395,15 +3074,25 @@ def route_api_request(
 
     if method == "GET" and path in ("/api/v1/sync/state", "/api/v1/sync/pts"):
         cid_q = extract_query_param(query, "chat_id")
-        cid = int(cid_q) if cid_q and cid_q.lstrip("-").isdigit() else 1
+        cid = int(cid_q) if cid_q and _is_ascii_int_str(cid_q) else 1
         with state.lock:
             cur_pts = state.chat_pts.get(cid, 0)
             return 200, {"chat_id": cid, "pts": cur_pts, "current_pts": cur_pts, "seq": state.next_seq}
 
     # Media JSON upload control & Instant View
     if method == "POST" and path == "/api/v1/media/upload/init":
-        total_size = int(body.get("total_size", body.get("size_bytes", 0)))
-        part_size = int(body.get("part_size", body.get("chunk_size", 1024 * 1024)))
+        if "total_size" in body:
+            total_size = parse_int_or_400(body["total_size"], field="total_size")
+        elif "size_bytes" in body:
+            total_size = parse_int_or_400(body["size_bytes"], field="size_bytes")
+        else:
+            total_size = 0
+        if "part_size" in body:
+            part_size = parse_int_or_400(body["part_size"], field="part_size")
+        elif "chunk_size" in body:
+            part_size = parse_int_or_400(body["chunk_size"], field="chunk_size")
+        else:
+            part_size = 1024 * 1024
         if total_size < 0 or total_size > MAX_UPLOAD_TOTAL_SIZE:
             return 400, {"error": "upload_size_exceeded"}
         if part_size <= 0 or part_size > MAX_UPLOAD_PART_SIZE:
@@ -2815,7 +3504,12 @@ def route_api_request(
 
     if method == "POST" and path == "/api/v1/computer/action":
         did = _str_nonempty_trim(body.get("device_id") or body.get("node_id")) or "default_device"
-        req_gen = body.get("generation")
+        req_gen_raw = body.get("generation")
+        req_gen: int | None = None
+        if "generation" in body and req_gen_raw is not None:
+            if not _is_strict_int(req_gen_raw):
+                raise ApiParamError("generation must be an integer")
+            req_gen = req_gen_raw
         with state.lock:
             node = state.remote_nodes.get(did)
             op = str(body.get("op", ""))
@@ -2833,7 +3527,7 @@ def route_api_request(
                     )
             lease = state.computer_leases.get(did)
             if lease is not None:
-                if isinstance(req_gen, int) and req_gen < lease["generation"]:
+                if req_gen is not None and req_gen < lease["generation"]:
                     return (
                         403,
                         {
@@ -2854,23 +3548,84 @@ def route_api_request(
                 200,
                 {
                     "status": "action_executed",
-                    "generation": int(req_gen) if isinstance(req_gen, int) else 1,
+                    "generation": req_gen if req_gen is not None else 1,
                     "lease_id": "lease_default",
                     "target_device_id": did,
                 },
             )
 
-    # MiniApps catalog
+    # MiniApps catalog & stateful ToS persistence
     if method == "GET" and path == "/api/v1/miniapps":
         with state.lock:
             apps = [dict(state.miniapps[k]) for k in sorted(state.miniapps.keys())]
             return 200, {"miniapps": apps, "total": len(apps)}
 
+    if (
+        method == "GET"
+        and path.startswith("/api/v1/miniapps/")
+        and "/" not in path[len("/api/v1/miniapps/") :]
+    ):
+        aid = urllib.parse.unquote(path[len("/api/v1/miniapps/") :]).strip()
+        with state.lock:
+            app = state.miniapps.get(aid)
+            if app is None:
+                return 404, {"error": "miniapp_not_found"}
+            return 200, dict(app)
+
+    if method in ("POST", "PUT") and (
+        path in ("/api/v1/miniapps/tos", "/api/v1/miniapps/accept-tos", "/api/v1/miniapps/accept_tos")
+        or (
+            path.startswith("/api/v1/miniapps/")
+            and (
+                path.endswith("/tos")
+                or path.endswith("/accept-tos")
+                or path.endswith("/accept_tos")
+            )
+        )
+    ):
+        aid = None
+        if path.startswith("/api/v1/miniapps/") and path not in (
+            "/api/v1/miniapps/tos",
+            "/api/v1/miniapps/accept-tos",
+            "/api/v1/miniapps/accept_tos",
+        ):
+            rest = path[len("/api/v1/miniapps/") :]
+            aid = urllib.parse.unquote(rest.rsplit("/", 1)[0]).strip() or None
+        if not aid:
+            aid = _str_nonempty_trim(body.get("app_id") or body.get("bot_id"))
+        if not aid:
+            return 400, {"error": "invalid_params", "message": "app_id is required"}
+        if "tos_accepted" in body and body["tos_accepted"] is not None:
+            if not isinstance(body["tos_accepted"], bool):
+                return 400, {"error": "invalid_params", "message": "tos_accepted must be boolean"}
+            accepted = body["tos_accepted"]
+        elif "accepted" in body and body["accepted"] is not None:
+            if not isinstance(body["accepted"], bool):
+                return 400, {"error": "invalid_params", "message": "accepted must be boolean"}
+            accepted = body["accepted"]
+        else:
+            accepted = True
+        with state.lock:
+            app = state.miniapps.get(aid)
+            if app is None:
+                app = {
+                    "app_id": aid,
+                    "title": _str_nonempty_trim(body.get("title")) or aid,
+                    "tos_accepted": accepted,
+                    "webmcp_enabled": True,
+                }
+                state.miniapps[aid] = app
+            else:
+                app["tos_accepted"] = accepted
+            resp = dict(app)
+            resp["ok"] = True
+            return 200, resp
+
     # Search, WebRTC, Tasks, MCP, Talk, Magpie, Updates
     if method == "GET" and path == "/api/v1/search/messages":
         q = extract_query_param(query, "q") or ""
         cid_q = extract_query_param(query, "chat_id")
-        cid_filter = int(cid_q) if cid_q and cid_q.lstrip("-").isdigit() else None
+        cid_filter = int(cid_q) if cid_q and _is_ascii_int_str(cid_q) else None
         q_lower = q.lower()
         with state.lock:
             results = []
@@ -2904,7 +3659,10 @@ def route_api_request(
         return (
             200,
             {
-                "ice_servers": [{"urls": ["stun:127.0.0.1:3478"]}],
+                "urls": ["stun:stun.l.google.com:19302"],
+                "username": "ephemeral_fabushi_user",
+                "credential": "ephemeral_fabushi_credential",
+                "ice_servers": [{"urls": ["stun:stun.l.google.com:19302"]}],
                 "ttl_seconds": 43200,
             },
         )
@@ -2941,10 +3699,27 @@ def route_api_request(
         tid = path[len("/api/v1/tasks/") : -len("/approve")]
         with state.lock:
             task = state.tasks.setdefault(tid, {"task_id": tid, "state": "review"})
-            approved = bool(body.get("approved", body.get("decision") != "deny"))
+            if "approved" in body and isinstance(body["approved"], bool):
+                approved = body["approved"]
+            else:
+                dec = str(body.get("decision", "approve")).strip().lower()
+                approved = dec not in (
+                    "deny",
+                    "denied",
+                    "reject",
+                    "rejected",
+                    "false",
+                    "cancel",
+                    "cancelled",
+                )
             task["approved"] = approved
             task["state"] = "active" if approved else "cancelled"
-            return 200, dict(task)
+            resp = dict(task)
+            resp["decision"] = "approved" if approved else "rejected"
+            resp["current_state"] = task["state"]
+            resp["transition_success"] = True
+            resp["gate_id"] = f"gate_{tid}"
+            return 200, resp
 
     if method == "GET" and path == "/api/v1/mcp/servers":
         with state.lock:
@@ -3031,19 +3806,24 @@ class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
         handler_cls: type[http.server.BaseHTTPRequestHandler],
         state: LoopbackState,
         quiet: bool = False,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.state = state
         self.quiet = quiet
+        self.stop_event: threading.Event = (
+            stop_event if stop_event is not None else threading.Event()
+        )
         super().__init__(server_address, handler_cls)
 
 
 class LoopbackHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = HTTP_SOCKET_TIMEOUT_SECS
 
     def handle_one_request(self) -> None:
         try:
             super().handle_one_request()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout, OSError):
             self.close_connection = True
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -3083,18 +3863,71 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
         data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
         self._send_bytes(status, "application/json", data, extra_headers, is_head=is_head)
 
+    def _send_fault(self, fault: dict[str, Any], *, is_head: bool = False) -> None:
+        extra: list[tuple[str, str]] = []
+        retry_ms = fault.get("retry_after_ms")
+        if _is_strict_int(retry_ms) and retry_ms > 0:
+            sec = (retry_ms + 999) // 1000
+            extra.append(("Retry-After", str(sec)))
+        body_obj = fault.get("body")
+        if not isinstance(body_obj, dict):
+            body_obj = {"error": f"injected_http_{fault['status']}"}
+        self._send_json(fault["status"], body_obj, extra_headers=extra, is_head=is_head)
+
+    def _parse_content_length(self) -> int | None:
+        cl_values = self.headers.get_all("Content-Length") or []
+        if not cl_values:
+            return None
+        parsed_vals: list[int] = []
+        for raw in cl_values:
+            for part in raw.split(","):
+                tok = part.strip()
+                if not tok or not _is_ascii_uint_str(tok):
+                    raise BadRequestError("invalid_content_length")
+                parsed_vals.append(int(tok))
+        if not parsed_vals:
+            raise BadRequestError("invalid_content_length")
+        first = parsed_vals[0]
+        if any(v != first for v in parsed_vals[1:]):
+            raise BadRequestError("conflicting_content_length")
+        if first > MAX_HTTP_BODY_BYTES:
+            raise PayloadTooLargeError("body_too_large")
+        return first
+
+    def _read_exact(self, length: int, *, err_msg: str = "truncated_body") -> bytes:
+        buf = bytearray()
+        remaining = length
+        while remaining > 0:
+            try:
+                chunk = self.rfile.read(remaining)
+            except (TimeoutError, socket.timeout) as exc:
+                raise BadRequestError(f"{err_msg}_timeout") from exc
+            if not chunk:
+                raise BadRequestError(err_msg)
+            buf.extend(chunk)
+            remaining -= len(chunk)
+        return bytes(buf)
+
     def _read_request_body(self) -> bytes:
+        te_values = self.headers.get_all("Transfer-Encoding") or []
+        is_chunked = any("chunked" in v.lower() for v in te_values)
+        cl = self._parse_content_length()
+        if is_chunked and cl is not None:
+            raise BadRequestError("conflicting_te_and_cl")
+
         expect = self.headers.get("Expect", "")
-        if "100-continue" in expect.lower():
+        if "100-continue" in expect.lower() and (is_chunked or (cl is not None and cl > 0)):
             self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             self.wfile.flush()
 
-        te = self.headers.get("Transfer-Encoding", "").lower()
-        if "chunked" in te:
+        if is_chunked:
             out = bytearray()
             while True:
-                line = self.rfile.readline(65536)
-                if not line:
+                try:
+                    line = self.rfile.readline(65536)
+                except (TimeoutError, socket.timeout) as exc:
+                    raise BadRequestError("truncated_chunk_size") from exc
+                if not line or not line.endswith(b"\n"):
                     raise BadRequestError("truncated_chunk_size")
                 size_part = line.split(b";", 1)[0].strip()
                 if not size_part or not all(
@@ -3106,8 +3939,15 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
                 if chunk_size == 0:
                     trailer_count = 0
                     while True:
-                        tline = self.rfile.readline(65536)
-                        if not tline or tline in (b"\r\n", b"\n"):
+                        try:
+                            tline = self.rfile.readline(65536)
+                        except (TimeoutError, socket.timeout) as exc:
+                            raise BadRequestError("truncated_chunk_trailers") from exc
+                        if not tline:
+                            raise BadRequestError("truncated_chunk_trailers")
+                        if not tline.endswith(b"\n"):
+                            raise BadRequestError("chunk_trailer_too_long")
+                        if tline in (b"\r\n", b"\n"):
                             break
                         trailer_count += 1
                         if trailer_count > MAX_HTTP_TRAILER_LINES:
@@ -3115,32 +3955,19 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
                     break
                 if len(out) + chunk_size > MAX_HTTP_BODY_BYTES:
                     raise PayloadTooLargeError("chunked_body_too_large")
-                chunk = self.rfile.read(chunk_size)
-                if len(chunk) != chunk_size:
-                    raise BadRequestError("truncated_chunk_data")
+                chunk = self._read_exact(chunk_size, err_msg="truncated_chunk_data")
                 out.extend(chunk)
-                crlf = self.rfile.readline(4)
+                try:
+                    crlf = self.rfile.readline(4)
+                except (TimeoutError, socket.timeout) as exc:
+                    raise BadRequestError("missing_chunk_crlf") from exc
                 if crlf not in (b"\r\n", b"\n"):
                     raise BadRequestError("missing_chunk_crlf")
             return bytes(out)
 
-        cl_raw = self.headers.get("Content-Length")
-        if cl_raw is None:
+        if cl is None or cl == 0:
             return b""
-        try:
-            cl = int(cl_raw.strip())
-        except ValueError as exc:
-            raise BadRequestError("invalid_content_length") from exc
-        if cl < 0:
-            raise BadRequestError("negative_content_length")
-        if cl > MAX_HTTP_BODY_BYTES:
-            raise PayloadTooLargeError("body_too_large")
-        if cl == 0:
-            return b""
-        data = self.rfile.read(cl)
-        if len(data) != cl:
-            raise BadRequestError("truncated_body")
-        return data
+        return self._read_exact(cl, err_msg="truncated_body")
 
     def _extract_media_bytes(self, headers: dict[str, str], body_bytes: bytes) -> bytes:
         ct = headers.get("content-type", "").lower()
@@ -3153,7 +3980,191 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
                 pass
         return body_bytes
 
+    def _handle_websocket(
+        self, state: LoopbackState, ws_key: str, ws_token: str | None
+    ) -> None:
+        assert isinstance(self.server, LoopbackHTTPServer)
+        try:
+            accept = compute_websocket_accept(ws_key)
+        except UnicodeEncodeError:
+            self._send_json(400, {"error": "invalid_websocket_key"})
+            return
+
+        self.close_connection = True
+        sock = self.connection
+        # Drain any already-buffered bytes from self.rfile before taking raw socket ownership
+        initial_ws = bytearray()
+        sock.settimeout(0.0)
+        try:
+            while True:
+                chunk = self.rfile.read1(65536)
+                if not chunk:
+                    break
+                initial_ws.extend(chunk)
+        except (BlockingIOError, TimeoutError, socket.timeout, OSError):
+            pass
+        reader = _WsConnReader(bytes(initial_ws))
+
+        with state.lock:
+            should_drop = state.drop_next_ws
+            if should_drop:
+                state.drop_next_ws = False
+        if should_drop:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+        try:
+            sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+            handshake_resp = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+            sock.sendall(handshake_resp)
+
+            frag_opcode: int | None = None
+            frag_buf = bytearray()
+            stop_event = self.server.stop_event
+
+            def _dispatch_ws_data(msg_opcode: int, msg_bytes: bytes) -> None:
+                if msg_opcode == 0x1:
+                    try:
+                        text = msg_bytes.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise _WsProtocolError(1007, "invalid_utf8") from exc
+                    with state.lock:
+                        state.ws_received_frames.append(text)
+                    ack = json.dumps(
+                        {"type": "ws_ack", "echo": text, "timestamp_ms": now_ms()},
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_frame(sock, 0x1, ack)
+                else:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_frame(sock, 0x2, msg_bytes)
+
+            while not stop_event.is_set():
+                pending_pushes: list[str] = []
+                with state.lock:
+                    is_revoked = ws_token is not None and state.is_token_rejected(ws_token)
+                    is_offline = state.offline
+                    if not is_revoked and not is_offline:
+                        while state.ws_push_queue:
+                            pending_pushes.append(state.ws_push_queue.popleft())
+                if is_revoked:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_close(sock, 4001, "session_revoked")
+                    break
+                if is_offline:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_close(sock, 1001, "offline")
+                    break
+                for msg in pending_pushes:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_frame(sock, 0x1, msg.encode("utf-8"))
+
+                try:
+                    frame = reader.read_frame(sock, stop_event)
+                except _WsProtocolError as exc:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_close(sock, exc.code, exc.reason)
+                    break
+                except (_WsClosedError, OSError):
+                    break
+
+                if frame is None:
+                    continue
+                fin, opcode, payload = frame
+                if opcode == 0x9:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_frame(sock, 0xA, payload)
+                elif opcode == 0xA:
+                    continue
+                elif opcode == 0x8:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_close(sock, 1000, "")
+                    break
+                elif opcode in (0x1, 0x2):
+                    if frag_opcode is not None:
+                        sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                        _write_ws_close(sock, 1002, "interleaved_data_frame")
+                        break
+                    if fin:
+                        try:
+                            _dispatch_ws_data(opcode, payload)
+                        except _WsProtocolError as exc:
+                            sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                            _write_ws_close(sock, exc.code, exc.reason)
+                            break
+                    else:
+                        if len(payload) > MAX_WS_MESSAGE_BYTES:
+                            sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                            _write_ws_close(sock, 1009, "message_too_large")
+                            break
+                        frag_opcode = opcode
+                        frag_buf = bytearray(payload)
+                elif opcode == 0x0:
+                    if frag_opcode is None:
+                        sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                        _write_ws_close(sock, 1002, "unexpected_continuation")
+                        break
+                    if len(frag_buf) + len(payload) > MAX_WS_MESSAGE_BYTES:
+                        sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                        _write_ws_close(sock, 1009, "message_too_large")
+                        break
+                    frag_buf.extend(payload)
+                    if fin:
+                        try:
+                            _dispatch_ws_data(frag_opcode, bytes(frag_buf))
+                        except _WsProtocolError as exc:
+                            sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                            _write_ws_close(sock, exc.code, exc.reason)
+                            break
+                        frag_opcode = None
+                        frag_buf.clear()
+                else:
+                    sock.settimeout(HTTP_SOCKET_TIMEOUT_SECS)
+                    _write_ws_close(sock, 1002, "unsupported_opcode")
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def _dispatch(self) -> None:
+        is_head = self.command.upper() == "HEAD"
+        try:
+            self._dispatch_inner()
+        except ApiParamError as exc:
+            self._send_json(
+                400, {"error": "invalid_params", "message": str(exc)}, is_head=is_head
+            )
+        except PayloadTooLargeError as exc:
+            self._send_json(
+                413, {"error": "payload_too_large", "message": str(exc)}, is_head=is_head
+            )
+        except BadRequestError as exc:
+            self._send_json(
+                400, {"error": "bad_request", "message": str(exc)}, is_head=is_head
+            )
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
+            self.close_connection = True
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(
+                500,
+                {"error": "internal_error", "message": f"{type(exc).__name__}: {exc}"},
+                is_head=is_head,
+            )
+
+    def _dispatch_inner(self) -> None:
         assert isinstance(self.server, LoopbackHTTPServer)
         state = self.server.state
         method = self.command.upper()
@@ -3163,14 +4174,7 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
 
         # Control plane `/__e2e__/*` is immune to offline, faults, and delays, and excluded from recorded
         if matches_segment_prefix(path, "/__e2e__"):
-            try:
-                body_bytes = self._read_request_body()
-            except PayloadTooLargeError as exc:
-                self._send_json(413, {"error": "payload_too_large", "message": str(exc)}, is_head=is_head)
-                return
-            except BadRequestError as exc:
-                self._send_json(400, {"error": "bad_request", "message": str(exc)}, is_head=is_head)
-                return
+            body_bytes = self._read_request_body()
             status, resp = handle_e2e_control(state, method, path, query, body_bytes)
             self._send_json(status, resp, is_head=is_head)
             return
@@ -3186,15 +4190,7 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
                 pass
             return
 
-        try:
-            body_bytes = self._read_request_body()
-        except PayloadTooLargeError as exc:
-            self._send_json(413, {"error": "payload_too_large", "message": str(exc)}, is_head=is_head)
-            return
-        except BadRequestError as exc:
-            self._send_json(400, {"error": "bad_request", "message": str(exc)}, is_head=is_head)
-            return
-
+        body_bytes = self._read_request_body()
         state.record_request(method, path, query, headers, body_bytes)
 
         # Delay injection slept strictly OUTSIDE lock
@@ -3204,15 +4200,51 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
 
         # Deterministic fault injection
         fault = state.pop_matching_fault(method, path)
+
+        # HTTP CONNECT proxy tunneling (subject to offline/delays/faults)
+        if method == "CONNECT":
+            if fault is not None:
+                self._send_fault(fault, is_head=False)
+                return
+            self.close_connection = True
+            self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            self.wfile.flush()
+            return
+
+        # RFC 6455 WebSocket Upgrade Gate (strict path gate, pre-101 fault & Bearer revocation)
+        upgrade_hdr = headers.get("upgrade", "").strip().lower()
+        ws_key = headers.get("sec-websocket-key", "").strip()
+        if upgrade_hdr == "websocket" and ws_key:
+            if path not in ("/api/v1/ws", "/ws"):
+                self._send_json(
+                    404,
+                    {
+                        "error": "not_found",
+                        "message": f"unrecognized websocket path: {path}",
+                        "path": path,
+                    },
+                    is_head=is_head,
+                )
+                return
+            if fault is not None:
+                self._send_fault(fault, is_head=is_head)
+                return
+            ws_token = extract_bearer_token(headers, query)
+            if ws_token is not None:
+                with state.lock:
+                    rejected = state.is_token_rejected(ws_token)
+                if rejected:
+                    self._send_json(
+                        401,
+                        {"error": "unauthorized", "message": "session_revoked"},
+                        is_head=is_head,
+                    )
+                    return
+            self._handle_websocket(state, ws_key, ws_token)
+            return
+
         if fault is not None:
-            extra: list[tuple[str, str]] = []
-            if isinstance(fault.get("retry_after_ms"), int) and fault["retry_after_ms"] > 0:
-                sec = (fault["retry_after_ms"] + 999) // 1000
-                extra.append(("Retry-After", str(sec)))
-            body_obj = fault.get("body")
-            if not isinstance(body_obj, dict):
-                body_obj = {"error": f"injected_http_{fault['status']}"}
-            self._send_json(fault["status"], body_obj, extra_headers=extra, is_head=is_head)
+            self._send_fault(fault, is_head=is_head)
             return
 
         # Instant View HTML article routes (segment-bounded)
@@ -3274,7 +4306,7 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
         ):
             rest = path[len("/api/v1/media/upload/") :]
             upl_id, part_s = rest.split("/part/", 1)
-            if not part_s.isdigit():
+            if not _is_ascii_uint_str(part_s):
                 self._send_json(400, {"error": "invalid_part_index"})
                 return
             part_index = int(part_s)
@@ -3373,13 +4405,11 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
         self._dispatch()
 
     def do_CONNECT(self) -> None:
-        self.close_connection = True
-        self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        self.wfile.flush()
+        self._dispatch()
 
 
 # ---------------------------------------------------------------------------
-# Deterministic --self-test suite (10 checks, zero external deps, zero repo files)
+# Deterministic --self-test suite (11 checks, zero external deps, zero repo files)
 # ---------------------------------------------------------------------------
 
 
@@ -3449,6 +4479,7 @@ def _start_ephemeral_server(version: str = DEFAULT_SERVER_VERSION) -> tuple[Loop
 
 
 def _stop_ephemeral_server(srv: LoopbackHTTPServer, thread: threading.Thread) -> None:
+    srv.stop_event.set()
     srv.shutdown()
     thread.join(timeout=5.0)
     srv.server_close()
@@ -3581,7 +4612,93 @@ def run_self_test(report_path: str = "") -> int:
             assert st_lo == 200
             st_after, _ = _json_call(base, "GET", "/api/v1/auth/me", bearer=tok2)
             assert st_after == 401
-            return "split_key_v2+rotation+logout verified"
+
+            # Split-Key V2 vs legacy_v1 seed normalization & whitespace upgrade guard (B-01 / A-01)
+            st_seed_pw, _ = _json_call(
+                base,
+                "POST",
+                "/__e2e__/seed",
+                {
+                    "users": [
+                        {
+                            "username": "legacy_pw_user",
+                            "password": "Legacy!Password1",
+                            "auth_version": 2,
+                        },
+                        {
+                            "username": "v2_seeded_user",
+                            "auth_salt_b64": salt1,
+                            "auth_verifier_b64": ver1,
+                        },
+                    ]
+                },
+            )
+            assert st_seed_pw == 200
+            st_lk, lk = _json_call(
+                base, "GET", "/api/v1/auth/kdf-params?identifier=legacy_pw_user"
+            )
+            assert st_lk == 200 and lk["auth_version"] == 1 and lk["kdf_alg"] == "legacy_v1"
+            st_pw_ok, pw_login = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "legacy_pw_user", "password": "Legacy!Password1"},
+            )
+            assert st_pw_ok == 200
+            pw_tok = pw_login["token"]
+            st_ws_login, _ = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "legacy_pw_user", "password": "   "},
+            )
+            assert st_ws_login == 401
+            st_ws_upg, _ = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/upgrade-split-key",
+                {"current_password": "   ", "new_auth_verifier_b64": ver2},
+                bearer=pw_tok,
+            )
+            assert st_ws_upg == 401
+            st_upg_ok, upg = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/upgrade-split-key",
+                {"current_password": "Legacy!Password1", "new_auth_verifier_b64": ver2},
+                bearer=pw_tok,
+            )
+            assert st_upg_ok == 200 and upg["auth_version"] == 2
+            st_lk2, lk2 = _json_call(
+                base, "GET", "/api/v1/auth/kdf-params?identifier=legacy_pw_user"
+            )
+            assert st_lk2 == 200 and lk2["auth_version"] == 2 and lk2["kdf_alg"] == "split_key_v2"
+            st_pw_after, _ = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "legacy_pw_user", "password": "Legacy!Password1"},
+            )
+            assert st_pw_after == 401
+            st_v2k, v2k = _json_call(
+                base, "GET", "/api/v1/auth/kdf-params?identifier=v2_seeded_user"
+            )
+            assert st_v2k == 200 and v2k["auth_version"] == 2 and v2k["kdf_alg"] == "split_key_v2"
+            st_v2_ok, _ = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "v2_seeded_user", "auth_verifier_b64": ver1},
+            )
+            assert st_v2_ok == 200
+            st_v2_bad, _ = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/login",
+                {"username": "v2_seeded_user", "auth_verifier_b64": ver2},
+            )
+            assert st_v2_bad == 401
+            return "split_key_v2+legacy_v1+rotation+logout verified"
         finally:
             _stop_ephemeral_server(srv, th)
 
@@ -3739,7 +4856,84 @@ def run_self_test(report_path: str = "") -> int:
                 headers={"Authorization": f"Bearer {tok}"},
             )
             assert st_rev == 401
-            return f"media_id={mid}, 206/416/revoked=401"
+
+            # HTTP/1.1 framing, Expect: 100-continue pre-validation, HEAD & CONNECT checks (B-04)
+            for bad_cl in ("+5", "1_000"):
+                raw_req = (
+                    f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{port}\r\n"
+                    f"Content-Length: {bad_cl}\r\n"
+                    f"Expect: 100-continue\r\n"
+                    f"Connection: close\r\n\r\nhello"
+                ).encode("ascii")
+                st_bcl, head_bcl, _ = _raw_tcp_request("127.0.0.1", port, raw_req)
+                assert st_bcl == 400 and "100 Continue" not in head_bcl
+            dup_cl_req = (
+                f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Content-Length: 5\r\n"
+                f"Content-Length: 10\r\n"
+                f"Connection: close\r\n\r\nhello"
+            ).encode("ascii")
+            st_dcl, _, _ = _raw_tcp_request("127.0.0.1", port, dup_cl_req)
+            assert st_dcl == 400
+            big_req = (
+                f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Content-Length: 40000000\r\n"
+                f"Expect: 100-continue\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("ascii")
+            st_413, head_413, _ = _raw_tcp_request("127.0.0.1", port, big_req)
+            assert st_413 == 413 and "100 Continue" not in head_413
+            bad_chunk_plus = (
+                f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n\r\n+a\r\n0123456789\r\n0\r\n\r\n"
+            ).encode("ascii")
+            st_bc1, _, _ = _raw_tcp_request("127.0.0.1", port, bad_chunk_plus)
+            assert st_bc1 == 400
+            trunc_trailer = (
+                f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n\r\n0\r\n"
+            ).encode("ascii")
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as s_tr:
+                s_tr.settimeout(5.0)
+                s_tr.sendall(trunc_trailer)
+                s_tr.shutdown(socket.SHUT_WR)
+                raw_tr = s_tr.recv(4096)
+            assert raw_tr.startswith(b"HTTP/1.1 400 ")
+            many_trailers = (
+                f"POST /api/v1/messages/send HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Transfer-Encoding: chunked\r\n"
+                f"Connection: close\r\n\r\n0\r\n"
+                + "".join(f"X-T{i}: 1\r\n" for i in range(66))
+                + "\r\n"
+            ).encode("ascii")
+            st_mt, _, _ = _raw_tcp_request("127.0.0.1", port, many_trailers)
+            assert st_mt == 400
+            st_hd, hdr_hd, body_hd = _http_call(base, "HEAD", "/healthz")
+            assert st_hd == 200 and int(hdr_hd.get("content-length", "0")) > 0 and body_hd == b""
+            conn_req = (
+                f"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n"
+            ).encode("ascii")
+            st_cn, _, _ = _raw_tcp_request("127.0.0.1", port, conn_req)
+            assert st_cn == 200
+            _json_call(base, "POST", "/__e2e__/fault", {"offline": True})
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as s_cn:
+                s_cn.settimeout(5.0)
+                s_cn.sendall(conn_req)
+                try:
+                    raw_cn_off = s_cn.recv(4096)
+                except OSError:
+                    raw_cn_off = b""
+            assert raw_cn_off == b"", f"CONNECT must disconnect while offline, got {raw_cn_off!r}"
+            _json_call(base, "DELETE", "/__e2e__/fault")
+            return f"media_id={mid}, 206/416/revoked=401+framing+connect"
         finally:
             _stop_ephemeral_server(srv, th)
 
@@ -3946,8 +5140,54 @@ def run_self_test(report_path: str = "") -> int:
                 {"miniapps": [{"app_id": "global_dharma", "title": "全球法布施", "tos_accepted": False}]},
             )
             st_ma, ma = _json_call(base, "GET", "/api/v1/miniapps", bearer=tok)
-            assert st_ma == 200 and ma["total"] == 1
-            return "passkey+alipay+iv+agent+mcp+miniapps verified"
+            assert st_ma == 200 and ma["total"] == 1 and ma["miniapps"][0]["tos_accepted"] is False
+            st_tos1, tos1 = _json_call(
+                base, "POST", "/api/v1/miniapps/global_dharma/accept-tos", {}, bearer=tok
+            )
+            assert st_tos1 == 200 and tos1["tos_accepted"] is True
+            st_ma2, ma2 = _json_call(base, "GET", "/api/v1/miniapps/global_dharma", bearer=tok)
+            assert st_ma2 == 200 and ma2["tos_accepted"] is True
+            st_tos2, tos2 = _json_call(
+                base,
+                "POST",
+                "/api/v1/miniapps/global_dharma/tos",
+                {"tos_accepted": False},
+                bearer=tok,
+            )
+            assert st_tos2 == 200 and tos2["tos_accepted"] is False
+
+            # Route parity checks: alipay_confirm custom token, .well-known, pair/init+accept, turn, tasks
+            st_ac_seed, _ = _json_call(
+                base,
+                "POST",
+                "/__e2e__/seed",
+                {"alipay_confirm": {"attempt_id": "alipay_seeded_custom", "token": "tok_alipay_seeded_1"}},
+            )
+            assert st_ac_seed == 200
+            st_ac_me, _ = _json_call(base, "GET", "/api/v1/auth/me", bearer="tok_alipay_seeded_1")
+            assert st_ac_me == 200
+            st_wk, wk = _json_call(base, "GET", "/.well-known/oauth-authorization-server")
+            assert (
+                st_wk == 200
+                and wk["supported_mcp_versions"][0] == "2025-11-25"
+                and wk["registration_endpoint"] == "/api/v1/mcp/oauth/register"
+            )
+            st_pi, pi = _json_call(base, "POST", "/api/v1/auth/pair/init", {})
+            assert st_pi == 200 and pi["qr_url"].startswith("tg://login?token=")
+            st_pa1, _ = _json_call(
+                base, "POST", "/api/v1/auth/pair/accept", {"pair_token": pi["pair_token"]}, bearer=tok
+            )
+            st_pa2, _ = _json_call(
+                base, "POST", "/api/v1/auth/pair/accept", {"pair_token": pi["pair_token"]}, bearer=tok
+            )
+            assert st_pa1 == 200 and st_pa2 == 400
+            st_turn, turn = _json_call(base, "GET", "/api/v1/webrtc/turn_credentials", bearer=tok)
+            assert st_turn == 200 and "urls" in turn and "username" in turn and "credential" in turn
+            st_tdec, tdec = _json_call(
+                base, "POST", "/api/v1/tasks/t1/approve", {"decision": "rejected"}, bearer=tok
+            )
+            assert st_tdec == 200 and tdec["approved"] is False and tdec["state"] == "cancelled"
+            return "passkey+alipay+iv+agent+mcp+miniapps+parity verified"
         finally:
             _stop_ephemeral_server(srv, th)
 
@@ -3968,15 +5208,95 @@ def run_self_test(report_path: str = "") -> int:
             _, st_obj = _json_call(base, "GET", "/__e2e__/state")
             assert st_obj["counts"]["chats"] == 1
 
+            # Atomic pre-validation zero-poisoning on /__e2e__/fault (B-03)
+            for bad_fault in (
+                {"http_fault": {"path_prefix": "/api/v1/chats", "status": 500, "remaining_hits": "1"}},
+                {"delay": {"path_prefix": "/api/v1/chats", "delay_ms": True}},
+                {"http_fault": {"path_prefix": "/api/v1/chats", "status": 204}},
+            ):
+                st_bf, bf = _json_call(base, "POST", "/__e2e__/fault", bad_fault)
+                assert st_bf == 400 and bf["error"] == "invalid_fault_payload"
+            st_after_bf, after_bf = _json_call(base, "GET", "/__e2e__/state")
+            assert st_after_bf == 200 and after_bf["active_fault_count"] == 0
+
+            # Crash-free 400 on malformed numeric path/body parameters (B-03)
+            st_bad_p, _ = _json_call(base, "GET", "/api/v1/chats/abc/messages", bearer=tok)
+            assert st_bad_p == 400
+            st_null_cid, _ = _json_call(
+                base, "POST", "/api/v1/messages/send", {"chat_id": None, "text": "x"}, bearer=tok
+            )
+            assert st_null_cid == 400
+            st_null_del, _ = _json_call(
+                base, "POST", "/api/v1/messages/delete", {"message_ids": None}, bearer=tok
+            )
+            assert st_null_del == 400
+
+            # 2FA None==None bypass & whitespace/UTF-8 byte length guards (B-03)
+            st_p2fa, p2fa = _json_call(
+                base,
+                "POST",
+                "/api/v1/auth/phone/verify",
+                {"code": "123456", "require_2fa_account": True},
+            )
+            assert st_p2fa == 200 and p2fa["requires_2fa"] is True
+            st_2fa_byp, _ = _json_call(
+                base, "POST", "/api/v1/auth/2fa/verify", {"challenge_token": p2fa["challenge_token"]}
+            )
+            assert st_2fa_byp == 401
+            st_2fa_ws, _ = _json_call(base, "POST", "/api/v1/auth/2fa", {"password": "   "}, bearer=tok)
+            assert st_2fa_ws == 400
+            st_2fa_cjk, _ = _json_call(
+                base, "POST", "/api/v1/auth/2fa", {"password": "法" * 400}, bearer=tok
+            )
+            assert st_2fa_cjk == 400
+
+            # Integer chat_type 0..=5 preservation & non-destructive GET invite (B-03)
+            st_c4, c4 = _json_call(
+                base, "POST", "/api/v1/chats", {"title": "Bot Chat", "chat_type": 4}, bearer=tok
+            )
+            assert st_c4 == 200 and c4["chat_type"] == 4
+            c4_id = c4["chat_id"]
+            c4_mc0 = c4["member_count"]
+            st_inv, inv = _json_call(base, "POST", f"/api/v1/chats/{c4_id}/invites", {}, bearer=tok)
+            assert st_inv == 200
+            st_inv_get, inv_get = _json_call(
+                base, "GET", f"/api/v1/chats/{c4_id}/invites/{inv['invite_id']}", bearer=tok
+            )
+            assert st_inv_get == 200 and inv_get["revoked"] is False
+            st_join1, _ = _json_call(base, "POST", "/api/v1/chats/join", {"code": inv["code"]}, bearer=tok)
+            assert st_join1 == 200
+            _, c4_after = _json_call(base, "GET", f"/api/v1/chats/{c4_id}", bearer=tok)
+            assert c4_after["member_count"] == c4_mc0 + 1
+            st_inv_del, _ = _json_call(
+                base, "DELETE", f"/api/v1/chats/{c4_id}/invites/{inv['invite_id']}", bearer=tok
+            )
+            assert st_inv_del == 200
+            st_join2, _ = _json_call(base, "POST", "/api/v1/chats/join", {"code": inv["code"]}, bearer=tok)
+            assert st_join2 == 400
+
+            # Method-filtered fault + Retry-After header + delay non-blocking concurrency
             _json_call(
                 base,
                 "POST",
                 "/__e2e__/fault",
-                {"http_fault": {"path_prefix": "/api/v1/chats", "status": 500, "remaining_hits": 1}},
+                {
+                    "http_fault": {
+                        "path_prefix": "/api/v1/chats",
+                        "method": "GET",
+                        "status": 429,
+                        "retry_after_ms": 2500,
+                        "remaining_hits": 1,
+                    },
+                    "delay": {"path_prefix": "/api/v1/status", "delay_ms": 80},
+                },
             )
-            st_500, _ = _json_call(base, "GET", "/api/v1/chats", bearer=tok)
+            st_429, hdr_429, _ = _http_call(
+                base, "GET", "/api/v1/chats", headers={"Authorization": f"Bearer {tok}"}
+            )
+            assert st_429 == 429 and hdr_429.get("retry-after") == "3"
             st_200, _ = _json_call(base, "GET", "/api/v1/chats", bearer=tok)
-            assert st_500 == 500 and st_200 == 200
+            assert st_200 == 200
+            _json_call(base, "DELETE", "/__e2e__/fault")
 
             _json_call(base, "POST", "/__e2e__/fault", {"offline": True})
             disconnected = False
@@ -4002,7 +5322,7 @@ def run_self_test(report_path: str = "") -> int:
             assert st_rst == 200
             _, chats_after = _json_call(base, "GET", "/api/v1/chats")
             assert chats_after["chats"] == []
-            return "seed+500+offline_disconnect+reset verified"
+            return "seed+fault_preval+400+2fa+invite+chat_type+offline+reset verified"
         finally:
             _stop_ephemeral_server(srv, th)
 
@@ -4072,6 +5392,271 @@ def run_self_test(report_path: str = "") -> int:
         finally:
             _stop_ephemeral_server(srv, th)
 
+    def check_11_rfc6455_websocket() -> str:
+        assert (
+            compute_websocket_accept("dGhlIHNhbXBsZSBub25jZQ==")
+            == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        )
+        srv, th, base, port = _start_ephemeral_server()
+
+        class _TestWsClient:
+            def __init__(self) -> None:
+                self.sock: socket.socket | None = None
+                self.buf = bytearray()
+
+            def connect(
+                self,
+                path: str,
+                extra_headers: dict[str, str] | None = None,
+                ws_key: str = "dGhlIHNhbXBsZSBub25jZQ==",
+            ) -> tuple[int, dict[str, str]]:
+                self.sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+                self.sock.settimeout(5.0)
+                hdr_lines = [
+                    f"GET {path} HTTP/1.1",
+                    f"Host: 127.0.0.1:{port}",
+                    "Upgrade: websocket",
+                    "Connection: Upgrade",
+                    f"Sec-WebSocket-Key: {ws_key}",
+                    "Sec-WebSocket-Version: 13",
+                ]
+                for k, v in (extra_headers or {}).items():
+                    hdr_lines.append(f"{k}: {v}")
+                raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("ascii")
+                self.sock.sendall(raw_req)
+                while b"\r\n\r\n" not in self.buf:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        break
+                    self.buf.extend(chunk)
+                sep = self.buf.find(b"\r\n\r\n")
+                assert sep != -1, f"missing WS HTTP response headers: {bytes(self.buf)!r}"
+                head = bytes(self.buf[:sep]).decode("utf-8", errors="replace")
+                del self.buf[: sep + 4]
+                lines = head.splitlines()
+                status = int(lines[0].split()[1])
+                hdrs: dict[str, str] = {}
+                for ln in lines[1:]:
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        hdrs[k.strip().lower()] = v.strip()
+                return status, hdrs
+
+            def send_frame(
+                self,
+                opcode: int,
+                payload: bytes,
+                *,
+                fin: bool = True,
+                masked: bool = True,
+                split_delay_s: float = 0.0,
+            ) -> None:
+                assert self.sock is not None
+                b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
+                mask_bit = 0x80 if masked else 0x00
+                n = len(payload)
+                if n <= 125:
+                    hdr = struct.pack("!BB", b0, mask_bit | n)
+                elif n <= 65535:
+                    hdr = struct.pack("!BBH", b0, mask_bit | 126, n)
+                else:
+                    hdr = struct.pack("!BBQ", b0, mask_bit | 127, n)
+                if masked:
+                    mask = b"\x37\xfa\x21\x3d"
+                    masked_body = bytes(payload[i] ^ mask[i & 3] for i in range(n))
+                    wire = hdr + mask + masked_body
+                else:
+                    wire = hdr + payload
+                if split_delay_s > 0.0 and len(wire) > 1:
+                    self.sock.sendall(wire[:1])
+                    time.sleep(split_delay_s)
+                    self.sock.sendall(wire[1:])
+                else:
+                    self.sock.sendall(wire)
+
+            def _ensure(self, needed: int, timeout: float = 5.0) -> None:
+                assert self.sock is not None
+                self.sock.settimeout(timeout)
+                while len(self.buf) < needed:
+                    chunk = self.sock.recv(4096)
+                    assert chunk, f"unexpected WS EOF waiting for {needed} bytes"
+                    self.buf.extend(chunk)
+
+            def recv_frame(self, timeout: float = 5.0) -> tuple[bool, int, bytes]:
+                self._ensure(2, timeout=timeout)
+                b0, b1 = self.buf[0], self.buf[1]
+                fin = (b0 & 0x80) != 0
+                opcode = b0 & 0x0F
+                assert (b1 & 0x80) == 0, "server WS frames must be unmasked"
+                len7 = b1 & 0x7F
+                if len7 <= 125:
+                    offset, plen = 2, len7
+                elif len7 == 126:
+                    self._ensure(4, timeout=timeout)
+                    offset = 4
+                    plen = struct.unpack("!H", self.buf[2:4])[0]
+                else:
+                    self._ensure(10, timeout=timeout)
+                    offset = 10
+                    plen = struct.unpack("!Q", self.buf[2:10])[0]
+                self._ensure(offset + plen, timeout=timeout)
+                payload = bytes(self.buf[offset : offset + plen])
+                del self.buf[: offset + plen]
+                return fin, opcode, payload
+
+            def close(self) -> None:
+                if self.sock is not None:
+                    try:
+                        self.sock.close()
+                    except OSError:
+                        pass
+                    self.sock = None
+
+        try:
+            _, reg1 = _json_call(
+                base, "POST", "/api/v1/auth/register", {"username": "ws_u1", "password": "Password1!"}
+            )
+            tok1, sid1 = reg1["token"], reg1["session_id"]
+
+            # Seed push frame + verify 101 + text/binary echo + fragmentation + Ping/Pong + split 16-bit frame
+            st_push, _ = _json_call(
+                base, "POST", "/__e2e__/seed", {"ws_push_frames": ["pushed_v168_event"]}
+            )
+            assert st_push == 200
+            c1 = _TestWsClient()
+            try:
+                st, hdrs = c1.connect(f"/api/v1/ws?token={tok1}")
+                assert st == 101 and hdrs.get("sec-websocket-accept") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+                _, op_p, pl_p = c1.recv_frame()
+                assert op_p == 0x1 and pl_p.decode("utf-8") == "pushed_v168_event"
+
+                c1.send_frame(0x1, b"hello_ws_v168")
+                _, op_t, pl_t = c1.recv_frame()
+                assert op_t == 0x1 and json.loads(pl_t.decode("utf-8"))["echo"] == "hello_ws_v168"
+
+                c1.send_frame(0x2, b"\x00\x01\xfe\xff")
+                _, op_b, pl_b = c1.recv_frame()
+                assert op_b == 0x2 and pl_b == b"\x00\x01\xfe\xff"
+
+                # Fragmented text + interleaved Ping/Pong
+                c1.send_frame(0x1, b"frag_", fin=False)
+                c1.send_frame(0x9, b"ping42", fin=True)
+                _, op_pong, pl_pong = c1.recv_frame()
+                assert op_pong == 0xA and pl_pong == b"ping42"
+                c1.send_frame(0x0, b"joined", fin=True)
+                _, op_f, pl_f = c1.recv_frame()
+                assert op_f == 0x1 and json.loads(pl_f.decode("utf-8"))["echo"] == "frag_joined"
+
+                # Extended 16-bit payload split across > 50ms poll boundary
+                big_msg = "A" * 300
+                c1.send_frame(0x1, big_msg.encode("ascii"), split_delay_s=0.065)
+                _, op_big, pl_big = c1.recv_frame()
+                assert op_big == 0x1 and json.loads(pl_big.decode("utf-8"))["echo"] == big_msg
+
+                c1.send_frame(0x8, struct.pack("!H", 1000))
+                _, op_cl, pl_cl = c1.recv_frame()
+                assert op_cl == 0x8 and struct.unpack("!H", pl_cl[:2])[0] == 1000
+            finally:
+                c1.close()
+
+            # Unmasked client frame -> Close 1002
+            c_unm = _TestWsClient()
+            try:
+                st, _ = c_unm.connect("/api/v1/ws")
+                assert st == 101
+                c_unm.send_frame(0x1, b"bad", masked=False)
+                _, op_u, pl_u = c_unm.recv_frame()
+                assert op_u == 0x8 and struct.unpack("!H", pl_u[:2])[0] == 1002
+            finally:
+                c_unm.close()
+
+            # Invalid UTF-8 text frame -> Close 1007
+            c_utf = _TestWsClient()
+            try:
+                st, _ = c_utf.connect("/api/v1/ws")
+                assert st == 101
+                c_utf.send_frame(0x1, b"\xff\xfe")
+                _, op_i, pl_i = c_utf.recv_frame()
+                assert op_i == 0x8 and struct.unpack("!H", pl_i[:2])[0] == 1007
+            finally:
+                c_utf.close()
+
+            # Active session revocation -> Close 4001
+            c_rev = _TestWsClient()
+            try:
+                st, _ = c_rev.connect(f"/api/v1/ws?token={tok1}")
+                assert st == 101
+                st_del, _ = _json_call(base, "DELETE", f"/api/v1/auth/sessions/{sid1}", bearer=tok1)
+                assert st_del == 200
+                _, op_r, pl_r = c_rev.recv_frame()
+                assert op_r == 0x8 and struct.unpack("!H", pl_r[:2])[0] == 4001
+            finally:
+                c_rev.close()
+
+            # Pre-upgrade revoked token (?token= and Authorization: Bearer) -> HTTP 401
+            for req_path, req_hdrs in (
+                (f"/api/v1/ws?token={tok1}", {}),
+                ("/api/v1/ws", {"Authorization": f"Bearer {tok1}"}),
+            ):
+                c_pre = _TestWsClient()
+                try:
+                    st_pre, _ = c_pre.connect(req_path, extra_headers=req_hdrs)
+                    assert st_pre == 401
+                finally:
+                    c_pre.close()
+
+            # Active offline fault -> Close 1001
+            _, reg2 = _json_call(
+                base, "POST", "/api/v1/auth/register", {"username": "ws_u2", "password": "Password1!"}
+            )
+            tok2 = reg2["token"]
+            c_off = _TestWsClient()
+            try:
+                st, _ = c_off.connect("/api/v1/ws", extra_headers={"Authorization": f"Bearer {tok2}"})
+                assert st == 101
+                _json_call(base, "POST", "/__e2e__/fault", {"offline": True})
+                _, op_o, pl_o = c_off.recv_frame()
+                assert op_o == 0x8 and struct.unpack("!H", pl_o[:2])[0] == 1001
+            finally:
+                c_off.close()
+            _json_call(base, "DELETE", "/__e2e__/fault")
+
+            # Pre-upgrade fault -> HTTP 503
+            _json_call(
+                base,
+                "POST",
+                "/__e2e__/fault",
+                {"http_fault": {"path_prefix": "/api/v1/ws", "status": 503, "remaining_hits": 1}},
+            )
+            c_flt = _TestWsClient()
+            try:
+                st_f, _ = c_flt.connect("/api/v1/ws")
+                assert st_f == 503
+            finally:
+                c_flt.close()
+
+            # Bogus WS paths -> 404; /ws -> 101 + Close 1000
+            for bogus_ws in ("/api/v1/ws_bogus", "/ws_bogus"):
+                c_bog = _TestWsClient()
+                try:
+                    st_b, _ = c_bog.connect(bogus_ws)
+                    assert st_b == 404
+                finally:
+                    c_bog.close()
+            c_ws2 = _TestWsClient()
+            try:
+                st_w2, _ = c_ws2.connect("/ws")
+                assert st_w2 == 101
+                c_ws2.send_frame(0x8, struct.pack("!H", 1000))
+                _, op_w2, pl_w2 = c_ws2.recv_frame()
+                assert op_w2 == 0x8 and struct.unpack("!H", pl_w2[:2])[0] == 1000
+            finally:
+                c_ws2.close()
+
+            return "rfc6455 ws 101+push+echo+frag+ping+1002+1007+4001+1001+401+503+404 verified"
+        finally:
+            _stop_ephemeral_server(srv, th)
+
     run_check("cli_atomic_files_healthz_and_sigterm", check_1_cli_atomic_and_sigterm)
     run_check("auth_split_key_v2_rotation_and_logout", check_2_auth_split_key_v2_rotation_logout)
     run_check("chats_messages_idempotency_pts_sync_and_cjk_search", check_3_chats_messages_pts_cjk_search)
@@ -4082,6 +5667,7 @@ def run_self_test(report_path: str = "") -> int:
     run_check("e2e_control_seed_state_fault_500_offline_and_reset", check_8_e2e_control_seed_fault_offline_reset)
     run_check("fail_closed_404_unknown_and_sibling_routes", check_9_fail_closed_404_unknown_and_siblings)
     run_check("thread_safety_concurrent_requests", check_10_thread_safety_concurrent_requests)
+    run_check("rfc6455_websocket_handshake_echo_ping_revocation_and_404", check_11_rfc6455_websocket)
 
     passed = sum(1 for c in checks if c["ok"])
     report = {
@@ -4114,26 +5700,13 @@ def main() -> int:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run all 10 deterministic self-test checks and exit",
+        help="Run all 11 deterministic self-test checks and exit",
     )
     parser.add_argument("--report", default="", help="Optional JSON report path for --self-test")
     args = parser.parse_args()
 
     if args.self_test:
         return run_self_test(report_path=args.report)
-
-    state = LoopbackState(version=args.version)
-    server = LoopbackHTTPServer((args.host, args.port), LoopbackHandler, state=state, quiet=args.quiet)
-    bound_host, bound_port = server.server_address[:2]
-    url = f"http://{bound_host}:{bound_port}"
-
-    if args.port_file:
-        atomic_write_text(pathlib.Path(args.port_file), f"{bound_port}\n")
-    if args.url_file:
-        atomic_write_text(pathlib.Path(args.url_file), f"{url}\n")
-
-    if not args.quiet:
-        print(f"[loopback] listening on {url}", flush=True)
 
     stop_event = threading.Event()
 
@@ -4143,15 +5716,35 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    state = LoopbackState(version=args.version)
+    server = LoopbackHTTPServer(
+        (args.host, args.port),
+        LoopbackHandler,
+        state=state,
+        quiet=args.quiet,
+        stop_event=stop_event,
+    )
+    bound_host, bound_port = server.server_address[:2]
+    url = f"http://{bound_host}:{bound_port}"
+
     serve_thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
     )
     serve_thread.start()
 
     try:
+        if args.port_file:
+            atomic_write_text(pathlib.Path(args.port_file), f"{bound_port}\n")
+        if args.url_file:
+            atomic_write_text(pathlib.Path(args.url_file), f"{url}\n")
+
+        if not args.quiet:
+            print(f"[loopback] listening on {url}", flush=True)
+
         while not stop_event.is_set():
             stop_event.wait(0.2)
     finally:
+        stop_event.set()
         server.shutdown()
         serve_thread.join(timeout=5.0)
         server.server_close()

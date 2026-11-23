@@ -30,6 +30,7 @@ const MAX_WS_FRAME_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_SIZE: u64 = 4_294_967_296;
 const MAX_UPLOAD_PART_SIZE: u64 = 16_777_216;
+const DEFAULT_SERVER_VERSION: &str = "1.6.8";
 
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
@@ -1723,9 +1724,9 @@ fn handle_connection(
             .strip_prefix("/article/")
             .or_else(|| req.path.strip_prefix("/iv/"))
             .filter(|s| !s.is_empty())
-            .unwrap_or("v167");
+            .unwrap_or("v168");
         let html = format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Fabushi v1.6.7 Instant View</title></head><body><article><h1>Fabushi v1.6.7</h1><p>Instant View content for {slug}.</p></article></body></html>"
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Fabushi v{DEFAULT_SERVER_VERSION} Instant View</title></head><body><article><h1>Fabushi v{DEFAULT_SERVER_VERSION}</h1><p>Instant View content for {slug}.</p></article></body></html>"
         );
         write_http_response_mode(
             &mut stream,
@@ -2092,7 +2093,7 @@ fn route_api_request(
         ("GET" | "HEAD", "/health")
         | ("GET" | "HEAD", "/healthz")
         | ("GET" | "HEAD", "/api/v1/health") => {
-            (200, json!({"ok": true, "version": "1.6.7", "ts_ms": ts}))
+            (200, json!({"ok": true, "version": DEFAULT_SERVER_VERSION, "ts_ms": ts}))
         }
         ("GET" | "HEAD", "/api/v1/status") => (
             200,
@@ -2100,7 +2101,7 @@ fn route_api_request(
                 "ok": true,
                 "server": "gpui_telegram_server",
                 "status": "healthy",
-                "version": "1.6.7",
+                "version": DEFAULT_SERVER_VERSION,
                 "ts_ms": ts
             }),
         ),
@@ -2487,6 +2488,9 @@ fn route_api_request(
                 .unwrap_or_else(|| g.default_user_id());
             let existing = g.ensure_user_by_id(uid).clone();
 
+            let has_current_pw = matches!(body.get("current_password"), Some(v) if !v.is_null());
+            let has_current_v =
+                matches!(body.get("current_auth_verifier_b64"), Some(v) if !v.is_null());
             let current_pw = body
                 .get("current_password")
                 .and_then(Value::as_str)
@@ -2496,16 +2500,13 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            if let (Some(expected_pw), Some(provided_pw)) = (existing.password.as_deref(), current_pw)
-            {
-                if provided_pw != expected_pw {
+            if let Some(expected_pw) = existing.password.as_deref() {
+                if has_current_pw && current_pw != Some(expected_pw) {
                     return (401, json!({"error": "invalid_credentials"}));
                 }
             }
-            if let (Some(expected_v), Some(provided_v)) =
-                (existing.auth_verifier_b64.as_deref(), current_v)
-            {
-                if provided_v != expected_v {
+            if let Some(expected_v) = existing.auth_verifier_b64.as_deref() {
+                if has_current_v && current_v != Some(expected_v) {
                     return (401, json!({"error": "invalid_credentials"}));
                 }
             }
@@ -4412,15 +4413,15 @@ fn route_api_request(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| extract_query_param(query, "url"))
-                .unwrap_or_else(|| "/article/v167".to_owned());
+                .unwrap_or_else(|| "/article/v168".to_owned());
             (
                 200,
                 json!({
                     "ok": true,
                     "url": url,
-                    "title": "Fabushi v1.6.7",
+                    "title": format!("Fabushi v{DEFAULT_SERVER_VERSION}"),
                     "blocks": [
-                        {"type": "heading", "text": "Fabushi v1.6.7"},
+                        {"type": "heading", "text": format!("Fabushi v{DEFAULT_SERVER_VERSION}")},
                         {"type": "paragraph", "text": "Instant View article content"}
                     ]
                 }),
@@ -5145,7 +5146,7 @@ fn route_api_request(
         ("GET", "/api/v1/updates/check") => (
             200,
             json!({
-                "latest_version": "1.6.7",
+                "latest_version": DEFAULT_SERVER_VERSION,
                 "store_url": "https://apps.apple.com/app/fabushi",
                 "binary_self_update_allowed": false
             }),

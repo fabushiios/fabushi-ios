@@ -31,9 +31,13 @@ extension FabushiV167Tier1UITests {
             FabushiAccessibilityIDs.Studio.tabSessions,
         ]
         for tabID in sevenTabs {
-            let tab = tapControl(tabID, in: application)
-            assertMinimumTouchTarget44pt(tab)
-            assertVoiceOverReady(tab)
+            tapControlWithHIGChecks(
+                tabID,
+                in: application,
+                verifyMinTouchTarget: true,
+                verifyWithinBounds: true,
+                verifyVoiceOver: true
+            )
         }
 
         tapControl(FabushiAccessibilityIDs.Studio.tabOverview, in: application)
@@ -62,8 +66,16 @@ extension FabushiV167Tier1UITests {
 
         let floorBanner = requireElement(FabushiAccessibilityIDs.Stage.floorControlBanner, in: application)
         assertVoiceOverReady(floorBanner)
-        let interruptBtn = tapControl(FabushiAccessibilityIDs.Stage.floorInterruptButton, in: application)
-        assertMinimumTouchTarget44pt(interruptBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.floorInterruptButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        XCTAssertTrue(
+            floorBanner.waitForNonExistence(timeout: 6),
+            "F18 human interrupt must dismiss floorControlBanner"
+        )
 
         tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
         let workspaceBadge = requireElement(FabushiAccessibilityIDs.Inspector.multiAgentWorkspaceBadge, in: application)
@@ -86,10 +98,19 @@ extension FabushiV167Tier1UITests {
 
         let magpieRoot = requireElement(FabushiAccessibilityIDs.Magpie.root, in: application)
         assertWithinWindowBounds(magpieRoot, in: application)
-        let piiToggle = tapControl(FabushiAccessibilityIDs.Magpie.piiMaskingToggle, in: application)
-        assertVoiceOverReady(piiToggle)
-        let probeBtn = tapControl(FabushiAccessibilityIDs.Magpie.probeHealthButton, in: application)
-        assertMinimumTouchTarget44pt(probeBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Magpie.piiMaskingToggle,
+            in: application,
+            verifyMinTouchTarget: false,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Magpie.probeHealthButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let probeStatus = requireElement(FabushiAccessibilityIDs.Magpie.probeStatusLabel, in: application)
         assertVoiceOverReady(probeStatus)
         recordCheckpoint("T1_F19_magpie_gateway", passed: true)
@@ -102,7 +123,14 @@ extension FabushiV167Tier1UITests {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t1_f20_coding")],
-                chats: [FabushiLoopbackSeedChat(chatId: 120, title: "@ClaudeCode", chatType: "bot", memberCount: 2)]
+                chats: [FabushiLoopbackSeedChat(chatId: 120, title: "@ClaudeCode", chatType: "bot", memberCount: 2)],
+                messages: [
+                    FabushiLoopbackSeedMessage(
+                        chatId: 120,
+                        text: "```diff\n--- a/Sources/Host.swift\n+++ b/Sources/Host.swift\n@@ -1,1 +1,1 @@\n-let v = \"1.6.7\"\n+let v = \"1.6.8\"\n```",
+                        messageType: "coding_diff"
+                    )
+                ]
             )
         )
         let application = try launchFabushi()
@@ -111,8 +139,12 @@ extension FabushiV167Tier1UITests {
 
         let diffCard = requireElement(FabushiAccessibilityIDs.Stage.codingDiffCard, in: application)
         assertWithinWindowBounds(diffCard, in: application)
-        let checkpointBtn = tapControl(FabushiAccessibilityIDs.Stage.codingCheckpointButton, in: application)
-        assertMinimumTouchTarget44pt(checkpointBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.codingCheckpointButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
 
         tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
         let hostProbe = requireElement(FabushiAccessibilityIDs.Inspector.codingHostProbeButton, in: application)
@@ -132,14 +164,35 @@ extension FabushiV167Tier1UITests {
         signInIfNeeded(in: application, username: "t1_f21_mcp", password: "FabushiV168!Pass")
 
         openShellTab(FabushiAccessibilityIDs.Shell.tabStudio, in: application)
-        let grantsBtn = tapControl(FabushiAccessibilityIDs.Studio.mcpGrantsButton, in: application)
-        assertMinimumTouchTarget44pt(grantsBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Studio.mcpGrantsButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
         let auditLog = requireElement(FabushiAccessibilityIDs.Studio.mcpAuditLogList, in: application)
         assertWithinWindowBounds(auditLog, in: application)
         assertVoiceOverReady(auditLog)
 
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Studio.mcpApproveButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        XCTAssertFalse(
+            auditLog.label.contains("Bearer ") || auditLog.label.contains("tok_"),
+            "F21 MCP audit log must redact sensitive bearer tokens"
+        )
+
         let state = try await client.fetchState(pathPrefix: "/api/v1/mcp")
-        XCTAssertGreaterThanOrEqual(state.matchedRequestCount, 0, "F21 MCP audit query completed cleanly")
+        XCTAssertGreaterThanOrEqual(
+            state.matchedRequestCount,
+            1,
+            "F21 MCP grants & audit flow must send >= 1 real /api/v1/mcp request to loopback"
+        )
         recordCheckpoint("T1_F21_mcp_grants_and_audit", passed: true)
     }
 
@@ -173,11 +226,25 @@ extension FabushiV167Tier1UITests {
         assertWithinWindowBounds(streamCanvas, in: application)
         let controlledBanner = requireElement(FabushiAccessibilityIDs.Remote.controlledBanner, in: application)
         assertVoiceOverReady(controlledBanner)
-        let takeoverBtn = tapControl(FabushiAccessibilityIDs.Remote.emergencyTakeoverButton, in: application)
-        assertMinimumTouchTarget44pt(takeoverBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Remote.emergencyTakeoverButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
 
         let pty = requireElement(FabushiAccessibilityIDs.Remote.ptyTerminal, in: application)
         assertWithinWindowBounds(pty, in: application)
+
+        let state = try await client.fetchState(pathPrefix: "/api/v1/computer/")
+        let takeoverCalls = state.recordedRequests.filter {
+            $0.method == "POST" && $0.path.contains("emergency_takeover")
+        }
+        XCTAssertGreaterThanOrEqual(
+            takeoverCalls.count,
+            1,
+            "F22 emergency takeover must POST /api/v1/computer/lease/emergency_takeover"
+        )
         recordCheckpoint("T1_F22_remote_workbench_takeover", passed: true, attachScreen: true)
     }
 
@@ -204,8 +271,12 @@ extension FabushiV167Tier1UITests {
         openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionVault, in: application)
 
-        let unlockBtn = tapControl(FabushiAccessibilityIDs.Settings.vaultUnlockButton, in: application)
-        assertMinimumTouchTarget44pt(unlockBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Settings.vaultUnlockButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let totpLabel = requireElement(FabushiAccessibilityIDs.Settings.vaultTotpCodeLabel, in: application)
         assertVoiceOverReady(totpLabel)
         recordCheckpoint("T1_F23_vault_and_totp", passed: true)
@@ -226,8 +297,12 @@ extension FabushiV167Tier1UITests {
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t1_f24_miniapp", password: "FabushiV168!Pass")
 
-        let launcher = tapControl(FabushiAccessibilityIDs.MiniApp.launcherButton, in: application)
-        assertMinimumTouchTarget44pt(launcher)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.MiniApp.launcherButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         tapControl(FabushiAccessibilityIDs.MiniApp.globalDharmaCard, in: application)
 
         let tosModal = requireElement(FabushiAccessibilityIDs.MiniApp.tosModal, in: application)
@@ -257,6 +332,20 @@ extension FabushiV167Tier1UITests {
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t1_f25_media")],
                 chats: [FabushiLoopbackSeedChat(chatId: 125, title: "Rich Media Room")],
+                messages: [
+                    FabushiLoopbackSeedMessage(
+                        chatId: 125,
+                        text: "Voice note waveform demo",
+                        messageType: "audio_voice",
+                        mediaFileId: "cas_v168_audio_demo"
+                    ),
+                    FabushiLoopbackSeedMessage(
+                        chatId: 125,
+                        text: "Instant View: /article/v168",
+                        messageType: "instant_view",
+                        instantViewUrl: "/article/v168"
+                    ),
+                ],
                 mediaBlobs: [
                     FabushiLoopbackSeedMediaBlob(
                         fileId: "cas_v168_audio_demo",
@@ -272,13 +361,20 @@ extension FabushiV167Tier1UITests {
         assertWithinWindowBounds(storiesStrip, in: application)
 
         openFirstChat(in: application)
-        let stickerBtn = tapControl(FabushiAccessibilityIDs.Composer.stickerPickerButton, in: application)
-        assertMinimumTouchTarget44pt(stickerBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Composer.stickerPickerButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let stickerGrid = requireElement(FabushiAccessibilityIDs.Composer.stickerGrid, in: application)
         assertWithinWindowBounds(stickerGrid, in: application)
+        tapControl(FabushiAccessibilityIDs.Composer.stickerPickerButton, in: application)
 
         let mediaCard = requireElement(FabushiAccessibilityIDs.Stage.mediaPlayerCard, in: application)
         assertVoiceOverReady(mediaCard)
+        let waveform = requireElement(FabushiAccessibilityIDs.Stage.waveformView, in: application)
+        assertWithinWindowBounds(waveform, in: application)
         let ivCard = requireElement(FabushiAccessibilityIDs.Stage.instantViewCard, in: application)
         assertVoiceOverReady(ivCard)
         recordCheckpoint("T1_F25_media_stories_stickers_iv", passed: true)
@@ -298,8 +394,12 @@ extension FabushiV167Tier1UITests {
         signInIfNeeded(in: application, username: "t1_f26_calls", password: "FabushiV168!Pass")
         openFirstChat(in: application)
 
-        let callBtn = tapControl(FabushiAccessibilityIDs.Stage.callStartButton, in: application)
-        assertMinimumTouchTarget44pt(callBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.callStartButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let callOverlay = requireElement(FabushiAccessibilityIDs.Call.overlay, in: application)
         assertWithinWindowBounds(callOverlay, in: application)
 
@@ -307,8 +407,12 @@ extension FabushiV167Tier1UITests {
         assertVoiceOverReady(fingerprint)
         let muteBtn = requireElement(FabushiAccessibilityIDs.Call.muteButton, in: application)
         assertMinimumTouchTarget44pt(muteBtn)
-        let shareBtn = tapControl(FabushiAccessibilityIDs.Call.screenShareButton, in: application)
-        assertMinimumTouchTarget44pt(shareBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Call.screenShareButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
 
         let sharePicker = element(FabushiAccessibilityIDs.Call.screenSharePicker, in: application)
         let shareUnavailable = element(FabushiAccessibilityIDs.Call.screenShareUnavailableBanner, in: application)
@@ -343,6 +447,12 @@ extension FabushiV167Tier1UITests {
 
         let resultsList = requireElement(FabushiAccessibilityIDs.ChatList.searchResultsList, in: application)
         assertWithinWindowBounds(resultsList, in: application)
+        let hitPredicate = NSPredicate(format: "label CONTAINS[cd] %@ OR label CONTAINS[cd] %@", "全球法布施", "Dharma Archive")
+        let hit = resultsList.descendants(matching: .any).matching(hitPredicate).firstMatch
+        XCTAssertTrue(hit.waitForExistence(timeout: 6), "F27 unified CJK search must return seeded '全球法布施' / 'Dharma Archive' hit")
+        hit.tap()
+        let stageRoot = requireElement(FabushiAccessibilityIDs.Stage.root, in: application, timeout: 8)
+        assertWithinWindowBounds(stageRoot, in: application)
         recordCheckpoint("T1_F27_unified_cjk_search", passed: true)
     }
 
@@ -363,8 +473,12 @@ extension FabushiV167Tier1UITests {
         let e2eeBadge = requireElement(FabushiAccessibilityIDs.Stage.e2eeVerifiedBadge, in: application)
         assertVoiceOverReady(e2eeBadge)
         tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
-        let safetyBtn = tapControl(FabushiAccessibilityIDs.Inspector.e2eeSafetyNumberButton, in: application)
-        assertMinimumTouchTarget44pt(safetyBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Inspector.e2eeSafetyNumberButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let emojiGrid = requireElement(FabushiAccessibilityIDs.Inspector.e2eeSafetyEmojiGrid, in: application)
         assertWithinWindowBounds(emojiGrid, in: application)
         assertVoiceOverReady(emojiGrid)
@@ -386,8 +500,12 @@ extension FabushiV167Tier1UITests {
 
         let balance = requireElement(FabushiAccessibilityIDs.Settings.starsBalanceLabel, in: application)
         assertVoiceOverReady(balance)
-        let restoreBtn = tapControl(FabushiAccessibilityIDs.Settings.storeKitRestoreButton, in: application)
-        assertMinimumTouchTarget44pt(restoreBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Settings.storeKitRestoreButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let disclosure = requireElement(FabushiAccessibilityIDs.Settings.storeKitDisclosureBanner, in: application)
         assertVoiceOverReady(disclosure)
         recordCheckpoint("T1_F29_stars_and_storekit2", passed: true)
@@ -437,9 +555,13 @@ extension FabushiV167Tier1UITests {
             FabushiAccessibilityIDs.Settings.themeClassicButton,
         ]
         for themeID in themes {
-            let btn = tapControl(themeID, in: application)
-            assertMinimumTouchTarget44pt(btn)
-            assertVoiceOverReady(btn)
+            tapControlWithHIGChecks(
+                themeID,
+                in: application,
+                verifyMinTouchTarget: true,
+                verifyWithinBounds: true,
+                verifyVoiceOver: true
+            )
         }
         let contrastBadge = requireElement(FabushiAccessibilityIDs.Settings.accentContrastBadge, in: application)
         assertVoiceOverReady(contrastBadge)
@@ -466,8 +588,12 @@ extension FabushiV167Tier1UITests {
 
         let metricsLabel = requireElement(FabushiAccessibilityIDs.Settings.storageMetricsLabel, in: application)
         assertVoiceOverReady(metricsLabel)
-        let purgeBtn = tapControl(FabushiAccessibilityIDs.Settings.storagePurgeCacheButton, in: application)
-        assertMinimumTouchTarget44pt(purgeBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Settings.storagePurgeCacheButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         recordCheckpoint("T1_F32_settings_26_and_storage", passed: true)
     }
 
@@ -481,22 +607,30 @@ extension FabushiV167Tier1UITests {
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t1_f33_net", password: "FabushiV168!Pass")
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionNetworkProxy, in: application)
 
         let hostField = requireElement(FabushiAccessibilityIDs.Settings.proxyHostField, in: application)
         replaceText(in: hostField, with: "127.0.0.1")
         let portField = requireElement(FabushiAccessibilityIDs.Settings.proxyPortField, in: application)
         replaceText(in: portField, with: "8080")
-        let probeBtn = tapControl(FabushiAccessibilityIDs.Settings.proxyProbeButton, in: application)
-        assertMinimumTouchTarget44pt(probeBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Settings.proxyProbeButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let statusLabel = requireElement(FabushiAccessibilityIDs.Settings.proxyStatusLabel, in: application)
         assertVoiceOverReady(statusLabel)
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionUpdates, in: application)
-        let updateBtn = tapControl(FabushiAccessibilityIDs.Settings.updateCheckButton, in: application)
-        assertMinimumTouchTarget44pt(updateBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Settings.updateCheckButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let updateLabel = requireElement(FabushiAccessibilityIDs.Settings.updateStatusLabel, in: application)
         assertVoiceOverReady(updateLabel)
         recordCheckpoint("T1_F33_network_proxy_updates", passed: true)
@@ -513,12 +647,9 @@ extension FabushiV167Tier1UITests {
         signInIfNeeded(in: application, username: "t1_f34_gov", password: "FabushiV168!Pass")
 
         assertNoSampleChats(in: application)
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionCapabilities, in: application)
-
-        let ledger = requireElement(FabushiAccessibilityIDs.Settings.capabilityLedgerList, in: application)
-        assertWithinWindowBounds(ledger, in: application)
-        assertVoiceOverReady(ledger)
+        assertCapabilityLedgerShowsCanonicalIDs(in: application)
 
         let state = try await client.fetchState()
         XCTAssertEqual(state.version, "1.6.8", "F34 loopback authority version must match v1.6.8")

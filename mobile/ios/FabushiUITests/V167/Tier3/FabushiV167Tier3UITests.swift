@@ -25,22 +25,34 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
 
         setDeviceOrientation(.landscapeLeft)
         openFirstChat(in: application)
-        tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
-
-        let stageRoot = requireElement(FabushiAccessibilityIDs.Stage.root, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.inspectorToggleButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let inspector = requireElement(FabushiAccessibilityIDs.Inspector.drawer, in: application)
-        assertWithinWindowBounds(stageRoot, in: application)
         assertWithinWindowBounds(inspector, in: application)
 
         if activeFormFactor() == .ipad {
+            let stageRoot = requireElement(FabushiAccessibilityIDs.Stage.root, in: application)
             let splitView = requireElement(FabushiAccessibilityIDs.Shell.splitView, in: application)
+            assertWithinWindowBounds(stageRoot, in: application)
             assertWithinWindowBounds(splitView, in: application)
             assertNonOverlapping(stageRoot, inspector)
-        }
 
-        setDeviceOrientation(.portrait)
-        let stillVisible = stageRoot.waitForExistence(timeout: 5)
-        XCTAssertTrue(stillVisible, "T3_01 F07/F16/F31 stage must remain intact after landscape -> portrait rotation")
+            setDeviceOrientation(.portrait)
+            XCTAssertTrue(
+                stageRoot.waitForExistence(timeout: 5),
+                "T3_01 F07/F16/F31 iPad stage must remain intact after landscape -> portrait rotation"
+            )
+        } else {
+            setDeviceOrientation(.portrait)
+            assertWithinWindowBounds(inspector, in: application)
+            dismissInspectorIfPresented(in: application)
+            let stageRoot = requireElement(FabushiAccessibilityIDs.Stage.root, in: application, timeout: 5)
+            assertWithinWindowBounds(stageRoot, in: application)
+        }
         recordCheckpoint("T3_01_ipad_3col_rotation_night", passed: true, attachScreen: true)
     }
 
@@ -98,12 +110,18 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         replaceText(in: composerField, with: "Sync check before account switch")
         tapControl(FabushiAccessibilityIDs.Composer.sendButton, in: application)
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabChats, in: application)
-        tapControl(FabushiAccessibilityIDs.Shell.accountSwitcherButton, in: application)
+        navigateBackToChatListIfCompact(in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Shell.accountSwitcherButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let sheet = requireElement(FabushiAccessibilityIDs.Shell.accountSwitcherSheet, in: application)
         assertWithinWindowBounds(sheet, in: application)
+        dismissAccountSwitcherIfPresented(in: application)
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionVault, in: application)
         let vaultBtn = requireElement(FabushiAccessibilityIDs.Settings.vaultUnlockButton, in: application)
         assertMinimumTouchTarget44pt(vaultBtn)
@@ -122,7 +140,7 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t3_grok_multiagent")],
                 chats: [
-                    FabushiLoopbackSeedChat(chatId: 304, title: "@GrokAI", chatType: "bot", memberCount: 2),
+                    FabushiLoopbackSeedChat(chatId: 304, title: "@GrokBot", chatType: "bot", memberCount: 2),
                     FabushiLoopbackSeedChat(chatId: 305, title: "@HermesBot", chatType: "bot", memberCount: 2),
                 ]
             )
@@ -147,6 +165,10 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         let interruptBtn = requireElement(FabushiAccessibilityIDs.Stage.floorInterruptButton, in: application)
         assertMinimumTouchTarget44pt(interruptBtn)
         interruptBtn.tap()
+        XCTAssertTrue(
+            floorBanner.waitForNonExistence(timeout: 6),
+            "T3_04 interrupt must dismiss floorControlBanner"
+        )
         recordCheckpoint("T3_04_grok_compose_multi_agent_floor", passed: true)
     }
 
@@ -177,11 +199,24 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         assertMinimumTouchTarget44pt(approveBtn)
         assertMinimumTouchTarget44pt(denyBtn)
         assertNonOverlapping(approveBtn, denyBtn)
+        let preApprovalLabel = element(FabushiAccessibilityIDs.Stage.messageBubbleLatest, in: application).label
         approveBtn.tap()
 
-        let streamOrBubble = element(FabushiAccessibilityIDs.Stage.streamingIndicator, in: application).waitForExistence(timeout: 5)
-            || element(FabushiAccessibilityIDs.Stage.messageBubbleLatest, in: application).waitForExistence(timeout: 5)
-        XCTAssertTrue(streamOrBubble, "T3_05 F15/F17 approving tool dock must advance streaming AI turn")
+        XCTAssertTrue(
+            approvalDock.waitForNonExistence(timeout: 6),
+            "T3_05 F15/F17 approving tool dock must dismiss toolApprovalDock"
+        )
+        let progressed = await waitUntil(timeout: 10) {
+            if self.element(FabushiAccessibilityIDs.Stage.streamingIndicator, in: application).exists {
+                return true
+            }
+            let latest = self.element(FabushiAccessibilityIDs.Stage.messageBubbleLatest, in: application)
+            return latest.exists && !latest.label.isEmpty && latest.label != preApprovalLabel
+        }
+        XCTAssertTrue(
+            progressed,
+            "T3_05 F15/F17 approving tool dock must trigger streaming indicator or render a new post-approval AI bubble"
+        )
         recordCheckpoint("T3_05_slash_approval_streaming_turn", passed: true)
     }
 
@@ -246,11 +281,19 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         openShellTab(FabushiAccessibilityIDs.Shell.tabRemote, in: application)
         tapControl(FabushiAccessibilityIDs.Remote.firstNodeRow, in: application)
 
-        let permModal = element(FabushiAccessibilityIDs.Remote.permissionModal, in: application)
-        if permModal.waitForExistence(timeout: 6) {
-            assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Remote.permissionModalScreenStatus, in: application))
-            tapControl(FabushiAccessibilityIDs.Remote.permissionModalDismissButton, in: application)
-        }
+        let permModal = requireElement(FabushiAccessibilityIDs.Remote.permissionModal, in: application, timeout: 10)
+        assertWithinWindowBounds(permModal, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Remote.permissionModalScreenStatus, in: application))
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Remote.permissionModalDismissButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        XCTAssertTrue(
+            permModal.waitForNonExistence(timeout: 5),
+            "T3_07 v1.6.8 permission modal must dismiss cleanly"
+        )
 
         let controlledPill = requireElement(FabushiAccessibilityIDs.Remote.controlledBanner, in: application)
         assertVoiceOverReady(controlledPill)
@@ -260,8 +303,15 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         assertMinimumTouchTarget44pt(takeover)
         takeover.tap()
 
-        let state = try await client.fetchState(pathPrefix: "/api/v1/computer")
-        XCTAssertGreaterThanOrEqual(state.matchedRequestCount, 1, "T3_07 F21/F22 takeover must record loopback computer request")
+        let state = try await client.fetchState(pathPrefix: "/api/v1/computer/")
+        let takeoverCalls = state.recordedRequests.filter {
+            $0.method == "POST" && $0.path.contains("emergency_takeover")
+        }
+        XCTAssertGreaterThanOrEqual(
+            takeoverCalls.count,
+            1,
+            "T3_07 F21/F22 emergency takeover must POST /api/v1/computer/lease/emergency_takeover"
+        )
         recordCheckpoint("T3_07_remote_pty_takeover_v168_perm", passed: true)
     }
 
@@ -307,10 +357,20 @@ final class FabushiV167Tier3UITests: FabushiE2EUITestCase {
         openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionAIProviders, in: application)
 
-        let piiToggle = tapControl(FabushiAccessibilityIDs.Magpie.piiMaskingToggle, in: application)
-        assertVoiceOverReady(piiToggle)
-        let routingToggle = tapControl(FabushiAccessibilityIDs.Magpie.routingRuleToggle, in: application)
-        assertVoiceOverReady(routingToggle)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Magpie.piiMaskingToggle,
+            in: application,
+            verifyMinTouchTarget: false,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Magpie.routingRuleToggle,
+            in: application,
+            verifyMinTouchTarget: false,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
         let vaultOAuthBtn = requireElement(FabushiAccessibilityIDs.Magpie.vaultOAuthSyncButton, in: application)
         assertMinimumTouchTarget44pt(vaultOAuthBtn)
         vaultOAuthBtn.tap()

@@ -54,33 +54,71 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t2_vo_user")],
-                chats: [FabushiLoopbackSeedChat(chatId: 202, title: "VoiceOver Audit Room")]
+                chats: [FabushiLoopbackSeedChat(chatId: 202, title: "VoiceOver Audit Room")],
+                remoteNodes: [
+                    FabushiLoopbackSeedRemoteNode(deviceId: "mac_vo_v168", name: "VoiceOver Mac Studio")
+                ],
+                miniapps: [
+                    FabushiLoopbackSeedMiniApp(appId: "global_dharma", title: "全球法布施", tosAccepted: true)
+                ]
             )
         )
         let application = try launchFabushi(FabushiE2ELaunchConfig(languageCode: "zh-Hans", localeIdentifier: "zh_CN"))
-        XCTAssertEqual(FabushiAccessibilityIDs.allRequiredNamespaces.count, 13)
 
-        let authRoot = element(FabushiAccessibilityIDs.Auth.root, in: application)
-        if authRoot.waitForExistence(timeout: 3) {
-            assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Auth.loginButton, in: application))
-        }
+        // 1. fabushi.auth (fail-closed)
+        let authRoot = requireElement(FabushiAccessibilityIDs.Auth.root, in: application)
+        assertWithinWindowBounds(authRoot, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Auth.loginButton, in: application))
+
         signInIfNeeded(in: application, username: "t2_vo_user", password: "FabushiV168!Pass")
 
+        // 2. fabushi.shell & 3. fabushi.chatlist
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Shell.accountSwitcherButton, in: application))
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.ChatList.composeButton, in: application))
 
+        // 4. fabushi.compose
+        tapControl(FabushiAccessibilityIDs.ChatList.composeButton, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Compose.toField, in: application))
+        tapControl(FabushiAccessibilityIDs.Compose.cancelButton, in: application)
+
+        // 5. fabushi.stage & 6. fabushi.composer
         openFirstChat(in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Stage.headerTitle, in: application))
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Composer.sendButton, in: application))
+
+        // 7. fabushi.call
+        tapControl(FabushiAccessibilityIDs.Stage.callStartButton, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Call.muteButton, in: application))
+        tapControl(FabushiAccessibilityIDs.Call.hangupButton, in: application)
+        XCTAssertTrue(
+            element(FabushiAccessibilityIDs.Call.overlay, in: application).waitForNonExistence(timeout: 5),
+            "T2_02 Call overlay must dismiss cleanly after hangup"
+        )
+
+        // 8. fabushi.inspector (dismiss sheet before tab switching on iPhone)
         tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Inspector.drawer, in: application))
+        dismissInspectorIfPresented(in: application)
+        navigateBackToChatListIfCompact(in: application)
 
+        // 9. fabushi.miniapp
+        tapControl(FabushiAccessibilityIDs.MiniApp.launcherButton, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.MiniApp.globalDharmaCard, in: application))
+        tapControl(FabushiAccessibilityIDs.MiniApp.closeButton, in: application)
+
+        // 10. fabushi.studio
         openShellTab(FabushiAccessibilityIDs.Shell.tabStudio, in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Studio.tabOverview, in: application))
+
+        // 11. fabushi.remote
         openShellTab(FabushiAccessibilityIDs.Shell.tabRemote, in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Remote.workbench, in: application))
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+
+        // 12. fabushi.settings & 13. fabushi.magpie
+        openSettingsRoot(in: application)
         assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Settings.searchField, in: application))
+        tapControl(FabushiAccessibilityIDs.Settings.sectionAIProviders, in: application)
+        assertVoiceOverReady(requireElement(FabushiAccessibilityIDs.Magpie.probeHealthButton, in: application))
         recordCheckpoint("T2_02_voiceover_zero_raw_keys", passed: true)
     }
 
@@ -106,18 +144,58 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             )
             let application = try launchFabushi(config)
             signInIfNeeded(in: application, username: "t2_theme_user", password: "FabushiV168!Pass")
-            openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+            openSettingsRoot(in: application)
             tapControl(FabushiAccessibilityIDs.Settings.sectionAppearance, in: application)
             let badge = requireElement(FabushiAccessibilityIDs.Settings.accentContrastBadge, in: application)
             assertVoiceOverReady(badge)
-            if pair.1 == "#FFFF00" || pair.1 == "#FFFFFF" {
-                let badgeValue = (badge.value as? String) ?? badge.label
-                XCTAssertFalse(
-                    badgeValue.uppercased().contains("#FFFF00") && !badgeValue.lowercased().contains("dark"),
-                    "F31 WCAG >138 luma guard must darken bright accent \(pair.1) on theme \(pair.0)"
+            let rawAccent = pair.1.uppercased()
+            guard let expected = Self.computeWCAGAccentFill(rawAccent) else {
+                XCTFail("Invalid test accent hex \(rawAccent)")
+                return
+            }
+            let badgeValue = ((badge.value as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let combined = "\(badgeValue) \(badge.label)".trimmingCharacters(in: .whitespacesAndNewlines)
+            let upperCombined = combined.uppercased()
+            let lowerCombined = combined.lowercased()
+            let renderedHexes = Self.extractHexColors(from: upperCombined)
+
+            if expected.adjusted {
+                if let effectiveHex = renderedHexes.last {
+                    XCTAssertNotEqual(
+                        effectiveHex,
+                        rawAccent,
+                        "F31 WCAG >138 luma guard must not leave bright accent \(rawAccent) unmodified on theme \(pair.0)"
+                    )
+                    XCTAssertEqual(
+                        effectiveHex,
+                        expected.effectiveHex,
+                        "F31 WCAG >138 luma guard expected darkened \(expected.effectiveHex) for \(rawAccent) on theme \(pair.0), got \(effectiveHex)"
+                    )
+                } else {
+                    XCTAssertFalse(
+                        upperCombined.contains(rawAccent),
+                        "F31 WCAG >138 luma guard must not expose raw bright accent \(rawAccent) on theme \(pair.0) (badge='\(combined)')"
+                    )
+                    let hasDarkenedIndicator = lowerCombined.contains("dark")
+                        || lowerCombined.contains("adjusted")
+                        || lowerCombined.contains("guard")
+                        || combined.contains("调暗")
+                        || combined.contains("对比度")
+                    XCTAssertTrue(
+                        hasDarkenedIndicator,
+                        "F31 WCAG >138 guard must positively report darkened hex \(expected.effectiveHex) or contrast-guard cue for \(rawAccent) on theme \(pair.0) (badge='\(combined)')"
+                    )
+                }
+            } else if let effectiveHex = renderedHexes.last {
+                XCTAssertEqual(
+                    effectiveHex,
+                    rawAccent,
+                    "F31 WCAG >138 guard must preserve compliant accent \(rawAccent) without false darkening on theme \(pair.0)"
                 )
             }
-            application.terminate()
+            if index < themesWithAccents.count - 1 {
+                application.terminate()
+            }
         }
         recordCheckpoint("T2_03_themes_wcag_138_guard", passed: true)
     }
@@ -130,17 +208,19 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             FabushiLoopbackSeedRequest(users: [FabushiLoopbackSeedUser(username: "t2_locale_user")])
         )
 
-        for localePair in [("zh-Hans", "zh_CN"), ("en", "en_US")] {
+        var labelsByLocale: [String: [String]] = [:]
+        let localePairs = [("zh-Hans", "zh_CN"), ("en", "en_US")]
+        for (index, localePair) in localePairs.enumerated() {
             let application = try launchFabushi(
                 FabushiE2ELaunchConfig(
                     theme: "night",
                     languageCode: localePair.0,
                     localeIdentifier: localePair.1,
-                    resetState: localePair.0 == "zh-Hans"
+                    resetState: index == 0
                 )
             )
             signInIfNeeded(in: application, username: "t2_locale_user", password: "FabushiV168!Pass")
-            openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+            openSettingsRoot(in: application)
 
             let appearanceRow = requireElement(FabushiAccessibilityIDs.Settings.sectionAppearance, in: application)
             let languageRow = requireElement(FabushiAccessibilityIDs.Settings.sectionLanguage, in: application)
@@ -148,7 +228,33 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             assertVoiceOverReady(appearanceRow)
             assertVoiceOverReady(languageRow)
             assertVoiceOverReady(privacyRow)
-            application.terminate()
+            labelsByLocale[localePair.0] = [appearanceRow.label, languageRow.label, privacyRow.label]
+            if index < localePairs.count - 1 {
+                application.terminate()
+            }
+        }
+        guard let zhLabels = labelsByLocale["zh-Hans"], let enLabels = labelsByLocale["en"] else {
+            XCTFail("T2_04 failed to capture both zh-Hans and en Settings labels")
+            return
+        }
+        for i in 0..<zhLabels.count {
+            XCTAssertNotEqual(
+                zhLabels[i],
+                enLabels[i],
+                "F31 localization parity violated: Settings row \(i) rendered identical label '\(zhLabels[i])' for zh-Hans and en"
+            )
+            XCTAssertNotNil(
+                zhLabels[i].range(of: "\\p{Han}", options: .regularExpression),
+                "F31 zh-Hans localization must render Han/CJK text for Settings row \(i), got '\(zhLabels[i])'"
+            )
+            XCTAssertNotNil(
+                enLabels[i].range(of: "[A-Za-z]", options: .regularExpression),
+                "F31 en localization must render English text for Settings row \(i), got '\(enLabels[i])'"
+            )
+            XCTAssertNil(
+                enLabels[i].range(of: "\\p{Han}", options: .regularExpression),
+                "F31 en localization must not leak untranslated Han/CJK text in row \(i), got '\(enLabels[i])'"
+            )
         }
         recordCheckpoint("T2_04_zh_hans_en_parity", passed: true)
     }
@@ -165,7 +271,7 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         )
         signInIfNeeded(in: application, username: "t2_a11y_user", password: "FabushiV168!Pass")
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
+        openSettingsRoot(in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionAppearance, in: application)
 
         let reduceMotion = requireElement(FabushiAccessibilityIDs.Settings.reduceMotionToggle, in: application)
@@ -174,6 +280,29 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         assertVoiceOverReady(highContrast)
         assertMinimumTouchTarget44pt(reduceMotion)
         assertMinimumTouchTarget44pt(highContrast)
+
+        XCTAssertTrue(
+            isSwitchEnabled(reduceMotion),
+            "F31 reduceMotionToggle must initialize ON when FABUSHI_UI_REDUCE_MOTION=1"
+        )
+        XCTAssertTrue(
+            isSwitchEnabled(highContrast),
+            "F31 highContrastToggle must initialize ON when FABUSHI_UI_HIGH_CONTRAST=1"
+        )
+
+        reduceMotion.tap()
+        let rmDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(reduceMotion) }
+        XCTAssertTrue(rmDisabled, "F31 tapping reduceMotionToggle must flip state to OFF")
+        reduceMotion.tap()
+        let rmReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(reduceMotion) }
+        XCTAssertTrue(rmReenabled, "F31 tapping reduceMotionToggle again must flip state back to ON")
+
+        highContrast.tap()
+        let hcDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(highContrast) }
+        XCTAssertTrue(hcDisabled, "F31 tapping highContrastToggle must flip state to OFF")
+        highContrast.tap()
+        let hcReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(highContrast) }
+        XCTAssertTrue(hcReenabled, "F31 tapping highContrastToggle again must flip state back to ON")
         recordCheckpoint("T2_05_reduce_motion_high_contrast", passed: true)
     }
 
@@ -223,14 +352,32 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t2_http500_user", password: "FabushiV168!Pass")
 
+        let faultBody = ["error": "PROVIDER_ERROR", "message": "upstream model gateway returned 500"]
         try await client.injectFault(
             FabushiLoopbackFaultRequest(
-                httpFault: FabushiLoopbackHTTPFault(
-                    pathPrefix: "/api/v1/messages",
-                    status: 500,
-                    body: ["error": "PROVIDER_ERROR", "message": "upstream model gateway returned 500"],
-                    remainingHits: 2
-                )
+                httpFaults: [
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/chats/207/messages",
+                        method: "POST",
+                        status: 500,
+                        body: faultBody,
+                        remainingHits: 2
+                    ),
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/messages",
+                        method: "POST",
+                        status: 500,
+                        body: faultBody,
+                        remainingHits: 2
+                    ),
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/agent",
+                        method: "POST",
+                        status: 500,
+                        body: faultBody,
+                        remainingHits: 2
+                    ),
+                ]
             )
         )
 
@@ -275,13 +422,24 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
 
         try await client.injectFault(
             FabushiLoopbackFaultRequest(
-                httpFault: FabushiLoopbackHTTPFault(
-                    pathPrefix: "/api/v1/messages",
-                    status: 429,
-                    body: ["error": "rate_limited"],
-                    retryAfterMs: 3000,
-                    remainingHits: 1
-                )
+                httpFaults: [
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/chats/208/messages",
+                        method: "POST",
+                        status: 429,
+                        body: ["error": "rate_limited"],
+                        retryAfterMs: 3000,
+                        remainingHits: 2
+                    ),
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/messages",
+                        method: "POST",
+                        status: 429,
+                        body: ["error": "rate_limited"],
+                        retryAfterMs: 3000,
+                        remainingHits: 2
+                    ),
+                ]
             )
         )
 
@@ -311,10 +469,11 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
 
         if stagePill.exists {
             assertNonOverlapping(stagePill, inputWrap)
-            tapControl(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
+            openChatRow(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
             let cleared = stagePill.waitForNonExistence(timeout: 4)
             XCTAssertTrue(cleared, "v1.6.8 F07: switching chats must clear chat-scoped stage toast")
         }
+        try await client.clearFaults()
         recordCheckpoint("T2_08_v168_two_layer_toast_non_overlap", passed: true)
     }
 
@@ -335,6 +494,7 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         let priorComposer = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
         replaceText(in: priorComposer, with: "草稿保留测试")
 
+        navigateBackToChatListIfCompact(in: application)
         tapControl(FabushiAccessibilityIDs.ChatList.composeButton, in: application)
         let inputWrap = element(FabushiAccessibilityIDs.Composer.inputWrap, in: application)
         let hiddenInitially = inputWrap.waitForNonExistence(timeout: 3)
@@ -355,6 +515,7 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         XCTAssertTrue(hiddenAgain, "v1.6.8 F08: removing last chip must re-hide composer")
 
         tapControl(FabushiAccessibilityIDs.Compose.cancelButton, in: application)
+        reopenFirstChatIfComposerNotVisible(in: application)
         let restoredField = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
         let restoredVal = (restoredField.value as? String) ?? ""
         XCTAssertTrue(
@@ -376,27 +537,49 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         )
         let application = try launchFabushi()
 
-        let urlField = element(FabushiAccessibilityIDs.Auth.serverURLField, in: application)
-        if urlField.waitForExistence(timeout: 4) {
-            replaceText(in: urlField, with: "not-a-valid-url://bad")
-            tapControl(FabushiAccessibilityIDs.Auth.loginButton, in: application)
-            let urlErr = requireElement(FabushiAccessibilityIDs.Auth.serverURLError, in: application)
-            assertVoiceOverReady(urlErr)
-            let validURL = try resolvedServerURL()
-            replaceText(in: urlField, with: validURL.absoluteString)
-        }
+        // 1. Fail-closed invalid server URL inline error (no silent-skip `if`)
+        let urlField = requireElement(FabushiAccessibilityIDs.Auth.serverURLField, in: application)
+        replaceText(in: urlField, with: "not-a-valid-url://bad")
+        tapControl(FabushiAccessibilityIDs.Auth.loginButton, in: application)
+        let urlErr = requireElement(FabushiAccessibilityIDs.Auth.serverURLError, in: application)
+        assertWithinWindowBounds(urlErr, in: application)
+        assertVoiceOverReady(urlErr)
+        let validURL = try resolvedServerURL()
+        replaceText(in: urlField, with: validURL.absoluteString)
 
         signInIfNeeded(in: application, username: "t2_val_user", password: "FabushiV168!Pass")
         openFirstChat(in: application)
 
+        // 2. Whitespace-only composer must never send
         let field = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
         replaceText(in: field, with: "   ")
         let sendBtn = requireElement(FabushiAccessibilityIDs.Composer.sendButton, in: application)
         if sendBtn.isEnabled && sendBtn.isHittable {
             sendBtn.tap()
         }
-        let state = try await client.fetchState(pathPrefix: "/api/v1/chats/211/messages")
-        XCTAssertEqual(state.counts.messages, 0, "F14 whitespace-only composer input must never send empty message")
+        let afterEmptyState = try await client.fetchState(pathPrefix: "/api/v1/chats/211/messages")
+        XCTAssertEqual(afterEmptyState.counts.messages, 0, "F14 whitespace-only composer input must never send empty message")
+
+        // 3. Oversized (> 4096 chars) composer payload must surface Composer.validationErrorBanner & send 0 messages
+        let chunk512 = String(repeating: "x", count: 512)
+        replaceText(in: field, with: chunk512)
+        for _ in 0..<7 {
+            field.typeText(chunk512)
+        }
+        field.typeText("OVERFLOW9")
+        if sendBtn.isEnabled && sendBtn.isHittable {
+            sendBtn.tap()
+        }
+        let validationBanner = requireElement(FabushiAccessibilityIDs.Composer.validationErrorBanner, in: application)
+        assertWithinWindowBounds(validationBanner, in: application)
+        assertVoiceOverReady(validationBanner)
+
+        let afterOversizeState = try await client.fetchState(pathPrefix: "/api/v1/chats/211/messages")
+        XCTAssertEqual(
+            afterOversizeState.counts.messages,
+            0,
+            "F14 oversized (>4096 chars) composer payload must fail closed and persist 0 messages"
+        )
         recordCheckpoint("T2_10_validation_composer_and_server_url", passed: true)
     }
 
@@ -439,40 +622,124 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
                 chats: [
                     FabushiLoopbackSeedChat(chatId: 212, title: "@BotPeer", chatType: "bot", memberCount: 2),
                     FabushiLoopbackSeedChat(chatId: 213, title: "GroupPeer", chatType: "group", memberCount: 8),
+                    FabushiLoopbackSeedChat(chatId: 214, title: "DirectUserPeer", chatType: "private", memberCount: 2),
                 ]
             )
         )
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t2_insp_user", password: "FabushiV168!Pass")
 
+        // Way 1: Bot Inspector
         openFirstChat(in: application)
-        tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.inspectorToggleButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let botSection = requireElement(FabushiAccessibilityIDs.Inspector.profileBotSection, in: application)
         assertVoiceOverReady(botSection)
+        let openAppBtn = requireElement(FabushiAccessibilityIDs.Inspector.openAppButton, in: application)
+        assertMinimumTouchTarget44pt(openAppBtn)
+        assertVoiceOverReady(openAppBtn)
         XCTAssertFalse(
             element(FabushiAccessibilityIDs.Inspector.tabMembers, in: application).exists,
             "v1.6.8 F16: Bot inspector must never expose group Members tab"
         )
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.leaveGroupButton, in: application).exists,
+            "v1.6.8 F16: Bot inspector must never expose leaveGroupButton"
+        )
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.blockContactButton, in: application).exists,
+            "v1.6.8 F16: Bot inspector must never expose 1v1 blockContactButton"
+        )
 
-        tapControl(FabushiAccessibilityIDs.Inspector.copyUsernameButton, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Inspector.copyUsernameButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let copied = requireElement(FabushiAccessibilityIDs.Inspector.copiedFeedback, in: application)
         assertVoiceOverReady(copied)
 
-        tapControl(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
-        let clearedOnSwitch = copied.waitForNonExistence(timeout: 3)
-        XCTAssertTrue(clearedOnSwitch, "v1.6.8 F16: copiedFeedback must clear immediately on chat switch")
+        // Switch to Way 2: Group Inspector (adaptive iPad side-by-side vs iPhone sheet)
+        if activeFormFactor() == .ipad {
+            tapControl(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
+            let clearedOnSwitch = copied.waitForNonExistence(timeout: 3)
+            XCTAssertTrue(clearedOnSwitch, "v1.6.8 F16: copiedFeedback must clear immediately on chat switch")
+        } else {
+            dismissInspectorIfPresented(in: application)
+            openChatRow(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
+            tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
+            XCTAssertFalse(
+                element(FabushiAccessibilityIDs.Inspector.copiedFeedback, in: application).exists,
+                "v1.6.8 F16: copiedFeedback must not persist across chat switch"
+            )
+        }
 
         let groupSection = requireElement(FabushiAccessibilityIDs.Inspector.profileGroupSection, in: application)
         assertVoiceOverReady(groupSection)
+        let membersTab = requireElement(FabushiAccessibilityIDs.Inspector.tabMembers, in: application)
+        assertMinimumTouchTarget44pt(membersTab)
         XCTAssertFalse(
             element(FabushiAccessibilityIDs.Inspector.openAppButton, in: application).exists,
             "v1.6.8 F16: Group inspector must never leak bot openAppButton"
         )
-        let leaveBtn = tapControl(FabushiAccessibilityIDs.Inspector.leaveGroupButton, in: application)
-        assertMinimumTouchTarget44pt(leaveBtn)
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.startSecretChatButton, in: application).exists,
+            "v1.6.8 F16: Group inspector must never leak 1v1 startSecretChatButton"
+        )
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.blockContactButton, in: application).exists,
+            "v1.6.8 F16: Group inspector must never leak 1v1 blockContactButton"
+        )
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Inspector.leaveGroupButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let leaveModal = requireElement(FabushiAccessibilityIDs.Inspector.leaveConfirmModal, in: application)
         assertWithinWindowBounds(leaveModal, in: application)
-        tapControl(FabushiAccessibilityIDs.Inspector.leaveConfirmCancel, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Inspector.leaveConfirmCancel,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        XCTAssertTrue(
+            leaveModal.waitForNonExistence(timeout: 5),
+            "v1.6.8 F16: cancelling leave group modal must dismiss confirmation dialog"
+        )
+
+        // Way 3: 1v1 User Inspector
+        openChatRow(FabushiAccessibilityIDs.ChatList.thirdRow, in: application)
+        if !element(FabushiAccessibilityIDs.Inspector.drawer, in: application).exists {
+            tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
+        }
+        let userSection = requireElement(FabushiAccessibilityIDs.Inspector.profileUserSection, in: application)
+        assertVoiceOverReady(userSection)
+        let secretBtn = requireElement(FabushiAccessibilityIDs.Inspector.startSecretChatButton, in: application)
+        assertMinimumTouchTarget44pt(secretBtn)
+        assertVoiceOverReady(secretBtn)
+        let blockBtn = requireElement(FabushiAccessibilityIDs.Inspector.blockContactButton, in: application)
+        assertMinimumTouchTarget44pt(blockBtn)
+        assertVoiceOverReady(blockBtn)
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.tabMembers, in: application).exists,
+            "v1.6.8 F16: 1v1 User inspector must never expose group Members tab"
+        )
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.openAppButton, in: application).exists,
+            "v1.6.8 F16: 1v1 User inspector must never expose bot openAppButton"
+        )
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Inspector.leaveGroupButton, in: application).exists,
+            "v1.6.8 F16: 1v1 User inspector must never expose leaveGroupButton"
+        )
+        dismissInspectorIfPresented(in: application)
         recordCheckpoint("T2_12_v168_3way_inspector_isolation", passed: true)
     }
 
@@ -502,7 +769,34 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             element(FabushiAccessibilityIDs.MiniApp.webView, in: application).exists,
             "F24 declining Mini App ToS must fail closed and refuse loading WKWebView"
         )
-        recordCheckpoint("T2_13_miniapp_tos_fail_closed", passed: true)
+
+        // Inject WebMCP fault, accept ToS, and verify MiniApp.webMcpErrorBanner surfaces cleanly
+        let webMcpFaultBody = ["error": "webmcp_bridge_unavailable", "message": "injected WebMCP error"]
+        try await client.injectFault(
+            FabushiLoopbackFaultRequest(
+                httpFaults: [
+                    FabushiLoopbackHTTPFault(pathPrefix: "/api/v1/mcp", status: 500, body: webMcpFaultBody, remainingHits: 4),
+                    FabushiLoopbackHTTPFault(pathPrefix: "/api/v1/webmcp", status: 500, body: webMcpFaultBody, remainingHits: 4),
+                    FabushiLoopbackHTTPFault(pathPrefix: "/api/v1/miniapps/global_dharma/webmcp", status: 500, body: webMcpFaultBody, remainingHits: 4),
+                ]
+            )
+        )
+        if !element(FabushiAccessibilityIDs.MiniApp.globalDharmaCard, in: application).exists {
+            tapControl(FabushiAccessibilityIDs.MiniApp.launcherButton, in: application)
+        }
+        tapControl(FabushiAccessibilityIDs.MiniApp.globalDharmaCard, in: application)
+        _ = requireElement(FabushiAccessibilityIDs.MiniApp.tosModal, in: application)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.MiniApp.tosAcceptButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        let webMcpError = requireElement(FabushiAccessibilityIDs.MiniApp.webMcpErrorBanner, in: application, timeout: 12)
+        assertWithinWindowBounds(webMcpError, in: application)
+        assertVoiceOverReady(webMcpError)
+        try await client.clearFaults()
+        recordCheckpoint("T2_13_miniapp_tos_fail_closed_and_webmcp_error", passed: true)
     }
 
     // MARK: - 14. v1.6.8 Remote Host ScreenCaptureKit (-3801) / Accessibility Denial & iOS Local Host Unsupported
@@ -569,11 +863,41 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         let deniedBanner = requireElement(FabushiAccessibilityIDs.Call.permissionDeniedBanner, in: application)
         assertWithinWindowBounds(deniedBanner, in: application)
         assertVoiceOverReady(deniedBanner)
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Call.overlay, in: application).exists,
+            "F26 mic/camera permission denial must fail closed and refuse presenting fake Call.overlay"
+        )
 
         let openSettingsBtn = requireElement(FabushiAccessibilityIDs.Call.permissionDeniedOpenSettings, in: application)
         assertMinimumTouchTarget44pt(openSettingsBtn)
         let sfuBanner = requireElement(FabushiAccessibilityIDs.Call.sfuDisclosureBanner, in: application)
         assertVoiceOverReady(sfuBanner)
+
+        application.terminate()
+        let replayKitApp = try launchFabushi(
+            FabushiE2ELaunchConfig(
+                resetState: false,
+                extraEnvironment: ["FABUSHI_E2E_SIMULATE_REPLAYKIT_DENIED": "1"]
+            )
+        )
+        signInIfNeeded(in: replayKitApp, username: "t2_call_perm", password: "FabushiV168!Pass")
+        openFirstChat(in: replayKitApp)
+        tapControl(FabushiAccessibilityIDs.Stage.callStartButton, in: replayKitApp)
+        _ = requireElement(FabushiAccessibilityIDs.Call.overlay, in: replayKitApp)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Call.screenShareButton,
+            in: replayKitApp,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        let shareDenied = requireElement(FabushiAccessibilityIDs.Call.screenShareUnavailableBanner, in: replayKitApp, timeout: 8)
+        assertWithinWindowBounds(shareDenied, in: replayKitApp)
+        assertVoiceOverReady(shareDenied)
+        XCTAssertFalse(
+            element(FabushiAccessibilityIDs.Call.screenSharePicker, in: replayKitApp).exists,
+            "F26 ReplayKit denial must not present broadcast picker"
+        )
+        tapControl(FabushiAccessibilityIDs.Call.hangupButton, in: replayKitApp)
         recordCheckpoint("T2_15_call_permission_denial_blk02", passed: true)
     }
 
@@ -595,18 +919,26 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
 
         assertNoDeadInteractiveControls(
             in: application,
-            identifiers: [
-                FabushiAccessibilityIDs.ChatList.composeButton,
-                FabushiAccessibilityIDs.Shell.accountSwitcherButton,
-                FabushiAccessibilityIDs.Shell.tabSettings,
+            probes: [
+                FabushiLiveControlProbe(
+                    controlIdentifier: FabushiAccessibilityIDs.ChatList.composeButton,
+                    expectedElementIdentifier: FabushiAccessibilityIDs.Compose.stage,
+                    dismissIdentifier: FabushiAccessibilityIDs.Compose.cancelButton
+                ),
+                FabushiLiveControlProbe(
+                    controlIdentifier: FabushiAccessibilityIDs.Shell.accountSwitcherButton,
+                    expectedElementIdentifier: FabushiAccessibilityIDs.Shell.accountSwitcherSheet,
+                    dismissIdentifier: FabushiAccessibilityIDs.Shell.accountSwitcherCloseButton
+                ),
+                FabushiLiveControlProbe(
+                    controlIdentifier: FabushiAccessibilityIDs.Shell.tabSettings,
+                    expectedElementIdentifier: FabushiAccessibilityIDs.Settings.root
+                ),
             ]
         )
 
-        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application)
         tapControl(FabushiAccessibilityIDs.Settings.sectionCapabilities, in: application)
-        let ledger = requireElement(FabushiAccessibilityIDs.Settings.capabilityLedgerList, in: application)
-        assertWithinWindowBounds(ledger, in: application)
-        assertVoiceOverReady(ledger)
+        assertCapabilityLedgerShowsCanonicalIDs(in: application)
         recordCheckpoint("T2_16_zero_dead_controls_and_sample_chats", passed: true)
     }
 }

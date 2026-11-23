@@ -18,6 +18,8 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         assertNoSampleChats(in: application)
 
         tapControl(FabushiAccessibilityIDs.Auth.registerTabButton, in: application)
+        let splitKeyBadge = requireElement(FabushiAccessibilityIDs.Auth.splitKeyBadge, in: application)
+        assertVoiceOverReady(splitKeyBadge)
         let userField = requireElement(FabushiAccessibilityIDs.Auth.usernameField, in: application)
         replaceText(in: userField, with: "t1_f01_v2user")
         let passField = requireElement(FabushiAccessibilityIDs.Auth.passwordField, in: application)
@@ -35,6 +37,16 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let backendState = try await client.fetchState(pathPrefix: "/api/v1/auth")
         XCTAssertGreaterThanOrEqual(backendState.counts.users, 1, "F01 register must persist user on loopback")
         XCTAssertGreaterThanOrEqual(backendState.counts.activeSessions, 1, "F01 register must mint active session")
+        let registerRequests = backendState.recordedRequests.filter { $0.path == "/api/v1/auth/register" }
+        XCTAssertGreaterThanOrEqual(registerRequests.count, 1, "F01 register must POST /api/v1/auth/register")
+        XCTAssertTrue(
+            registerRequests.contains(where: { $0.bodyPreview.contains("auth_verifier_b64") }),
+            "F01 Split-Key V2 registration must send derived auth_verifier_b64"
+        )
+        XCTAssertTrue(
+            registerRequests.allSatisfy { !$0.bodyPreview.contains("SplitKeyV2!Strong9") },
+            "F01 Split-Key V2 registration must never transmit plaintext password on the wire"
+        )
         recordCheckpoint("T1_F01_split_key_v2_bootstrap", passed: true, attachScreen: true)
     }
 
@@ -48,8 +60,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         assertVoiceOverReady(phoneField)
         replaceText(in: phoneField, with: "+14155550168")
 
-        let sendButton = tapControl(FabushiAccessibilityIDs.Auth.sendOTPButton, in: application)
-        assertMinimumTouchTarget44pt(sendButton)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Auth.sendOTPButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
 
         let otpField = requireElement(FabushiAccessibilityIDs.Auth.otpCodeField, in: application)
         replaceText(in: otpField, with: "123456")
@@ -71,9 +87,13 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let client = try await prepareCleanLoopback()
         let application = try launchFabushi(FabushiE2ELaunchConfig(theme: "night"))
 
-        let alipayButton = tapControl(FabushiAccessibilityIDs.Auth.alipayLoginButton, in: application)
-        assertMinimumTouchTarget44pt(alipayButton)
-        assertVoiceOverReady(alipayButton)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Auth.alipayLoginButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
 
         let qrView = requireElement(FabushiAccessibilityIDs.Auth.alipayQRView, in: application)
         assertWithinWindowBounds(qrView, in: application)
@@ -82,6 +102,14 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
 
         let state = try await client.fetchState(pathPrefix: "/api/v1/auth/alipay")
         XCTAssertGreaterThanOrEqual(state.matchedRequestCount, 1, "F03 Alipay start must call /api/v1/auth/alipay/start")
+
+        try await client.seed(
+            FabushiLoopbackSeedRequest(
+                alipayConfirm: FabushiLoopbackSeedAlipayConfirm(attemptId: "alipay_1")
+            )
+        )
+        let shellRoot = requireElement(FabushiAccessibilityIDs.Shell.root, in: application, timeout: 15)
+        assertWithinWindowBounds(shellRoot, in: application)
         recordCheckpoint("T1_F03_alipay_qr_started", passed: true)
     }
 
@@ -95,8 +123,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         assertMinimumTouchTarget44pt(passkeyButton)
         assertVoiceOverReady(passkeyButton)
 
-        let qrPairButton = tapControl(FabushiAccessibilityIDs.Auth.qrPairButton, in: application)
-        assertMinimumTouchTarget44pt(qrPairButton)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Auth.qrPairButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let qrCanvas = requireElement(FabushiAccessibilityIDs.Auth.qrPairCanvas, in: application)
         assertWithinWindowBounds(qrCanvas, in: application)
 
@@ -160,18 +192,46 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t1_f06_primary", password: "FabushiV168!Pass")
 
-        let switcher = tapControl(FabushiAccessibilityIDs.Shell.accountSwitcherButton, in: application)
-        assertMinimumTouchTarget44pt(switcher)
-        assertVoiceOverReady(switcher)
-
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Shell.accountSwitcherButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
         let sheet = requireElement(FabushiAccessibilityIDs.Shell.accountSwitcherSheet, in: application)
         assertWithinWindowBounds(sheet, in: application)
-        let addAccount = requireElement(FabushiAccessibilityIDs.Shell.addAccountButton, in: application)
-        assertMinimumTouchTarget44pt(addAccount)
-        assertVoiceOverReady(addAccount)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Shell.addAccountButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
 
-        let state = try await client.fetchState()
-        XCTAssertGreaterThanOrEqual(state.counts.users, 2, "F06 multi-account setup requires >= 2 seeded users")
+        let secUserField = requireElement(FabushiAccessibilityIDs.Auth.usernameField, in: application)
+        replaceText(in: secUserField, with: "t1_f06_secondary")
+        let secPassField = requireElement(FabushiAccessibilityIDs.Auth.passwordField, in: application)
+        replaceText(in: secPassField, with: "FabushiV168!Pass")
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Auth.loginButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
+        _ = requireElement(FabushiAccessibilityIDs.Shell.root, in: application, timeout: 15)
+
+        let loginState = try await client.fetchState(pathPrefix: "/api/v1/auth/login")
+        XCTAssertGreaterThanOrEqual(
+            loginState.matchedRequestCount,
+            2,
+            "F06 multi-account flow must authenticate both primary and secondary accounts against loopback"
+        )
+        XCTAssertGreaterThanOrEqual(
+            loginState.counts.activeSessions,
+            2,
+            "F06 multi-account switcher must maintain >= 2 distinct active sessions"
+        )
         recordCheckpoint("T1_F06_multi_account_switcher", passed: true)
     }
 
@@ -194,8 +254,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         if activeFormFactor() == .ipad {
             let splitView = requireElement(FabushiAccessibilityIDs.Shell.splitView, in: application)
             assertWithinWindowBounds(splitView, in: application)
-            let collapseToggle = tapControl(FabushiAccessibilityIDs.Shell.sidebarCollapseToggle, in: application)
-            assertMinimumTouchTarget44pt(collapseToggle)
+            tapControlWithHIGChecks(
+                FabushiAccessibilityIDs.Shell.sidebarCollapseToggle,
+                in: application,
+                verifyMinTouchTarget: true,
+                verifyWithinBounds: true
+            )
             let rail = requireElement(FabushiAccessibilityIDs.Shell.sidebarCollapsedRail, in: application)
             assertWithinWindowBounds(rail, in: application)
             tapControl(FabushiAccessibilityIDs.Shell.sidebarCollapseToggle, in: application)
@@ -208,14 +272,44 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let stageSlot = requireElement(FabushiAccessibilityIDs.Shell.stageSlot, in: application)
         assertWithinWindowBounds(stageSlot, in: application)
         let inputWrap = requireElement(FabushiAccessibilityIDs.Composer.inputWrap, in: application)
-        let windowBanner = element(FabushiAccessibilityIDs.Shell.toastWindowBanner, in: application)
-        if windowBanner.exists {
-            XCTAssertLessThanOrEqual(
-                windowBanner.frame.maxY,
-                inputWrap.frame.minY,
-                "v1.6.8 F07 invariant: window toast banner must never overlap composer input wrap"
+        try await client.injectFault(
+            FabushiLoopbackFaultRequest(
+                httpFaults: [
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/chats/107/messages",
+                        method: "POST",
+                        status: 429,
+                        body: ["error": "rate_limited"],
+                        retryAfterMs: 3000,
+                        remainingHits: 1
+                    ),
+                    FabushiLoopbackHTTPFault(
+                        pathPrefix: "/api/v1/messages",
+                        method: "POST",
+                        status: 429,
+                        body: ["error": "rate_limited"],
+                        retryAfterMs: 3000,
+                        remainingHits: 1
+                    ),
+                ]
             )
-        }
+        )
+        let composerField = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
+        replaceText(in: composerField, with: "Trigger v1.6.8 shell toast check")
+        tapControl(FabushiAccessibilityIDs.Composer.sendButton, in: application)
+
+        let windowBanner = element(FabushiAccessibilityIDs.Shell.toastWindowBanner, in: application)
+        let stagePill = element(FabushiAccessibilityIDs.Shell.toastStagePill, in: application)
+        let toastVisible = windowBanner.waitForExistence(timeout: 6) || stagePill.waitForExistence(timeout: 4)
+        XCTAssertTrue(toastVisible, "v1.6.8 F07: rate-limited send must surface windowBanner or stagePill toast")
+        let activeToast = windowBanner.exists ? windowBanner : stagePill
+        XCTAssertLessThanOrEqual(
+            activeToast.frame.maxY,
+            inputWrap.frame.minY,
+            "v1.6.8 F07 invariant: toast must sit strictly above composer inputWrap"
+        )
+        assertNonOverlapping(activeToast, inputWrap)
+        try await client.clearFaults()
         recordCheckpoint("T1_F07_adaptive_shell_v168", passed: true, attachScreen: true)
     }
 
@@ -226,14 +320,29 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t1_f08_grok")],
-                chats: [FabushiLoopbackSeedChat(chatId: 108, title: "@GrokAI", chatType: "bot", memberCount: 2)]
+                chats: [
+                    FabushiLoopbackSeedChat(
+                        chatId: 108,
+                        title: "@GrokAI",
+                        chatType: "bot",
+                        memberCount: 2,
+                        botStarted: true
+                    )
+                ],
+                messages: [
+                    FabushiLoopbackSeedMessage(chatId: 108, text: "Grok bot ready")
+                ]
             )
         )
         let application = try launchFabushi()
         signInIfNeeded(in: application, username: "t1_f08_grok", password: "FabushiV168!Pass")
 
-        let composeBtn = tapControl(FabushiAccessibilityIDs.ChatList.composeButton, in: application)
-        assertMinimumTouchTarget44pt(composeBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.ChatList.composeButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let composeStage = requireElement(FabushiAccessibilityIDs.Compose.stage, in: application)
         assertWithinWindowBounds(composeStage, in: application)
 
@@ -254,16 +363,44 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         tapControl(FabushiAccessibilityIDs.Compose.cancelButton, in: application)
         openFirstChat(in: application)
 
-        // v1.6.8 R1-B/R2-3: botMenuButton sits strictly left of inputWrap in bot chat
-        let botMenu = element(FabushiAccessibilityIDs.Composer.botMenuButton, in: application)
-        if botMenu.waitForExistence(timeout: 5) {
-            let inputWrap = requireElement(FabushiAccessibilityIDs.Composer.inputWrap, in: application)
-            XCTAssertLessThanOrEqual(
-                botMenu.frame.maxX,
-                inputWrap.frame.minX + 1.0,
-                "v1.6.8 F08: botMenuButton must sit outside and left of composer inputWrap"
-            )
-        }
+        // v1.6.8 R1-B/R2-3: botMenuButton sits strictly left of inputWrap (fail-closed)
+        let botMenu = requireElement(FabushiAccessibilityIDs.Composer.botMenuButton, in: application)
+        let inputWrap = requireElement(FabushiAccessibilityIDs.Composer.inputWrap, in: application)
+        assertMinimumTouchTarget44pt(botMenu)
+        assertVoiceOverReady(botMenu)
+        assertNonOverlapping(botMenu, inputWrap)
+        XCTAssertLessThanOrEqual(
+            botMenu.frame.maxX,
+            inputWrap.frame.minX + 1.0,
+            "v1.6.8 F08: botMenuButton must sit outside and left of composer inputWrap"
+        )
+
+        // v1.6.8 external `/` coexistence & BotKeyboard toggle
+        let botSlash = requireElement(FabushiAccessibilityIDs.Composer.botSlashButton, in: application)
+        assertVoiceOverReady(botSlash)
+        assertNonOverlapping(botSlash, botMenu)
+
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Composer.botKeyboardToggle,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        let replyKeyboard = requireElement(FabushiAccessibilityIDs.Composer.botReplyKeyboard, in: application)
+        assertWithinWindowBounds(replyKeyboard, in: application)
+        tapControl(FabushiAccessibilityIDs.Composer.botKeyboardToggle, in: application)
+
+        // v1.6.8 compact shrink (is_small) while typing
+        let initialBotMenuWidth = botMenu.frame.width
+        let botComposerField = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
+        replaceText(in: botComposerField, with: "Checking compact bot menu width")
+        XCTAssertLessThanOrEqual(
+            botMenu.frame.width,
+            initialBotMenuWidth + 0.5,
+            "v1.6.8 F08: botMenuButton must remain compact (<= expanded width) while typing"
+        )
+        assertNonOverlapping(botMenu, inputWrap)
         recordCheckpoint("T1_F08_grok_compose_and_bot_controls", passed: true)
     }
 
@@ -275,8 +412,27 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t1_f09_chats")],
                 chats: [
-                    FabushiLoopbackSeedChat(chatId: 109, title: "Pinned Engineering", chatType: "group", memberCount: 6),
-                    FabushiLoopbackSeedChat(chatId: 110, title: "@HermesBot", chatType: "bot", memberCount: 2),
+                    FabushiLoopbackSeedChat(
+                        chatId: 109,
+                        title: "Pinned Engineering",
+                        chatType: "group",
+                        memberCount: 6,
+                        pinned: true,
+                        unreadCount: 3
+                    ),
+                    FabushiLoopbackSeedChat(
+                        chatId: 110,
+                        title: "@HermesBot",
+                        chatType: "bot",
+                        memberCount: 2,
+                        isUnreadMarked: true
+                    ),
+                    FabushiLoopbackSeedChat(
+                        chatId: 111,
+                        title: "Release Feed",
+                        chatType: "group",
+                        memberCount: 4
+                    ),
                 ]
             )
         )
@@ -287,8 +443,22 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         assertWithinWindowBounds(chatList, in: application)
         assertNoSampleChats(in: application)
 
+        let pinnedGrid = requireElement(FabushiAccessibilityIDs.ChatList.pinnedGrid, in: application)
+        assertWithinWindowBounds(pinnedGrid, in: application)
+        let unreadBadge = requireElement(FabushiAccessibilityIDs.ChatList.unreadBadge, in: application)
+        assertVoiceOverReady(unreadBadge)
+        let unreadMarkDot = requireElement(FabushiAccessibilityIDs.ChatList.unreadMarkDot, in: application)
+        assertVoiceOverReady(unreadMarkDot)
+
+        let seededRowPred = NSPredicate(format: "label CONTAINS[cd] %@", "Pinned Engineering")
+        XCTAssertTrue(
+            chatList.descendants(matching: .any).matching(seededRowPred).firstMatch.waitForExistence(timeout: 6),
+            "F09 chat list must render seeded 'Pinned Engineering' row"
+        )
+
         let folderBar = requireElement(FabushiAccessibilityIDs.ChatList.folderBar, in: application)
         assertWithinWindowBounds(folderBar, in: application)
+        tapControl(FabushiAccessibilityIDs.ChatList.folderUnreadTab, in: application)
         tapControl(FabushiAccessibilityIDs.ChatList.folderBotsTab, in: application)
         let botBadge = requireElement(FabushiAccessibilityIDs.ChatList.botAvatarBadge, in: application)
         assertVoiceOverReady(botBadge)
@@ -297,8 +467,21 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let firstRow = requireElement(FabushiAccessibilityIDs.ChatList.firstRow, in: application)
         assertVoiceOverReady(firstRow)
 
+        if activeFormFactor() == .ipad {
+            tapControlWithHIGChecks(
+                FabushiAccessibilityIDs.Shell.sidebarCollapseToggle,
+                in: application,
+                verifyMinTouchTarget: true,
+                verifyWithinBounds: true
+            )
+            let railList = requireElement(FabushiAccessibilityIDs.ChatList.railList, in: application)
+            assertWithinWindowBounds(railList, in: application)
+            tapControl(FabushiAccessibilityIDs.Shell.sidebarCollapseToggle, in: application)
+        }
+
         let state = try await client.fetchState(pathPrefix: "/api/v1/chats")
-        XCTAssertEqual(state.counts.chats, 2, "F09 must reflect exact 2 seeded chats with zero sample rows")
+        XCTAssertGreaterThanOrEqual(state.matchedRequestCount, 1, "F09 must fetch /api/v1/chats from loopback")
+        XCTAssertEqual(state.counts.chats, 3, "F09 must reflect exact 3 seeded chats with zero sample rows")
         recordCheckpoint("T1_F09_chatlist_folders_v168", passed: true)
     }
 
@@ -309,7 +492,15 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [FabushiLoopbackSeedUser(username: "t1_f10_contacts")],
-                chats: [FabushiLoopbackSeedChat(chatId: 111, title: "@PrestartBot", chatType: "bot", memberCount: 2)]
+                chats: [
+                    FabushiLoopbackSeedChat(
+                        chatId: 111,
+                        title: "@PrestartBot",
+                        chatType: "bot",
+                        memberCount: 2,
+                        botStarted: false
+                    )
+                ]
             )
         )
         let application = try launchFabushi()
@@ -319,20 +510,37 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let contactsList = requireElement(FabushiAccessibilityIDs.ChatList.contactsList, in: application)
         assertWithinWindowBounds(contactsList, in: application)
 
-        let addContact = tapControl(FabushiAccessibilityIDs.ChatList.addContactButton, in: application)
-        assertMinimumTouchTarget44pt(addContact)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.ChatList.addContactButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let contactField = requireElement(FabushiAccessibilityIDs.ChatList.contactUsernameField, in: application)
         replaceText(in: contactField, with: "dharma_peer")
         tapControl(FabushiAccessibilityIDs.ChatList.contactSaveButton, in: application)
 
+        let contactsState = try await client.fetchState(pathPrefix: "/api/v1/contacts")
+        XCTAssertGreaterThanOrEqual(contactsState.matchedRequestCount, 1, "F10 saving contact must call /api/v1/contacts")
+
         openShellTab(FabushiAccessibilityIDs.Shell.tabChats, in: application)
         openFirstChat(in: application)
-        let botStartBar = element(FabushiAccessibilityIDs.Stage.botStartBar, in: application)
-        if botStartBar.waitForExistence(timeout: 4) {
-            let descCard = requireElement(FabushiAccessibilityIDs.Stage.botDescriptionCard, in: application)
-            assertWithinWindowBounds(descCard, in: application)
-            tapControl(FabushiAccessibilityIDs.Stage.botStartButton, in: application)
-        }
+        let botStartBar = requireElement(FabushiAccessibilityIDs.Stage.botStartBar, in: application)
+        assertWithinWindowBounds(botStartBar, in: application)
+        let descCard = requireElement(FabushiAccessibilityIDs.Stage.botDescriptionCard, in: application)
+        assertWithinWindowBounds(descCard, in: application)
+        assertVoiceOverReady(descCard)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.botStartButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        XCTAssertTrue(
+            botStartBar.waitForNonExistence(timeout: 6),
+            "v1.6.8 F10: tapping botStartButton must dismiss pre-start bar and unlock composer"
+        )
         let composerField = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
         assertVoiceOverReady(composerField)
         recordCheckpoint("T1_F10_contacts_and_prestart_bot", passed: true)
@@ -357,8 +565,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
 
         let textField = requireElement(FabushiAccessibilityIDs.Composer.textField, in: application)
         replaceText(in: textField, with: "Atomic PTS sync test message")
-        let sendBtn = tapControl(FabushiAccessibilityIDs.Composer.sendButton, in: application)
-        assertMinimumTouchTarget44pt(sendBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Composer.sendButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
 
         let delivered = await waitUntil(timeout: 10) {
             self.element(FabushiAccessibilityIDs.Stage.messageBubbleLatest, in: application).exists
@@ -474,8 +686,22 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         let popover = requireElement(FabushiAccessibilityIDs.Composer.slashCommandPopover, in: application)
         assertWithinWindowBounds(popover, in: application)
 
-        let firstCmd = tapControl(FabushiAccessibilityIDs.Composer.slashCommandFirstItem, in: application)
-        assertVoiceOverReady(firstCmd)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Composer.slashCommandFirstItem,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true
+        )
+        XCTAssertTrue(
+            popover.waitForNonExistence(timeout: 4),
+            "F15 selecting a slash command must dismiss slashCommandPopover"
+        )
+        let selectedVal = (textField.value as? String) ?? ""
+        XCTAssertTrue(
+            selectedVal.hasPrefix("/"),
+            "F15 selecting a slash command must populate composer field with command text"
+        )
         recordCheckpoint("T1_F15_slash_commands_popover", passed: true)
     }
 
@@ -496,8 +722,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         signInIfNeeded(in: application, username: "t1_f16_inspector", password: "FabushiV168!Pass")
         openFirstChat(in: application)
 
-        let toggleBtn = tapControl(FabushiAccessibilityIDs.Stage.inspectorToggleButton, in: application)
-        assertMinimumTouchTarget44pt(toggleBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Stage.inspectorToggleButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let drawer = requireElement(FabushiAccessibilityIDs.Inspector.drawer, in: application)
         assertWithinWindowBounds(drawer, in: application)
 
@@ -519,8 +749,12 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         )
 
         // v1.6.8 R2-2: Copy feedback appears then auto-dismisses cleanly
-        let copyBtn = tapControl(FabushiAccessibilityIDs.Inspector.copyUsernameButton, in: application)
-        assertMinimumTouchTarget44pt(copyBtn)
+        tapControlWithHIGChecks(
+            FabushiAccessibilityIDs.Inspector.copyUsernameButton,
+            in: application,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true
+        )
         let feedback = requireElement(FabushiAccessibilityIDs.Inspector.copiedFeedback, in: application)
         assertVoiceOverReady(feedback)
         let dismissed = feedback.waitForNonExistence(timeout: 5)

@@ -227,7 +227,7 @@ fn self_validate_loopback_http_206_416_and_fault_injection() {
     assert_eq!(status, 200);
     let health: Value = serde_json::from_slice(&body).expect("valid health JSON");
     assert_eq!(health["ok"], true);
-    assert_eq!(health["version"], "1.6.7");
+    assert_eq!(health["version"], "1.6.8");
 
     // 2. Seed 4096-byte blob and verify HTTP 206 Partial Content + HTTP 416 Range Not Satisfiable
     let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
@@ -1293,7 +1293,7 @@ fn self_validate_loopback_blocking1_canonical_routes_and_fail_closed_404() {
     let status_json: Value = serde_json::from_slice(&abs_body).expect("status JSON");
     assert_eq!(status_json["server"], "gpui_telegram_server");
     assert_eq!(status_json["status"], "healthy");
-    assert_eq!(status_json["version"], "1.6.7");
+    assert_eq!(status_json["version"], "1.6.8");
 
     let (st_wk, _, wk_json) = raw_json_request(
         addr,

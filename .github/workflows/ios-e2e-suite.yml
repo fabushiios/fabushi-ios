@@ -41,6 +41,9 @@ concurrency:
   group: ios-e2e-suite-${{ github.ref }}-${{ inputs.tier || 'auto' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   detect-mode:
     name: Detect E2E Execution Mode
@@ -152,10 +155,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile \
+          PYTHONDONTWRITEBYTECODE=1 python3 - "${RUNNER_TEMP}/pycompile_cache" \
             tests/e2e/runner.py \
             tests/e2e/spec_coverage_check.py \
-            tests/e2e/simulator_loopback_server.py
+            tests/e2e/simulator_loopback_server.py <<'PY'
+          import pathlib
+          import py_compile
+          import sys
+
+          cache_dir = pathlib.Path(sys.argv[1])
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          for raw_path in sys.argv[2:]:
+              src = pathlib.Path(raw_path)
+              cfile = cache_dir / f"{raw_path.replace('/', '__')}c"
+              py_compile.compile(str(src), cfile=str(cfile), doraise=True)
+          PY
+          test ! -d tests/e2e/__pycache__
           PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py \
             --self-test \
             --report "$EVIDENCE_DIR/loopback_self_test_report.json" \
@@ -589,10 +604,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile \
+          PYTHONDONTWRITEBYTECODE=1 python3 - "${RUNNER_TEMP}/pycompile_cache" \
             tests/e2e/runner.py \
             tests/e2e/spec_coverage_check.py \
-            tests/e2e/simulator_loopback_server.py
+            tests/e2e/simulator_loopback_server.py <<'PY'
+          import pathlib
+          import py_compile
+          import sys
+
+          cache_dir = pathlib.Path(sys.argv[1])
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          for raw_path in sys.argv[2:]:
+              src = pathlib.Path(raw_path)
+              cfile = cache_dir / f"{raw_path.replace('/', '__')}c"
+              py_compile.compile(str(src), cfile=str(cfile), doraise=True)
+          PY
+          test ! -d tests/e2e/__pycache__
           PYTHONDONTWRITEBYTECODE=1 python3 tests/e2e/simulator_loopback_server.py \
             --self-test \
             --report "$EVIDENCE_DIR/loopback_self_test_report.json" \
@@ -1008,7 +1035,9 @@ jobs:
                 kill -0 "$LOOPBACK_PID" 2>/dev/null || break
                 sleep 0.1
               done
-              kill -KILL "$LOOPBACK_PID" 2>/dev/null || true
+              if kill -0 "$LOOPBACK_PID" 2>/dev/null; then
+                kill -KILL "$LOOPBACK_PID" 2>/dev/null || true
+              fi
             fi
             wait "$LOOPBACK_PID" 2>/dev/null || true
           }

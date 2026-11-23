@@ -1202,7 +1202,7 @@
         "min_tests": 16,
         "tests": [
           {"id": "TC-UI-T2-01", "method": "testT2_01_F07_F14_F17_F31_F32_dynamicTypeAX5ZeroClippingAnd44ptTouchTargets", "features": ["F07", "F14", "F17", "F31", "F32"], "ui_namespaces": ["fabushi.shell", "fabushi.chatlist", "fabushi.composer", "fabushi.studio", "fabushi.settings"]},
-          {"id": "TC-UI-T2-02", "method": "testT2_02_F31_F32_voiceOverCompletenessAndZeroRawKeyLeaksAcross13Namespaces", "features": ["F31", "F32"], "ui_namespaces": ["fabushi.auth", "fabushi.shell", "fabushi.chatlist", "fabushi.stage", "fabushi.composer", "fabushi.inspector", "fabushi.studio", "fabushi.remote", "fabushi.settings"]},
+          {"id": "TC-UI-T2-02", "method": "testT2_02_F31_F32_voiceOverCompletenessAndZeroRawKeyLeaksAcross13Namespaces", "features": ["F31", "F32"], "ui_namespaces": ["fabushi.auth", "fabushi.shell", "fabushi.chatlist", "fabushi.compose", "fabushi.stage", "fabushi.composer", "fabushi.inspector", "fabushi.studio", "fabushi.magpie", "fabushi.remote", "fabushi.miniapp", "fabushi.call", "fabushi.settings"]},
           {"id": "TC-UI-T2-03", "method": "testT2_03_F31_all4V168ThemesAndBrightCustomAccentWCAG138Guard", "features": ["F31"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
           {"id": "TC-UI-T2-04", "method": "testT2_04_F31_zhHansAndEnLocalizationParityZeroUntranslatedKeyLeaks", "features": ["F31"], "ui_namespaces": ["fabushi.settings", "fabushi.shell"]},
           {"id": "TC-UI-T2-05", "method": "testT2_05_F31_reduceMotionAndHighContrastDeterministicToggles", "features": ["F31"], "ui_namespaces": ["fabushi.settings"]},

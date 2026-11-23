@@ -99,7 +99,7 @@ struct FabushiLoopbackSeedUser: Codable, Sendable {
         username: String,
         firstName: String? = nil,
         password: String? = "FabushiV168!Pass",
-        authVersion: Int? = 2,
+        authVersion: Int? = nil,
         authSaltB64: String? = nil,
         authVerifierB64: String? = nil,
         twoFactorPassword: String? = nil,
@@ -109,14 +109,38 @@ struct FabushiLoopbackSeedUser: Codable, Sendable {
     ) {
         self.username = username
         self.firstName = firstName
-        self.password = password
-        self.authVersion = authVersion
+        self.password = authVerifierB64 != nil ? nil : password
+        self.authVersion = authVersion ?? (authVerifierB64 != nil ? 2 : 1)
         self.authSaltB64 = authSaltB64
         self.authVerifierB64 = authVerifierB64
         self.twoFactorPassword = twoFactorPassword
         self.twoFactorHint = twoFactorHint
         self.mintSession = mintSession
         self.deviceName = deviceName
+    }
+
+    static func splitKeyV2(
+        username: String,
+        firstName: String? = nil,
+        authSaltB64: String = "QkJCQkJCQkJCQkJCQkJCQg==",
+        authVerifierB64: String,
+        twoFactorPassword: String? = nil,
+        twoFactorHint: String? = nil,
+        mintSession: Bool? = true,
+        deviceName: String? = "iOS E2E Simulator"
+    ) -> FabushiLoopbackSeedUser {
+        FabushiLoopbackSeedUser(
+            username: username,
+            firstName: firstName,
+            password: nil,
+            authVersion: 2,
+            authSaltB64: authSaltB64,
+            authVerifierB64: authVerifierB64,
+            twoFactorPassword: twoFactorPassword,
+            twoFactorHint: twoFactorHint,
+            mintSession: mintSession,
+            deviceName: deviceName
+        )
     }
 }
 
@@ -125,24 +149,40 @@ struct FabushiLoopbackSeedChat: Codable, Sendable {
     let title: String
     let chatType: String?
     let memberCount: Int?
+    let pinned: Bool?
+    let unreadCount: Int?
+    let isUnreadMarked: Bool?
+    let botStarted: Bool?
 
     enum CodingKeys: String, CodingKey {
         case chatId = "chat_id"
         case title
         case chatType = "chat_type"
         case memberCount = "member_count"
+        case pinned
+        case unreadCount = "unread_count"
+        case isUnreadMarked = "is_unread_marked"
+        case botStarted = "bot_started"
     }
 
     init(
         chatId: Int? = nil,
         title: String,
         chatType: String? = "group",
-        memberCount: Int? = 2
+        memberCount: Int? = 2,
+        pinned: Bool? = nil,
+        unreadCount: Int? = nil,
+        isUnreadMarked: Bool? = nil,
+        botStarted: Bool? = nil
     ) {
         self.chatId = chatId
         self.title = title
         self.chatType = chatType
         self.memberCount = memberCount
+        self.pinned = pinned
+        self.unreadCount = unreadCount
+        self.isUnreadMarked = isUnreadMarked
+        self.botStarted = botStarted
     }
 }
 
@@ -150,17 +190,33 @@ struct FabushiLoopbackSeedMessage: Codable, Sendable {
     let chatId: Int
     let text: String
     let clientNonce: Int?
+    let messageType: String?
+    let mediaFileId: String?
+    let instantViewUrl: String?
 
     enum CodingKeys: String, CodingKey {
         case chatId = "chat_id"
         case text
         case clientNonce = "client_nonce"
+        case messageType = "message_type"
+        case mediaFileId = "media_file_id"
+        case instantViewUrl = "instant_view_url"
     }
 
-    init(chatId: Int, text: String, clientNonce: Int? = nil) {
+    init(
+        chatId: Int,
+        text: String,
+        clientNonce: Int? = nil,
+        messageType: String? = nil,
+        mediaFileId: String? = nil,
+        instantViewUrl: String? = nil
+    ) {
         self.chatId = chatId
         self.text = text
         self.clientNonce = clientNonce
+        self.messageType = messageType
+        self.mediaFileId = mediaFileId
+        self.instantViewUrl = instantViewUrl
     }
 }
 
@@ -236,6 +292,40 @@ struct FabushiLoopbackSeedMiniApp: Codable, Sendable {
     }
 }
 
+struct FabushiLoopbackSeedAlipayConfirm: Codable, Sendable {
+    let attemptId: String
+    let userId: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case attemptId = "attempt_id"
+        case userId = "user_id"
+    }
+
+    init(attemptId: String, userId: Int? = nil) {
+        self.attemptId = attemptId
+        self.userId = userId
+    }
+}
+
+struct FabushiLiveControlProbe: Sendable {
+    let controlIdentifier: String
+    let expectedElementIdentifier: String
+    let dismissIdentifier: String?
+    let timeout: TimeInterval
+
+    init(
+        controlIdentifier: String,
+        expectedElementIdentifier: String,
+        dismissIdentifier: String? = nil,
+        timeout: TimeInterval = 8
+    ) {
+        self.controlIdentifier = controlIdentifier
+        self.expectedElementIdentifier = expectedElementIdentifier
+        self.dismissIdentifier = dismissIdentifier
+        self.timeout = timeout
+    }
+}
+
 struct FabushiLoopbackSeedRequest: Codable, Sendable {
     let users: [FabushiLoopbackSeedUser]?
     let chats: [FabushiLoopbackSeedChat]?
@@ -245,6 +335,7 @@ struct FabushiLoopbackSeedRequest: Codable, Sendable {
     let journalFloors: [String: Int]?
     let remoteNodes: [FabushiLoopbackSeedRemoteNode]?
     let miniapps: [FabushiLoopbackSeedMiniApp]?
+    let alipayConfirm: FabushiLoopbackSeedAlipayConfirm?
 
     enum CodingKeys: String, CodingKey {
         case users
@@ -255,6 +346,7 @@ struct FabushiLoopbackSeedRequest: Codable, Sendable {
         case journalFloors = "journal_floors"
         case remoteNodes = "remote_nodes"
         case miniapps
+        case alipayConfirm = "alipay_confirm"
     }
 
     init(
@@ -265,7 +357,8 @@ struct FabushiLoopbackSeedRequest: Codable, Sendable {
         vaultItems: [FabushiLoopbackSeedVaultItem]? = nil,
         journalFloors: [String: Int]? = nil,
         remoteNodes: [FabushiLoopbackSeedRemoteNode]? = nil,
-        miniapps: [FabushiLoopbackSeedMiniApp]? = nil
+        miniapps: [FabushiLoopbackSeedMiniApp]? = nil,
+        alipayConfirm: FabushiLoopbackSeedAlipayConfirm? = nil
     ) {
         self.users = users
         self.chats = chats
@@ -275,6 +368,7 @@ struct FabushiLoopbackSeedRequest: Codable, Sendable {
         self.journalFloors = journalFloors
         self.remoteNodes = remoteNodes
         self.miniapps = miniapps
+        self.alipayConfirm = alipayConfirm
     }
 }
 
@@ -725,10 +819,10 @@ class FabushiE2EUITestCase: XCTestCase {
         let url = try resolvedServerURL(file: file, line: line)
         let client = FabushiLoopbackClient(baseURL: url)
         activeLoopbackClient = client
-        let health = try await client.checkHealth()
-        XCTAssertTrue(health.ok, "Loopback /healthz must return ok == true", file: file, line: line)
         let resetResp = try await client.resetState()
         XCTAssertTrue(resetResp.ok && resetResp.reset, "Loopback /__e2e__/reset must succeed", file: file, line: line)
+        let health = try await client.checkHealth()
+        XCTAssertTrue(health.ok, "Loopback /healthz must return ok == true", file: file, line: line)
         metadata["server_url"] = url.absoluteString
         return client
     }
@@ -824,14 +918,36 @@ class FabushiE2EUITestCase: XCTestCase {
         return target
     }
 
-    @discardableResult
     func tapControl(
         _ identifier: String,
         in application: XCUIApplication,
         timeout: TimeInterval = 10,
         file: StaticString = #filePath,
         line: UInt = #line
-    ) -> XCUIElement {
+    ) {
+        tapControlWithHIGChecks(
+            identifier,
+            in: application,
+            timeout: timeout,
+            verifyMinTouchTarget: false,
+            verifyWithinBounds: false,
+            verifyVoiceOver: false,
+            file: file,
+            line: line
+        )
+    }
+
+    func tapControlWithHIGChecks(
+        _ identifier: String,
+        in application: XCUIApplication,
+        timeout: TimeInterval = 10,
+        verifyMinTouchTarget: Bool = true,
+        minTouchTarget: CGFloat = 44.0,
+        verifyWithinBounds: Bool = true,
+        verifyVoiceOver: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         let control = requireElement(identifier, in: application, timeout: timeout, file: file, line: line)
         XCTAssertTrue(
             control.isEnabled,
@@ -851,8 +967,22 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
+        if verifyMinTouchTarget {
+            assertMinimumTouchTarget44pt(
+                control,
+                minPoints: minTouchTarget,
+                requireHittable: true,
+                file: file,
+                line: line
+            )
+        }
+        if verifyWithinBounds {
+            assertWithinWindowBounds(control, in: application, file: file, line: line)
+        }
+        if verifyVoiceOver {
+            assertVoiceOverReady(control, file: file, line: line)
+        }
         control.tap()
-        return control
     }
 
     func replaceText(in field: XCUIElement, with text: String) {
@@ -974,6 +1104,11 @@ class FabushiE2EUITestCase: XCTestCase {
         let backButton = element(FabushiAccessibilityIDs.Shell.backButton, in: application)
         if backButton.exists && backButton.isHittable {
             backButton.tap()
+        } else {
+            let navBack = application.navigationBars.buttons.firstMatch
+            if navBack.exists && navBack.isHittable {
+                navBack.tap()
+            }
         }
         tapControl(tabIdentifier, in: application, timeout: 10, file: file, line: line)
     }
@@ -983,8 +1118,143 @@ class FabushiE2EUITestCase: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        tapControl(FabushiAccessibilityIDs.ChatList.firstRow, in: application, file: file, line: line)
+        openChatRow(FabushiAccessibilityIDs.ChatList.firstRow, in: application, file: file, line: line)
+    }
+
+    func dismissSheetIfPresented(
+        _ sheetIdentifier: String,
+        dismissButtonID: String,
+        in application: XCUIApplication,
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let sheet = element(sheetIdentifier, in: application)
+        guard sheet.exists else { return }
+        tapControlWithHIGChecks(
+            dismissButtonID,
+            in: application,
+            timeout: timeout,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: false,
+            file: file,
+            line: line
+        )
+        let dismissed = sheet.waitForNonExistence(timeout: timeout)
+        XCTAssertTrue(
+            dismissed,
+            "Presented sheet '\(sheetIdentifier)' must dismiss after tapping '\(dismissButtonID)'",
+            file: file,
+            line: line
+        )
+    }
+
+    func dismissInspectorIfPresented(
+        in application: XCUIApplication,
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        dismissSheetIfPresented(
+            FabushiAccessibilityIDs.Inspector.drawer,
+            dismissButtonID: FabushiAccessibilityIDs.Inspector.closeButton,
+            in: application,
+            timeout: timeout,
+            file: file,
+            line: line
+        )
+    }
+
+    func dismissAccountSwitcherIfPresented(
+        in application: XCUIApplication,
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        dismissSheetIfPresented(
+            FabushiAccessibilityIDs.Shell.accountSwitcherSheet,
+            dismissButtonID: FabushiAccessibilityIDs.Shell.accountSwitcherCloseButton,
+            in: application,
+            timeout: timeout,
+            file: file,
+            line: line
+        )
+    }
+
+    func navigateBackToChatListIfCompact(
+        in application: XCUIApplication,
+        timeout: TimeInterval = 8,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let chatList = element(FabushiAccessibilityIDs.ChatList.list, in: application)
+        if activeFormFactor() == .ipad && chatList.exists && chatList.isHittable {
+            return
+        }
+        dismissInspectorIfPresented(in: application, file: file, line: line)
+        dismissAccountSwitcherIfPresented(in: application, file: file, line: line)
+        if chatList.exists && chatList.isHittable {
+            return
+        }
+        let shellBack = element(FabushiAccessibilityIDs.Shell.backButton, in: application)
+        if shellBack.exists && shellBack.isHittable {
+            shellBack.tap()
+        } else {
+            let navBack = application.navigationBars.buttons.firstMatch
+            if navBack.exists && navBack.isHittable {
+                navBack.tap()
+            }
+        }
+        let visible = chatList.waitForExistence(timeout: timeout)
+        XCTAssertTrue(
+            visible,
+            "ChatList '\(FabushiAccessibilityIDs.ChatList.list)' must be visible after compact back navigation",
+            file: file,
+            line: line
+        )
+    }
+
+    func openChatRow(
+        _ rowIdentifier: String,
+        in application: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        navigateBackToChatListIfCompact(in: application, file: file, line: line)
+        tapControl(rowIdentifier, in: application, file: file, line: line)
         _ = requireElement(FabushiAccessibilityIDs.Stage.root, in: application, file: file, line: line)
+    }
+
+    func reopenFirstChatIfComposerNotVisible(
+        in application: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        if !element(FabushiAccessibilityIDs.Composer.textField, in: application).waitForExistence(timeout: 2) {
+            openFirstChat(in: application, file: file, line: line)
+        }
+    }
+
+    func openSettingsRoot(
+        in application: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        openShellTab(FabushiAccessibilityIDs.Shell.tabSettings, in: application, file: file, line: line)
+        let sectionList = element(FabushiAccessibilityIDs.Settings.sectionList, in: application)
+        if !sectionList.waitForExistence(timeout: 2) {
+            let shellBack = element(FabushiAccessibilityIDs.Shell.backButton, in: application)
+            if shellBack.exists && shellBack.isHittable {
+                shellBack.tap()
+            } else {
+                let navBack = application.navigationBars.buttons.firstMatch
+                if navBack.exists && navBack.isHittable {
+                    navBack.tap()
+                }
+            }
+        }
+        _ = requireElement(FabushiAccessibilityIDs.Settings.root, in: application, file: file, line: line)
     }
 
     // MARK: - Apple HIG & Accessibility Assertion Oracles
@@ -992,6 +1262,7 @@ class FabushiE2EUITestCase: XCTestCase {
     func assertMinimumTouchTarget44pt(
         _ target: XCUIElement,
         minPoints: CGFloat = 44.0,
+        requireHittable: Bool = false,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
@@ -1002,6 +1273,18 @@ class FabushiE2EUITestCase: XCTestCase {
             line: line
         )
         let frame = target.frame
+        XCTAssertFalse(
+            frame.isNull || frame.isInfinite || frame.isEmpty,
+            "Touch-target element '\(target.identifier)' has null/infinite/empty frame: \(frame)",
+            file: file,
+            line: line
+        )
+        XCTAssertTrue(
+            frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width.isFinite && frame.height.isFinite,
+            "Touch-target element '\(target.identifier)' has non-finite frame coordinates: \(frame)",
+            file: file,
+            line: line
+        )
         XCTAssertGreaterThanOrEqual(
             frame.width,
             minPoints,
@@ -1016,6 +1299,14 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
+        if requireHittable {
+            XCTAssertTrue(
+                target.isHittable,
+                "Touch-target element '\(target.identifier)' must be hittable",
+                file: file,
+                line: line
+            )
+        }
     }
 
     func assertWithinWindowBounds(
@@ -1030,11 +1321,28 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
-        let windowFrame = application.windows.firstMatch.frame
+        let window = application.windows.firstMatch
+        XCTAssertTrue(
+            window.exists,
+            "Application window must exist for bounds check of '\(target.identifier)'",
+            file: file,
+            line: line
+        )
+        let windowFrame = window.frame
+        XCTAssertFalse(
+            windowFrame.isNull || windowFrame.isInfinite || windowFrame.isEmpty
+                || !windowFrame.origin.x.isFinite || !windowFrame.origin.y.isFinite
+                || !windowFrame.width.isFinite || !windowFrame.height.isFinite,
+            "Application window has invalid/empty frame: \(windowFrame)",
+            file: file,
+            line: line
+        )
         let elemFrame = target.frame
         XCTAssertFalse(
-            elemFrame.isEmpty,
-            "Element '\(target.identifier)' has empty frame",
+            elemFrame.isNull || elemFrame.isInfinite || elemFrame.isEmpty
+                || !elemFrame.origin.x.isFinite || !elemFrame.origin.y.isFinite
+                || !elemFrame.width.isFinite || !elemFrame.height.isFinite,
+            "Element '\(target.identifier)' has null/infinite/empty/non-finite frame: \(elemFrame)",
             file: file,
             line: line
         )
@@ -1076,7 +1384,25 @@ class FabushiE2EUITestCase: XCTestCase {
     ) {
         XCTAssertTrue(first.exists, "First element '\(first.identifier)' missing", file: file, line: line)
         XCTAssertTrue(second.exists, "Second element '\(second.identifier)' missing", file: file, line: line)
-        let overlap = first.frame.intersection(second.frame)
+        let firstFrame = first.frame
+        let secondFrame = second.frame
+        XCTAssertFalse(
+            firstFrame.isNull || firstFrame.isInfinite || firstFrame.isEmpty
+                || !firstFrame.origin.x.isFinite || !firstFrame.origin.y.isFinite
+                || !firstFrame.width.isFinite || !firstFrame.height.isFinite,
+            "First element '\(first.identifier)' has empty/invalid frame for non-overlap check: \(firstFrame)",
+            file: file,
+            line: line
+        )
+        XCTAssertFalse(
+            secondFrame.isNull || secondFrame.isInfinite || secondFrame.isEmpty
+                || !secondFrame.origin.x.isFinite || !secondFrame.origin.y.isFinite
+                || !secondFrame.width.isFinite || !secondFrame.height.isFinite,
+            "Second element '\(second.identifier)' has empty/invalid frame for non-overlap check: \(secondFrame)",
+            file: file,
+            line: line
+        )
+        let overlap = firstFrame.intersection(secondFrame)
         let hasOverlap = !overlap.isNull && overlap.width > 0.5 && overlap.height > 0.5
         XCTAssertFalse(
             hasOverlap,
@@ -1090,16 +1416,19 @@ class FabushiE2EUITestCase: XCTestCase {
         _ target: XCUIElement,
         forbiddenKeyPrefixes: [String] = [
             "fabushi.",
-            "settings.",
             "auth.",
+            "shell.",
             "chatlist.",
+            "compose.",
             "stage.",
             "composer.",
             "inspector.",
             "studio.",
+            "magpie.",
             "remote.",
             "miniapp.",
             "call.",
+            "settings.",
         ],
         file: StaticString = #filePath,
         line: UInt = #line
@@ -1123,11 +1452,18 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
+        XCTAssertNotEqual(
+            label,
+            target.identifier,
+            "VoiceOver label must be human-readable, not raw accessibilityIdentifier '\(target.identifier)'",
+            file: file,
+            line: line
+        )
         let lowerLabel = label.lowercased()
         for prefix in forbiddenKeyPrefixes {
             XCTAssertFalse(
-                lowerLabel.hasPrefix(prefix),
-                "Raw localization key leak detected in VoiceOver label '\(label)' for '\(target.identifier)'",
+                lowerLabel.contains(prefix),
+                "Raw localization key leak ('\(prefix)') detected in VoiceOver label '\(label)' for '\(target.identifier)'",
                 file: file,
                 line: line
             )
@@ -1149,19 +1485,71 @@ class FabushiE2EUITestCase: XCTestCase {
                 file: file,
                 line: line
             )
-            XCTAssertTrue(
-                control.isHittable,
-                "Dead control detected (not hittable): '\(identifier)'",
-                file: file,
-                line: line
-            )
-            XCTAssertFalse(
-                control.frame.isEmpty,
-                "Dead control detected (empty frame): '\(identifier)'",
-                file: file,
-                line: line
-            )
+            assertMinimumTouchTarget44pt(control, requireHittable: true, file: file, line: line)
+            assertWithinWindowBounds(control, in: application, file: file, line: line)
             assertVoiceOverReady(control, file: file, line: line)
+        }
+    }
+
+    func assertControlIsLive(
+        _ controlIdentifier: String,
+        producesElement expectedIdentifier: String,
+        dismissWith dismissIdentifier: String? = nil,
+        in application: XCUIApplication,
+        timeout: TimeInterval = 8,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        tapControlWithHIGChecks(
+            controlIdentifier,
+            in: application,
+            timeout: timeout,
+            verifyMinTouchTarget: true,
+            verifyWithinBounds: true,
+            verifyVoiceOver: true,
+            file: file,
+            line: line
+        )
+        let expected = requireElement(expectedIdentifier, in: application, timeout: timeout, file: file, line: line)
+        assertWithinWindowBounds(expected, in: application, file: file, line: line)
+        if let dismissID = dismissIdentifier {
+            tapControlWithHIGChecks(
+                dismissID,
+                in: application,
+                timeout: timeout,
+                verifyMinTouchTarget: true,
+                verifyWithinBounds: true,
+                verifyVoiceOver: false,
+                file: file,
+                line: line
+            )
+            let dismissed = expected.waitForNonExistence(timeout: timeout)
+            XCTAssertTrue(
+                dismissed,
+                "Control '\(controlIdentifier)' destination '\(expectedIdentifier)' must dismiss via '\(dismissID)'",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    func assertNoDeadInteractiveControls(
+        in application: XCUIApplication,
+        probes: [FabushiLiveControlProbe],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertFalse(probes.isEmpty, "Live control probe list must not be empty", file: file, line: line)
+        for probe in probes {
+            assertControlIsLive(
+                probe.controlIdentifier,
+                producesElement: probe.expectedElementIdentifier,
+                dismissWith: probe.dismissIdentifier,
+                in: application,
+                timeout: probe.timeout,
+                file: file,
+                line: line
+            )
         }
     }
 
@@ -1170,12 +1558,99 @@ class FabushiE2EUITestCase: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        let forbiddenTitles = ["Fabushi Community", "Sample Chat", "Demo Bot Chat"]
+        let forbiddenTitles = [
+            "Saved Messages",
+            "Fabushi Community",
+            "Sample Chat",
+            "Demo Bot Chat",
+            "Chief of Staff",
+        ]
         for title in forbiddenTitles {
-            let leaked = application.staticTexts[title]
+            let predicate = NSPredicate(format: "label CONTAINS[cd] %@", title)
+            let leaked = application.descendants(matching: .any).matching(predicate).firstMatch
             XCTAssertFalse(
                 leaked.exists,
                 "Forbidden hardcoded sample chat '\(title)' rendered in live UI",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    static func computeWCAGAccentFill(_ hex: String) -> (effectiveHex: String, inputLuma: Double, adjusted: Bool)? {
+        let cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = cleaned.hasPrefix("#") ? String(cleaned.dropFirst()) : cleaned
+        guard stripped.count == 6,
+              stripped.allSatisfy(\.isHexDigit),
+              let rgb = UInt32(stripped, radix: 16)
+        else {
+            return nil
+        }
+        let r = Int((rgb >> 16) & 0xFF)
+        let g = Int((rgb >> 8) & 0xFF)
+        let b = Int(rgb & 0xFF)
+        let luma = 0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b)
+        if luma <= 138.0 {
+            return (String(format: "#%02X%02X%02X", r, g, b), luma, false)
+        }
+        let darkenT = min(max((luma - 138.0) / 145.0, 0.0), 0.36)
+        func mix(_ channel: Int) -> Int {
+            let blended = Double(channel) * (1.0 - darkenT) + Double(0x11) * darkenT
+            return min(max(Int(blended.rounded()), 0), 255)
+        }
+        return (String(format: "#%02X%02X%02X", mix(r), mix(g), mix(b)), luma, true)
+    }
+
+    static func extractHexColors(from text: String) -> [String] {
+        let chars = Array(text)
+        var results: [String] = []
+        var idx = 0
+        while idx + 6 < chars.count {
+            if chars[idx] == "#" {
+                let slice = chars[(idx + 1)...(idx + 6)]
+                if slice.allSatisfy(\.isHexDigit) {
+                    let boundaryAfter = (idx + 7 == chars.count) || !chars[idx + 7].isHexDigit
+                    if boundaryAfter {
+                        results.append("#" + String(slice).uppercased())
+                        idx += 7
+                        continue
+                    }
+                }
+            }
+            idx += 1
+        }
+        return results
+    }
+
+    func isSwitchEnabled(_ toggle: XCUIElement) -> Bool {
+        if let raw = toggle.value as? String {
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized == "1" || normalized == "true" || normalized == "on" || normalized == "enabled"
+        }
+        if let number = toggle.value as? NSNumber {
+            return number.boolValue
+        }
+        return false
+    }
+
+    func assertCapabilityLedgerShowsCanonicalIDs(
+        in application: XCUIApplication,
+        requiredIDs: [String] = ["OCRM-001", "FBCP-001", "TON_ONCHAIN_SIGNING", "TELEGRAM_PASSPORT"],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let ledger = requireElement(FabushiAccessibilityIDs.Settings.capabilityLedgerList, in: application, file: file, line: line)
+        assertWithinWindowBounds(ledger, in: application, file: file, line: line)
+        assertVoiceOverReady(ledger, file: file, line: line)
+        for capID in requiredIDs {
+            let pred = NSPredicate(format: "label CONTAINS[c] %@ OR identifier CONTAINS[c] %@", capID, capID)
+            let row = ledger.descendants(matching: .any).matching(pred).firstMatch
+            if !row.exists {
+                _ = scrollToElement(row, in: ledger, maxSwipes: 4)
+            }
+            XCTAssertTrue(
+                row.exists,
+                "F34 honest capability ledger must visibly disclose canonical tracked ID '\(capID)'",
                 file: file,
                 line: line
             )

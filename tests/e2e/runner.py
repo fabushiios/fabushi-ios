@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI-native opaque-box E2E test orchestrator for Fabushi iOS v1.6.7.
+"""CI-native opaque-box E2E test orchestrator for Fabushi iOS v1.6.8.
 
 Standard-library only. Designed to execute exclusively inside GitHub Actions CI
 (`ubuntu-latest` / `macos-15`). Zero hardcoded workstation paths, zero mocks in
@@ -287,7 +287,7 @@ def run_production(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fabushi iOS v1.6.7 Opaque-Box E2E Runner")
+    parser = argparse.ArgumentParser(description="Fabushi iOS v1.6.8 Opaque-Box E2E Runner")
     parser.add_argument(
         "--mode",
         required=True,
