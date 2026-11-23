@@ -164,10 +164,11 @@ private final class LoopbackHTTPTestServer: Sendable {
             }
         }
 
+        let capturedAuthHeader = authHeader
         let slowDelayMs = lock.withLock { state -> Int in
             state.routeHits[routeKey, default: 0] += 1
             if routeKey == "GET /api/v1/chats" {
-                state.lastChatsAuthHeader = authHeader
+                state.lastChatsAuthHeader = capturedAuthHeader
             }
             return state.slowHealthDelayMs
         }

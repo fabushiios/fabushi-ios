@@ -100,11 +100,13 @@ final class FabushiBridgeZeroMockTests: XCTestCase, @unchecked Sendable {
             token: "tok-901"
         ))
         XCTAssertEqual(gen, 2)
-        XCTAssertTrue(try await scope.hasActiveKey(for: "901"))
+        let hasKeyBefore = try await scope.hasActiveKey(for: "901")
+        XCTAssertTrue(hasKeyBefore)
 
         let postLogoutGen = try await scope.logout()
         XCTAssertEqual(postLogoutGen, 3)
-        XCTAssertFalse(try await scope.hasActiveKey(for: "901"))
+        let hasKeyAfter = try await scope.hasActiveKey(for: "901")
+        XCTAssertFalse(hasKeyAfter)
 
         await host.shutdown()
     }
