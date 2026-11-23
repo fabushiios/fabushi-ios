@@ -199,8 +199,11 @@ pub fn handle_chats(
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| HostError::invalid_arguments("Missing u32 'ttl_seconds'"))?
                 as u32;
-            client.local_store.set_chat_ttl(ChatId(chat_id), ttl_seconds);
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client.local_store.set_chat_ttl(ChatId(chat_id), ttl_seconds);
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 let applied = host.run_cancellable(req_id, async move {
                     client
                         .set_chat_ttl(chat_id, ttl_seconds)
@@ -406,10 +409,13 @@ pub fn handle_chats(
         "draftSave" => {
             let chat_id = req_i64(params, "chat_id")?;
             let draft: DraftDto = parse_req(params.get("draft").unwrap_or(params))?;
-            client
-                .local_store
-                .set_draft(ChatId(chat_id), Some(draft.clone()));
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client
+                    .local_store
+                    .set_draft(ChatId(chat_id), Some(draft.clone()));
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 let res = host.run_cancellable(req_id, async move {
                     client
                         .save_draft(chat_id, &draft)
@@ -422,8 +428,11 @@ pub fn handle_chats(
         }
         "draftClear" => {
             let chat_id = req_i64(params, "chat_id")?;
-            client.local_store.set_draft(ChatId(chat_id), None);
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client.local_store.set_draft(ChatId(chat_id), None);
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 host.run_cancellable(req_id, async move {
                     client.clear_draft(chat_id).await.map_err(HostError::from)
                 })?;
@@ -489,25 +498,34 @@ pub fn handle_folders(
     let client = host.client();
     match action {
         "list" => {
-            if client.token().is_some() {
+            if host.fenced_client_token(&client)?.is_some() {
                 let c = std::sync::Arc::clone(&client);
                 let res = host.run_cancellable(req_id, async move {
                     c.list_folders().await.map_err(HostError::from)
                 })?;
-                client.local_store.set_folders(res.clone());
+                host.with_fenced_session_read(&client, || {
+                    client.local_store.set_folders(res.clone());
+                    Ok(())
+                })?;
                 return to_val(res);
             }
             to_val(client.local_store.get_folders())
         }
         "save" => {
             let folder: ChatFolderDto = parse_req(params)?;
-            client.local_store.upsert_folder(folder.clone());
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client.local_store.upsert_folder(folder.clone());
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 let c = std::sync::Arc::clone(&client);
                 let res = host.run_cancellable(req_id, async move {
                     c.save_folder(&folder).await.map_err(HostError::from)
                 })?;
-                client.local_store.upsert_folder(res.clone());
+                host.with_fenced_session_read(&client, || {
+                    client.local_store.upsert_folder(res.clone());
+                    Ok(())
+                })?;
                 return to_val(res);
             }
             to_val(folder)
@@ -515,8 +533,11 @@ pub fn handle_folders(
         "update" => {
             let folder_id = req_i64(params, "folder_id")?;
             let folder: ChatFolderDto = parse_req(params.get("folder").unwrap_or(params))?;
-            client.local_store.upsert_folder(folder.clone());
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client.local_store.upsert_folder(folder.clone());
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 let res = host.run_cancellable(req_id, async move {
                     client
                         .update_folder(folder_id, &folder)
@@ -529,8 +550,11 @@ pub fn handle_folders(
         }
         "delete" => {
             let folder_id = req_i64(params, "folder_id")?;
-            client.local_store.remove_folder(folder_id);
-            if client.token().is_some() {
+            let has_token = host.with_fenced_session_read(&client, || {
+                client.local_store.remove_folder(folder_id);
+                Ok(client.token().is_some())
+            })?;
+            if has_token {
                 host.run_cancellable(req_id, async move {
                     client
                         .delete_folder(folder_id)
@@ -807,11 +831,19 @@ pub fn handle_messages(
                     Ok(resp) => {
                         assigned_id = resp.message_id as i64;
                         if resp.pts > 0 {
-                            client.sync_coordinator.set_pts(ChatId(chat_id), resp.pts);
-                            let _ = host.host_db.save_pts(chat_id, resp.pts);
+                            host.with_fenced_session_read(&client, || {
+                                client.sync_coordinator.set_pts(ChatId(chat_id), resp.pts);
+                                let _ = host.host_db.save_pts(chat_id, resp.pts);
+                                Ok(())
+                            })?;
                         }
                     }
-                    Err(e) if e.code == "cancelled" => {
+                    Err(e)
+                        if matches!(
+                            e.code.as_str(),
+                            "cancelled" | "stale_generation" | "host_closed"
+                        ) =>
+                    {
                         return Err(e);
                     }
                     Err(e) => {
@@ -819,24 +851,34 @@ pub fn handle_messages(
                         // holds a Pending/InFlight entry as "queued_outbox". Permanent HTTP 4xx
                         // (400/401/403/404/409/422) or OutboxStatus::Failed MUST fail closed so
                         // LeaderGuard::drop aborts the dedup slot without poisoning nonce_dedup or search!
-                        let outbox_pending = client
-                            .outbox
-                            .store()
-                            .get(effective_nonce)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|rec| {
-                                matches!(rec.status, OutboxStatus::Pending | OutboxStatus::InFlight)
-                            });
+                        let outbox_pending = host.with_fenced_session_read(&client, || {
+                            let pending = client
+                                .outbox
+                                .store()
+                                .get(effective_nonce)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|rec| {
+                                    matches!(
+                                        rec.status,
+                                        OutboxStatus::Pending | OutboxStatus::InFlight
+                                    )
+                                });
+                            if !(e.retryable && pending) {
+                                let _ = client.outbox.store().delete_failed(effective_nonce);
+                            }
+                            Ok(pending)
+                        })?;
                         if e.retryable && outbox_pending {
                             delivery_status = "queued_outbox";
                         } else {
-                            let _ = client.outbox.store().delete_failed(effective_nonce);
                             return Err(e);
                         }
                     }
                 }
-            } else {
+            }
+
+            let local_msg_opt = if !remote_delivery {
                 let mut msg_item = MessageItem::new(
                     MessageId(assigned_id),
                     ChatId(chat_id),
@@ -850,37 +892,53 @@ pub fn handle_messages(
                 if let Some(r) = reply_to {
                     msg_item.reply_to = Some(ReplyHeader::new(MessageId(r)));
                 }
-                client.local_store.insert_message(msg_item);
-            }
+                Some(msg_item)
+            } else {
+                None
+            };
 
-            // Index locally into SQLite FTS5 + persistent Tantivy index
-            if !text.is_empty() {
-                let _ = host
-                    .host_db
-                    .index_message_fts(assigned_id, chat_id, sender_id, timestamp, &text);
-                let _ = host
-                    .search_engine
-                    .index_message(assigned_id, chat_id, sender_id, timestamp, &text);
-            }
-
-            if let Some(mut guard) = leader_guard {
-                let cached = CachedMessage {
-                    message_id: assigned_id,
-                    chat_id,
-                    sender_id,
-                    text: text.clone(),
-                    timestamp,
-                    reply_to,
-                    client_nonce: guard.nonce,
-                    delivery_status: delivery_status.to_string(),
-                    created_at: now,
-                };
-                let _ = host.host_db.persist_nonce(&cached);
-                host.dedup_store
-                    .lock()
-                    .complete_slot(sender_id, guard.nonce, &guard.slot, cached);
-                guard.completed = true;
-            }
+            // Fence offline LocalStore insert, SQLite FTS5, Tantivy search index, and nonce dedup
+            // persistence under session_lock.read() strictly before emit_event (NB5-02).
+            host.with_fenced_session_read(&client, || {
+                if let Some(msg_item) = local_msg_opt {
+                    client.local_store.insert_message(msg_item);
+                }
+                if !text.is_empty() {
+                    let _ = host.host_db.index_message_fts(
+                        assigned_id,
+                        chat_id,
+                        sender_id,
+                        timestamp,
+                        &text,
+                    );
+                    let _ = host.search_engine.index_message(
+                        assigned_id,
+                        chat_id,
+                        sender_id,
+                        timestamp,
+                        &text,
+                    );
+                }
+                if let Some(mut guard) = leader_guard {
+                    let cached = CachedMessage {
+                        message_id: assigned_id,
+                        chat_id,
+                        sender_id,
+                        text: text.clone(),
+                        timestamp,
+                        reply_to,
+                        client_nonce: guard.nonce,
+                        delivery_status: delivery_status.to_string(),
+                        created_at: now,
+                    };
+                    let _ = host.host_db.persist_nonce(&cached);
+                    host.dedup_store
+                        .lock()
+                        .complete_slot(sender_id, guard.nonce, &guard.slot, cached);
+                    guard.completed = true;
+                }
+                Ok(())
+            })?;
 
             let payload = json!({
                 "id": assigned_id,
@@ -1057,19 +1115,25 @@ pub fn handle_sync(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(100) as u32;
             if let Some(explicit_pts) = params.get("pts").and_then(|v| v.as_u64()) {
-                let current = client.sync_coordinator.last_pts(ChatId(chat_id));
-                if explicit_pts > current {
-                    client.sync_coordinator.set_pts(ChatId(chat_id), explicit_pts);
-                }
+                host.with_fenced_session_read(&client, || {
+                    let current = client.sync_coordinator.last_pts(ChatId(chat_id));
+                    if explicit_pts > current {
+                        client.sync_coordinator.set_pts(ChatId(chat_id), explicit_pts);
+                    }
+                    Ok(())
+                })?;
             }
+            let c = std::sync::Arc::clone(&client);
             let diff = host.run_cancellable(req_id, async move {
-                client
-                    .sync_chat_difference(ChatId(chat_id), limit)
+                c.sync_chat_difference(ChatId(chat_id), limit)
                     .await
                     .map_err(HostError::from)
             })?;
-            let updated_pts = host.client().sync_coordinator.last_pts(ChatId(chat_id));
-            let _ = host.host_db.save_pts(chat_id, updated_pts);
+            let updated_pts = host.with_fenced_session_read(&client, || {
+                let pts = client.sync_coordinator.last_pts(ChatId(chat_id));
+                let _ = host.host_db.save_pts(chat_id, pts);
+                Ok(pts)
+            })?;
             let val = to_val(&diff)?;
             host.emit_event(
                 "syncDifference",
@@ -1167,7 +1231,7 @@ pub fn handle_outbox(
     match action {
         "enqueue" => {
             let req: RichSendMessageRequest = parse_req(params)?;
-            let rec = client.enqueue_message(req)?;
+            let rec = host.with_fenced_session_read(&client, || Ok(client.enqueue_message(req)?))?;
             to_val(rec)
         }
         "list" => {
@@ -1194,11 +1258,14 @@ pub fn handle_outbox(
         })),
         "retryNow" => {
             let now_ms = Utc::now().timestamp_millis();
-            let reset = client
-                .outbox
-                .store()
-                .reset_all_pending_retry_times(now_ms)?;
-            client.outbox.wake();
+            let reset = host.with_fenced_session_read(&client, || {
+                let count = client
+                    .outbox
+                    .store()
+                    .reset_all_pending_retry_times(now_ms)?;
+                client.outbox.wake();
+                Ok(count)
+            })?;
             Ok(json!({ "reset_count": reset }))
         }
         "setNetworkState" => {
@@ -1206,14 +1273,18 @@ pub fn handle_outbox(
                 .get("online")
                 .and_then(|v| v.as_bool())
                 .ok_or_else(|| HostError::invalid_arguments("Missing bool 'online'"))?;
-            client.network_listener.set_online(online);
-            if online {
-                client.outbox.wake();
-            }
-            Ok(json!({ "online": client.network_listener.is_online() }))
+            let current_online = host.with_fenced_session_read(&client, || {
+                client.network_listener.set_online(online);
+                if online {
+                    client.outbox.wake();
+                }
+                Ok(client.network_listener.is_online())
+            })?;
+            Ok(json!({ "online": current_online }))
         }
         "recoverInFlight" => {
-            let recovered = client.outbox.recover_in_flight()?;
+            let recovered =
+                host.with_fenced_session_read(&client, || Ok(client.outbox.recover_in_flight()?))?;
             Ok(json!({ "recovered": recovered }))
         }
         _ => Err(HostError::unknown_command(&format!("outbox.{action}"))),
@@ -1229,14 +1300,22 @@ pub fn handle_e2ee(
     let client = host.client();
     match action {
         "identity" => {
-            let id = client
-                .e2ee
-                .identity()
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let (x25519_pub_b64, ed25519_pub_b64, device_id) =
+                host.with_fenced_session_read(&client, || {
+                    let id = client
+                        .e2ee
+                        .identity()
+                        .map_err(|e| HostError::crypto(e.to_string()))?;
+                    Ok((
+                        b64_encode(&id.x25519_pub),
+                        b64_encode(&id.ed25519_pub),
+                        client.device_id(),
+                    ))
+                })?;
             Ok(json!({
-                "x25519_pub_b64": b64_encode(&id.x25519_pub),
-                "ed25519_pub_b64": b64_encode(&id.ed25519_pub),
-                "device_id": client.device_id(),
+                "x25519_pub_b64": x25519_pub_b64,
+                "ed25519_pub_b64": ed25519_pub_b64,
+                "device_id": device_id,
             }))
         }
         "initAndPublishPrekeys" => {
@@ -1266,14 +1345,17 @@ pub fn handle_e2ee(
         }
         "establishSession" => {
             let bundle: DevicePreKeyBundle = parse_req(params)?;
-            let sess = client
-                .e2ee
-                .establish_session_from_bundle(&bundle)
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let dh_self_pub_b64 = host.with_fenced_session_read(&client, || {
+                let sess = client
+                    .e2ee
+                    .establish_session_from_bundle(&bundle)
+                    .map_err(|e| HostError::crypto(e.to_string()))?;
+                Ok(b64_encode(&sess.dh_self_pub))
+            })?;
             Ok(json!({
                 "established": true,
                 "device_id": bundle.device_id,
-                "dh_self_pub_b64": b64_encode(&sess.dh_self_pub),
+                "dh_self_pub_b64": dh_self_pub_b64,
             }))
         }
         "encryptDm" => {
@@ -1333,9 +1415,11 @@ pub fn handle_e2ee(
         }
         "decryptEnvelope" => {
             let env: EncryptedEnvelope = parse_req(params)?;
-            let plain = client
-                .e2ee_decrypt_envelope(&env)
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let plain = host.with_fenced_session_read(&client, || {
+                client
+                    .e2ee_decrypt_envelope(&env)
+                    .map_err(|e| HostError::crypto(e.to_string()))
+            })?;
             Ok(json!({
                 "plaintext_b64": BASE64_STANDARD.encode(&plain),
                 "plaintext_utf8": String::from_utf8(plain).ok(),
@@ -1352,9 +1436,11 @@ pub fn handle_e2ee(
                 return Ok(json!({ "emojis": emojis }));
             }
             let remote_b64 = req_str(params, "remote_identity_key_b64")?;
-            let emojis = client
-                .e2ee_safety_fingerprint(remote_b64)
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let emojis = host.with_fenced_session_read(&client, || {
+                client
+                    .e2ee_safety_fingerprint(remote_b64)
+                    .map_err(|e| HostError::crypto(e.to_string()))
+            })?;
             Ok(json!({ "emojis": emojis }))
         }
         // Offline / local Double Ratchet & Sender Key session primitives for end-to-end verification

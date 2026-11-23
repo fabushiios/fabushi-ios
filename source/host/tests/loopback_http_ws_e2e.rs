@@ -1020,6 +1020,9 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             "http://[::1]:0",
             "http://example.com:+80",
             "http://example.com:0",
+            "http://example.com:80:90",
+            "http://2001:db8::1:8080",
+            "http://2001:db8::1",
         ] {
             let bad = dispatch(
                 host,
@@ -2346,10 +2349,13 @@ fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_lo
     let wire_log: Arc<std::sync::Mutex<Vec<(String, String)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let round_a_hits = Arc::new(AtomicUsize::new(0));
+    let send_as_a_hits = Arc::new(AtomicUsize::new(0));
 
     let wire_log_del = Arc::clone(&wire_log);
     let round_a_hits_del = Arc::clone(&round_a_hits);
     let wire_log_me = Arc::clone(&wire_log);
+    let wire_log_send_as = Arc::clone(&wire_log);
+    let send_as_hits_srv = Arc::clone(&send_as_a_hits);
 
     let server_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -2418,6 +2424,33 @@ fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_lo
                             "first_name": "Caller",
                             "session_id": "sess-me-b402"
                         }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/chats/{chat_id}/send_as",
+                get(move |Path(chat_id): Path<i64>, headers: HeaderMap| {
+                    let log = Arc::clone(&wire_log_send_as);
+                    let hits = Arc::clone(&send_as_hits_srv);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        log.lock()
+                            .unwrap()
+                            .push((format!("chats.sendAsPeers:{chat_id}"), auth_val));
+                        Json(json!([
+                            {
+                                "peer_id": 101,
+                                "title": "Alice",
+                                "username": "alice_b402",
+                                "kind": "user",
+                                "is_default": true
+                            }
+                        ]))
                     }
                 }),
             );
@@ -2496,8 +2529,8 @@ fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_lo
                     bar_w.wait();
                     let mut seq = 0usize;
                     while !stop_w.load(Ordering::Acquire) {
-                        let resp = if seq % 2 == 0 {
-                            dispatch(
+                        let resp = match seq % 3 {
+                            0 => dispatch(
                                 host_addr as *mut c_void,
                                 &json!({
                                     "id": format!("b402-r{round}-w{w}-s{seq}"),
@@ -2505,16 +2538,24 @@ fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_lo
                                     "generation": gen_a,
                                     "params": { "session_id": format!("acctA-r{round}-g{gen_a}-w{w}-{seq}") }
                                 }),
-                            )
-                        } else {
-                            dispatch(
+                            ),
+                            1 => dispatch(
                                 host_addr as *mut c_void,
                                 &json!({
                                     "id": format!("b402-r{round}-w{w}-m{seq}"),
                                     "method": "auth.me",
                                     "generation": gen_a
                                 }),
-                            )
+                            ),
+                            _ => dispatch(
+                                host_addr as *mut c_void,
+                                &json!({
+                                    "id": format!("b402-r{round}-w{w}-p{seq}"),
+                                    "method": "chats.sendAsPeers",
+                                    "generation": gen_a,
+                                    "params": { "chat_id": 777 }
+                                }),
+                            ),
                         };
                         if resp["ok"] == false && resp["error"]["code"] == "stale_generation" {
                             stale_w.fetch_add(1, Ordering::Relaxed);
@@ -2604,6 +2645,10 @@ fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_lo
         assert!(
             total_a_wire_hits >= 24,
             "Expected >= 24 real Account A wire hits across 6 rounds, got {total_a_wire_hits}"
+        );
+        assert!(
+            send_as_a_hits.load(Ordering::SeqCst) > 0,
+            "Expected direct fenced_client_token arm (chats.sendAsPeers) to execute real wire requests (CI NB5-02)"
         );
         assert!(
             total_stale_rejections > 0,
@@ -2764,9 +2809,25 @@ fn test_nb4_01_persistence_rollback_preserves_storage_error_while_raced_network_
             "unauthorized",
             "Rolled-back auth.login MUST leave live_client token cleared (B4-02)"
         );
+        let switch_charlie = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "303"}}),
+        );
         assert_eq!(
-            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
-            Value::Null
+            switch_charlie["ok"], false,
+            "Rolled-back account 303 must fail closed on switchAccount (CI NB5-01): {switch_charlie}"
+        );
+        assert_eq!(switch_charlie["error"]["code"], "not_found");
+        let list_after_charlie = dispatch(host, &json!({"method": "session.listAccounts"}));
+        assert_eq!(list_after_charlie["result"]["active_account_id"], Value::Null);
+        let charlie_present = list_after_charlie["result"]["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .any(|a| a["account_id"] == "303");
+        assert!(
+            !charlie_present,
+            "Rolled-back account 303 must be absent from session.listAccounts (CI NB5-01): {list_after_charlie}"
         );
 
         // 2. set_meta("active_account_id") failure MUST preserve storage_error (NOT stale_generation),
@@ -2829,4 +2890,1016 @@ fn test_nb4_01_persistence_rollback_preserves_storage_error_while_raced_network_
         fabushi_host_destroy(host);
     }
 }
+
+#[test]
+fn test_b5_01_per_poll_fence_blocks_poll2_bearer_token_leak_on_multistep_rpcs() {
+    let dir = tempdir().unwrap();
+
+    let wire_log: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let count_gate_armed = Arc::new(AtomicBool::new(false));
+    let count_entered = Arc::new(AtomicBool::new(false));
+    let count_release = Arc::new(AtomicBool::new(false));
+    let publish_hits = Arc::new(AtomicUsize::new(0));
+
+    let sync_gate_armed = Arc::new(AtomicBool::new(false));
+    let sync_entered = Arc::new(AtomicBool::new(false));
+    let sync_release = Arc::new(AtomicBool::new(false));
+    let sync_round_calls = Arc::new(AtomicUsize::new(0));
+    let sync_total_hits = Arc::new(AtomicUsize::new(0));
+
+    let log_count = Arc::clone(&wire_log);
+    let gate_armed_srv = Arc::clone(&count_gate_armed);
+    let entered_srv = Arc::clone(&count_entered);
+    let release_srv = Arc::clone(&count_release);
+
+    let log_pub = Arc::clone(&wire_log);
+    let pub_hits_srv = Arc::clone(&publish_hits);
+
+    let log_sync = Arc::clone(&wire_log);
+    let sync_armed_srv = Arc::clone(&sync_gate_armed);
+    let sync_entered_srv = Arc::clone(&sync_entered);
+    let sync_release_srv = Arc::clone(&sync_release);
+    let sync_round_srv = Arc::clone(&sync_round_calls);
+    let sync_total_srv = Arc::clone(&sync_total_hits);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|Json(body): Json<Value>| async move {
+                    if body["username"].as_str() == Some("bob_b501") {
+                        Json(json!({
+                            "user_id": 202,
+                            "username": "bob_b501",
+                            "session_id": "sess-bob-b501",
+                            "token": "TOK_B",
+                            "first_name": "Bob"
+                        }))
+                    } else {
+                        Json(json!({
+                            "user_id": 101,
+                            "username": "alice_b501",
+                            "session_id": "sess-alice-b501",
+                            "token": "TOK_A",
+                            "first_name": "Alice"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/e2ee/prekeys/count",
+                get(move |headers: HeaderMap| {
+                    let log = Arc::clone(&log_count);
+                    let armed = Arc::clone(&gate_armed_srv);
+                    let entered = Arc::clone(&entered_srv);
+                    let release = Arc::clone(&release_srv);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        log.lock()
+                            .unwrap()
+                            .push(("GET /e2ee/prekeys/count".to_string(), auth_val));
+                        if armed.load(Ordering::SeqCst) {
+                            entered.store(true, Ordering::SeqCst);
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                        }
+                        // Return low count & no signed prekey so replenish_prekeys_if_low MUST
+                        // proceed to Step 2: init_and_publish_prekeys -> POST /api/v1/e2ee/prekeys.
+                        Json(json!({
+                            "user_id": 101,
+                            "device_id": "dev-b501",
+                            "remaining_one_time_prekeys": 0,
+                            "has_signed_prekey": false
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/e2ee/prekeys",
+                post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                    let log = Arc::clone(&log_pub);
+                    let hits = Arc::clone(&pub_hits_srv);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        log.lock()
+                            .unwrap()
+                            .push(("POST /e2ee/prekeys".to_string(), auth_val));
+                        Json(json!({
+                            "success": true,
+                            "user_id": 101,
+                            "device_id": "dev-b501",
+                            "remaining_one_time_prekeys": 5,
+                            "updated_at_ms": Utc::now().timestamp_millis()
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/sync/get_difference",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let log = Arc::clone(&log_sync);
+                    let armed = Arc::clone(&sync_armed_srv);
+                    let entered = Arc::clone(&sync_entered_srv);
+                    let release = Arc::clone(&sync_release_srv);
+                    let round_calls = Arc::clone(&sync_round_srv);
+                    let total_hits = Arc::clone(&sync_total_srv);
+                    async move {
+                        let cid = body["chat_id"].as_i64().unwrap_or(0);
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        total_hits.fetch_add(1, Ordering::SeqCst);
+                        let call_idx = round_calls.fetch_add(1, Ordering::SeqCst);
+                        log.lock()
+                            .unwrap()
+                            .push((format!("POST /sync/get_difference:{cid}"), auth_val));
+                        if armed.load(Ordering::SeqCst) && call_idx == 0 {
+                            entered.store(true, Ordering::SeqCst);
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                        }
+                        Json(json!({
+                            "chat_id": cid,
+                            "new_messages": [],
+                            "other_updates": [],
+                            "pts": 10,
+                            "current_pts": 10,
+                            "updates": [],
+                            "has_more": false,
+                            "snapshot_required": false
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "storage_passphrase": "b501-per-poll-passphrase",
+            "server_url": format!("http://{addr}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        // Prime Bob ("202") in host_state.db so session.switchAccount("202") works
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "bob_b501", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        // Login Alice ("101", TOK_A)
+        let login_a = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_b501", "password": "pw"}}),
+        );
+        assert_eq!(login_a["ok"], true);
+        let gen_a0 = login_a["generation"].as_u64().unwrap();
+
+        // === Scenario A1 (Non-Tautology Baseline): e2ee.replenishPrekeys genuinely triggers
+        //     Step 2 POST /api/v1/e2ee/prekeys with Bearer TOK_A ===
+        let base_replenish = dispatch(
+            host,
+            &json!({
+                "method": "e2ee.replenishPrekeys",
+                "generation": gen_a0,
+                "params": { "min_threshold": 10, "batch_size": 5 }
+            }),
+        );
+        assert_eq!(
+            base_replenish["ok"], true,
+            "Baseline e2ee.replenishPrekeys must succeed: {base_replenish}"
+        );
+        assert_eq!(
+            publish_hits.load(Ordering::SeqCst),
+            1,
+            "Non-tautology proof: baseline replenishPrekeys MUST execute Step 2 POST /e2ee/prekeys"
+        );
+        {
+            let entries = wire_log.lock().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|(ep, auth)| ep == "GET /e2ee/prekeys/count" && auth == "Bearer TOK_A"),
+                "Baseline must send Step 1 GET with Bearer TOK_A: {entries:?}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|(ep, auth)| ep == "POST /e2ee/prekeys" && auth == "Bearer TOK_A"),
+                "Baseline must send Step 2 POST with Bearer TOK_A: {entries:?}"
+            );
+        }
+
+        // === Scenario A2 (Direct Poll-2 Fence WITHOUT token.cancel()): race e2ee.replenishPrekeys
+        //     with generation.bump at the Step-1 barrier ===
+        {
+            let log_start = wire_log.lock().unwrap().len();
+            let pub_before = publish_hits.load(Ordering::SeqCst);
+            count_entered.store(false, Ordering::SeqCst);
+            count_release.store(false, Ordering::SeqCst);
+            count_gate_armed.store(true, Ordering::SeqCst);
+
+            let worker = thread::spawn(move || {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": "b501-e2ee-genbump",
+                        "method": "e2ee.replenishPrekeys",
+                        "generation": gen_a0,
+                        "params": { "min_threshold": 10, "batch_size": 5 }
+                    }),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !count_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                count_entered.load(Ordering::SeqCst),
+                "Step 1 GET /e2ee/prekeys/count must enter barrier"
+            );
+
+            // generation.bump advances generation WITHOUT cancelling in_flight_cancels, directly
+            // exercising PerPollFencedFuture's Poll-2+ fence when the GET response completes!
+            let bumped = dispatch(host, &json!({"method": "generation.bump"}));
+            assert_eq!(bumped["ok"], true);
+            count_release.store(true, Ordering::SeqCst);
+
+            let res = worker.join().expect("e2ee genbump worker must not panic");
+            count_gate_armed.store(false, Ordering::SeqCst);
+            assert_eq!(res["ok"], false, "Raced replenishPrekeys must fail closed: {res}");
+            assert_eq!(
+                res["error"]["code"], "stale_generation",
+                "Poll-2 PerPollFencedFuture MUST fail closed with stale_generation on generation.bump: {res}"
+            );
+            assert_eq!(
+                publish_hits.load(Ordering::SeqCst),
+                pub_before,
+                "PerPollFencedFuture MUST block Step 2 POST /e2ee/prekeys on Poll 2 after generation bump (B5-01)"
+            );
+            let entries = wire_log.lock().unwrap();
+            assert!(
+                !entries[log_start..]
+                    .iter()
+                    .any(|(ep, _)| ep == "POST /e2ee/prekeys"),
+                "Zero Step 2 POST /e2ee/prekeys allowed after generation.bump: {:?}",
+                &entries[log_start..]
+            );
+        }
+
+        // === Scenario A3: Race e2ee.replenishPrekeys at Step-1 barrier against ALL 3 account
+        //     transitions (switchAccount("202"), auth.login(Bob), session.setToken("TOK_C")) ===
+        for round in 0..3usize {
+            let login_round = dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_b501", "password": "pw"}}),
+            );
+            assert_eq!(login_round["ok"], true);
+            let gen_a = login_round["generation"].as_u64().unwrap();
+
+            let log_start = wire_log.lock().unwrap().len();
+            count_entered.store(false, Ordering::SeqCst);
+            count_release.store(false, Ordering::SeqCst);
+            count_gate_armed.store(true, Ordering::SeqCst);
+
+            let worker = thread::spawn(move || {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": format!("b501-e2ee-r{round}"),
+                        "method": "e2ee.replenishPrekeys",
+                        "generation": gen_a,
+                        "params": { "min_threshold": 10, "batch_size": 5 }
+                    }),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !count_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(count_entered.load(Ordering::SeqCst));
+
+            // Execute account transition WHILE Worker is parked at the Step-1 barrier, then
+            // release the barrier so the server task finishes cleanly without hanging:
+            // worker_res["ok"] == false is 100% deterministic (zero OS-scheduler flakiness).
+            let (trans_resp, expected_new_auth) = match round {
+                0 => (
+                    dispatch(
+                        host,
+                        &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+                    ),
+                    "Bearer TOK_B",
+                ),
+                1 => (
+                    dispatch(
+                        host,
+                        &json!({"method": "auth.login", "params": {"username": "bob_b501", "password": "pw"}}),
+                    ),
+                    "Bearer TOK_B",
+                ),
+                _ => (
+                    dispatch(
+                        host,
+                        &json!({"method": "session.setToken", "params": {"token": "TOK_C"}}),
+                    ),
+                    "Bearer TOK_C",
+                ),
+            };
+            count_release.store(true, Ordering::SeqCst);
+            assert_eq!(trans_resp["ok"], true, "Round {round} transition failed: {trans_resp}");
+            let new_gen = trans_resp["generation"].as_u64().unwrap();
+
+            let worker_res = worker.join().expect("e2ee race worker must not panic");
+            count_gate_armed.store(false, Ordering::SeqCst);
+            assert_eq!(
+                worker_res["ok"], false,
+                "Round {round} Account A replenishPrekeys must fail closed: {worker_res}"
+            );
+            assert!(
+                matches!(
+                    worker_res["error"]["code"].as_str(),
+                    Some("stale_generation" | "cancelled")
+                ),
+                "Round {round} expected stale_generation or cancelled, got: {worker_res}"
+            );
+
+            // ZERO requests from Account A's RPC may EVER carry Account B / TOK_C's bearer token!
+            {
+                let entries = wire_log.lock().unwrap();
+                for (ep, auth) in &entries[log_start..] {
+                    assert_eq!(
+                        auth, "Bearer TOK_A",
+                        "POLL-2+ CROSS-ACCOUNT BEARER TOKEN LEAK in e2ee.replenishPrekeys round {round} on {ep}: got '{auth}' (B5-01)"
+                    );
+                }
+            }
+
+            // Confirm post-transition replenishPrekeys at new_gen genuinely uses the new token
+            let verify_after = dispatch(
+                host,
+                &json!({
+                    "method": "e2ee.replenishPrekeys",
+                    "generation": new_gen,
+                    "params": { "min_threshold": 10, "batch_size": 5 }
+                }),
+            );
+            assert_eq!(verify_after["ok"], true, "Post-transition replenishPrekeys failed: {verify_after}");
+            assert_eq!(
+                wire_log.lock().unwrap().last().map(|(ep, auth)| (ep.as_str(), auth.as_str())),
+                Some(("POST /e2ee/prekeys", expected_new_auth))
+            );
+        }
+
+        // === Scenario A4: Tight simultaneous-release Poll-2 race (releasing Step-1 response at
+        //     the exact moment switchAccount / setToken executes, exercising Poll 2 vs session_lock.write()) ===
+        for sim_round in 0..6usize {
+            let login_sim = dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_b501", "password": "pw"}}),
+            );
+            assert_eq!(login_sim["ok"], true);
+            let gen_a = login_sim["generation"].as_u64().unwrap();
+
+            let log_start = wire_log.lock().unwrap().len();
+            count_entered.store(false, Ordering::SeqCst);
+            count_release.store(false, Ordering::SeqCst);
+            count_gate_armed.store(true, Ordering::SeqCst);
+
+            let worker = thread::spawn(move || {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": format!("b501-e2ee-sim-{sim_round}"),
+                        "method": "e2ee.replenishPrekeys",
+                        "generation": gen_a,
+                        "params": { "min_threshold": 10, "batch_size": 5 }
+                    }),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !count_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(count_entered.load(Ordering::SeqCst));
+
+            // Release Step-1 simultaneously with account transition so Poll 2 genuinely races session_lock.write()
+            count_release.store(true, Ordering::SeqCst);
+            let trans = if sim_round % 2 == 0 {
+                dispatch(
+                    host,
+                    &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+                )
+            } else {
+                dispatch(
+                    host,
+                    &json!({"method": "session.setToken", "params": {"token": "TOK_C"}}),
+                )
+            };
+            assert_eq!(trans["ok"], true);
+            let _ = worker.join().expect("simultaneous e2ee race worker must not panic");
+            count_gate_armed.store(false, Ordering::SeqCst);
+
+            let entries = wire_log.lock().unwrap();
+            for (ep, auth) in &entries[log_start..] {
+                assert_eq!(
+                    auth, "Bearer TOK_A",
+                    "SIMULTANEOUS POLL-2+ BEARER TOKEN LEAK in round {sim_round} on {ep}: got '{auth}' (B5-01)"
+                );
+            }
+        }
+
+        // === Scenario B: sync.syncAllGaps across 2 pending gap chats with barrier after Chat 1 ===
+        let seed_two_gaps = |host: *mut c_void, c1: i64, c2: i64| {
+            for cid in [c1, c2] {
+                assert_eq!(
+                    dispatch(host, &json!({"method": "sync.setPts", "params": {"chat_id": cid, "pts": 1}}))["ok"],
+                    true
+                );
+                let frame = WsServerFrame::PtsPush(PtsUpdate::new(
+                    ChatId(cid),
+                    5,
+                    1,
+                    UpdateEvent::ReadHistoryIn {
+                        max_id: MessageId(10),
+                    },
+                    1_700_000_000_000,
+                ));
+                let applied = dispatch(
+                    host,
+                    &json!({"method": "sync.applyWsFrame", "params": serde_json::to_value(frame).unwrap()}),
+                );
+                assert_eq!(applied["ok"], true, "sync.applyWsFrame failed: {applied}");
+            }
+            let pending = dispatch(host, &json!({"method": "sync.pendingGaps"}));
+            assert_eq!(
+                pending["result"]["gap_chats"].as_array().map(|a| a.len()),
+                Some(2),
+                "Expected exactly 2 pending gap chats: {pending}"
+            );
+        };
+
+        // Login Alice and run non-tautology baseline across 2 gap chats
+        let login_sync_base = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_b501", "password": "pw"}}),
+        );
+        assert_eq!(login_sync_base["ok"], true);
+        let gen_sync_base = login_sync_base["generation"].as_u64().unwrap();
+        seed_two_gaps(host, 701, 702);
+        sync_total_hits.store(0, Ordering::SeqCst);
+        sync_round_calls.store(0, Ordering::SeqCst);
+        let base_sync = dispatch(
+            host,
+            &json!({"method": "sync.syncAllGaps", "generation": gen_sync_base, "params": {"limit": 50}}),
+        );
+        assert_eq!(base_sync["ok"], true, "Baseline syncAllGaps failed: {base_sync}");
+        assert_eq!(
+            sync_total_hits.load(Ordering::SeqCst),
+            2,
+            "Non-tautology proof: baseline syncAllGaps MUST dispatch both gap chats"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "sync.pendingGaps"}))["result"]["gap_chats"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(0)
+        );
+
+        // Scenario B1: Direct Poll-2 fence on sync.syncAllGaps via generation.bump (NO token.cancel())
+        {
+            seed_two_gaps(host, 703, 704);
+            sync_entered.store(false, Ordering::SeqCst);
+            sync_release.store(false, Ordering::SeqCst);
+            sync_round_calls.store(0, Ordering::SeqCst);
+            sync_gate_armed.store(true, Ordering::SeqCst);
+
+            let worker = thread::spawn(move || {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": "b501-sync-genbump",
+                        "method": "sync.syncAllGaps",
+                        "generation": gen_sync_base,
+                        "params": { "limit": 50 }
+                    }),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !sync_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(sync_entered.load(Ordering::SeqCst));
+
+            assert_eq!(dispatch(host, &json!({"method": "generation.bump"}))["ok"], true);
+            sync_release.store(true, Ordering::SeqCst);
+
+            let res = worker.join().expect("sync genbump worker must not panic");
+            sync_gate_armed.store(false, Ordering::SeqCst);
+            assert_eq!(res["ok"], false);
+            assert_eq!(
+                res["error"]["code"], "stale_generation",
+                "Poll-2 PerPollFencedFuture MUST abort sync.syncAllGaps before Chat 2 on generation.bump: {res}"
+            );
+            assert_eq!(
+                sync_round_calls.load(Ordering::SeqCst),
+                1,
+                "Chat 2 MUST NOT be dispatched after Poll-1 generation bump (B5-01)"
+            );
+        }
+
+        // Drain any remaining gap chat cleanly before Scenario B2
+        assert_eq!(
+            dispatch(host, &json!({"method": "sync.syncAllGaps", "params": {"limit": 50}}))["ok"],
+            true
+        );
+
+        // Scenario B2: Race sync.syncAllGaps across 2 gap chats against session.setToken("TOK_B")
+        {
+            let login_sync2 = dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_b501", "password": "pw"}}),
+            );
+            assert_eq!(login_sync2["ok"], true);
+            let gen_sync2 = login_sync2["generation"].as_u64().unwrap();
+            seed_two_gaps(host, 705, 706);
+
+            let log_start = wire_log.lock().unwrap().len();
+            sync_entered.store(false, Ordering::SeqCst);
+            sync_release.store(false, Ordering::SeqCst);
+            sync_round_calls.store(0, Ordering::SeqCst);
+            sync_gate_armed.store(true, Ordering::SeqCst);
+
+            let worker = thread::spawn(move || {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": "b501-sync-settoken",
+                        "method": "sync.syncAllGaps",
+                        "generation": gen_sync2,
+                        "params": { "limit": 50 }
+                    }),
+                )
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !sync_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(sync_entered.load(Ordering::SeqCst));
+
+            let set_b = dispatch(
+                host,
+                &json!({"method": "session.setToken", "params": {"token": "TOK_B"}}),
+            );
+            sync_release.store(true, Ordering::SeqCst);
+            assert_eq!(set_b["ok"], true);
+
+            let res = worker.join().expect("sync setToken worker must not panic");
+            sync_gate_armed.store(false, Ordering::SeqCst);
+            assert_eq!(res["ok"], false);
+            assert!(
+                matches!(
+                    res["error"]["code"].as_str(),
+                    Some("stale_generation" | "cancelled")
+                ),
+                "Expected stale_generation or cancelled on raced syncAllGaps, got: {res}"
+            );
+            let entries = wire_log.lock().unwrap();
+            for (ep, auth) in &entries[log_start..] {
+                assert_eq!(
+                    auth, "Bearer TOK_A",
+                    "POLL-2+ CROSS-ACCOUNT BEARER TOKEN LEAK in sync.syncAllGaps on {ep}: got '{auth}' (B5-01)"
+                );
+            }
+        }
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_b5_02_local_store_outbox_and_e2ee_wiped_across_token_logout_clear_and_server_switch() {
+    let dir = tempdir().unwrap();
+    let sent_log: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    async fn quiet_ws_handler(
+        ws: WebSocketUpgrade,
+        Query(_q): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(|mut socket: WebSocket| async move {
+            while let Some(Ok(_)) = socket.recv().await {}
+        })
+    }
+
+    let spawn_mock_server = |label: &'static str,
+                             sent_log_ref: Arc<std::sync::Mutex<Vec<(String, String, String)>>>| {
+        async move {
+            let log_send = Arc::clone(&sent_log_ref);
+            let app = Router::new()
+                .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+                .route(
+                    "/api/v1/auth/login",
+                    post(|Json(body): Json<Value>| async move {
+                        if body["username"].as_str() == Some("bob_b502") {
+                            Json(json!({
+                                "user_id": 202,
+                                "username": "bob_b502",
+                                "session_id": "sess-bob-b502",
+                                "token": "TOK_B",
+                                "first_name": "Bob"
+                            }))
+                        } else {
+                            Json(json!({
+                                "user_id": 101,
+                                "username": "alice_b502",
+                                "session_id": "sess-alice-b502",
+                                "token": "TOK_A",
+                                "first_name": "Alice"
+                            }))
+                        }
+                    }),
+                )
+                .route("/api/v1/auth/logout", post(|| async { StatusCode::OK }))
+                .route("/api/v1/ws", get(quiet_ws_handler))
+                .route(
+                    "/api/v1/messages/send",
+                    post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let log = Arc::clone(&log_send);
+                        async move {
+                            let auth_val = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let chat_id = body["chat_id"].as_i64().unwrap_or(0);
+                            let text = body["text"].as_str().unwrap_or("").to_string();
+                            let nonce = body["client_nonce"].as_u64();
+                            log.lock().unwrap().push((
+                                label.to_string(),
+                                auth_val,
+                                text.clone(),
+                            ));
+                            let now = Utc::now();
+                            Json(json!({
+                                "message_id": 9101,
+                                "id": 9101,
+                                "pts": 20,
+                                "pts_count": 1,
+                                "duplicate": false,
+                                "date_ms": now.timestamp_millis(),
+                                "date": now.to_rfc3339(),
+                                "sender_id": 202,
+                                "chat_id": chat_id,
+                                "text": text,
+                                "client_nonce": nonce,
+                                "status": "sent"
+                            }))
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local_addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            local_addr
+        }
+    };
+
+    let addr_a = server_rt.block_on(spawn_mock_server("server_a", Arc::clone(&sent_log)));
+    let addr_b = server_rt.block_on(spawn_mock_server("server_b", Arc::clone(&sent_log)));
+
+    let cache_db_path = dir.path().join("client_cache.db");
+    let query_cache_counts = |db_path: &std::path::Path| -> (i64, i64, i64) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let outbox_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbox_messages", [], |r| r.get(0))
+            .unwrap();
+        let msg_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let e2ee_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM e2ee_identity", [], |r| r.get(0))
+            .unwrap();
+        (outbox_cnt, msg_cnt, e2ee_cnt)
+    };
+
+    let stage_account_a = |host: *mut c_void, chat_id: i64, nonce: u64, secret: &str| -> (String, String) {
+        unsafe {
+            let login = dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_b502", "password": "pw"}}),
+            );
+            assert_eq!(login["ok"], true, "Alice login failed: {login}");
+            assert_eq!(
+                dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+                true
+            );
+            let enq = dispatch(
+                host,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": chat_id, "text": secret, "client_nonce": nonce}
+                }),
+            );
+            assert_eq!(enq["ok"], true, "outbox.enqueue failed: {enq}");
+
+            let id = dispatch(host, &json!({"method": "e2ee.identity"}));
+            assert_eq!(id["ok"], true, "e2ee.identity failed: {id}");
+            let x_pub = id["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
+            let e_pub = id["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+
+            assert!(
+                dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"]
+                    .as_u64()
+                    .unwrap()
+                    >= 1,
+                "Precondition: Account A must have >= 1 pending outbox message"
+            );
+            let local_list = dispatch(
+                host,
+                &json!({"method": "messages.localList", "params": {"chat_id": chat_id}}),
+            );
+            assert!(
+                !local_list["result"].as_array().unwrap().is_empty(),
+                "Precondition: Account A messages.localList must be non-empty: {local_list}"
+            );
+            let (ob_c, msg_c, e2ee_c) = query_cache_counts(&cache_db_path);
+            assert!(ob_c >= 1 && msg_c >= 1 && e2ee_c == 1);
+            (x_pub, e_pub)
+        }
+    };
+
+    let assert_wiped = |host: *mut c_void,
+                        chat_id: i64,
+                        prev_x: &str,
+                        prev_e: &str,
+                        label: &str| {
+        unsafe {
+            assert_eq!(
+                dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+                0,
+                "{label}: outbox.pendingCount MUST be 0 after wipe (B5-02)"
+            );
+            let local_after = dispatch(
+                host,
+                &json!({"method": "messages.localList", "params": {"chat_id": chat_id}}),
+            );
+            assert!(
+                local_after["result"].as_array().unwrap().is_empty(),
+                "{label}: messages.localList MUST be empty after wipe (B5-02): {local_after}"
+            );
+            let (ob_c, msg_c, e2ee_c) = query_cache_counts(&cache_db_path);
+            assert_eq!(
+                (ob_c, msg_c, e2ee_c),
+                (0, 0, 0),
+                "{label}: client_cache.db outbox/messages/e2ee_identity MUST be empty (B5-02)"
+            );
+            let fresh_id = dispatch(host, &json!({"method": "e2ee.identity"}));
+            assert_eq!(fresh_id["ok"], true);
+            assert_ne!(
+                fresh_id["result"]["x25519_pub_b64"].as_str().unwrap(),
+                prev_x,
+                "{label}: E2EE X25519 identity key MUST be regenerated after wipe (B5-02)"
+            );
+            assert_ne!(
+                fresh_id["result"]["ed25519_pub_b64"].as_str().unwrap(),
+                prev_e,
+                "{label}: E2EE Ed25519 identity key MUST be regenerated after wipe (B5-02)"
+            );
+        }
+    };
+
+    let cfg_a = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr_a}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_a.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. session.setToken("TOK_B") wipes outbox, messages, and E2EE identity; re-enabling
+        //    network + connectWs transmits ZERO Account A messages with Bearer TOK_B!
+        let (x1, e1) = stage_account_a(host, 8101, 81_001, "SECRET_A_SET_TOKEN");
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.setToken", "params": {"token": "TOK_B"}}))["ok"],
+            true
+        );
+        assert_wiped(host, 8101, &x1, &e1, "session.setToken(TOK_B)");
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "session.connectWs"}))["ok"], true);
+        assert_eq!(dispatch(host, &json!({"method": "outbox.retryNow"}))["ok"], true);
+        thread::sleep(Duration::from_millis(120));
+        // Non-tautology: verify Account B CAN genuinely deliver its own message with Bearer TOK_B
+        let send_b = dispatch(
+            host,
+            &json!({"method": "messages.send", "params": {"chat_id": 8101, "text": "GENUINE_B_MSG"}}),
+        );
+        assert_eq!(send_b["ok"], true, "Genuine Account B send failed: {send_b}");
+        {
+            let log = sent_log.lock().unwrap();
+            assert!(
+                log.iter()
+                    .any(|(srv, auth, txt)| srv == "server_a" && auth == "Bearer TOK_B" && txt == "GENUINE_B_MSG"),
+                "Non-tautology proof: genuine Account B message must arrive with Bearer TOK_B: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|(_, _, txt)| txt == "SECRET_A_SET_TOKEN"),
+                "Account A queued outbox message MUST NEVER transmit under Bearer TOK_B (B5-02): {log:?}"
+            );
+        }
+
+        // 2. Token-only TOK_A -> auth.login(Bob) ALSO wipes token-only outbox/messages/E2EE
+        //    even though LocalStore owner_scope was None during the token-only session!
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.setToken", "params": {"token": "TOK_A"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": 8102, "text": "SECRET_TOK_ONLY_A", "client_nonce": 81_002}
+                })
+            )["ok"],
+            true
+        );
+        let id_tok = dispatch(host, &json!({"method": "e2ee.identity"}));
+        let x_tok = id_tok["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
+        let e_tok = id_tok["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+        assert_eq!(
+            dispatch(host, &json!({"method": "auth.login", "params": {"username": "bob_b502", "password": "pw"}}))["ok"],
+            true
+        );
+        assert_wiped(host, 8102, &x_tok, &e_tok, "token-only -> auth.login(Bob)");
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "session.connectWs"}))["ok"], true);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !sent_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, txt)| txt == "SECRET_TOK_ONLY_A"),
+            "Token-only Account A outbox message MUST NEVER transmit under Bob's Bearer TOK_B (B5-02)"
+        );
+
+        // 3. auth.logout wipes outbox, messages, and E2EE identity
+        let (x3, e3) = stage_account_a(host, 8103, 81_003, "SECRET_A_LOGOUT");
+        assert_eq!(dispatch(host, &json!({"method": "auth.logout"}))["ok"], true);
+        assert_wiped(host, 8103, &x3, &e3, "auth.logout");
+
+        // 4. session.clearSession wipes outbox, messages, and E2EE identity
+        let (x4, e4) = stage_account_a(host, 8104, 81_004, "SECRET_A_CLEAR");
+        assert_eq!(dispatch(host, &json!({"method": "session.clearSession"}))["ok"], true);
+        assert_wiped(host, 8104, &x4, &e4, "session.clearSession");
+
+        // 5. session.setServerUrl (Server A -> Server B) wipes both old and new LocalStores;
+        //    authenticating on Server B with TOK_SERVER_B transmits ZERO Server A messages!
+        let (x5, e5) = stage_account_a(host, 8105, 81_005, "SECRET_SERVER_A");
+        let switched = dispatch(
+            host,
+            &json!({"method": "session.setServerUrl", "params": {"server_url": format!("http://{addr_b}")}}),
+        );
+        assert_eq!(switched["ok"], true, "setServerUrl Server A -> Server B failed: {switched}");
+        assert_wiped(host, 8105, &x5, &e5, "session.setServerUrl(Server A -> Server B)");
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.setToken", "params": {"token": "TOK_SERVER_B"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "session.connectWs"}))["ok"], true);
+        assert_eq!(dispatch(host, &json!({"method": "outbox.retryNow"}))["ok"], true);
+        thread::sleep(Duration::from_millis(120));
+        let send_srv_b = dispatch(
+            host,
+            &json!({"method": "messages.send", "params": {"chat_id": 8105, "text": "GENUINE_SERVER_B"}}),
+        );
+        assert_eq!(send_srv_b["ok"], true);
+        {
+            let log = sent_log.lock().unwrap();
+            assert!(
+                log.iter().any(|(srv, auth, txt)| {
+                    srv == "server_b" && auth == "Bearer TOK_SERVER_B" && txt == "GENUINE_SERVER_B"
+                }),
+                "Non-tautology proof: genuine Server B send must reach server_b with TOK_SERVER_B: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|(srv, _, txt)| srv == "server_b" && txt == "SECRET_SERVER_A"),
+                "Server A queued outbox message MUST NEVER transmit to Server B (B5-02): {log:?}"
+            );
+        }
+
+        // 6. Same-account shutdown() + cold restart MUST still preserve offline outbox, cached
+        //    messages, and E2EE identity!
+        let (x6, e6) = stage_account_a(host, 8106, 81_006, "KEEP_ON_SAME_ACCOUNT_RESTART");
+        fabushi_host_destroy(host);
+
+        let cfg_b = CString::new(
+            json!({
+                "app_data_dir": dir.path().to_string_lossy(),
+                "server_url": format!("http://{addr_b}"),
+                "test_mode": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let host2 = fabushi_host_create(cfg_b.as_ptr());
+        assert!(!host2.is_null());
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            1,
+            "Same-account shutdown() + restart MUST preserve offline outbox persistence"
+        );
+        let kept_msgs = dispatch(
+            host2,
+            &json!({"method": "messages.localList", "params": {"chat_id": 8106}}),
+        );
+        assert!(
+            kept_msgs["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m.to_string().contains("KEEP_ON_SAME_ACCOUNT_RESTART")),
+            "Same-account restart MUST preserve cached messages: {kept_msgs}"
+        );
+        let kept_id = dispatch(host2, &json!({"method": "e2ee.identity"}));
+        assert_eq!(kept_id["result"]["x25519_pub_b64"].as_str().unwrap(), x6);
+        assert_eq!(kept_id["result"]["ed25519_pub_b64"].as_str().unwrap(), e6);
+
+        fabushi_host_destroy(host2);
+    }
+}
+
 

@@ -268,7 +268,10 @@ fn validate_server_url_input(raw_url: &str) -> HostResult<String> {
             )));
         }
         if let Some((host_part, port_part)) = authority.rsplit_once(':') {
-            if host_part.is_empty() || !is_valid_rfc3986_port(port_part) {
+            if host_part.is_empty()
+                || host_part.contains(':')
+                || !is_valid_rfc3986_port(port_part)
+            {
                 return Err(HostError::invalid_arguments(format!(
                     "Invalid server_url host/port in '{raw_url}'"
                 )));
@@ -1032,6 +1035,10 @@ impl FabushiAppHost {
             old_client.clear_session();
             let _ = self.host_db.delete_meta("active_account_id");
             self.reset_account_scope();
+            // Wipe both old_client and new_client LocalStores (RAM + client_cache.db) so Server A's
+            // outbox_messages, cached messages, drafts, and E2EE keys never carry over to Server B (B5-02).
+            old_client.local_store.clear_all();
+            new_client.local_store.clear_all();
             *self.client.write() = Arc::clone(&new_client);
             *self.server_url.write() = normalized.clone();
             self.bump_generation();
@@ -1175,10 +1182,22 @@ impl FabushiAppHost {
         }
     }
 
-    /// Atomically reads `client.token()` under a shared `session_lock.read()` fenced against the
-    /// active dispatch generation so a stale Account A RPC can never observe Account B's bearer
-    /// token across a concurrent login/switchAccount/setToken commit (B4-02).
-    pub fn fenced_client_token(&self, client: &Arc<TelegramClient>) -> HostResult<Option<String>> {
+    /// Executes a short synchronous closure under a shared `session_lock.read()` guard fenced
+    /// against host shutdown, generation changes, and live `TelegramClient` swaps (B4-02, NB5-01, NB5-02).
+    ///
+    /// # Lock-Ordering Invariant
+    /// `f` MUST ONLY acquire leaf locks (`TelegramClient` / `LocalStore` / `HostSqliteStore` /
+    /// `HostSearchEngine` / `dedup_store` / `server_url`) and MUST NEVER acquire `session_lock`,
+    /// `reconfig_lock`, `pump_lifecycle`, `callback_gate`, call `run_cancellable`, or invoke
+    /// `emit_event` / C callbacks. `_sess_read` is dropped strictly before this method returns.
+    pub fn with_fenced_session_read<R, F>(
+        &self,
+        client: &Arc<TelegramClient>,
+        f: F,
+    ) -> HostResult<R>
+    where
+        F: FnOnce() -> HostResult<R>,
+    {
         let _sess_read = self.session_lock.read();
         if self.is_shutdown.load(Ordering::Acquire) {
             return Err(HostError::host_closed());
@@ -1195,12 +1214,20 @@ impl FabushiAppHost {
             let exp_gen = crate::dispatch::current_dispatch_generation().unwrap_or(cur_gen);
             return Err(HostError::stale_generation(exp_gen, cur_gen));
         }
-        Ok(client.token())
+        f()
+    }
+
+    /// Atomically reads `client.token()` under a shared `session_lock.read()` fenced against the
+    /// active dispatch generation so a stale Account A RPC can never observe Account B's bearer
+    /// token across a concurrent login/switchAccount/setToken commit (B4-02).
+    pub fn fenced_client_token(&self, client: &Arc<TelegramClient>) -> HostResult<Option<String>> {
+        self.with_fenced_session_read(client, || Ok(client.token()))
     }
 
     /// Runs an async operation on the single canonical `TelegramClient` Tokio runtime
-    /// with cooperative `CancellationToken` support for `fabushi_host_cancel` and a first-poll
-    /// `session_lock.read()` generation fence eliminating cross-account bearer token TOCTOU races.
+    /// with cooperative `CancellationToken` support for `fabushi_host_cancel` and a per-poll
+    /// `session_lock.read()` generation & client-identity fence eliminating Poll 1 and Poll 2+
+    /// cross-account bearer token TOCTOU races, cache contamination, and post-shutdown WAL writes (B5-01).
     pub fn run_cancellable<F, T>(&self, request_id: &str, fut: F) -> HostResult<T>
     where
         F: Future<Output = HostResult<T>> + Send,
@@ -1239,10 +1266,10 @@ impl FabushiAppHost {
         let client = self.client();
         let runtime = Arc::clone(client.runtime());
         let expected_gen = crate::dispatch::current_dispatch_generation();
-        let fenced_fut = FirstPollFencedFuture {
+        let fenced_fut = PerPollFencedFuture {
             host: self,
+            client: Arc::clone(&client),
             expected_gen,
-            first_poll_done: false,
             inner: Box::pin(fut),
         };
 
@@ -1320,17 +1347,21 @@ impl FabushiAppHost {
     }
 }
 
-/// Acquires `session_lock.read()` strictly across the generation check and VERY FIRST synchronous
-/// poll of `inner` (where `TelegramClient::require_token()` captures the bearer token before any
-/// network `.await`), then drops the read guard immediately before returning `Poll::Pending`.
-struct FirstPollFencedFuture<'a, F> {
+/// Acquires `session_lock.read()` strictly across the shutdown/generation/client-identity check
+/// and EVERY synchronous `poll()` of `inner`, dropping the read guard immediately whenever `poll()`
+/// returns `Poll::Pending` or `Poll::Ready` (B5-01).
+///
+/// Closes Poll-2+ cross-account bearer token leakage in multi-step async RPCs
+/// (`e2ee.sendEncryptedDm`, `e2ee.sendEncryptedGroup`, `e2ee.replenishPrekeys`, `sync.syncAllGaps`),
+/// Poll-2+ cross-account `client_cache.db` contamination, and post-`shutdown()` WAL writes.
+struct PerPollFencedFuture<'a, F> {
     host: &'a FabushiAppHost,
+    client: Arc<TelegramClient>,
     expected_gen: Option<u64>,
-    first_poll_done: bool,
     inner: std::pin::Pin<Box<F>>,
 }
 
-impl<'a, F, T> Future for FirstPollFencedFuture<'a, F>
+impl<'a, F, T> Future for PerPollFencedFuture<'a, F>
 where
     F: Future<Output = HostResult<T>>,
 {
@@ -1340,21 +1371,25 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if !self.first_poll_done {
-            let _sess_read = self.host.session_lock.read();
-            if self.host.is_shutdown.load(Ordering::Acquire) {
-                return std::task::Poll::Ready(Err(HostError::host_closed()));
+        let _sess_read = self.host.session_lock.read();
+        if self.host.is_shutdown.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(HostError::host_closed()));
+        }
+        if let Some(exp_gen) = self.expected_gen {
+            let cur_gen = self.host.current_generation();
+            if cur_gen != exp_gen {
+                return std::task::Poll::Ready(Err(HostError::stale_generation(
+                    exp_gen, cur_gen,
+                )));
             }
-            if let Some(exp_gen) = self.expected_gen {
-                let cur_gen = self.host.current_generation();
-                if cur_gen != exp_gen {
-                    return std::task::Poll::Ready(Err(HostError::stale_generation(
-                        exp_gen, cur_gen,
-                    )));
-                }
-            }
-            self.first_poll_done = true;
-            return self.inner.as_mut().poll(cx);
+        }
+        let live_client = self.host.client();
+        if !Arc::ptr_eq(&self.client, &live_client) {
+            let cur_gen = self.host.current_generation();
+            let exp_gen = self.expected_gen.unwrap_or(cur_gen);
+            return std::task::Poll::Ready(Err(HostError::stale_generation(
+                exp_gen, cur_gen,
+            )));
         }
         self.inner.as_mut().poll(cx)
     }

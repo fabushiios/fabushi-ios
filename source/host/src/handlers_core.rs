@@ -224,13 +224,23 @@ fn finalize_authenticated_session(
     if current_gen != start_gen || !std::sync::Arc::ptr_eq(client, &live_client) {
         return Err(HostError::stale_generation(start_gen, current_gen));
     }
+    let prev_uid = live_client.current_user_id();
+    let had_token_only_session = prev_uid.is_none() && live_client.token().is_some();
     // Step 1: Clear live client session (token == None, user_id == None)
     live_client.clear_session();
-    // Step 2: Wipe all account-scoped cryptographic keys and runtime state
+    // Step 2: Wipe all account-scoped cryptographic keys and runtime state.
+    // If transitioning out of a token-only session (where LocalStore owner_scope is None so
+    // bind_account_scope would not wipe it), clear LocalStore immediately (B5-02).
     host.reset_account_scope();
+    if had_token_only_session {
+        live_client.local_store.clear_all();
+    }
     // Step 3: Execute ALL fallible SQLite persistence while live_client.token() is STILL None
     if let Err(err) = persist_account_record(host, auth) {
         let _ = host.host_db.delete_meta("active_account_id");
+        if prev_uid != Some(auth.user_id) {
+            live_client.local_store.clear_all();
+        }
         host.bump_generation();
         *generation_advanced = true;
         return Err(err);
@@ -240,6 +250,9 @@ fn finalize_authenticated_session(
         .set_meta("active_account_id", &auth.user_id.to_string())
     {
         let _ = host.host_db.delete_meta("active_account_id");
+        if prev_uid != Some(auth.user_id) {
+            live_client.local_store.clear_all();
+        }
         host.bump_generation();
         *generation_advanced = true;
         return Err(err);
@@ -248,6 +261,7 @@ fn finalize_authenticated_session(
     let new_gen = host.bump_generation();
     *generation_advanced = true;
     // Step 5: Infallible live credential installation LAST strictly inside session_lock.write()
+    // (calls bind_account_scope, preserving same-user cache and wiping on cross-user switch)
     live_client.set_auth_session(auth.clone());
     Ok(new_gen)
 }
@@ -270,8 +284,11 @@ fn finalize_token_only_session(
     }
     // Step 1: Clear live client session (token == None, user_id == None)
     live_client.clear_session();
-    // Step 2: Wipe all account-scoped cryptographic keys and runtime state
+    // Step 2: Wipe all account-scoped cryptographic keys, runtime state, and LocalStore
+    // (outbox_messages, messages, chats, drafts, E2EE keys) because a token-only session has
+    // no user_id to verify cache ownership (B5-02).
     host.reset_account_scope();
+    live_client.local_store.clear_all();
     // Step 3: Execute fallible SQLite persistence while live_client.token() is STILL None
     if let Err(err) = host.host_db.delete_meta("active_account_id") {
         host.bump_generation();
@@ -440,6 +457,8 @@ pub fn handle_auth(
                             .filter(|s| !s.is_empty())
                     });
                 live_client.clear_session();
+                host.reset_account_scope();
+                live_client.local_store.clear_all();
                 let mut delete_err = None;
                 if let Some(uid) = target_uid {
                     host.account_tokens.lock().remove(&uid);
@@ -448,7 +467,6 @@ pub fn handle_auth(
                     }
                 }
                 let _ = host.host_db.delete_meta("active_account_id");
-                host.reset_account_scope();
                 let next_gen = host.bump_generation();
                 *generation_advanced = true;
                 if let Some(err) = delete_err {
@@ -834,24 +852,28 @@ pub fn handle_session(
             Ok(json!({ "revoked_others": true }))
         }
         "connectWs" => {
-            client.connect_ws();
-            let status = format!("{:?}", client.status());
+            let (status, server_url) = host.with_fenced_session_read(&client, || {
+                client.connect_ws();
+                Ok((format!("{:?}", client.status()), host.current_server_url()))
+            })?;
             host.emit_event(
                 "connectionStateChanged",
-                json!({ "status": status, "server_url": host.current_server_url() }),
+                json!({ "status": status, "server_url": server_url }),
             );
             Ok(json!({
                 "connecting": true,
-                "status": format!("{:?}", client.status()),
-                "server_url": host.current_server_url(),
+                "status": status,
+                "server_url": server_url,
             }))
         }
         "disconnectWs" => {
-            client.disconnect_ws();
-            let status = format!("{:?}", client.status());
+            let (status, server_url) = host.with_fenced_session_read(&client, || {
+                client.disconnect_ws();
+                Ok((format!("{:?}", client.status()), host.current_server_url()))
+            })?;
             host.emit_event(
                 "connectionStateChanged",
-                json!({ "status": status, "server_url": host.current_server_url() }),
+                json!({ "status": status, "server_url": server_url }),
             );
             Ok(json!({ "disconnected": true, "status": status }))
         }
@@ -895,6 +917,7 @@ pub fn handle_session(
                         live_client.clear_session();
                         let _ = host.host_db.delete_meta("active_account_id");
                         host.reset_account_scope();
+                        live_client.local_store.clear_all();
                         let next_gen = host.bump_generation();
                         *generation_advanced = true;
                         next_gen
@@ -928,6 +951,7 @@ pub fn handle_session(
                 live_client.clear_session();
                 let _ = host.host_db.delete_meta("active_account_id");
                 host.reset_account_scope();
+                live_client.local_store.clear_all();
                 let next_gen = host.bump_generation();
                 *generation_advanced = true;
                 next_gen
@@ -952,14 +976,22 @@ pub fn handle_session(
             // Validate server binding, AEAD integrity, and non-empty recoverable token BEFORE
             // clearing the current live session, wiping account scope, or bumping generation!
             let auth = restore_account_auth(host, account_id, &raw)?;
-            // Strict 5-step commit order (B4-02):
+            let prev_uid = live_client.current_user_id();
+            let had_token_only_session = prev_uid.is_none() && live_client.token().is_some();
+            // Strict 5-step commit order (B4-02, B5-02):
             // Step 1: Clear live client session (token == None, user_id == None)
             live_client.clear_session();
             // Step 2: Wipe all account-scoped cryptographic keys and runtime state
             host.reset_account_scope();
+            if had_token_only_session {
+                live_client.local_store.clear_all();
+            }
             // Step 3: Persist active_account_id while live_client.token() is STILL None
             if let Err(err) = host.host_db.set_meta("active_account_id", account_id) {
                 let _ = host.host_db.delete_meta("active_account_id");
+                if prev_uid != Some(auth.user_id) {
+                    live_client.local_store.clear_all();
+                }
                 host.bump_generation();
                 *generation_advanced = true;
                 return Err(err);

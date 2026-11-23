@@ -940,12 +940,18 @@ pub fn handle_tailnet(
     match action {
         "status" => to_val(client.tailnet_status()),
         "start" => {
-            client.start_tailnet_mesh();
-            to_val(client.tailnet_status())
+            let status = host.with_fenced_session_read(&client, || {
+                client.start_tailnet_mesh();
+                Ok(client.tailnet_status())
+            })?;
+            to_val(status)
         }
         "stop" => {
-            client.stop_tailnet_mesh();
-            to_val(client.tailnet_status())
+            let status = host.with_fenced_session_read(&client, || {
+                client.stop_tailnet_mesh();
+                Ok(client.tailnet_status())
+            })?;
+            to_val(status)
         }
         "register" => {
             let res = host.run_cancellable(req_id, async move {
