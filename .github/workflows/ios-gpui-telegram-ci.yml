@@ -1,0 +1,267 @@
+name: iOS GPUI-Telegram CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ios-gpui-telegram-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IOS_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  CI: "true"
+
+jobs:
+  authority-check:
+    name: Authority & Architecture Lock Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          git show -s --format='source_sha=%H source_tree=%T' HEAD
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Resolve canonical bhrumom/gpui-telegram@main lock
+        id: desktop-main-lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          lock = json.loads(Path("manifests/desktop-main-authority.json").read_text(encoding="utf-8"))
+          assert lock["repository"] == "bhrumom/gpui-telegram" and lock["branch"] == "main", lock
+          print("sha=" + lock["commit"])
+          PY
+
+      - name: Checkout exact bhrumom/gpui-telegram@main snapshot
+        uses: actions/checkout@v5
+        with:
+          repository: bhrumom/gpui-telegram
+          ref: ${{ steps.desktop-main-lock.outputs.sha }}
+          path: desktop-main-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify strict authority lock & full tracked Git tree
+        run: python3 scripts/check-desktop-main-ios-architecture.py --strict --desktop-checkout desktop-main-source
+
+      - name: Run authority checker unit tests
+        run: python3 -m unittest discover -s tests -p 'test_desktop_main_authority.py' -v
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  rust-desktop-core-ubuntu:
+    name: Rust Desktop Core Tests (Ubuntu + sccache)
+    needs: [authority-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update -o Acquire::Languages=none
+          sudo apt-get install -y --no-install-recommends \
+            mold clang pkg-config cmake protobuf-compiler libclang-dev \
+            libssl-dev libsqlite3-dev libzstd-dev \
+            libegl-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libdrm-dev \
+            libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Rust toolchain >= 1.85 (edition 2024)
+        run: rustc --version && cargo --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source/desktop_core -> target
+          cache-on-failure: true
+          shared-key: "ubuntu-m1a-desktop-core-v1"
+
+      - name: Compile all workspace test targets (--no-run)
+        env:
+          GPUI_OFFLINE_TEST: "1"
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path source/desktop_core/Cargo.toml --workspace --no-run
+
+      - name: Run full offline tests across all vendored mobile crates
+        env:
+          GPUI_OFFLINE_TEST: "1"
+        run: |
+          set -euo pipefail
+          for pkg in \
+            gpui_telegram_core \
+            gpui_telegram_proto \
+            gpui_telegram_media \
+            gpui_telegram_webrtc \
+            gpui_telegram_agent \
+            gpui_telegram_coding \
+            magpie_gateway \
+            bot-browser \
+            fabushi_remote_engine \
+            fabushi_miniapp; do
+            echo "=== Testing crate: $pkg ==="
+            cargo test --manifest-path source/desktop_core/Cargo.toml -p "$pkg"
+          done
+
+          echo "=== Testing crate: fabushi_miniapp (--features server) ==="
+          cargo test --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server
+
+          echo "=== Testing crate: gpui_telegram_client (--lib + 15 deterministic offline integration suites) ==="
+          cargo test --manifest-path source/desktop_core/Cargo.toml -p gpui_telegram_client \
+            --lib \
+            --test auth_client_tests \
+            --test client_contract_and_sync_tests \
+            --test m2_protocol_outbox_e2ee_proxy_tests \
+            --test adversarial_data_subsystem_tests \
+            --test adversarial_main_domain_tests \
+            --test data_media_content_subsystem_tests \
+            --test data_peers_subsystem_tests \
+            --test dialogs_core_adversarial_oracle_tests \
+            --test dialogs_core_subsystem_tests \
+            --test history_item_subsystem_tests \
+            --test main_layout_subsystem_tests \
+            --test storage_adversarial_oracle_tests \
+            --test storage_subsystem_tests \
+            --test wallet_part2_subsystem_tests \
+            --test wallet_part4_subsystem_tests
+
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  rust-desktop-core-ios-check:
+    name: Rust Desktop Core iOS Targets Check (macOS-15 + sccache)
+    needs: [authority-check]
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Verify Xcode SDKs and build tools (protoc + cmake)
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+          command -v protoc >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install protobuf
+          command -v cmake >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Verify Rust toolchain & installed iOS targets
+        run: |
+          rustc --version
+          rustup target list --installed
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source/desktop_core -> target
+          cache-on-failure: true
+          shared-key: "macos15-m1a-ios-check-v1"
+
+      - name: Verify zero forbidden desktop/EGL crates in iOS dependency trees
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-ios-sim aarch64-apple-ios; do
+            echo "=== Auditing cargo tree for $target ==="
+            TREE="$(cargo tree --manifest-path source/desktop_core/Cargo.toml --workspace --target "$target" --prefix none)"
+            if grep -Eq '^(gpui|khronos-egl|khronos_egl|openssl-sys|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) ' <<< "$TREE"; then
+              echo "ERROR: Forbidden crate found in $target dependency tree:"
+              grep -E '^(gpui|khronos-egl|khronos_egl|openssl-sys|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) ' <<< "$TREE"
+              exit 1
+            fi
+          done
+          echo "PASS: Zero forbidden desktop/EGL crates in iOS target dependency trees."
+
+      - name: Check all vendored crates for aarch64-apple-ios-sim and aarch64-apple-ios
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+          CFLAGS_aarch64_apple_ios: "-miphoneos-version-min=17.0"
+          CFLAGS_aarch64_apple_ios_sim: "-mios-simulator-version-min=17.0"
+          CARGO_ENCODED_RUSTFLAGS: "-Cembed-bitcode=no"
+        run: |
+          set -euo pipefail
+          unset SDKROOT DEVELOPER_DIR PLATFORM_DISPLAY_NAME PLATFORM_NAME CURRENT_ARCH ARCHS
+          unset CC CXX CFLAGS CXXFLAGS LDFLAGS AR RANLIB SDK_NAME
+          cargo check --manifest-path source/desktop_core/Cargo.toml --workspace --lib --target aarch64-apple-ios-sim
+          cargo check --manifest-path source/desktop_core/Cargo.toml --workspace --lib --target aarch64-apple-ios
+          cargo check --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --lib --target aarch64-apple-ios-sim
+          cargo check --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --lib --target aarch64-apple-ios
+
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only

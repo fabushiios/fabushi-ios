@@ -192,26 +192,37 @@ fn test_cua_lease_lifecycle_and_generation_fencing() {
     assert_eq!(broker.current_generation(), lease.generation);
     assert!(broker.is_lease_active());
 
-    // 2. Execute fenced CUA actions
+    // 2. Execute fenced CUA actions (honest backend check when no remote computer is bound)
     let click_action = CuaAction::Click {
         x: 640,
         y: 480,
         button: "left".into(),
     };
+    assert!(CuaExecutor::validate_fenced_lease(&lease, broker.current_generation()).is_ok());
     let exec_res = CuaExecutor::execute_action_fenced(
         &click_action,
         &lease,
         broker.current_generation(),
     );
-    assert!(exec_res.is_ok());
+    let err_msg = exec_res
+        .expect_err("unbound CUA executor must not fabricate Ok")
+        .to_string();
+    assert!(
+        err_msg.contains("CUA backend unavailable"),
+        "expected honest backend-unavailable error, got: {err_msg}"
+    );
 
-    // 3. Stale generation fencing: rejecting outdated lease generation
+    // 3. Stale generation fencing: rejecting outdated lease generation with AuthFailed
     let stale_exec_res = CuaExecutor::execute_action_fenced(
         &click_action,
         &lease,
         broker.current_generation() + 1,
     );
     assert!(stale_exec_res.is_err());
+    assert!(
+        stale_exec_res.unwrap_err().to_string().contains("Stale lease"),
+        "stale lease must fail generation fence before backend check"
+    );
 
     // 4. Protocol mapping verification
     let proto_click = CuaExecutor::action_to_protocol(&click_action);

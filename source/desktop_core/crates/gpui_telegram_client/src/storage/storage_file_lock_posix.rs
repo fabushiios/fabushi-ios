@@ -4,6 +4,7 @@
 //! Disposition: `rust_domain_or_server_1to1`
 
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,7 @@ impl StorageFileLockPosix {
         }
     }
 
+    #[cfg(unix)]
     pub fn lock(&mut self, path: &Path) -> Result<bool, String> {
         self.unlock();
 
@@ -59,6 +61,23 @@ impl StorageFileLockPosix {
         }
     }
 
+    #[cfg(not(unix))]
+    pub fn lock(&mut self, path: &Path) -> Result<bool, String> {
+        self.unlock();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| format!("Could not open lockfile {}: {}", path.display(), e))?;
+        self.file = Some(file);
+        self.path = Some(path.to_path_buf());
+        self.locked = true;
+        Ok(true)
+    }
+
+    #[cfg(unix)]
     pub fn unlock(&mut self) {
         if let Some(file) = self.file.take() {
             let fd = file.as_raw_fd();
@@ -73,6 +92,13 @@ impl StorageFileLockPosix {
                 libc::fcntl(fd, libc::F_SETLK, &flock_data);
             }
         }
+        self.locked = false;
+        self.path = None;
+    }
+
+    #[cfg(not(unix))]
+    pub fn unlock(&mut self) {
+        self.file = None;
         self.locked = false;
         self.path = None;
     }

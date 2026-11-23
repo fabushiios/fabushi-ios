@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed live Desktop-main source/ownership authority validation for Fabushi iOS.
 
-This validates the recorded snapshot against the actual pinned Git tree and the
-live Desktop main ref in GitHub Actions. No PR20 SHA or file count is hardcoded.
+Validates the recorded snapshot against the pinned Git tree and the live
+bhrumom/gpui-telegram@main ref in GitHub Actions. No historical PR #20 SHA or
+legacy file count is treated as a permanent acceptance target.
 --complete is intentionally stronger than ordinary inventory validation.
 """
 import argparse
@@ -12,19 +13,66 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover
+    tomllib = None
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "manifests/desktop-main-authority.json"
 MANIFEST_INDEX = ROOT / "manifests/desktop-main-reference-index.json"
 LEDGER_INDEX = ROOT / "docs/parity/desktop-main-index.json"
-ACTIVE_SPEC = ROOT / "docs/specs/fabushi-desktop-main-ios-parity.md"
+ACTIVE_SPEC = ROOT / "docs/specs/gpui-telegram-main-ios-parity.md"
+SUPERSEDED_DESKTOP_SPEC = ROOT / "docs/specs/fabushi-desktop-main-ios-parity.md"
 HISTORICAL_SPEC = ROOT / "docs/specs/fabushi-desktop-pr20-ios-architecture-parity.md"
-UPSTREAM_URL = "https://github.com/bhrumom/fabushi-desktop.git"
+HISTORICAL_SPECS = [SUPERSEDED_DESKTOP_SPEC, HISTORICAL_SPEC]
+UPSTREAM_REPO = "bhrumom/gpui-telegram"
+UPSTREAM_URL = "https://github.com/bhrumom/gpui-telegram.git"
+TYPO_OR_HISTORICAL_REPOS = {
+    "bhrunom/gpui-telegram",
+    "bhrum/gpui-telegram",
+    "bhrumom/fabushi-desktop",
+}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DISPOSITIONS = {"unreviewed", "direct-port", "ios-adapted", "not-applicable-with-replacement"}
 STATUSES = {"unreviewed", "understood", "mapped", "implemented", "verified", "not-applicable"}
+EXCLUDED_DESKTOP_CRATES = {
+    "gpui_telegram_desktop",
+    "fabushi_remote_daemon",
+    "gpui_telegram_cli",
+    "fabushi_miniapp_wasm",
+    "gpui_telegram_server",
+    "gpui_telegram_test_harness",
+}
+FORBIDDEN_MOBILE_DEPS = {
+    "gpui",
+    "khronos-egl",
+    "khronos_egl",
+    "openssl-sys",
+} | EXCLUDED_DESKTOP_CRATES
+FORBIDDEN_EXTERNAL_REPO_STRINGS = [
+    "bhrumom/fabushi-platform-core",
+    "../fabushi-platform-core",
+    "../fabushi-desktop",
+    "../gpui-telegram",
+    "github.com/bhrumom/fabushi-desktop",
+    "github.com/bhrumom/gpui-telegram",
+    "github.com/bhrum/gpui-telegram",
+    "github.com/bhrunom/gpui-telegram",
+]
+FORBIDDEN_GIT_ORG_RE = re.compile(r"(?:github\.com[:/])?(bhrumom|bhrum|bhrunom)/", re.IGNORECASE)
+WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+LOCAL_PATH_PATTERNS = [
+    re.compile(r"/Users/"),
+    re.compile(r"/home/[^/\s]+/"),
+    re.compile(r"[A-Za-z]:\\Users\\"),
+]
 
 
 def document(path):
@@ -57,11 +105,13 @@ def git_tree(checkout):
     return result
 
 
-def live_head():
+def live_head(url=UPSTREAM_URL):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     result = subprocess.check_output(
-        ["git", "ls-remote", "--heads", UPSTREAM_URL, "refs/heads/main"],
+        ["git", "ls-remote", "--heads", url, "refs/heads/main"],
         stderr=subprocess.PIPE,
         timeout=60,
+        env=env,
     ).decode("ascii", "strict").strip()
     if not result:
         raise ValueError("Desktop main ref could not be resolved")
@@ -69,6 +119,114 @@ def live_head():
     if ref != "refs/heads/main" or not HEX40.fullmatch(sha):
         raise ValueError(f"unexpected Desktop main ref: {result!r}")
     return sha
+
+
+def github_api_json(url):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "fabushi-ios-authority-checker",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise ValueError(f"GitHub API request failed for {url}: {exc}") from exc
+
+
+def github_api_commit_tree(repo, commit_sha, fetch_json=None):
+    fetcher = fetch_json or github_api_json
+    data = fetcher(f"https://api.github.com/repos/{repo}/git/commits/{commit_sha}")
+    if data.get("sha") != commit_sha:
+        raise ValueError(f"GitHub API commit SHA mismatch: {data.get('sha')!r} != {commit_sha!r}")
+    tree_sha = (data.get("tree") or {}).get("sha")
+    if not HEX40.fullmatch(tree_sha or ""):
+        raise ValueError(f"GitHub API commit response missing valid tree SHA: {tree_sha!r}")
+    return tree_sha
+
+
+def github_api_tree(repo, tree_sha, fetch_json=None):
+    fetcher = fetch_json or github_api_json
+    data = fetcher(f"https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1")
+    if data.get("truncated") is not False:
+        raise ValueError(f"GitHub API Git tree response is truncated or non-boolean: {data.get('truncated')!r}")
+    if data.get("sha") != tree_sha:
+        raise ValueError(f"GitHub API tree SHA mismatch: {data.get('sha')!r} != {tree_sha!r}")
+    result = {}
+    for entry in data.get("tree", []):
+        kind = entry.get("type")
+        if kind == "tree":
+            continue
+        path = entry.get("path")
+        mode = entry.get("mode")
+        sha = entry.get("sha")
+        size = entry.get("size") if kind == "blob" else None
+        if not path or not mode or not HEX40.fullmatch(sha or ""):
+            raise ValueError(f"malformed GitHub API tree entry: {entry!r}")
+        if path in result:
+            raise ValueError(f"duplicate GitHub API tree identity: {path}")
+        result[path] = (mode, kind, sha, None if size is None else int(size))
+    return result
+
+
+def verify_tree_entries(real, lock, errors, actual_head=None, actual_tree=None):
+    source_sha = lock.get("commit")
+    root_tree = lock.get("rootTreeSha")
+    if actual_head is not None and actual_head != source_sha:
+        errors.append(f"Desktop tree identity drift: commit={actual_head} expected={source_sha}")
+    if actual_tree is not None and actual_tree != root_tree:
+        errors.append(f"Desktop tree identity drift: tree={actual_tree} expected={root_tree}")
+
+    inv = lock.get("inventory", {})
+    blobs = {p: v for p, v in real.items() if v[1] == "blob"}
+    gitlinks = {p: v for p, v in real.items() if v[1] == "commit"}
+    crates_blobs = {p: v for p, v in blobs.items() if p.startswith("crates/")}
+    inherited_blobs = {p: v for p, v in blobs.items() if p.startswith("inherited/")}
+
+    if len(gitlinks) != inv.get("gitlinkCount", 0):
+        errors.append(f"Desktop tree gitlink count drift: {len(gitlinks)} != {inv.get('gitlinkCount', 0)}")
+    if len(blobs) != inv.get("fullTrackedCount"):
+        errors.append(f"full tracked Desktop blob count drift: {len(blobs)} != {inv.get('fullTrackedCount')}")
+    if len(crates_blobs) != inv.get("selectedFileCount"):
+        errors.append(f"selected crates/** blob count drift: {len(crates_blobs)} != {inv.get('selectedFileCount')}")
+    if inv.get("inheritedFileCount") is not None and len(inherited_blobs) != inv.get("inheritedFileCount"):
+        errors.append(f"inherited/** blob count drift: {len(inherited_blobs)} != {inv.get('inheritedFileCount')}")
+    if len(blobs) - len(crates_blobs) != inv.get("nonselectedCount"):
+        errors.append(
+            f"nonselected blob count drift: {len(blobs) - len(crates_blobs)} != {inv.get('nonselectedCount')}"
+        )
+
+    actual_crate_dirs = {p.split("/")[1] for p in crates_blobs if len(p.split("/")) > 2}
+    vendored = set(lock.get("vendoredCoreCrates", []))
+    shared = set(lock.get("vendoredSharedSourceDirs", []))
+    excluded = set(lock.get("excludedDesktopCrates", []))
+    if (vendored & excluded) or (shared & excluded) or (vendored & shared):
+        errors.append("authority lock vendored/shared/excluded crate sets overlap")
+    expected_crate_dirs = vendored | shared | excluded
+    if actual_crate_dirs != expected_crate_dirs:
+        missing = sorted(expected_crate_dirs - actual_crate_dirs)
+        extra = sorted(actual_crate_dirs - expected_crate_dirs)
+        errors.append(f"crates/* directory accounting drift: missing={missing} extra={extra}")
+
+    computed_full = tree_digest(real)
+    computed_selected = tree_digest(crates_blobs)
+    expected_full = inv.get("fullTreeSha256")
+    expected_selected = inv.get("selectedTreeSha256")
+    if expected_full is not None:
+        if not HEX64.fullmatch(str(expected_full)) or computed_full != expected_full:
+            errors.append(
+                f"full tracked Desktop root tree inventory SHA256 drift: got={computed_full} expected={expected_full}"
+            )
+    if expected_selected is not None:
+        if not HEX64.fullmatch(str(expected_selected)) or computed_selected != expected_selected:
+            errors.append(
+                f"selected crates/** inventory SHA256 drift: got={computed_selected} expected={expected_selected}"
+            )
+    return computed_full, computed_selected
 
 
 def check_status(row, path, complete, errors, warnings, locked_commit):
@@ -85,7 +243,8 @@ def check_status(row, path, complete, errors, warnings, locked_commit):
         if row.get("desktop_visible_effect") in (None, "", "pending-review"):
             errors.append(f"{path}: reviewed row missing a product effect")
     if status in {"implemented", "verified"}:
-        if not target or not (ROOT / target).is_file():
+        target_paths = [t.strip() for t in target.split(";") if t.strip()]
+        if not target_paths or any(not (ROOT / t).is_file() for t in target_paths):
             errors.append(f"{path}: {status} has no actual iOS source file: {target}")
         if not (row.get("production_evidence") or "").strip():
             errors.append(f"{path}: {status} missing production evidence")
@@ -123,46 +282,205 @@ def check_status(row, path, complete, errors, warnings, locked_commit):
 
 
 def verify_snapshot(lock, manifest_index, ledger_index, errors):
-    if lock.get("schemaVersion") != 2 or lock.get("authorityMode") != "live-main":
-        errors.append("missing v2 live-main authority lock")
+    if lock.get("schemaVersion") != 3 or lock.get("authorityMode") != "live-main":
+        errors.append("missing v3 live-main authority lock")
     sha, tree = lock.get("commit"), lock.get("rootTreeSha")
     if not HEX40.fullmatch(sha or "") or not HEX40.fullmatch(tree or ""):
         errors.append("authority lock missing exact 40-hex commit and root tree")
-    if lock.get("repository") != "bhrumom/fabushi-desktop" or lock.get("branch") != "main":
-        errors.append("authority lock is not bhrumom/fabushi-desktop@main")
+    repo = lock.get("repository")
+    if repo in TYPO_OR_HISTORICAL_REPOS:
+        errors.append(f"authority lock uses typo or historical repository {repo!r}; expected {UPSTREAM_REPO!r}")
+    elif repo != UPSTREAM_REPO or lock.get("branch") != "main":
+        errors.append(f"authority lock is not {UPSTREAM_REPO}@main")
+
+    typo = lock.get("typoNote", {})
+    if (
+        typo.get("requestedSlug") != "bhrunom/gpui-telegram"
+        or typo.get("resolvedSlug") != UPSTREAM_REPO
+        or typo.get("status") != "http-404-verified-typo"
+    ):
+        errors.append("authority lock missing verified bhrunom/gpui-telegram 404 typoNote")
+
+    lineage = lock.get("legacyLineage", {})
+    if (
+        lineage.get("repository") != "bhrumom/fabushi-desktop"
+        or not HEX40.fullmatch(lineage.get("commit") or "")
+        or not HEX40.fullmatch(lineage.get("rootTreeSha") or "")
+    ):
+        errors.append("authority lock missing valid bhrumom/fabushi-desktop legacyLineage")
+
+    vendored = lock.get("vendoredCoreCrates")
+    shared = lock.get("vendoredSharedSourceDirs", [])
+    excluded = lock.get("excludedDesktopCrates")
+    if not isinstance(vendored, list) or not vendored:
+        errors.append("authority lock missing non-empty vendoredCoreCrates")
+        vendored = []
+    if not isinstance(shared, list):
+        errors.append("authority lock vendoredSharedSourceDirs must be a list")
+        shared = []
+    if not isinstance(excluded, list) or not excluded:
+        errors.append("authority lock missing non-empty excludedDesktopCrates")
+        excluded = []
+    if (set(vendored) & set(excluded)) or (set(shared) & set(excluded)) or (set(vendored) & set(shared)):
+        errors.append("authority lock crate sets overlap")
+    if not EXCLUDED_DESKTOP_CRATES.issubset(set(excluded)):
+        errors.append("authority lock excludedDesktopCrates missing required excluded desktop crates")
+
     inventory = lock.get("inventory", {})
-    if inventory.get("selectedRoots") != ["frontend/**", "source/**"]:
-        errors.append("selected source roots drift")
-    for key, value in (("manifestIndex", "manifests/desktop-main-reference-index.json"),
-                       ("ledgerIndex", "docs/parity/desktop-main-index.json"),
-                       ("nonselectedRegister", "manifests/desktop-main/tracked-outside-selected.json"),
-                       ("impactRegister", "docs/parity/desktop-main-impact.json")):
+    ledger_mode = inventory.get("fileLedgerMode")
+    if ledger_mode not in {"legacy-predecessor-archived", "current-main-complete"}:
+        errors.append(f"invalid inventory.fileLedgerMode: {ledger_mode!r}")
+    if inventory.get("selectedRoots") != ["crates/**"]:
+        errors.append("selected source roots drift: expected ['crates/**']")
+    if inventory.get("treeTruncated") is not False:
+        errors.append("authority lock must record treeTruncated=false")
+    if inventory.get("gitlinkCount") != 0:
+        errors.append("authority lock must record gitlinkCount=0")
+    sel_cnt = inventory.get("selectedFileCount")
+    non_cnt = inventory.get("nonselectedCount")
+    full_cnt = inventory.get("fullTrackedCount")
+    if not all(isinstance(x, int) and x >= 0 for x in (sel_cnt, non_cnt, full_cnt)):
+        errors.append("authority lock inventory counts must be non-negative integers")
+    elif sel_cnt + non_cnt != full_cnt:
+        errors.append("authority lock selectedFileCount + nonselectedCount != fullTrackedCount")
+
+    if ledger_mode != "current-main-complete":
+        for flag in ("baselineReady", "dependenciesReviewed", "completenessAccepted", "acceptanceAccepted"):
+            if lock.get(flag) is True:
+                errors.append(f"premature closure flag {flag}=true while fileLedgerMode={ledger_mode!r}")
+
+    for key, value in (
+        ("manifestIndex", "manifests/desktop-main-reference-index.json"),
+        ("ledgerIndex", "docs/parity/desktop-main-index.json"),
+        ("nonselectedRegister", "manifests/desktop-main/tracked-outside-selected.json"),
+        ("impactRegister", "docs/parity/desktop-main-impact.json"),
+        ("releaseEvidence", "docs/parity/desktop-main-release-evidence.json"),
+    ):
         if inventory.get(key) != value:
             errors.append(f"authority lock file route drift: {key}")
-    for value, idx in (("manifest", manifest_index), ("ledger", ledger_index)):
-        source = idx.get("authority" if value == "manifest" else "source", {})
-        for k, expected in (("repository", lock.get("repository")), ("branch", "main"),
-                            ("commit", sha), ("tree", tree), ("mode", "live-main")):
-            if source.get(k) != expected:
-                errors.append(f"{value} authority drift: {k}={source.get(k)!r}; expected {expected!r}")
-    if manifest_index.get("fileCount") != inventory.get("selectedFileCount"):
-        errors.append("manifest row count does not agree with authority lock")
-    if ledger_index.get("rowCount") != inventory.get("selectedFileCount"):
-        errors.append("ledger row count does not agree with authority lock")
-    if manifest_index.get("selectedTreeSha256") != inventory.get("selectedTreeSha256"):
-        errors.append("manifest inventory digest differs from authority lock")
-    for file in [ACTIVE_SPEC, HISTORICAL_SPEC, ROOT / "MIGRATION_SOURCE.md", ROOT / "AGENTS.md"]:
+
+    if ledger_mode == "current-main-complete":
+        for value, idx in (("manifest", manifest_index), ("ledger", ledger_index)):
+            source = idx.get("authority" if value == "manifest" else "source", {})
+            for k, expected in (
+                ("repository", lock.get("repository")),
+                ("branch", "main"),
+                ("commit", sha),
+                ("tree", tree),
+                ("mode", "live-main"),
+            ):
+                if source.get(k) != expected:
+                    errors.append(f"{value} authority drift: {k}={source.get(k)!r}; expected {expected!r}")
+        if manifest_index.get("fileCount") != inventory.get("selectedFileCount"):
+            errors.append("manifest row count does not agree with authority lock")
+        if ledger_index.get("rowCount") != inventory.get("selectedFileCount"):
+            errors.append("ledger row count does not agree with authority lock")
+        if not HEX64.fullmatch(str(inventory.get("selectedTreeSha256") or "")):
+            errors.append("current-main-complete requires non-null 64-hex selectedTreeSha256")
+        elif manifest_index.get("selectedTreeSha256") != inventory.get("selectedTreeSha256"):
+            errors.append("manifest inventory digest differs from authority lock")
+    elif ledger_mode == "legacy-predecessor-archived":
+        leg_repo = lineage.get("repository")
+        leg_commit = lineage.get("lastInventoriedCommit")
+        leg_tree = lineage.get("lastInventoriedRootTreeSha")
+        leg_count = lineage.get("lastInventoriedSelectedCount")
+        for value, idx in (("manifest", manifest_index), ("ledger", ledger_index)):
+            source = idx.get("authority" if value == "manifest" else "source", {})
+            for k, expected in (
+                ("repository", leg_repo),
+                ("branch", "main"),
+                ("commit", leg_commit),
+                ("tree", leg_tree),
+                ("mode", "live-main"),
+            ):
+                if source.get(k) != expected:
+                    errors.append(f"{value} authority drift (legacy archived): {k}={source.get(k)!r}; expected {expected!r}")
+        if manifest_index.get("fileCount") != leg_count:
+            errors.append("archived legacy manifest row count does not agree with legacyLineage")
+        if ledger_index.get("rowCount") != leg_count:
+            errors.append("archived legacy ledger row count does not agree with legacyLineage")
+
+    required_docs = [
+        ROOT / "AGENTS.md",
+        ROOT / "README.md",
+        ROOT / "MIGRATION_SOURCE.md",
+        ACTIVE_SPEC,
+        SUPERSEDED_DESKTOP_SPEC,
+        HISTORICAL_SPEC,
+        ROOT / "docs/specs/spec-first-ai-development.md",
+        ROOT / "docs/parity/desktop-main-release-evidence.json",
+    ]
+    for file in required_docs:
         if not file.is_file():
             errors.append(f"missing canonical authority document: {file}")
+
+    agents_path = ROOT / "AGENTS.md"
+    if agents_path.is_file():
+        agents_text = agents_path.read_text(encoding="utf-8")
+        for token in [
+            "fabushiios/fabushi-ios",
+            "bhrumom/gpui-telegram",
+            "docs/specs/gpui-telegram-main-ios-parity.md",
+            "manifests/desktop-main-authority.json",
+            "only in GitHub Actions or a user-authorized remote runtime",
+            "IOS-MAIN-AC-01..21",
+        ]:
+            if token not in agents_text:
+                errors.append(f"AGENTS.md missing normative token {token}")
+
     if ACTIVE_SPEC.is_file():
         active = ACTIVE_SPEC.read_text(encoding="utf-8")
-        for token in ["Desktop main", "IOS-MAIN-AUTH-01", "IOS-MAIN-AC-21"]:
+        for token in [
+            "bhrumom/gpui-telegram",
+            "bhrunom/gpui-telegram",
+            "bhrumom/fabushi-desktop",
+            "manifests/desktop-main-authority.json",
+            "IOS-MAIN-AUTH-01",
+            "IOS-MAIN-INV-01",
+            "IOS-MAIN-LEDGER-01",
+            "IOS-MAIN-GATE-01",
+            "IOS-MAIN-AC-01",
+            "IOS-MAIN-AC-21",
+        ]:
             if token not in active:
                 errors.append(f"canonical iOS Spec missing normative token {token}")
 
+    if SUPERSEDED_DESKTOP_SPEC.is_file():
+        superseded = SUPERSEDED_DESKTOP_SPEC.read_text(encoding="utf-8")
+        for token in ["Status: superseded", "docs/specs/gpui-telegram-main-ios-parity.md"]:
+            if token not in superseded:
+                errors.append(f"superseded fabushi-desktop Spec missing token {token}")
 
-def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete, checkout):
+
+def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete, checkout, verify_api_tree=False):
     source_sha = lock.get("commit")
+    inv = lock.get("inventory", {})
+    ledger_mode = inv.get("fileLedgerMode")
+    lineage = lock.get("legacyLineage", {})
+
+    if complete and ledger_mode != "current-main-complete":
+        errors.append(
+            f"--complete requires inventory.fileLedgerMode == 'current-main-complete'; got {ledger_mode!r}"
+        )
+
+    is_legacy_archived = ledger_mode == "legacy-predecessor-archived"
+    if is_legacy_archived:
+        warnings.append(
+            "per-file manifest/ledger chunks remain archived bhrumom/fabushi-desktop predecessor lineage "
+            "pending M6 full crates/** ledger regeneration; --complete remains fail-closed blocked"
+        )
+
+    expected_selected_count = (
+        lineage.get("lastInventoriedSelectedCount") if is_legacy_archived else inv.get("selectedFileCount")
+    )
+    expected_nonselected_count = (
+        (lineage.get("lastInventoriedFullTrackedCount", 0) - lineage.get("lastInventoriedSelectedCount", 0))
+        if is_legacy_archived
+        else inv.get("nonselectedCount")
+    )
+    expected_ledger_commit = lineage.get("lastInventoriedCommit") if is_legacy_archived else source_sha
+    expected_ledger_tree = lineage.get("lastInventoriedRootTreeSha") if is_legacy_archived else lock.get("rootTreeSha")
+
     recorded = {}
     for group in manifest_index.get("groups", []):
         path = ROOT / group["path"]
@@ -180,6 +498,7 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
             if p in recorded:
                 errors.append(f"duplicate manifest source path {p}")
             recorded[p] = row
+
     ledgers = {}
     statuses, dispositions = Counter(), Counter()
     for group in ledger_index.get("chunks", []):
@@ -200,22 +519,30 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
             ledgers[p] = row
             statuses[row.get("implementation_status")] += 1
             dispositions[row.get("ios_disposition")] += 1
-            check_status(row, p, complete, errors, warnings, source_sha)
-    if len(recorded) != lock["inventory"]["selectedFileCount"]:
-        errors.append(f"selected source count mismatch: {len(recorded)}")
-    if len(ledgers) != lock["inventory"]["selectedFileCount"]:
-        errors.append(f"selected parity row count mismatch: {len(ledgers)}")
+            check_status(row, p, False if is_legacy_archived else complete, errors, warnings, expected_ledger_commit)
+
+    if len(recorded) != expected_selected_count:
+        errors.append(f"selected source count mismatch: {len(recorded)} != {expected_selected_count}")
+    if len(ledgers) != expected_selected_count:
+        errors.append(f"selected parity row count mismatch: {len(ledgers)} != {expected_selected_count}")
     if set(recorded) != set(ledgers):
-        errors.append(f"manifest/ledger paths drift: missing={list(set(recorded)-set(ledgers))[:5]} extra={list(set(ledgers)-set(recorded))[:5]}")
+        errors.append(
+            f"manifest/ledger paths drift: missing={list(set(recorded)-set(ledgers))[:5]} "
+            f"extra={list(set(ledgers)-set(recorded))[:5]}"
+        )
     for path, row in recorded.items():
         if ledgers.get(path, {}).get("desktop_blob_sha") != row.get("blobSha"):
             errors.append(f"{path}: manifest/ledger Git blob mismatch")
-        if not (path.startswith("frontend/") or path.startswith("source/")):
-            errors.append(f"{path}: selected root contamination")
+        if is_legacy_archived:
+            if not (path.startswith("frontend/") or path.startswith("source/")):
+                errors.append(f"{path}: legacy archived selected root contamination")
+        else:
+            if not path.startswith("crates/"):
+                errors.append(f"{path}: selected root contamination (expected crates/**)")
         if not HEX40.fullmatch(row.get("blobSha") or ""):
             errors.append(f"{path}: invalid exact Git blob SHA")
 
-    unselected = document(ROOT / lock["inventory"]["nonselectedRegister"])
+    unselected = document(ROOT / inv["nonselectedRegister"])
     outside = {}
     if unselected.get("count") != len(unselected.get("entries", [])):
         errors.append("nonselected tracked entry count mismatch")
@@ -224,14 +551,18 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
         if p in outside:
             errors.append(f"duplicate nonselected path: {p}")
         outside[p] = r
-        if p in recorded or p.startswith("frontend/") or p.startswith("source/"):
-            errors.append(f"nonselected register contains selected path: {p}")
-    if len(outside) != lock["inventory"]["nonselectedCount"]:
-        errors.append("nonselected tracked count differs from authority lock")
+        if is_legacy_archived:
+            if p in recorded or p.startswith("frontend/") or p.startswith("source/"):
+                errors.append(f"nonselected register contains legacy selected path: {p}")
+        else:
+            if p in recorded or p.startswith("crates/"):
+                errors.append(f"nonselected register contains selected path: {p}")
+    if len(outside) != expected_nonselected_count:
+        errors.append(f"nonselected tracked count differs from expected: {len(outside)} != {expected_nonselected_count}")
 
-    impact = document(ROOT / lock["inventory"]["impactRegister"])
-    if impact.get("currentCommit") != source_sha or impact.get("fullTree") != lock.get("rootTreeSha"):
-        errors.append("impact register is not bound to current main")
+    impact = document(ROOT / inv["impactRegister"])
+    if impact.get("currentCommit") != expected_ledger_commit or impact.get("fullTree") != expected_ledger_tree:
+        errors.append("impact register is not bound to expected authority commit/tree")
     if impact.get("directCount") != len([x for x in impact.get("directChanges", []) if x["change"] != "metadata-corrected"]):
         errors.append("impact direct-change count inconsistent")
     for change in impact.get("directChanges", []):
@@ -244,76 +575,89 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
             if row and row.get("implementation_status") in {"verified", "implemented"}:
                 errors.append(f"changed source incorrectly accepted: {change['path']}")
 
+    computed_digests = (None, None)
+    real = None
     if checkout is not None:
         actual_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout).decode().strip()
         actual_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=checkout).decode().strip()
-        if actual_head != source_sha or actual_tree != lock["rootTreeSha"]:
-            errors.append(f"Desktop checkout identity drift: commit={actual_head} tree={actual_tree}")
         real = git_tree(checkout)
-        if len(real) != lock["inventory"]["fullTrackedCount"]:
-            errors.append(f"full tracked Desktop tree count drift: {len(real)}")
-        selected = {p:x for p,x in real.items() if p.startswith("frontend/") or p.startswith("source/")}
-        if len(selected) != lock["inventory"]["selectedFileCount"]:
-            errors.append(f"selected Desktop tree count drift: {len(selected)}")
-        if tree_digest(real) != lock["inventory"]["fullTreeSha256"]:
-            errors.append("full tracked Desktop root tree inventory SHA256 drift")
-        if tree_digest(selected) != lock["inventory"]["selectedTreeSha256"]:
-            errors.append("selected Desktop source inventory SHA256 drift")
+        computed_digests = verify_tree_entries(real, lock, errors, actual_head=actual_head, actual_tree=actual_tree)
+    elif verify_api_tree:
+        api_tree_sha = github_api_commit_tree(lock["repository"], source_sha)
+        real = github_api_tree(lock["repository"], lock["rootTreeSha"])
+        computed_digests = verify_tree_entries(real, lock, errors, actual_head=source_sha, actual_tree=api_tree_sha)
+
+    if real is not None and not is_legacy_archived:
         if set(real) != set(recorded) | set(outside):
             errors.append("full Desktop tree has missing/unexpected tracked paths")
         for path, row in recorded.items():
-            got=real.get(path)
+            got = real.get(path)
             if not got or got[1] != "blob" or got[2] != row["blobSha"] or got[3] != row.get("size"):
                 errors.append(f"{path}: blob/size does not match live main exact Git tree")
         for path, row in outside.items():
-            got=real.get(path)
+            got = real.get(path)
             if not got or got != (row.get("mode"), row.get("type"), row.get("sha"), row.get("size")):
                 errors.append(f"{path}: nonselected Git identity differs from live main")
+
     release_path = ROOT / "docs/parity/desktop-main-release-evidence.json"
     if not release_path.is_file():
         errors.append("missing durable current-main release acceptance/evidence matrix")
         release = {}
     else:
         release = document(release_path)
+        if release.get("desktopRepository") != lock.get("repository"):
+            errors.append(
+                f"release acceptance matrix desktopRepository mismatch: {release.get('desktopRepository')!r} != {lock.get('repository')!r}"
+            )
         if release.get("desktopSourceCommit") != source_sha or release.get("desktopRootTree") != lock.get("rootTreeSha"):
             errors.append("release acceptance matrix is not bound to current Desktop main")
-        expected_ac={f"IOS-MAIN-AC-{i:02d}" for i in range(1,22)}
-        entries=release.get("acceptanceCriteria", [])
-        actual_ac=[r.get("id") for r in entries]
-        if len(actual_ac)!=21 or set(actual_ac)!=expected_ac:
+        expected_ac = {f"IOS-MAIN-AC-{i:02d}" for i in range(1, 22)}
+        entries = release.get("acceptanceCriteria", [])
+        actual_ac = [r.get("id") for r in entries]
+        if len(actual_ac) != 21 or set(actual_ac) != expected_ac:
             errors.append("release matrix must contain exactly 21 stable acceptance criterion IDs")
         for r in entries:
-            if r.get("status")=="passed":
+            if r.get("status") == "passed":
                 if not r.get("evidence") or not r.get("independentReviewer"):
                     errors.append(f"{r.get('id')}: passed claim lacks evidence or independent reviewer")
                 if r.get("iosCommit") != os.environ.get("IOS_EXPECTED_HEAD"):
                     errors.append(f"{r.get('id')}: passed claim not tied to current iOS exact head")
-        for key,gate in release.get("releaseGates", {}).items():
-            if gate.get("status")=="passed":
-                required=["iosCommit","desktopCommit","workflowRun","runAttempt","job","requiredSteps","artifactId","artifactDigest","independentReviewer"]
+        for key, gate in release.get("releaseGates", {}).items():
+            if gate.get("status") == "passed":
+                required = [
+                    "iosCommit", "desktopCommit", "workflowRun", "runAttempt", "job",
+                    "requiredSteps", "artifactId", "artifactDigest", "independentReviewer",
+                ]
                 for field in required:
                     if not gate.get(field):
                         errors.append(f"{key}: passed release gate lacks {field}")
                 if gate.get("desktopCommit") != source_sha or gate.get("iosCommit") != os.environ.get("IOS_EXPECTED_HEAD"):
                     errors.append(f"{key}: passed release gate source identity mismatch")
-                if not re.fullmatch(r"sha256:[0-9a-f]{64}",gate.get("artifactDigest") or ""):
+                if not re.fullmatch(r"sha256:[0-9a-f]{64}", gate.get("artifactDigest") or ""):
                     errors.append(f"{key}: passed release artifact digest not sha256")
-                if gate.get("requiredSteps") and any(step.get("conclusion")!="success" or step.get("status")!="completed" for step in gate["requiredSteps"]):
+                if gate.get("requiredSteps") and any(
+                    step.get("conclusion") != "success" or step.get("status") != "completed"
+                    for step in gate["requiredSteps"]
+                ):
                     errors.append(f"{key}: passed release gate has missing, skipped or failed required step")
         if complete:
             if release.get("finalAcceptance") is not True:
                 errors.append("final independent iOS release acceptance not recorded")
             for r in entries:
-                if r.get("status")!="passed":
+                if r.get("status") != "passed":
                     errors.append(f"{r.get('id')}: mandatory release criterion not accepted")
-            for name,gate in release.get("releaseGates", {}).items():
-                if gate.get("status")!="passed":
+            for name, gate in release.get("releaseGates", {}).items():
+                if gate.get("status") != "passed":
                     errors.append(f"release gate pending/blocked: {name}")
 
     if complete:
         for key in ("baselineReady", "dependenciesReviewed", "completenessAccepted", "acceptanceAccepted"):
             if lock.get(key) is not True:
                 errors.append(f"release gate not closed: {key}")
+        if not HEX64.fullmatch(str(inv.get("fullTreeSha256") or "")):
+            errors.append("--complete requires non-null 64-hex inventory.fullTreeSha256")
+        if not HEX64.fullmatch(str(inv.get("selectedTreeSha256") or "")):
+            errors.append("--complete requires non-null 64-hex inventory.selectedTreeSha256")
         if impact.get("fullReviewAccepted") is not True or impact.get("dependencyReview", {}).get("status") != "verified":
             errors.append("upstream changed-owner/protocol impact review not closed")
         for row in outside.values():
@@ -321,13 +665,197 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
                 errors.append(f"nonselected tracked item unreviewed: {row.get('path')}")
         if checkout is None:
             errors.append("--complete requires a pinned actual Desktop Git checkout")
-    return statuses, dispositions
+        verify_host_anti_stub(ROOT, errors)
+    return statuses, dispositions, computed_digests
 
 
-def verify_ios_owners(errors):
-    """Keep preexisting shipping-path architecture regression fences intact."""
+def _iter_dependency_tables(parsed):
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        tbl = parsed.get(key)
+        if isinstance(tbl, dict):
+            yield key, tbl
+    ws = parsed.get("workspace")
+    if isinstance(ws, dict) and isinstance(ws.get("dependencies"), dict):
+        yield "workspace.dependencies", ws["dependencies"]
+    targets = parsed.get("target")
+    if isinstance(targets, dict):
+        for cfg, body in targets.items():
+            if not isinstance(body, dict):
+                continue
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                tbl = body.get(key)
+                if isinstance(tbl, dict):
+                    yield f"target.{cfg}.{key}", tbl
+
+
+def verify_cargo_toml_hygiene(
+    cargo_toml_path,
+    core_root,
+    forbidden_deps,
+    errors,
+    require_path_exists=True,
+):
+    text = cargo_toml_path.read_text(encoding="utf-8")
+    try:
+        rel_display = str(cargo_toml_path.relative_to(ROOT))
+    except ValueError:
+        rel_display = str(cargo_toml_path)
+
+    for forbidden in FORBIDDEN_EXTERNAL_REPO_STRINGS:
+        if forbidden in text:
+            errors.append(f"{rel_display}: introduces forbidden cross-repo dependency string: {forbidden}")
+
+    if tomllib is None:  # pragma: no cover
+        errors.append("Python 3.11+ tomllib is required to validate Cargo.toml manifests")
+        return
+
+    try:
+        parsed = tomllib.loads(text)
+    except Exception as exc:
+        errors.append(f"{rel_display}: failed to parse Cargo.toml: {exc}")
+        return
+
+    core_root_resolved = core_root.resolve()
+    forbidden_set = set(forbidden_deps)
+
+    for table_name, deps in _iter_dependency_tables(parsed):
+        for dep_key, spec in deps.items():
+            pkg_name = dep_key
+            if isinstance(spec, dict) and isinstance(spec.get("package"), str):
+                pkg_name = spec["package"]
+            if dep_key in forbidden_set or pkg_name in forbidden_set:
+                errors.append(
+                    f"{rel_display} [{table_name}]: forbidden mobile dependency {dep_key!r} (package={pkg_name!r})"
+                )
+            if isinstance(spec, dict):
+                dep_path = spec.get("path")
+                if isinstance(dep_path, str):
+                    if dep_path.startswith("/") or WINDOWS_ABS_RE.match(dep_path) or Path(dep_path).is_absolute():
+                        errors.append(
+                            f"{rel_display} [{table_name}.{dep_key}]: absolute path dependency forbidden: {dep_path!r}"
+                        )
+                    else:
+                        resolved = (cargo_toml_path.parent / dep_path).resolve()
+                        try:
+                            resolved.relative_to(core_root_resolved)
+                        except ValueError:
+                            errors.append(
+                                f"{rel_display} [{table_name}.{dep_key}]: path dependency escapes {core_root_resolved}: {dep_path!r}"
+                            )
+                        else:
+                            if require_path_exists and not resolved.exists():
+                                errors.append(
+                                    f"{rel_display} [{table_name}.{dep_key}]: path dependency target does not exist: {dep_path!r}"
+                                )
+                git_url = spec.get("git")
+                if isinstance(git_url, str) and FORBIDDEN_GIT_ORG_RE.search(git_url):
+                    errors.append(
+                        f"{rel_display} [{table_name}.{dep_key}]: external Fabushi git dependency forbidden: {git_url!r}"
+                    )
+
+
+def verify_desktop_core_workspace(core_root, lock, errors):
+    root_toml = core_root / "Cargo.toml"
+    if not core_root.is_dir():
+        errors.append("missing iOS-owned desktop_core directory: source/desktop_core")
+        return
+    if not root_toml.is_file():
+        errors.append("missing iOS-owned workspace manifest: source/desktop_core/Cargo.toml")
+        return
+
+    forbidden_deps = set(FORBIDDEN_MOBILE_DEPS)
+    if lock and isinstance(lock.get("forbiddenMobileWorkspaceDeps"), list):
+        forbidden_deps |= set(lock["forbiddenMobileWorkspaceDeps"])
+    excluded_crates = set(EXCLUDED_DESKTOP_CRATES)
+    if lock and isinstance(lock.get("excludedDesktopCrates"), list):
+        excluded_crates |= set(lock["excludedDesktopCrates"])
+
+    verify_cargo_toml_hygiene(root_toml, core_root, forbidden_deps, errors, require_path_exists=True)
+    parsed = tomllib.loads(root_toml.read_text(encoding="utf-8"))
+    ws = parsed.get("workspace", {})
+    members = ws.get("members", [])
+    excludes = set(ws.get("exclude", []))
+    ws_pkg = ws.get("package", {})
+    if ws_pkg.get("edition") != "2024":
+        errors.append(f"source/desktop_core/Cargo.toml: workspace.package.edition must be '2024', got {ws_pkg.get('edition')!r}")
+    for profile_name in ("dev", "test"):
+        prof = (parsed.get("profile") or {}).get(profile_name, {})
+        if prof.get("debug") != 0 or prof.get("incremental") is not False:
+            errors.append(f"source/desktop_core/Cargo.toml: profile.{profile_name} must enforce debug=0 and incremental=false")
+
+    member_set = set(members)
+    if lock:
+        for crate in lock.get("vendoredCoreCrates", []):
+            rel_member = f"crates/{crate}"
+            if rel_member not in member_set:
+                errors.append(f"source/desktop_core/Cargo.toml missing required vendored member: {rel_member}")
+            if not (core_root / rel_member / "Cargo.toml").is_file():
+                errors.append(f"missing vendored crate manifest: source/desktop_core/{rel_member}/Cargo.toml")
+        for shared_dir in lock.get("vendoredSharedSourceDirs", []):
+            if not (core_root / "crates" / shared_dir).is_dir():
+                errors.append(f"missing vendored shared source directory: source/desktop_core/crates/{shared_dir}")
+
+    for excluded in sorted(excluded_crates):
+        if f"crates/{excluded}" in member_set or excluded in member_set:
+            errors.append(f"source/desktop_core/Cargo.toml includes excluded desktop crate: {excluded}")
+        if (core_root / "crates" / excluded).exists():
+            errors.append(f"excluded desktop crate directory present under source/desktop_core/crates/{excluded}")
+
+    excluded_paths = [(core_root / ex).resolve() for ex in excludes]
+    for toml_file in sorted(core_root.rglob("Cargo.toml")):
+        if "target" in toml_file.relative_to(core_root).parts:
+            continue
+        if toml_file == root_toml:
+            continue
+        is_excluded = any(
+            toml_file.resolve() == ep or ep in toml_file.resolve().parents
+            for ep in excluded_paths
+        )
+        verify_cargo_toml_hygiene(
+            toml_file,
+            core_root,
+            forbidden_deps,
+            errors,
+            require_path_exists=not is_excluded,
+        )
+
+
+def verify_test_ready_integrity(root, errors):
+    test_ready = root / "TEST_READY.md"
+    if not test_ready.is_file():
+        return
+    text = test_ready.read_text(encoding="utf-8")
+    for pat in LOCAL_PATH_PATTERNS:
+        if pat.search(text):
+            errors.append(f"TEST_READY.md contains forbidden local host path matching {pat.pattern!r}")
+    for marker in ("cd /Users/", "worker_m6_iter3_impl", "bhrumom/fabushi-desktop"):
+        if marker in text:
+            errors.append(f"TEST_READY.md contains forbidden stale/local-only marker: {marker!r}")
+    has_actions_url = "github.com/fabushiios/fabushi-ios/actions/runs/" in text
+    has_run_id = "GITHUB_RUN_ID" in text
+    has_sha = bool(re.search(r"\b[0-9a-f]{40}\b", text))
+    if not ((has_actions_url or has_run_id) and has_sha):
+        errors.append(
+            "TEST_READY.md lacks required GitHub Actions run provenance (actions run URL or GITHUB_RUN_ID) and exact 40-hex commit SHA"
+        )
+
+
+def verify_host_anti_stub(root, errors):
+    dispatch = root / "source/host/src/dispatch.rs"
+    if not dispatch.is_file():
+        errors.append("missing C-ABI host dispatch owner: source/host/src/dispatch.rs")
+        return
+    text = dispatch.read_text(encoding="utf-8")
+    for bad in ('"status": "acknowledged"', "sample_chats"):
+        if bad in text:
+            errors.append(f"source/host/src/dispatch.rs contains forbidden stub/fake fallback: {bad}")
+
+
+def verify_ios_owners(errors, lock=None):
+    """Keep preexisting shipping-path architecture regression fences and standalone iOS core checks intact."""
     required_roots = [
         "frontend",
+        "source/desktop_core",
         "source/ios-main",
         "source/ios-preload",
         "source/ios-dev-controls",
@@ -351,21 +879,20 @@ def verify_ios_owners(errors):
     dependency_files = [
         ROOT / "mobile/ios/project.yml",
         ROOT / "source/packages/mahayana-rs/Cargo.toml",
+        ROOT / "source/host/Cargo.toml",
     ]
     for dependency_file in dependency_files:
         if not dependency_file.is_file():
             continue
         text = dependency_file.read_text(encoding="utf-8")
-        for forbidden in [
-            "bhrumom/fabushi-platform-core",
-            "../fabushi-platform-core",
-            "../fabushi-desktop",
-            "github.com/bhrumom/fabushi-desktop",
-        ]:
+        for forbidden in FORBIDDEN_EXTERNAL_REPO_STRINGS:
             if forbidden in text:
                 errors.append(
                     f"{dependency_file.relative_to(ROOT)} introduces forbidden cross-repo runtime dependency: {forbidden}"
                 )
+
+    verify_desktop_core_workspace(ROOT / "source/desktop_core", lock, errors)
+    verify_test_ready_integrity(ROOT, errors)
 
     # Preserve the shipping ownership chain established by PR #3 while it is re-audited.
     preload = ROOT / "source/ios-preload/preload.swift"
@@ -384,11 +911,7 @@ def verify_ios_owners(errors):
             if forbidden in text:
                 errors.append(f"FabushiApp.swift directly constructs runtime owner: {forbidden}")
 
-
     # Desktop packaged acceptance reads one canonical agent-avatar responsibility.
-    # iOS owns its platform-adapted dispatcher natively: custom image -> shared room ->
-    # group -> persona. Shipping Agent surfaces must call MobileAgentAvatar rather than
-    # bypassing that dispatcher through the legacy decorative ClothGhostAvatar.
     avatar_path = ROOT / "frontend/src/recovered/features/agent-info/ClothGhostAvatar.swift"
     summary_path = ROOT / "frontend/src/recovered/features/agent-info/MobileBotSummary.swift"
     bot_service_path = ROOT / "frontend/src/production/GrokMobileBotService.swift"
@@ -460,9 +983,9 @@ def verify_ios_owners(errors):
             errors.append("native Agent home rows bypass canonical MobileAgentAvatar")
 
     # Native owner composition and device security remain part of strict architecture.
-    rust_host=ROOT / "source/packages/mahayana-rs/mahayana-host/src/lib.rs"
+    rust_host = ROOT / "source/packages/mahayana-rs/mahayana-host/src/lib.rs"
     if rust_host.is_file():
-        source=rust_host.read_text(encoding="utf-8")
+        source = rust_host.read_text(encoding="utf-8")
         for token in ["ModelCredentialResolver", "credential_client.session_token()", "ModelProviderMode::UserConfiguredRemote"]:
             if token not in source:
                 errors.append(f"missing native credential separation contract: {token}")
@@ -472,56 +995,93 @@ def verify_ios_owners(errors):
 
 
 def run():
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--strict",action="store_true",help="verify shipping owner composition and fail closed on authority drift")
-    parser.add_argument("--complete",action="store_true",help="require full current-main responsibility, release, and evidence closure")
-    parser.add_argument("--authority-only",action="store_true",help="fast start/end live main authority check (not a complete source audit)")
-    parser.add_argument("--desktop-checkout",type=Path,help="pinned Desktop-main checkout; required for source tree acceptance")
-    args=parser.parse_args()
-    errors=[]; warnings=[]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--strict", action="store_true", help="verify shipping owner composition and fail closed on authority drift")
+    parser.add_argument("--complete", action="store_true", help="require full current-main responsibility, release, and evidence closure")
+    parser.add_argument("--authority-only", action="store_true", help="fast start/end live main authority check (not a complete source audit)")
+    parser.add_argument("--desktop-checkout", type=Path, help="pinned Desktop-main checkout; required for source tree acceptance")
+    parser.add_argument("--verify-api-tree", action="store_true", help="verify non-truncated full Git tree via GitHub REST API")
+    parser.add_argument("--check-host-bridge", action="store_true", help="enforce fail-closed anti-stub checks on source/host/src/dispatch.rs")
+    args = parser.parse_args()
+    errors = []
+    warnings = []
     try:
-        for p in [LOCK,MANIFEST_INDEX,LEDGER_INDEX]:
+        for p in [LOCK, MANIFEST_INDEX, LEDGER_INDEX]:
             if not p.is_file():
                 errors.append(f"missing canonical machine authority file: {p}")
         if errors:
             raise ValueError("; ".join(errors))
-        lock,manifest,ledger=(document(x) for x in (LOCK,MANIFEST_INDEX,LEDGER_INDEX))
-        verify_snapshot(lock,manifest,ledger,errors)
-        observed=live_head()
-        if observed!=lock.get("commit"):
+        lock, manifest, ledger = (document(x) for x in (LOCK, MANIFEST_INDEX, LEDGER_INDEX))
+        verify_snapshot(lock, manifest, ledger, errors)
+        observed = live_head()
+        if observed != lock.get("commit"):
             errors.append(f"STALE Desktop main lock: recorded={lock.get('commit')} live={observed}")
-        expected=os.environ.get("IOS_EXPECTED_HEAD")
+        expected = os.environ.get("IOS_EXPECTED_HEAD")
         if expected:
-            own_head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT).decode().strip()
-            if own_head!=expected:
+            own_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
+            if own_head != expected:
                 errors.append(f"iOS exact-head checkout differs from event source: {own_head} != {expected}")
-        statuses=dispositions=None
-        if not args.authority_only:
-            checkout=args.desktop_checkout.resolve() if args.desktop_checkout else None
-            statuses,dispositions=verify_files(lock,manifest,ledger,errors,warnings,args.complete,checkout)
-            if args.strict or args.complete:
-                verify_ios_owners(errors)
-        elif args.complete:
+        statuses = dispositions = None
+        computed_digests = (None, None)
+        if args.authority_only and args.complete:
             errors.append("--complete is incompatible with --authority-only")
+        elif not args.authority_only:
+            checkout = args.desktop_checkout.resolve() if args.desktop_checkout else None
+            use_api_tree = args.verify_api_tree or (args.strict and checkout is None)
+            statuses, dispositions, computed_digests = verify_files(
+                lock,
+                manifest,
+                ledger,
+                errors,
+                warnings,
+                args.complete,
+                checkout,
+                verify_api_tree=use_api_tree,
+            )
+            if args.strict or args.complete:
+                verify_ios_owners(errors, lock)
+        else:
+            if args.strict:
+                verify_ios_owners(errors, lock)
+            if args.verify_api_tree:
+                api_tree_sha = github_api_commit_tree(lock["repository"], lock["commit"])
+                real = github_api_tree(lock["repository"], lock["rootTreeSha"])
+                computed_digests = verify_tree_entries(
+                    real, lock, errors, actual_head=lock["commit"], actual_tree=api_tree_sha
+                )
+        if args.check_host_bridge:
+            verify_host_anti_stub(ROOT, errors)
         if errors:
             for message in errors[:250]:
-                print("ERROR:",message)
-            if len(errors)>250:
+                print("ERROR:", message)
+            if len(errors) > 250:
                 print(f"ERROR: {len(errors)-250} additional errors (truncated)")
             return 1
         if statuses is not None:
-            print(f"Desktop main -> iOS source authority {lock['commit']} tree={lock['rootTreeSha']} "
-                  f"tracked={lock['inventory']['fullTrackedCount']} selected={lock['inventory']['selectedFileCount']} "
-                  f"statuses={dict(statuses)} dispositions={dict(dispositions)}")
+            print(
+                f"Desktop main ({lock['repository']}) -> iOS source authority {lock['commit']} "
+                f"tree={lock['rootTreeSha']} tracked={lock['inventory']['fullTrackedCount']} "
+                f"selected={lock['inventory']['selectedFileCount']} "
+                f"fileLedgerMode={lock['inventory']['fileLedgerMode']} "
+                f"statuses={dict(statuses)} dispositions={dict(dispositions)}"
+            )
+        if computed_digests[0] is not None:
+            print(
+                f"TREE_DIGESTS fullTreeSha256={computed_digests[0]} "
+                f"selectedTreeSha256={computed_digests[1]}"
+            )
         for message in warnings[:15]:
-            print("HISTORICAL:",message)
-        if len(warnings)>15:
+            print("HISTORICAL:", message)
+        if len(warnings) > 15:
             print(f"HISTORICAL: {len(warnings)-15} additional row statuses are not current-main acceptance")
-        print("PASS: live Desktop main authority"+(" and source/ledger identity" if not args.authority_only else "")+
-              "; full product/release completeness is NOT implied")
+        print(
+            "PASS: live Desktop main authority"
+            + (" and source/ledger identity" if not args.authority_only else "")
+            + "; full product/release completeness is NOT implied"
+        )
         return 0
-    except (OSError,ValueError,KeyError,subprocess.SubprocessError,json.JSONDecodeError) as exc:
-        print("ERROR: fail-closed authority validation:",exc)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        print("ERROR: fail-closed authority validation:", exc)
         return 1
 
 

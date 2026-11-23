@@ -1,12 +1,15 @@
 # Fabushi Desktop main -> Fabushi iOS native product parity
 
-Status: active
+Status: superseded
+Superseded By: docs/specs/gpui-telegram-main-ios-parity.md
 Spec ID: IOS-DESKTOP-MAIN-001
 Revision: 1
-Updated: 2026-10-11
-Target: fabushi-ios/fabushi-ios PR #3 and successors
-Canonical policy: this file, AGENTS.md, manifests/desktop-main-authority.json
+Updated: 2026-11-23
+Target: fabushiios/fabushi-ios (historical predecessor workstream PR #3)
+Legacy Lineage: bhrumom/fabushi-desktop@78d076cb8cc7d1ec157974cb9e91df9f599f0a71 (root tree 849eddbff71592e72b3b2389ddd1372fb0320055), absorbed into bhrumom/gpui-telegram/inherited/
+Active Canonical Policy: docs/specs/gpui-telegram-main-ios-parity.md, AGENTS.md, manifests/desktop-main-authority.json
 Historical baseline: docs/history/ios-desktop-pr20-spec-2026-10-08.md
+
 
 ## 1. Goal and live authority
 

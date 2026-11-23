@@ -196,7 +196,13 @@ pub struct DateTextCache {
 
 impl DateTextCache {
     pub fn resolve_date_text(&mut self, date: i64, now: i64) -> (&str, i32) {
-        let today_serial = (now / 86400) as i32;
+        let today_serial = chrono::DateTime::from_timestamp(now, 0)
+            .map(|dt| {
+                chrono::Datelike::num_days_from_ce(
+                    &dt.with_timezone(&chrono::Local).date_naive(),
+                )
+            })
+            .unwrap_or_else(|| (now / 86400) as i32);
         if self.message_time_id != date || self.today_serial != today_serial {
             self.text = format_dialog_date(date, now);
             self.width = (self.text.len() * 7) as i32; // Standard font metric approximation
@@ -207,23 +213,20 @@ impl DateTextCache {
     }
 }
 
-/// Format unix timestamp into dialog list short date string.
+/// Format unix timestamp into dialog list short date string in the local timezone.
 pub fn format_dialog_date(date: i64, now: i64) -> String {
     if date <= 0 {
         return String::new();
     }
+    let dt = chrono::DateTime::from_timestamp(date, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .with_timezone(&chrono::Local);
     let diff = now.saturating_sub(date);
     if diff < 86400 {
-        let dt = chrono::DateTime::from_timestamp(date, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
         dt.format("%H:%M").to_string()
     } else if diff < 7 * 86400 {
-        let dt = chrono::DateTime::from_timestamp(date, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
         dt.format("%a").to_string()
     } else {
-        let dt = chrono::DateTime::from_timestamp(date, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
         dt.format("%d.%m.%y").to_string()
     }
 }
@@ -312,5 +315,28 @@ impl DialogEntryData {
             .split_whitespace()
             .map(|w| w.to_lowercase())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_dialog_date_uses_local_timezone() {
+        let ts = 1_700_000_000_i64;
+        let expected_hm = chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(format_dialog_date(ts, ts + 60), expected_hm);
+
+        let expected_dmy = chrono::DateTime::from_timestamp(ts, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%d.%m.%y")
+            .to_string();
+        assert_eq!(format_dialog_date(ts, ts + 10 * 86400), expected_dmy);
     }
 }

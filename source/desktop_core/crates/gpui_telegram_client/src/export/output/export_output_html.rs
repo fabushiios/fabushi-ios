@@ -1,7 +1,6 @@
 //! Target Symbol: ExportOutputHtmlOutput
 //! Telegram Desktop 1:1 Submodule: `Telegram/SourceFiles/export/output/export_output_html.h`
 //! Subsystem: `export`, Feature ID: `TCG-N43`
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case)]
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -162,7 +161,7 @@ impl AbstractOutputWriter for ExportOutputHtmlOutput {
         let mut msgs_html = String::new();
         for m in messages {
             let date_str = chrono::DateTime::from_timestamp(m.date, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| m.date.to_string());
             msgs_html.push_str(&format!(
                 "<div class=\"message\"><span class=\"from\">{}</span><span class=\"date\">{}</span><div class=\"text\">{}</div></div>",

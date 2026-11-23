@@ -1146,8 +1146,17 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
 }
 
 fn is_snapshot_node_race(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound
-        || error.raw_os_error().is_some_and(|errno| errno == libc::ELOOP)
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error().is_some_and(|errno| errno == libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(unix)]

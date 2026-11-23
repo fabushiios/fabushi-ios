@@ -161,15 +161,17 @@ fn test_adversarial_cua_stale_generation_fencing_attack() {
         .expect("lease granted");
     let initial_gen = broker.current_generation();
 
-    // Execute valid action
+    // Validate active lease passes generation fence, and unbound executor reports unavailable backend honestly
     let valid_action = CuaAction::Click {
         x: 100,
         y: 200,
         button: "left".into(),
     };
-    assert!(
-        CuaExecutor::execute_action_fenced(&valid_action, &lease1, initial_gen).is_ok()
-    );
+    assert!(CuaExecutor::validate_fenced_lease(&lease1, initial_gen).is_ok());
+    let unbound_err = CuaExecutor::execute_action_fenced(&valid_action, &lease1, initial_gen)
+        .expect_err("unbound CUA executor must honestly fail")
+        .to_string();
+    assert!(unbound_err.contains("CUA backend unavailable"));
 
     // Human emergency takeover
     let takeover_gen = broker.emergency_takeover();

@@ -12,3 +12,7 @@
 /tests/e2e/remediate_*.py
 /tests/e2e/fix_*.py
 /tests/e2e/patch_*.py
+.agents/
+build/
+mobile/ios/Fabushi.xcodeproj
+mobile/ios/Fabushi.xcodeproj/

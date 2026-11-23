@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "macos-apple-silicon",
+      "os": "macos",
+      "gpu_vendor": "apple",
+      "preferred_codecs": ["h265", "h264", "vp8", "jpeg_fallback"],
+      "supports_444": true,
+      "supports_hdr": true,
+      "max_fps": 120
+    },
+    {
+      "id": "windows-nvidia",
+      "os": "windows",
+      "gpu_vendor": "nvidia",
+      "preferred_codecs": ["h265", "h264", "vp8", "jpeg_fallback"],
+      "supports_444": true,
+      "supports_hdr": true,
+      "max_fps": 144
+    },
+    {
+      "id": "windows-amd-legacy-downgrade",
+      "os": "windows",
+      "gpu_vendor": "amd",
+      "preferred_codecs": ["h264", "vp8", "jpeg_fallback"],
+      "supports_444": false,
+      "supports_hdr": false,
+      "max_fps": 60
+    },
+    {
+      "id": "linux-headless-fallback",
+      "os": "linux",
+      "gpu_vendor": "unknown",
+      "preferred_codecs": ["vp8", "h264", "jpeg_fallback"],
+      "supports_444": false,
+      "supports_hdr": false,
+      "max_fps": 60
+    }
+  ]
+}

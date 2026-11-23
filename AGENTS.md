@@ -1,18 +1,20 @@
 # Fabushi iOS — Agent Instructions
 
-Repository: fabushi-ios/fabushi-ios (not historical bhrumom/fabushi-ios).
+Repository: fabushiios/fabushi-ios (not historical redirects fabushi-ios/fabushi-ios or bhrumom/fabushi-ios).
 
 ## Mandatory active authority
 
-The **only live desktop product/architecture upstream** is bhrumom/fabushi-desktop branch main. The canonical iOS migration Spec is docs/specs/fabushi-desktop-main-ios-parity.md and the machine lock is manifests/desktop-main-authority.json.
+The **only live desktop product/architecture upstream** is bhrumom/gpui-telegram branch main (verified release Fabushi v1.6.7; exact HEAD `6141456e2a1121b78a6cdcd5da2a6d24c9c37e15`, root tree `836c181ac03585d0abc468f9d56a67a0dd20a9bf`, `11342` blobs: `3056` `crates/**` + `7713` `inherited/**`, `0` gitlinks). The canonical iOS migration Spec is docs/specs/gpui-telegram-main-ios-parity.md and the machine lock is manifests/desktop-main-authority.json.
+
+- Note on upstream naming & lineage: `bhrunom/gpui-telegram` is a verified HTTP 404 1-character typo for `bhrumom/gpui-telegram`. `bhrum/gpui-telegram` (archived `v1.3.0` mirror), `bhrumom/fabushi-desktop` (`78d076cb8cc7d1ec157974cb9e91df9f599f0a71`, legacy Electron predecessor absorbed into `bhrumom/gpui-telegram/inherited/`), and PR #11/#12/#20 are historical/lineage references only.
 
 1. Read this AGENTS.md and the canonical iOS Spec before product-affecting work.
-2. Resolve Desktop main and iOS branch exact HEADs; read Desktop root AGENTS.md, current project SOURCE_OF_TRUTH and accepted active Specs/contracts, then current shipping owners and CI oracles.
-3. Treat PR #20, Grok and unmerged Desktop PRs as historical/research only. Their old SHA, ledger count and green jobs do not prove current main parity.
-4. Distinguish Desktop requirement-only planned work from real shipping implementation; both remain in final scope, but neither may be fabricated as implemented/verified.
+2. Resolve Desktop main (`bhrumom/gpui-telegram@main`) and iOS branch exact HEADs; read Desktop root AGENTS.md, current project SOURCE_OF_TRUTH and accepted active Specs/contracts, then current shipping owners and CI oracles.
+3. Treat PR #11, PR #12, PR #20, archived `bhrum/gpui-telegram`, Grok and unmerged Desktop PRs as historical/research only. Their old SHA, ledger count and green jobs do not prove current main parity.
+4. Distinguish Desktop requirement-only planned work and upstream/external stubs from real shipping implementation; both remain in final scope, but neither may be fabricated as implemented/verified.
 5. Rebaseline all selected source and full tracked inventory against Desktop main; propagate owner/contract impacts, don't silently keep old verified rows.
-6. Existing-owner-first: unified Fabushi shell/conversation/transcript/composer/profile/settings/Marketplace and typed capability differences. Preserve Coordinator/Host/Runner, canonical security/state and lifecycle boundaries. Do not introduce a second app, Telegram runtime, Human-only workspace or shared Desktop/iOS runtime repository.
-7. Port product responsibility/effect, not filenames; use SwiftUI/UIKit/Apple native mechanisms where required; the source for all build/runtime inputs is iOS-owned.
+6. Existing-owner-first: unified Fabushi shell/conversation/transcript/composer/profile/settings/Agent Studio/Remote/Mini Apps/Marketplace and typed capability differences. Preserve Coordinator/Host/Runner, canonical security/state and lifecycle boundaries. Do not introduce a second app, duplicate workspace, or shared Desktop/iOS runtime repository (iOS-owned pure-Rust domain crates vendored inside `source/desktop_core/` form the canonical standalone iOS runtime with zero external Desktop checkout/repo dependency).
+7. Port product responsibility/effect, not filenames; use SwiftUI/UIKit/Apple native mechanisms (Apple HIG) where required; the source for all build/runtime inputs is 100% iOS-owned.
 8. Blocker != complete. All required GitHub Actions and native-device/signed/TestFlight/release checks need exact-head proof, non-skipped steps and artifact digests.
 
 ## Spec-first development
@@ -24,3 +26,4 @@ The **only live desktop product/architecture upstream** is bhrumom/fabushi-deskt
 All executable builds, tests, linters, generators, validators, benchmarks and acceptance run **only in GitHub Actions or a user-authorized remote runtime**, never local Mac/Windows or assistant container. Read-only investigation, Git/API editing are permitted. Missing runner/account/device/signing = blocked, not passed.
 
 The full completion bar is IOS-MAIN-AC-01..21 in the active Spec. Current source acceptance requires Desktop main SHA at the start **and end** of the gate, matching Git root tree/authority lock, exact iOS SHA, successful real shipping paths, and independent evidence review.
+

@@ -38,7 +38,7 @@ impl StorageFileLockWin {
             Err(e) => return Err(format!("Could not open lockfile {}: {}", path.display(), e)),
         };
 
-        let handle = file.as_raw_handle() as isize;
+        let _handle = file.as_raw_handle() as isize;
         // Windows LockFileEx with LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
         self.file = Some(file);
         self.path = Some(path.to_path_buf());

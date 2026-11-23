@@ -1,44 +1,117 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "authorityMode": "live-main",
-  "repository": "bhrumom/fabushi-desktop",
+  "repository": "bhrumom/gpui-telegram",
+  "repositoryId": 1449467779,
   "branch": "main",
-  "commit": "0ecf132681845231b597ece11bc5f979a9a8f0cc",
-  "rootTreeSha": "af3eb1b18ea3b6c80aa8359623e07f473f251c5b",
-  "observedAt": "2026-10-19",
-  "previousSourceCommit": "160703057b24f6339ef2d88732c38dced8bc13aa",
+  "commit": "6141456e2a1121b78a6cdcd5da2a6d24c9c37e15",
+  "rootTreeSha": "836c181ac03585d0abc468f9d56a67a0dd20a9bf",
+  "releaseTag": "v1.6.7",
+  "releaseName": "Fabushi v1.6.7",
+  "releasePublishedAt": "2026-11-23T01:31:53Z",
+  "observedAt": "2026-11-23",
+  "targetIosRepository": "fabushiios/fabushi-ios",
+  "targetIosReleaseVersion": "1.6.7",
+  "targetIosBuildNumber": 35,
+  "canonicalSpec": "docs/specs/gpui-telegram-main-ios-parity.md",
+  "typoNote": {
+    "requestedSlug": "bhrunom/gpui-telegram",
+    "status": "http-404-verified-typo",
+    "resolvedSlug": "bhrumom/gpui-telegram",
+    "reason": "GitHub user 'bhrunom' returns HTTP 404; verified 1-character typo for canonical live upstream 'bhrumom/gpui-telegram'."
+  },
+  "archivedIntermediateMirror": {
+    "repository": "bhrum/gpui-telegram",
+    "repositoryId": 1456601492,
+    "archived": true,
+    "frozenCommit": "b436dcdca2c05584dd522301a3201441fb3b4e0e",
+    "frozenRelease": "v1.3.0",
+    "authorityStatus": "historical-research-only"
+  },
+  "legacyLineage": {
+    "repository": "bhrumom/fabushi-desktop",
+    "repositoryId": 1375312893,
+    "branch": "main",
+    "commit": "78d076cb8cc7d1ec157974cb9e91df9f599f0a71",
+    "rootTreeSha": "849eddbff71592e72b3b2389ddd1372fb0320055",
+    "absorbedPathInUpstream": "inherited/",
+    "supersededSpec": "docs/specs/fabushi-desktop-main-ios-parity.md",
+    "lastInventoriedCommit": "0ecf132681845231b597ece11bc5f979a9a8f0cc",
+    "lastInventoriedRootTreeSha": "af3eb1b18ea3b6c80aa8359623e07f473f251c5b",
+    "lastInventoriedSelectedCount": 8014,
+    "lastInventoriedFullTrackedCount": 8288,
+    "authorityStatus": "superseded-legacy-lineage"
+  },
+  "vendoredCoreRoot": "source/desktop_core",
+  "vendoredCoreCrates": [
+    "gpui_telegram_core",
+    "gpui_telegram_proto",
+    "gpui_telegram_client",
+    "gpui_telegram_media",
+    "gpui_telegram_webrtc",
+    "gpui_telegram_agent",
+    "gpui_telegram_coding",
+    "magpie_gateway",
+    "bot-browser",
+    "fabushi_remote_engine",
+    "fabushi_miniapp"
+  ],
+  "vendoredSharedSourceDirs": [
+    "gpui_telegram_common"
+  ],
+  "excludedDesktopCrates": [
+    "gpui_telegram_desktop",
+    "fabushi_remote_daemon",
+    "gpui_telegram_cli",
+    "fabushi_miniapp_wasm",
+    "gpui_telegram_server",
+    "gpui_telegram_test_harness"
+  ],
+  "forbiddenMobileWorkspaceDeps": [
+    "gpui",
+    "khronos-egl",
+    "khronos_egl",
+    "gpui_telegram_desktop",
+    "fabushi_remote_daemon",
+    "gpui_telegram_cli",
+    "fabushi_miniapp_wasm",
+    "gpui_telegram_server",
+    "gpui_telegram_test_harness"
+  ],
   "inventory": {
+    "fileLedgerMode": "legacy-predecessor-archived",
     "selectedRoots": [
-      "frontend/**",
-      "source/**"
+      "crates/**"
     ],
-    "selectedFileCount": 8014,
-    "fullTrackedCount": 8288,
+    "inheritedRoots": [
+      "inherited/**"
+    ],
+    "selectedFileCount": 3056,
+    "inheritedFileCount": 7713,
+    "fullTrackedCount": 11342,
     "gitlinkCount": 0,
-    "nonselectedCount": 274,
-    "fullTreeSha256": "ea771f1c935961a8153ace366230021902b18fb795fac99e86d9c0af314ff31f",
-    "selectedTreeSha256": "7962a2b26856d9459296d31ce05165f810ecbf9b94c4c5d030842e4887c21427",
+    "nonselectedCount": 8286,
+    "treeTruncated": false,
+    "fullTreeSha256": null,
+    "selectedTreeSha256": null,
     "manifestIndex": "manifests/desktop-main-reference-index.json",
     "ledgerIndex": "docs/parity/desktop-main-index.json",
     "nonselectedRegister": "manifests/desktop-main/tracked-outside-selected.json",
-    "impactRegister": "docs/parity/desktop-main-impact.json"
+    "impactRegister": "docs/parity/desktop-main-impact.json",
+    "releaseEvidence": "docs/parity/desktop-main-release-evidence.json"
   },
   "baselineReady": false,
   "dependenciesReviewed": false,
   "completenessAccepted": false,
   "acceptanceAccepted": false,
-  "notes": "Rebased to live Desktop main 0ecf132681845231b597ece11bc5f979a9a8f0cc/af3eb1b18ea3b6c80aa8359623e07f473f251c5b; 0 selected files added and 0 selected blobs changed. All affected iOS rows remain review-fenced.",
+  "notes": "Spec-first M1a authority cutover to live bhrumom/gpui-telegram@main (Fabushi v1.6.7, commit 6141456e2a1121b78a6cdcd5da2a6d24c9c37e15, rootTreeSha 836c181ac03585d0abc468f9d56a67a0dd20a9bf, 11342 blobs, 0 gitlinks, 3056 crates/** blobs, 7713 inherited/** blobs). Legacy bhrumom/fabushi-desktop@0ecf1326 per-file ledger chunks remain archived as historical predecessor provenance until M6 full per-file ledger regeneration; --complete remains fail-closed blocked until fileLedgerMode == 'current-main-complete' and all IOS-MAIN-AC-01..21 pass.",
   "iosVerificationRebaseline": {
-    "observedAt": "2026-10-19",
-    "preEvidenceIosHead": "5b9ee267ca4304dd53764c912aa85ffbd342b8bd",
-    "desktopCommit": "0ecf132681845231b597ece11bc5f979a9a8f0cc",
-    "desktopTree": "af3eb1b18ea3b6c80aa8359623e07f473f251c5b",
-    "predecessorWorkflowRuns": [
-      38891864016,
-      38891864278,
-      38891864120
-    ],
-    "status": "desktop-authority-drift-rebaseline-current-main-review-required",
+    "observedAt": "2026-11-23",
+    "preEvidenceIosHead": "8128951a71503a6f109ce0cb37618d022fe8e79a",
+    "desktopCommit": "6141456e2a1121b78a6cdcd5da2a6d24c9c37e15",
+    "desktopTree": "836c181ac03585d0abc468f9d56a67a0dd20a9bf",
+    "predecessorWorkflowRuns": [],
+    "status": "gpui-telegram-v167-authority-cutover-verification-pending",
     "promotion": "none"
   }
 }
