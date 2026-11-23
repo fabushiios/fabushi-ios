@@ -79,6 +79,20 @@ final class FabushiRustHostActorTests: XCTestCase, @unchecked Sendable {
     }
 
     func testDebugTriggerPanicSurvivesCatchUnwindAndHostRemainsHealthy() async throws {
+        // 1. Verify typed Swift error decoding of Rust catch_unwind `host_panic` envelope
+        let decodedPanic = FabushiHostError.fromRPCError(
+            FabushiRPCErrorPayload(code: "host_panic", message: "simulated rust panic", retryable: false),
+            method: "debug.trigger_panic",
+            requestId: "req-panic",
+            requestedGeneration: 1,
+            responseGeneration: 1
+        )
+        XCTAssertEqual(decodedPanic, .rustPanic(message: "simulated rust panic"))
+        XCTAssertEqual(decodedPanic.code, "host_panic")
+
+        // 2. Verify live C-ABI behavior: on Release iOS staticlibs, M1b security hardening
+        // (source/host/src/host.rs:355) forces test_mode = false so debug.trigger_panic fails
+        // closed with `unknown_command`; on debug staticlibs it triggers catch_unwind `host_panic`.
         let dir = try makeTempDir("panic")
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -92,14 +106,12 @@ final class FabushiRustHostActorTests: XCTestCase, @unchecked Sendable {
 
         do {
             let _: FabushiJSONValue = try await host.dispatch(method: "debug.trigger_panic")
-            XCTFail("Expected host_panic on debug.trigger_panic in test_mode")
+            XCTFail("debug.trigger_panic must fail closed (unknown_command on Release iOS or host_panic on debug)")
         } catch let err as FabushiHostError {
-            XCTAssertEqual(err.code, "host_panic")
-            if case .rustPanic = err {
-                // Expected safe catch_unwind recovery
-            } else {
-                XCTFail("Expected .rustPanic error, got \(err)")
-            }
+            XCTAssertTrue(
+                err.code == "unknown_command" || err.code == "host_panic",
+                "Expected fail-closed unknown_command (Release iOS gate) or host_panic (debug catch_unwind), got \(err)"
+            )
         }
 
         // Subsequent RPC MUST continue working normally

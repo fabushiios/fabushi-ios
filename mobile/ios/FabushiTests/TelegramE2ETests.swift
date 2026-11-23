@@ -84,12 +84,15 @@ public final class TelegramE2ETests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(err.code, "unknown_command")
         }
 
-        // Panic recovery MUST keep host alive
+        // Release iOS staticlib forces test_mode = false (unknown_command); debug staticlib triggers host_panic
         do {
             let _: FabushiJSONValue = try await host.dispatch(method: "debug.trigger_panic")
-            XCTFail("Expected host_panic")
+            XCTFail("Expected fail-closed unknown_command or host_panic")
         } catch let err as FabushiHostError {
-            XCTAssertEqual(err.code, "host_panic")
+            XCTAssertTrue(
+                err.code == "unknown_command" || err.code == "host_panic",
+                "Expected unknown_command or host_panic, got \(err)"
+            )
         }
         let afterPanic = try await host.ping(nonce: 99)
         XCTAssertTrue(afterPanic.pong)

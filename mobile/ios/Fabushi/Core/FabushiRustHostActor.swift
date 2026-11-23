@@ -188,6 +188,7 @@ public actor FabushiRustHostActor {
 
     private let handleBox = HostHandleBox()
     private let pollControl = PollControlBox()
+    private let pollGroup = DispatchGroup()
     private let eventBroadcaster = DomainEventBroadcaster()
 
     private let lifecycleQueue = DispatchQueue(
@@ -296,9 +297,14 @@ public actor FabushiRustHostActor {
         activeConfig = nil
 
         guard let removed else { return }
+        let group = pollGroup
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             lifecycleQueue.async {
                 fabushi_host_destroy(removed.pointer)
+                // Wait off the Swift cooperative pool until the woken pollQueue exits
+                // fabushi_host_poll_events and drops the final Rust Arc<FabushiAppHost>
+                // (releasing SQLite WAL & Tantivy IndexWriter file locks deterministically).
+                group.wait()
                 continuation.resume()
             }
         }
@@ -644,10 +650,13 @@ public actor FabushiRustHostActor {
     private func startEventPollLoop(handle: SendableRawHandle, pollToken: UInt64) {
         let control = pollControl
         let broadcaster = eventBroadcaster
+        let group = pollGroup
         let batchSize = Self.defaultPollBatchSize
         let timeoutMs = Self.defaultPollTimeoutMs
 
+        group.enter()
         pollQueue.async {
+            defer { group.leave() }
             let decoder = JSONDecoder()
             while control.isSessionActive(pollToken) {
                 let rawPtr = fabushi_host_poll_events(handle.pointer, batchSize, timeoutMs)
