@@ -1,5 +1,5 @@
 //! Strict JSON-RPC envelope validation and pure-Rust domain & boundary oracles
-//! grounded in `bhrumom/gpui-telegram@6141456e2a11` (`Fabushi v1.6.7`) and `PROJECT.md`.
+//! grounded in `bhrumom/gpui-telegram@424aa33cf67a` (`Fabushi v1.6.8`) and `PROJECT.md`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -643,7 +643,7 @@ fn parse_hex_rgb(hex: &str) -> Result<(u8, u8, u8), String> {
     Ok((r, g, b))
 }
 
-/// Exact v1.6.7 WCAG white-text accent contrast guard (`palette_presets.rs:276-287`).
+/// Exact v1.6.8 WCAG white-text accent contrast guard (`palette_presets.rs:276-287`).
 pub fn compute_wcag_accent_fill(hex: &str) -> Result<(String, f64, bool), String> {
     let (r, g, b) = parse_hex_rgb(hex)?;
     let luma = 0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b);

@@ -352,7 +352,9 @@ SWIFT_UI_NS_LITERAL_RE = re.compile(
     + "|".join(re.escape(ns) for ns in EXPECTED_UI_NAMESPACES)
     + r")\.[A-Za-z0-9_.]+"
 )
-SWIFT_SILENT_SKIP_WAIT_RE = re.compile(r"\bif\s+[^{}\n]*\bwaitForExistence\s*\(")
+SWIFT_SILENT_SKIP_WAIT_RE = re.compile(
+    r"(?<!\.)\b(?:if|guard)\s+[^{};]*\bwaitForExistence\s*\("
+)
 
 SWIFT_FORBIDDEN_CODE_REGEXES: list[tuple[str, re.Pattern[str]]] = [
     ("conditional_compilation_if", re.compile("#" + r"\s*(?:if|elseif)\b")),
@@ -430,6 +432,10 @@ SWIFT_STRING_SELF_EQ_RE = re.compile(
     r'^("(?:\\.|[^"\\\n])*"|(#+)"[^"\n]*"\2)\s*==\s*\1$'
 )
 SWIFT_ZERO_LIT_RE = re.compile(r"^0+(?:\.0+)?$")
+SWIFT_VACUOUS_COUNT_GE_ZERO_RE = re.compile(
+    r"^(?:.+\.\s*count\s*\)*\s*>=\s*\(*\s*0+(?:\.0+)?|0+(?:\.0+)?\s*\)*\s*<=\s*\(*\s*.+\.\s*count)$",
+    re.DOTALL,
+)
 
 
 def lex_rust_source(source: str) -> tuple[str, str]:
@@ -933,6 +939,8 @@ def _find_swift_tautological_or_vacuous_asserts(
         elif call_name in ("XCTAssert", "XCTAssertTrue") and len(args_nc) >= 1:
             if SWIFT_STRING_SELF_EQ_RE.match(args_nc[0]):
                 hits.append(("tautological_xctassert_true_string_eq", line_no))
+            elif SWIFT_VACUOUS_COUNT_GE_ZERO_RE.match(args_code[0]):
+                hits.append(("vacuous_xctassert_true_count_ge_zero", line_no))
         elif call_name == "XCTAssertNotNil" and len(args_nc) >= 1:
             if SWIFT_STRING_LIT_RE.match(args_nc[0]):
                 hits.append(("tautological_xctassert_notnil_string", line_no))
@@ -1171,7 +1179,8 @@ def parse_swift_v167_files(
                     if callee == caller or not callee_nss:
                         continue
                     if not callee_nss.issubset(caller_set) and re.search(
-                        rf"\b{re.escape(callee)}\s*\(", body_c
+                        rf"(?<![A-Za-z0-9_.])(?:self\s*\.\s*)?{re.escape(callee)}\s*\(",
+                        body_c,
                     ):
                         caller_set.update(callee_nss)
                         changed = True
@@ -1249,7 +1258,7 @@ def parse_swift_v167_files(
             has_assert = bool(SWIFT_ASSERTION_CALL_RE.search(body_code))
             if SWIFT_SILENT_SKIP_WAIT_RE.search(body_code):
                 parse_errors.append(
-                    f"FORBIDDEN silent-skip `if ...waitForExistence(...)` branch inside `{type_name}.{fn_name}` ({rel}:{start_line})"
+                    f"FORBIDDEN silent-skip `if/guard ...waitForExistence(...)` branch inside `{type_name}.{fn_name}` ({rel}:{start_line})"
                 )
             name_features = sorted(set(SWIFT_FEATURE_TAG_RE.findall(fn_name)))
             direct_ui_counts = _extract_swift_ui_ns_counts(body_code, body_raw, id_symbol_to_ns)
@@ -1257,7 +1266,10 @@ def parse_swift_v167_files(
                 tier_ui_namespace_hits[ns_k] = tier_ui_namespace_hits.get(ns_k, 0) + cnt_v
             effective_ui_ns = set(direct_ui_counts.keys())
             for callee, callee_nss in combined_helpers_by_tier[type_name].items():
-                if callee_nss and re.search(rf"\b{re.escape(callee)}\s*\(", body_code):
+                if callee_nss and re.search(
+                    rf"(?<![A-Za-z0-9_.])(?:self\s*\.\s*)?{re.escape(callee)}\s*\(",
+                    body_code,
+                ):
                     effective_ui_ns.update(callee_nss)
 
             if fn_name in tier_methods[type_name]:
@@ -1856,11 +1868,25 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
             tiers_obj = swift_matrix.get("tiers", {})
             seen_ui_ids: set[str] = set()
             valid_ui_ns_set = set(EXPECTED_UI_NAMESPACES)
-            feature_id_to_ui_ns = {
-                f["id"]: set(f.get("ui_namespaces", []))
-                for f in features
-                if isinstance(f, dict) and "id" in f
-            }
+            feature_id_to_ui_ns: dict[str, set[str]] = {}
+            for f in features:
+                if isinstance(f, dict) and "id" in f:
+                    fid_k = f["id"]
+                    raw_ui_nss = f.get("ui_accessibility_namespaces")
+                    if (
+                        not isinstance(raw_ui_nss, list)
+                        or not raw_ui_nss
+                        or any(
+                            not isinstance(ns, str) or ns not in valid_ui_ns_set
+                            for ns in raw_ui_nss
+                        )
+                    ):
+                        record(
+                            f"feature_matrix.json feature `{fid_k}` has missing or invalid `ui_accessibility_namespaces`: {raw_ui_nss!r}"
+                        )
+                        feature_id_to_ui_ns[fid_k] = set()
+                    else:
+                        feature_id_to_ui_ns[fid_k] = set(raw_ui_nss)
             for tier_key, (cls_name, min_count) in EXPECTED_SWIFT_TIER_CLASSES.items():
                 t_obj = tiers_obj.get(tier_key)
                 if not isinstance(t_obj, dict):
@@ -1921,7 +1947,11 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
                         if tier_key == "tier1":
                             for fid in feats:
                                 expected_feat_nss = feature_id_to_ui_ns.get(fid, set())
-                                if expected_feat_nss and not (effective_nss & expected_feat_nss):
+                                if not expected_feat_nss:
+                                    record(
+                                        f"feature_matrix.json feature `{fid}` missing non-empty `ui_accessibility_namespaces`"
+                                    )
+                                elif not (effective_nss & expected_feat_nss):
                                     record(
                                         f"swift_uitest_suite Tier 1 `{uid}` (`{cls_name}.{method}`) covers `{fid}` "
                                         f"but exercises none of its canonical UI namespaces {sorted(expected_feat_nss)} (exercised: {sorted(effective_nss)})"

@@ -130,16 +130,16 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             FabushiLoopbackSeedRequest(users: [FabushiLoopbackSeedUser(username: "t2_theme_user")])
         )
 
-        let themesWithAccents: [(String, String)] = [
-            ("night", "#FFFF00"),
-            ("tinted", "#FFFFFF"),
-            ("day", "#FFFF00"),
-            ("classic", "#007AFF"),
+        let themesWithAccents: [(theme: String, rawAccent: String, expectedHex: String, adjusted: Bool)] = [
+            ("night", "#FFFF00", "#A9A906", true),
+            ("tinted", "#FFFFFF", "#A9A9A9", true),
+            ("day", "#FFFF00", "#A9A906", true),
+            ("classic", "#007AFF", "#007AFF", false),
         ]
-        for (index, pair) in themesWithAccents.enumerated() {
+        for (index, item) in themesWithAccents.enumerated() {
             let config = FabushiE2ELaunchConfig(
-                theme: pair.0,
-                accentHex: pair.1,
+                theme: item.theme,
+                accentHex: item.rawAccent,
                 resetState: index == 0
             )
             let application = try launchFabushi(config)
@@ -148,49 +148,52 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             tapControl(FabushiAccessibilityIDs.Settings.sectionAppearance, in: application)
             let badge = requireElement(FabushiAccessibilityIDs.Settings.accentContrastBadge, in: application)
             assertVoiceOverReady(badge)
-            let rawAccent = pair.1.uppercased()
+
+            let rawAccent = item.rawAccent.uppercased()
             guard let expected = Self.computeWCAGAccentFill(rawAccent) else {
                 XCTFail("Invalid test accent hex \(rawAccent)")
                 return
             }
+            XCTAssertEqual(
+                expected.effectiveHex,
+                item.expectedHex,
+                "WCAG >138 reference formula mismatch for \(rawAccent)"
+            )
+            XCTAssertEqual(expected.adjusted, item.adjusted)
+
             let badgeValue = ((badge.value as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let combined = "\(badgeValue) \(badge.label)".trimmingCharacters(in: .whitespacesAndNewlines)
-            let upperCombined = combined.uppercased()
-            let lowerCombined = combined.lowercased()
-            let renderedHexes = Self.extractHexColors(from: upperCombined)
+            let badgeLabel = badge.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueHexes = Self.extractHexColors(from: badgeValue.uppercased())
+            let labelHexes = Self.extractHexColors(from: badgeLabel.uppercased())
+            let candidateHexes = !valueHexes.isEmpty ? valueHexes : labelHexes
+
+            XCTAssertFalse(
+                candidateHexes.isEmpty,
+                "F31 Settings.accentContrastBadge must expose rendered #RRGGBB hex for \(rawAccent) on theme \(item.theme) (value='\(badgeValue)', label='\(badgeLabel)')"
+            )
 
             if expected.adjusted {
-                if let effectiveHex = renderedHexes.last {
+                XCTAssertTrue(
+                    candidateHexes.contains(expected.effectiveHex),
+                    "F31 WCAG >138 luma guard expected darkened \(expected.effectiveHex) for \(rawAccent) on theme \(item.theme), got \(candidateHexes) (value='\(badgeValue)', label='\(badgeLabel)')"
+                )
+                let allowedHexes: Set<String> = [expected.effectiveHex, rawAccent]
+                XCTAssertTrue(
+                    Set(candidateHexes).isSubset(of: allowedHexes),
+                    "F31 WCAG >138 luma guard rendered unexpected hexes \(candidateHexes) for \(rawAccent) on theme \(item.theme)"
+                )
+                if candidateHexes.count == 1 {
                     XCTAssertNotEqual(
-                        effectiveHex,
+                        candidateHexes[0],
                         rawAccent,
-                        "F31 WCAG >138 luma guard must not leave bright accent \(rawAccent) unmodified on theme \(pair.0)"
-                    )
-                    XCTAssertEqual(
-                        effectiveHex,
-                        expected.effectiveHex,
-                        "F31 WCAG >138 luma guard expected darkened \(expected.effectiveHex) for \(rawAccent) on theme \(pair.0), got \(effectiveHex)"
-                    )
-                } else {
-                    XCTAssertFalse(
-                        upperCombined.contains(rawAccent),
-                        "F31 WCAG >138 luma guard must not expose raw bright accent \(rawAccent) on theme \(pair.0) (badge='\(combined)')"
-                    )
-                    let hasDarkenedIndicator = lowerCombined.contains("dark")
-                        || lowerCombined.contains("adjusted")
-                        || lowerCombined.contains("guard")
-                        || combined.contains("调暗")
-                        || combined.contains("对比度")
-                    XCTAssertTrue(
-                        hasDarkenedIndicator,
-                        "F31 WCAG >138 guard must positively report darkened hex \(expected.effectiveHex) or contrast-guard cue for \(rawAccent) on theme \(pair.0) (badge='\(combined)')"
+                        "F31 WCAG >138 luma guard must not leave bright accent \(rawAccent) unmodified on theme \(item.theme)"
                     )
                 }
-            } else if let effectiveHex = renderedHexes.last {
+            } else {
                 XCTAssertEqual(
-                    effectiveHex,
-                    rawAccent,
-                    "F31 WCAG >138 guard must preserve compliant accent \(rawAccent) without false darkening on theme \(pair.0)"
+                    Set(candidateHexes),
+                    [rawAccent],
+                    "F31 WCAG >138 guard must preserve compliant accent \(rawAccent) without false darkening on theme \(item.theme), got \(candidateHexes)"
                 )
             }
             if index < themesWithAccents.count - 1 {
@@ -276,32 +279,30 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
 
         let reduceMotion = requireElement(FabushiAccessibilityIDs.Settings.reduceMotionToggle, in: application)
         let highContrast = requireElement(FabushiAccessibilityIDs.Settings.highContrastToggle, in: application)
-        assertVoiceOverReady(reduceMotion)
-        assertVoiceOverReady(highContrast)
-        assertMinimumTouchTarget44pt(reduceMotion)
-        assertMinimumTouchTarget44pt(highContrast)
+        let reduceMotionSwitch = assertToggleTouchTarget(reduceMotion, in: application)
+        let highContrastSwitch = assertToggleTouchTarget(highContrast, in: application)
 
         XCTAssertTrue(
-            isSwitchEnabled(reduceMotion),
+            isSwitchEnabled(reduceMotionSwitch, in: application),
             "F31 reduceMotionToggle must initialize ON when FABUSHI_UI_REDUCE_MOTION=1"
         )
         XCTAssertTrue(
-            isSwitchEnabled(highContrast),
+            isSwitchEnabled(highContrastSwitch, in: application),
             "F31 highContrastToggle must initialize ON when FABUSHI_UI_HIGH_CONTRAST=1"
         )
 
-        reduceMotion.tap()
-        let rmDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(reduceMotion) }
+        tapSwitch(reduceMotionSwitch, in: application)
+        let rmDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(reduceMotionSwitch, in: application) }
         XCTAssertTrue(rmDisabled, "F31 tapping reduceMotionToggle must flip state to OFF")
-        reduceMotion.tap()
-        let rmReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(reduceMotion) }
+        tapSwitch(reduceMotionSwitch, in: application)
+        let rmReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(reduceMotionSwitch, in: application) }
         XCTAssertTrue(rmReenabled, "F31 tapping reduceMotionToggle again must flip state back to ON")
 
-        highContrast.tap()
-        let hcDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(highContrast) }
+        tapSwitch(highContrastSwitch, in: application)
+        let hcDisabled = await waitUntil(timeout: 4) { !self.isSwitchEnabled(highContrastSwitch, in: application) }
         XCTAssertTrue(hcDisabled, "F31 tapping highContrastToggle must flip state to OFF")
-        highContrast.tap()
-        let hcReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(highContrast) }
+        tapSwitch(highContrastSwitch, in: application)
+        let hcReenabled = await waitUntil(timeout: 4) { self.isSwitchEnabled(highContrastSwitch, in: application) }
         XCTAssertTrue(hcReenabled, "F31 tapping highContrastToggle again must flip state back to ON")
         recordCheckpoint("T2_05_reduce_motion_high_contrast", passed: true)
     }
@@ -450,7 +451,9 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         let inputWrap = requireElement(FabushiAccessibilityIDs.Composer.inputWrap, in: application)
         let windowBanner = element(FabushiAccessibilityIDs.Shell.toastWindowBanner, in: application)
         let stagePill = element(FabushiAccessibilityIDs.Shell.toastStagePill, in: application)
-        let toastVisible = windowBanner.waitForExistence(timeout: 6) || stagePill.waitForExistence(timeout: 4)
+        let toastVisible = await waitUntil(timeout: 8) {
+            windowBanner.exists || stagePill.exists
+        }
         XCTAssertTrue(toastVisible, "v1.6.8 F07: rate-limit feedback must render two-layer toast banner or stage pill")
 
         if windowBanner.exists {
@@ -465,13 +468,18 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
             closeBtn.tap()
             let closed = windowBanner.waitForNonExistence(timeout: 4)
             XCTAssertTrue(closed, "v1.6.8 F07: tapping windowBanner.close must dismiss banner immediately")
-        }
-
-        if stagePill.exists {
+        } else if stagePill.exists {
+            XCTAssertLessThanOrEqual(
+                stagePill.frame.maxY,
+                inputWrap.frame.minY,
+                "v1.6.8 F07: stagePill.maxY must remain strictly above inputWrap.minY"
+            )
             assertNonOverlapping(stagePill, inputWrap)
             openChatRow(FabushiAccessibilityIDs.ChatList.secondRow, in: application)
             let cleared = stagePill.waitForNonExistence(timeout: 4)
             XCTAssertTrue(cleared, "v1.6.8 F07: switching chats must clear chat-scoped stage toast")
+        } else {
+            XCTFail("v1.6.8 F07: toast dismissed before non-overlap and dismissal verification")
         }
         try await client.clearFaults()
         recordCheckpoint("T2_08_v168_two_layer_toast_non_overlap", passed: true)
@@ -561,12 +569,8 @@ final class FabushiV167Tier2UITests: FabushiE2EUITestCase {
         XCTAssertEqual(afterEmptyState.counts.messages, 0, "F14 whitespace-only composer input must never send empty message")
 
         // 3. Oversized (> 4096 chars) composer payload must surface Composer.validationErrorBanner & send 0 messages
-        let chunk512 = String(repeating: "x", count: 512)
-        replaceText(in: field, with: chunk512)
-        for _ in 0..<7 {
-            field.typeText(chunk512)
-        }
-        field.typeText("OVERFLOW9")
+        let oversizedPayload = String(repeating: "x", count: 4096) + "OVERFLOW9"
+        await pasteText(in: field, with: oversizedPayload, in: application)
         if sendBtn.isEnabled && sendBtn.isHittable {
             sendBtn.tap()
         }

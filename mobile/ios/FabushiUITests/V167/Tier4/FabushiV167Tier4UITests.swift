@@ -146,6 +146,12 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
         signInIfNeeded(in: application, username: "t4_j3_studio", password: "FabushiV168!Pass")
 
         openShellTab(FabushiAccessibilityIDs.Shell.tabStudio, in: application)
+        let studioRoot = requireElement(FabushiAccessibilityIDs.Studio.root, in: application)
+        let studioTabBar = resolveHorizontalScrollContainer(
+            preferredIdentifier: FabushiAccessibilityIDs.Studio.tabBar,
+            inside: studioRoot,
+            in: application
+        )
         for tabID in [
             FabushiAccessibilityIDs.Studio.tabOverview,
             FabushiAccessibilityIDs.Studio.tabKanban,
@@ -155,6 +161,9 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
             FabushiAccessibilityIDs.Studio.tabApprovals,
             FabushiAccessibilityIDs.Studio.tabSessions,
         ] {
+            if let studioTabBar {
+                scrollToElementHorizontally(element(tabID, in: application), in: studioTabBar, maxSwipes: 6)
+            }
             tapControl(tabID, in: application)
         }
         let codingPanel = requireElement(FabushiAccessibilityIDs.Studio.codingAgentsPanel, in: application)
@@ -403,6 +412,9 @@ final class FabushiV167Tier4UITests: FabushiE2EUITestCase {
             )
             let application = try launchFabushi(config)
             signInIfNeeded(in: application, username: "t4_j8_hig_audit", password: "FabushiV168!Pass")
+            if index >= 1 {
+                navigateBackToChatListIfCompact(in: application)
+            }
             assertNoSampleChats(in: application)
 
             let composeBtn = requireElement(FabushiAccessibilityIDs.ChatList.composeButton, in: application)

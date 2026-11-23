@@ -1,4 +1,4 @@
-//! Standalone opaque-box Rust E2E harness for `Fabushi v1.6.7` (`bhrumom/gpui-telegram@6141456e`).
+//! Standalone opaque-box Rust E2E harness for `Fabushi v1.6.8` (`bhrumom/gpui-telegram@424aa33cf67a`).
 //!
 //! Zero internal Cargo path dependencies on `source/host` or `source/desktop_core`.
 //! Every production Tier 1–4 test calls `FabushiE2EHarness::connect_production()`, which

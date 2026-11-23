@@ -3920,7 +3920,11 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
             raise BadRequestError("conflicting_te_and_cl")
 
         expect = self.headers.get("Expect", "")
-        if "100-continue" in expect.lower() and (is_chunked or (cl is not None and cl > 0)):
+        if (
+            self.request_version >= "HTTP/1.1"
+            and "100-continue" in expect.lower()
+            and (is_chunked or (cl is not None and cl > 0))
+        ):
             self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             self.wfile.flush()
 
@@ -3998,10 +4002,11 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
         sock = self.connection
         # Drain any already-buffered bytes from self.rfile before taking raw socket ownership
         initial_ws = bytearray()
+        max_initial_ws = MAX_WS_FRAME_PAYLOAD_BYTES + 65536
         sock.settimeout(0.0)
         try:
-            while True:
-                chunk = self.rfile.read1(65536)
+            while len(initial_ws) < max_initial_ws:
+                chunk = self.rfile.read1(min(65536, max_initial_ws - len(initial_ws)))
                 if not chunk:
                     break
                 initial_ws.extend(chunk)
@@ -4894,6 +4899,42 @@ def run_self_test(report_path: str = "") -> int:
             assert st_413 == 413 and "100 Continue" not in head_413, (
                 f"oversized CL expected 413 without 100 Continue, got st={st_413} head={head_413!r}"
             )
+            cont_body = b'{"clear":true}'
+            cont_headers = (
+                f"POST /__e2e__/fault HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(cont_body)}\r\n"
+                f"Expect: 100-continue\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("ascii")
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as s_100:
+                s_100.settimeout(5.0)
+                s_100.sendall(cont_headers)
+                interim = bytearray()
+                while b"\r\n\r\n" not in interim:
+                    b_in = s_100.recv(4096)
+                    if not b_in:
+                        break
+                    interim.extend(b_in)
+                assert bytes(interim) == b"HTTP/1.1 100 Continue\r\n\r\n", (
+                    f"positive Expect: 100-continue expected exact interim 100 Continue, got {bytes(interim)!r}"
+                )
+                s_100.sendall(cont_body)
+                fin_chunks: list[bytes] = []
+                while True:
+                    b_fin = s_100.recv(4096)
+                    if not b_fin:
+                        break
+                    fin_chunks.append(b_fin)
+                raw_final_100 = b"".join(fin_chunks)
+            assert raw_final_100.startswith(b"HTTP/1.1 200 "), (
+                f"positive Expect: 100-continue expected final 200, got {raw_final_100!r}"
+            )
+            fin_sep = raw_final_100.find(b"\r\n\r\n")
+            assert fin_sep != -1, f"missing header/body separator in 100-continue response: {raw_final_100!r}"
+            fin_json = json.loads(raw_final_100[fin_sep + 4 :].decode("utf-8"))
+            assert fin_json.get("ok") is True, f"expected ok:true after 100-continue body, got {fin_json!r}"
             bad_chunk_plus = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"

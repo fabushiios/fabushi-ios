@@ -955,10 +955,33 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
-        if !control.isHittable {
-            let scrollable = application.scrollViews.firstMatch
-            if scrollable.exists {
-                _ = scrollToElement(control, in: scrollable, maxSwipes: 6)
+        let needsHorizontalScroll: Bool = {
+            guard control.exists, !control.frame.isEmpty else { return false }
+            let window = application.windows.firstMatch
+            guard window.exists, !window.frame.isEmpty else { return false }
+            return control.frame.minX < window.frame.minX - 1.0
+                || control.frame.maxX > window.frame.maxX + 1.0
+        }()
+        if !control.isHittable || needsHorizontalScroll {
+            let matchingScrollView: XCUIElement? = {
+                let candidates = application.scrollViews.allElementsBoundByIndex
+                if control.exists && !control.frame.isEmpty {
+                    let midY = control.frame.midY
+                    if let aligned = candidates.first(where: { sv in
+                        sv.exists && !sv.frame.isEmpty && sv.frame.minY <= midY && midY <= sv.frame.maxY
+                    }) {
+                        return aligned
+                    }
+                }
+                let first = application.scrollViews.firstMatch
+                return first.exists ? first : nil
+            }()
+            if let scrollable = matchingScrollView {
+                if needsHorizontalScroll {
+                    _ = scrollToElementHorizontally(control, in: scrollable, maxSwipes: 6)
+                } else {
+                    _ = scrollToElement(control, in: scrollable, maxSwipes: 6)
+                }
             }
         }
         XCTAssertTrue(
@@ -986,18 +1009,296 @@ class FabushiE2EUITestCase: XCTestCase {
     }
 
     func replaceText(in field: XCUIElement, with text: String) {
-        field.tap()
-        if let existing = field.value as? String, !existing.isEmpty {
-            let placeholder = field.placeholderValue ?? ""
-            if existing != placeholder {
-                let deleteSequence = String(
-                    repeating: XCUIKeyboardKey.delete.rawValue,
-                    count: existing.count
-                )
-                field.typeText(deleteSequence)
+        clearTextSynchronously(in: field)
+        if !text.isEmpty {
+            field.typeText(text)
+        }
+    }
+
+    func pasteText(
+        in field: XCUIElement,
+        with text: String,
+        in application: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        clearTextSynchronously(in: field)
+        guard !text.isEmpty else {
+            return
+        }
+        UIPasteboard.general.string = text
+        defer {
+            UIPasteboard.general.string = ""
+        }
+
+        var pastedViaMenu = false
+        for attempt in 0..<3 {
+            switch attempt {
+            case 0:
+                // Tapping the leading caret of a focused empty UITextView/UITextField opens the Paste callout.
+                field.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
+            case 1:
+                field.doubleTap()
+            default:
+                field.press(forDuration: 0.9)
+            }
+            if let pasteItem = await findEditMenuItem(
+                primaryTitle: "Paste",
+                localizedTitle: "粘贴",
+                in: application,
+                timeout: 1.5
+            ) {
+                pasteItem.tap()
+                pastedViaMenu = true
+                break
             }
         }
-        field.typeText(text)
+
+        if pastedViaMenu {
+            let landedImmediately = await waitUntil(timeout: 0.5, pollMilliseconds: 100) {
+                !self.currentEditableText(in: field).isEmpty
+            }
+            if !landedImmediately {
+                let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+                let allowPred = NSPredicate(format: "label == %@ OR label == %@", "Allow Paste", "允许粘贴")
+                let allowBtn = springboard.alerts.buttons.matching(allowPred).firstMatch
+                let allowVisible = allowBtn.waitForExistence(timeout: 1.0)
+                if allowVisible && allowBtn.isHittable {
+                    allowBtn.tap()
+                }
+            }
+        } else if text.count <= 128 {
+            field.typeText(text)
+        }
+
+        let populated = await waitUntil(timeout: 2.0, pollMilliseconds: 100) {
+            !self.currentEditableText(in: field).isEmpty
+        }
+        XCTAssertTrue(
+            populated,
+            "Failed to paste \(text.count)-character payload into '\(field.identifier)' via UIPasteboard Edit Menu",
+            file: file,
+            line: line
+        )
+    }
+
+    private func currentEditableText(in field: XCUIElement) -> String {
+        guard let existing = field.value as? String, !existing.isEmpty else {
+            return ""
+        }
+        let placeholder = field.placeholderValue ?? ""
+        return existing == placeholder ? "" : existing
+    }
+
+    private func trailingFocusOffset(for field: XCUIElement) -> CGVector {
+        let dy: CGFloat = field.elementType == .textView ? 0.92 : 0.5
+        let fieldFrame = field.frame
+        if fieldFrame.width.isFinite && fieldFrame.width > 40.0 {
+            let trailingButton = field.buttons.firstMatch
+            if trailingButton.exists {
+                let buttonFrame = trailingButton.frame
+                if buttonFrame.minX.isFinite && buttonFrame.minX > fieldFrame.midX {
+                    let safeDx = (buttonFrame.minX - fieldFrame.minX - 6.0) / fieldFrame.width
+                    return CGVector(dx: max(CGFloat(0.5), min(CGFloat(0.95), safeDx)), dy: dy)
+                }
+            }
+        }
+        return CGVector(dx: field.elementType == .textView ? 0.96 : 0.98, dy: dy)
+    }
+
+    private func selectAllAndDeleteSynchronously(
+        in field: XCUIElement,
+        application: XCUIApplication
+    ) -> Bool {
+        field.doubleTap()
+        let selectAllPred = NSPredicate(format: "label == %@ OR label == %@", "Select All", "全选")
+        let selectAllMenu = application.menuItems.matching(selectAllPred).firstMatch
+        let selectAllMenuVisible = selectAllMenu.waitForExistence(timeout: 1.0)
+        if selectAllMenuVisible && selectAllMenu.isHittable {
+            selectAllMenu.tap()
+            field.typeText(XCUIKeyboardKey.delete.rawValue)
+            return true
+        }
+        let selectAllBtn = application.buttons.matching(selectAllPred).firstMatch
+        if selectAllBtn.exists && selectAllBtn.isHittable {
+            selectAllBtn.tap()
+            field.typeText(XCUIKeyboardKey.delete.rawValue)
+            return true
+        }
+        return false
+    }
+
+    private func clearTextSynchronously(in field: XCUIElement) {
+        if currentEditableText(in: field).isEmpty {
+            field.tap()
+            return
+        }
+
+        // Focus near trailing edge (avoiding any trailing accessory button) so delete never leaves right-hand residue.
+        field.coordinate(withNormalizedOffset: trailingFocusOffset(for: field)).tap()
+
+        for clearLabel in ["Clear text", "清除文本"] {
+            let clearButton = field.buttons[clearLabel]
+            if clearButton.exists && clearButton.isHittable {
+                clearButton.tap()
+                if currentEditableText(in: field).isEmpty {
+                    return
+                }
+            }
+        }
+
+        for pass in 0..<3 {
+            let remaining = currentEditableText(in: field)
+            if remaining.isEmpty {
+                return
+            }
+            if pass > 0 {
+                field.coordinate(withNormalizedOffset: trailingFocusOffset(for: field)).tap()
+            }
+            if remaining.count > 128, let application = self.app,
+               selectAllAndDeleteSynchronously(in: field, application: application) {
+                continue
+            }
+            let deleteCount = min(remaining.count + 2, 128)
+            let deleteSequence = String(
+                repeating: XCUIKeyboardKey.delete.rawValue,
+                count: deleteCount
+            )
+            field.typeText(deleteSequence)
+        }
+
+        if !currentEditableText(in: field).isEmpty, let application = self.app {
+            _ = selectAllAndDeleteSynchronously(in: field, application: application)
+        }
+    }
+
+    private func findEditMenuItem(
+        primaryTitle: String,
+        localizedTitle: String,
+        in application: XCUIApplication,
+        timeout: TimeInterval = 1.5
+    ) async -> XCUIElement? {
+        let predicate = NSPredicate(format: "label == %@ OR label == %@", primaryTitle, localizedTitle)
+        let menuCandidate = application.menuItems.matching(predicate).firstMatch
+        let buttonCandidate = application.buttons.matching(predicate).firstMatch
+        let appeared = await waitUntil(timeout: timeout, pollMilliseconds: 100) {
+            (menuCandidate.exists && menuCandidate.isHittable)
+                || (buttonCandidate.exists && buttonCandidate.isHittable)
+        }
+        guard appeared else {
+            return nil
+        }
+        if menuCandidate.exists && menuCandidate.isHittable {
+            return menuCandidate
+        }
+        if buttonCandidate.exists && buttonCandidate.isHittable {
+            return buttonCandidate
+        }
+        return nil
+    }
+
+    private func visibleHorizontalBounds(for container: XCUIElement) -> CGRect {
+        var bounds = container.frame
+        if let window = app?.windows.firstMatch, window.exists, !window.frame.isEmpty {
+            let clipped = bounds.intersection(window.frame)
+            if !clipped.isNull && !clipped.isEmpty {
+                bounds = clipped
+            }
+        }
+        return bounds
+    }
+
+    private func isElementHorizontallyVisible(
+        _ target: XCUIElement,
+        in container: XCUIElement
+    ) -> Bool {
+        guard target.exists, target.isHittable else { return false }
+        let targetFrame = target.frame
+        guard !targetFrame.isNull, !targetFrame.isInfinite, !targetFrame.isEmpty else {
+            return false
+        }
+        let bounds = visibleHorizontalBounds(for: container)
+        guard !bounds.isNull, !bounds.isInfinite, !bounds.isEmpty else {
+            return target.isHittable
+        }
+        return targetFrame.minX >= bounds.minX - 1.0
+            && targetFrame.maxX <= bounds.maxX + 1.0
+    }
+
+    func resolveHorizontalScrollContainer(
+        preferredIdentifier: String,
+        inside scope: XCUIElement,
+        in application: XCUIApplication
+    ) -> XCUIElement? {
+        let explicit = element(preferredIdentifier, in: application)
+        if explicit.exists {
+            return explicit
+        }
+        let scopedScrollViews = scope.scrollViews.allElementsBoundByIndex
+        if let compactStrip = scopedScrollViews.first(where: { sv in
+            sv.exists && !sv.frame.isEmpty && sv.frame.height <= 160.0 && sv.frame.width > sv.frame.height
+        }) {
+            return compactStrip
+        }
+        let scopedCollections = scope.collectionViews.allElementsBoundByIndex
+        if let compactCollection = scopedCollections.first(where: { cv in
+            cv.exists && !cv.frame.isEmpty && cv.frame.height <= 160.0 && cv.frame.width > cv.frame.height
+        }) {
+            return compactCollection
+        }
+        if let firstScoped = scopedScrollViews.first(where: { $0.exists && !$0.frame.isEmpty }) {
+            return firstScoped
+        }
+        let fallback = application.scrollViews.firstMatch
+        return fallback.exists ? fallback : nil
+    }
+
+    @discardableResult
+    func scrollToElementHorizontally(
+        _ target: XCUIElement,
+        in container: XCUIElement,
+        maxSwipes: Int = 6
+    ) -> Bool {
+        if isElementHorizontallyVisible(target, in: container) {
+            return true
+        }
+        guard container.exists else {
+            return target.exists && target.isHittable
+        }
+        let bounds = visibleHorizontalBounds(for: container)
+        let startsLeftOfViewport = target.exists
+            && !target.frame.isEmpty
+            && !bounds.isEmpty
+            && target.frame.minX < bounds.minX - 1.0
+
+        if startsLeftOfViewport {
+            for _ in 0..<maxSwipes {
+                container.swipeRight()
+                if isElementHorizontallyVisible(target, in: container) {
+                    return true
+                }
+            }
+            for _ in 0..<maxSwipes {
+                container.swipeLeft()
+                if isElementHorizontallyVisible(target, in: container) {
+                    return true
+                }
+            }
+        } else {
+            for _ in 0..<maxSwipes {
+                container.swipeLeft()
+                if isElementHorizontallyVisible(target, in: container) {
+                    return true
+                }
+            }
+            for _ in 0..<maxSwipes {
+                container.swipeRight()
+                if isElementHorizontallyVisible(target, in: container) {
+                    return true
+                }
+            }
+        }
+        return isElementHorizontallyVisible(target, in: container) || (target.exists && target.isHittable)
     }
 
     func scrollToElement(
@@ -1008,13 +1309,29 @@ class FabushiE2EUITestCase: XCTestCase {
         if target.exists && target.isHittable {
             return true
         }
+        if target.exists && !target.frame.isEmpty {
+            let bounds = visibleHorizontalBounds(for: container)
+            if !bounds.isEmpty
+                && (target.frame.maxX > bounds.maxX + 1.0 || target.frame.minX < bounds.minX - 1.0)
+            {
+                if scrollToElementHorizontally(target, in: container, maxSwipes: maxSwipes) {
+                    return true
+                }
+            }
+        }
         for _ in 0..<maxSwipes {
             container.swipeUp()
             if target.exists && target.isHittable {
                 return true
             }
         }
-        return target.exists
+        for _ in 0..<maxSwipes {
+            container.swipeDown()
+            if target.exists && target.isHittable {
+                return true
+            }
+        }
+        return target.exists && target.isHittable
     }
 
     func waitUntil(
@@ -1197,6 +1514,13 @@ class FabushiE2EUITestCase: XCTestCase {
         if chatList.exists && chatList.isHittable {
             return
         }
+        let stageRoot = element(FabushiAccessibilityIDs.Stage.root, in: application)
+        if !stageRoot.exists {
+            let chatListSettled = chatList.waitForExistence(timeout: 2)
+            if chatListSettled && chatList.isHittable {
+                return
+            }
+        }
         let shellBack = element(FabushiAccessibilityIDs.Shell.backButton, in: application)
         if shellBack.exists && shellBack.isHittable {
             shellBack.tap()
@@ -1285,17 +1609,19 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
+        let minWidth = minPoints
+        let minHeight: CGFloat = target.elementType == .switch ? min(minPoints, 31.0) : minPoints
         XCTAssertGreaterThanOrEqual(
             frame.width,
-            minPoints,
-            "Apple HIG 44pt width violation on '\(target.identifier)': width=\(frame.width)pt",
+            minWidth,
+            "Apple HIG \(minWidth)pt width violation on '\(target.identifier)': width=\(frame.width)pt",
             file: file,
             line: line
         )
         XCTAssertGreaterThanOrEqual(
             frame.height,
-            minPoints,
-            "Apple HIG 44pt height violation on '\(target.identifier)': height=\(frame.height)pt",
+            minHeight,
+            "Apple HIG \(minHeight)pt height violation on '\(target.identifier)': height=\(frame.height)pt",
             file: file,
             line: line
         )
@@ -1459,15 +1785,33 @@ class FabushiE2EUITestCase: XCTestCase {
             file: file,
             line: line
         )
-        let lowerLabel = label.lowercased()
-        for prefix in forbiddenKeyPrefixes {
-            XCTAssertFalse(
-                lowerLabel.contains(prefix),
-                "Raw localization key leak ('\(prefix)') detected in VoiceOver label '\(label)' for '\(target.identifier)'",
+        if let leak = Self.rawLocalizationKeyLeak(
+            in: label,
+            forbiddenKeyPrefixes: forbiddenKeyPrefixes
+        ) {
+            XCTFail(
+                "Raw localization key leak ('\(leak.matched)' matching '\(leak.prefix)') detected in VoiceOver label '\(label)' for '\(target.identifier)'",
                 file: file,
                 line: line
             )
         }
+    }
+
+    static func rawLocalizationKeyLeak(
+        in label: String,
+        forbiddenKeyPrefixes: [String]
+    ) -> (prefix: String, matched: String)? {
+        for prefix in forbiddenKeyPrefixes where !prefix.isEmpty {
+            let escaped = NSRegularExpression.escapedPattern(for: prefix)
+            let suffix = prefix.hasSuffix(".")
+                ? "[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*"
+                : "[a-z0-9_]*"
+            let pattern = "(?<![a-z0-9_])\(escaped)\(suffix)"
+            if let range = label.range(of: pattern, options: [.regularExpression, .caseInsensitive]) {
+                return (prefix, String(label[range]))
+            }
+        }
+        return nil
     }
 
     func assertNoDeadInteractiveControls(
@@ -1622,12 +1966,79 @@ class FabushiE2EUITestCase: XCTestCase {
         return results
     }
 
-    func isSwitchEnabled(_ toggle: XCUIElement) -> Bool {
-        if let raw = toggle.value as? String {
+    func resolveSwitchElement(
+        _ toggle: XCUIElement,
+        in application: XCUIApplication? = nil
+    ) -> XCUIElement {
+        if toggle.elementType == .switch {
+            return toggle
+        }
+        let nestedSwitch = toggle.switches.firstMatch
+        if nestedSwitch.exists {
+            return nestedSwitch
+        }
+        if let activeApp = application ?? self.app, !toggle.identifier.isEmpty {
+            let identifiedSwitch = activeApp.switches.matching(identifier: toggle.identifier).firstMatch
+            if identifiedSwitch.exists {
+                return identifiedSwitch
+            }
+        }
+        return toggle
+    }
+
+    @discardableResult
+    func assertToggleTouchTarget(
+        _ toggle: XCUIElement,
+        in application: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> XCUIElement {
+        let switchControl = resolveSwitchElement(toggle, in: application)
+        if !switchControl.isHittable {
+            let scrollable = application.scrollViews.firstMatch
+            if scrollable.exists {
+                _ = scrollToElement(switchControl, in: scrollable, maxSwipes: 4)
+            }
+        }
+        if toggle.elementType == .switch {
+            assertVoiceOverReady(switchControl, file: file, line: line)
+            assertMinimumTouchTarget44pt(switchControl, requireHittable: true, file: file, line: line)
+        } else if toggle.switches.firstMatch.exists {
+            // Enclosing Form/List row wraps a native UISwitch (51x31pt): check >=44pt row and >=44x31pt switch.
+            assertVoiceOverReady(toggle, file: file, line: line)
+            assertMinimumTouchTarget44pt(toggle, requireHittable: false, file: file, line: line)
+            assertMinimumTouchTarget44pt(switchControl, requireHittable: true, file: file, line: line)
+        } else {
+            // Sibling StaticText + Switch sharing identifier, or custom Button toggle.
+            assertVoiceOverReady(switchControl, file: file, line: line)
+            assertMinimumTouchTarget44pt(switchControl, requireHittable: true, file: file, line: line)
+        }
+        assertWithinWindowBounds(switchControl, in: application, file: file, line: line)
+        return switchControl
+    }
+
+    func tapSwitch(_ toggle: XCUIElement, in application: XCUIApplication) {
+        let switchControl = resolveSwitchElement(toggle, in: application)
+        let frame = switchControl.frame
+        if switchControl.elementType == .switch && frame.width > 80.0 && frame.width.isFinite {
+            // Full-row SwiftUI Form/List Toggle: tap trailing UISwitch thumb (~25pt from trailing edge).
+            let thumbX = max(CGFloat(0.5), min(CGFloat(0.99), (frame.width - 25.0) / frame.width))
+            switchControl.coordinate(withNormalizedOffset: CGVector(dx: thumbX, dy: 0.5)).tap()
+        } else {
+            switchControl.tap()
+        }
+    }
+
+    func isSwitchEnabled(
+        _ toggle: XCUIElement,
+        in application: XCUIApplication? = nil
+    ) -> Bool {
+        let switchControl = resolveSwitchElement(toggle, in: application)
+        if let raw = switchControl.value as? String {
             let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             return normalized == "1" || normalized == "true" || normalized == "on" || normalized == "enabled"
         }
-        if let number = toggle.value as? NSNumber {
+        if let number = switchControl.value as? NSNumber {
             return number.boolValue
         }
         return false

@@ -183,8 +183,8 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
         try await client.seed(
             FabushiLoopbackSeedRequest(
                 users: [
-                    FabushiLoopbackSeedUser(username: "t1_f06_primary"),
-                    FabushiLoopbackSeedUser(username: "t1_f06_secondary"),
+                    FabushiLoopbackSeedUser(username: "t1_f06_primary", mintSession: false),
+                    FabushiLoopbackSeedUser(username: "t1_f06_secondary", mintSession: false),
                 ],
                 chats: [FabushiLoopbackSeedChat(chatId: 101, title: "Primary Account Chat")]
             )
@@ -300,15 +300,27 @@ final class FabushiV167Tier1UITests: FabushiE2EUITestCase {
 
         let windowBanner = element(FabushiAccessibilityIDs.Shell.toastWindowBanner, in: application)
         let stagePill = element(FabushiAccessibilityIDs.Shell.toastStagePill, in: application)
-        let toastVisible = windowBanner.waitForExistence(timeout: 6) || stagePill.waitForExistence(timeout: 4)
+        let toastVisible = await waitUntil(timeout: 8) {
+            windowBanner.exists || stagePill.exists
+        }
         XCTAssertTrue(toastVisible, "v1.6.8 F07: rate-limited send must surface windowBanner or stagePill toast")
-        let activeToast = windowBanner.exists ? windowBanner : stagePill
-        XCTAssertLessThanOrEqual(
-            activeToast.frame.maxY,
-            inputWrap.frame.minY,
-            "v1.6.8 F07 invariant: toast must sit strictly above composer inputWrap"
-        )
-        assertNonOverlapping(activeToast, inputWrap)
+        if windowBanner.exists {
+            XCTAssertLessThanOrEqual(
+                windowBanner.frame.maxY,
+                inputWrap.frame.minY,
+                "v1.6.8 F07 invariant: windowBanner must sit strictly above composer inputWrap"
+            )
+            assertNonOverlapping(windowBanner, inputWrap)
+        } else if stagePill.exists {
+            XCTAssertLessThanOrEqual(
+                stagePill.frame.maxY,
+                inputWrap.frame.minY,
+                "v1.6.8 F07 invariant: stagePill must sit strictly above composer inputWrap"
+            )
+            assertNonOverlapping(stagePill, inputWrap)
+        } else {
+            XCTFail("v1.6.8 F07: toast dismissed before non-overlap geometry verification against composer inputWrap")
+        }
         try await client.clearFaults()
         recordCheckpoint("T1_F07_adaptive_shell_v168", passed: true, attachScreen: true)
     }

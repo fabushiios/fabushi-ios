@@ -4,10 +4,10 @@ resolver = "3"
 
 [package]
 name = "fabushi_e2e_ffi"
-version = "1.6.7"
+version = "1.6.8"
 edition = "2024"
 rust-version = "1.85"
-description = "Standalone opaque-box C-ABI FFI & loopback protocol E2E test suite for Fabushi iOS v1.6.7"
+description = "Standalone opaque-box C-ABI FFI & loopback protocol E2E test suite for Fabushi iOS v1.6.8"
 publish = false
 
 [dependencies]

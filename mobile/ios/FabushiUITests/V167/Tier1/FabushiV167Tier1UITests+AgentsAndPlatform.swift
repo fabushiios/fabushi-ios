@@ -21,6 +21,11 @@ extension FabushiV167Tier1UITests {
         let studioRoot = requireElement(FabushiAccessibilityIDs.Studio.root, in: application)
         assertWithinWindowBounds(studioRoot, in: application)
 
+        let studioTabBar = resolveHorizontalScrollContainer(
+            preferredIdentifier: FabushiAccessibilityIDs.Studio.tabBar,
+            inside: studioRoot,
+            in: application
+        )
         let sevenTabs = [
             FabushiAccessibilityIDs.Studio.tabOverview,
             FabushiAccessibilityIDs.Studio.tabKanban,
@@ -31,6 +36,9 @@ extension FabushiV167Tier1UITests {
             FabushiAccessibilityIDs.Studio.tabSessions,
         ]
         for tabID in sevenTabs {
+            if let studioTabBar {
+                scrollToElementHorizontally(element(tabID, in: application), in: studioTabBar, maxSwipes: 6)
+            }
             tapControlWithHIGChecks(
                 tabID,
                 in: application,
@@ -40,6 +48,13 @@ extension FabushiV167Tier1UITests {
             )
         }
 
+        if let studioTabBar {
+            scrollToElementHorizontally(
+                element(FabushiAccessibilityIDs.Studio.tabOverview, in: application),
+                in: studioTabBar,
+                maxSwipes: 6
+            )
+        }
         tapControl(FabushiAccessibilityIDs.Studio.tabOverview, in: application)
         let toolsets = requireElement(FabushiAccessibilityIDs.Studio.toolsetList, in: application)
         assertWithinWindowBounds(toolsets, in: application)
@@ -182,10 +197,6 @@ extension FabushiV167Tier1UITests {
             verifyWithinBounds: true,
             verifyVoiceOver: true
         )
-        XCTAssertFalse(
-            auditLog.label.contains("Bearer ") || auditLog.label.contains("tok_"),
-            "F21 MCP audit log must redact sensitive bearer tokens"
-        )
 
         let state = try await client.fetchState(pathPrefix: "/api/v1/mcp")
         XCTAssertGreaterThanOrEqual(
@@ -193,6 +204,31 @@ extension FabushiV167Tier1UITests {
             1,
             "F21 MCP grants & audit flow must send >= 1 real /api/v1/mcp request to loopback"
         )
+
+        let auditVisible = auditLog.waitForExistence(timeout: 5)
+        XCTAssertTrue(
+            auditVisible,
+            "F21 MCP audit log must remain rendered after grant approval for redaction verification"
+        )
+        let containerLabel = auditLog.label
+        let containerValue = (auditLog.value as? String) ?? ""
+        for sensitiveToken in ["Bearer ", "tok_"] {
+            XCTAssertFalse(
+                containerLabel.localizedCaseInsensitiveContains(sensitiveToken)
+                    || containerValue.localizedCaseInsensitiveContains(sensitiveToken),
+                "F21 MCP audit log container must redact sensitive token '\(sensitiveToken)'"
+            )
+            let leakPredicate = NSPredicate(
+                format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                sensitiveToken,
+                sensitiveToken
+            )
+            let leakedRow = auditLog.descendants(matching: .any).matching(leakPredicate).firstMatch
+            XCTAssertFalse(
+                leakedRow.exists,
+                "F21 MCP audit log child row must redact sensitive token '\(sensitiveToken)' (leaked: '\(leakedRow.label)')"
+            )
+        }
         recordCheckpoint("T1_F21_mcp_grants_and_audit", passed: true)
     }
 

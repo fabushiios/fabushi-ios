@@ -1,6 +1,6 @@
 [package]
 name = "fabushi_e2e_mutant_stub"
-version = "1.6.7"
+version = "1.6.8"
 edition = "2024"
 rust-version = "1.85"
 description = "Negative-oracle mutant cdylib strictly for self_validate_antistub verification (never used by production Tiers 1-4)"

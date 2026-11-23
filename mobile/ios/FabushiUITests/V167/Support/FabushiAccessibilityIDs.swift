@@ -220,6 +220,7 @@ enum FabushiAccessibilityIDs {
     enum Studio {
         static let namespace = "fabushi.studio"
         static let root = "fabushi.studio.root"
+        static let tabBar = "fabushi.studio.tabBar"
         static let tabOverview = "fabushi.studio.tab.overview"
         static let tabKanban = "fabushi.studio.tab.kanban"
         static let tabSkills = "fabushi.studio.tab.skills"
