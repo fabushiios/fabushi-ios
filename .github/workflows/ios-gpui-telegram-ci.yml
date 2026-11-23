@@ -175,11 +175,15 @@ jobs:
           cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
             -p fabushi_miniapp --features server
 
-          echo "=== Testing crate: gpui_telegram_client (--lib + 15 deterministic offline integration suites) ==="
+          echo "=== Testing crate: gpui_telegram_client (auth_client_tests loopback bridge, unsetting GPUI_OFFLINE_TEST) ==="
+          env -u GPUI_OFFLINE_TEST cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
+            -p gpui_telegram_client \
+            --test auth_client_tests
+
+          echo "=== Testing crate: gpui_telegram_client (--lib + 14 deterministic offline integration suites) ==="
           cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
             -p gpui_telegram_client \
             --lib \
-            --test auth_client_tests \
             --test client_contract_and_sync_tests \
             --test m2_protocol_outbox_e2ee_proxy_tests \
             --test adversarial_data_subsystem_tests \

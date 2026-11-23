@@ -580,6 +580,11 @@ pub fn window_control_with_lease_fenced(
             {
                 return linux_native::window_control(request);
             }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                let _ = request;
+                Err(ComputerError::Unavailable)
+            }
         },
     )?;
     Ok(ObservedComputerWindowResult {
@@ -614,6 +619,11 @@ pub fn accessibility_tree_with_lease_fenced(
             {
                 return linux_native::accessibility_tree(request, observation_generation);
             }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (request, observation_generation);
+                Err(ComputerError::Unavailable)
+            }
         },
     )?;
     Ok(ObservedComputerAccessibilityTree {
@@ -644,6 +654,11 @@ pub fn semantic_action_with_lease_fenced(
             #[cfg(target_os = "linux")]
             {
                 return linux_native::semantic_action(request, current_generation);
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (request, current_generation);
+                Err(ComputerError::Unavailable)
             }
         },
     )?;
