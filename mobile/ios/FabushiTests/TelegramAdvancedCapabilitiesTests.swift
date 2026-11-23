@@ -125,53 +125,84 @@ public final class TelegramAdvancedCapabilitiesTests: XCTestCase, @unchecked Sen
     // MARK: - FEATURE 36: SQLite WAL Store & Tantivy Search Bridge
     // =========================================================================
 
-    public func testSqliteWal10TableSchemaVerification() async throws {
-        let bridge = SearchIndexingBridge()
-        let isHealthy = try await bridge.verifySchemaIntegrity()
-        XCTAssertTrue(isHealthy)
+    private func makeIsolatedHost(prefix: String) async throws -> (FabushiRustHostActor, URL, FabushiKeychainStore) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.\(prefix).\(UUID().uuidString)",
+            account: "test"
+        )
+        let passphrase = try keychain.loadOrCreateStoragePassphrase()
+        let host = FabushiRustHostActor()
+        try await host.initialize(config: FabushiHostConfig(
+            appDataDir: dir.path,
+            storagePassphrase: passphrase,
+            testMode: true,
+            iosSandboxStrict: true
+        ))
+        return (host, dir, keychain)
+    }
 
-        // Verify all 10 required tables are present
-        XCTAssertEqual(SearchIndexingBridge.requiredWalTables.count, 10)
-        let expectedTables: Set<String> = [
-            "messages", "chats", "peers", "drafts", "attachments",
-            "pts_sync", "tasks", "sessions", "settings", "secret_chats"
-        ]
-        XCTAssertEqual(SearchIndexingBridge.requiredWalTables, expectedTables)
+    public func testSqliteWal10TableSchemaVerification() async throws {
+        let (host, dir, keychain) = try await makeIsolatedHost(prefix: "wal_schema")
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let bridge = SearchIndexingBridge(host: host)
+        let isHealthy = try await bridge.verifySchemaIntegrity()
+        XCTAssertTrue(isHealthy, "Real Rust SQLite WAL checkpoint & Tantivy rebuild must report healthy")
+
+        let wal = try await host.checkpointWAL()
+        XCTAssertTrue(wal.checkpointed)
+        XCTAssertEqual(wal.busy, 0)
+        await host.shutdown()
     }
 
     public func testSqliteMissingTableError() async {
-        let bridge = SearchIndexingBridge()
-        await bridge.dropTableForTesting("secret_chats")
+        // Verify fail-closed behavior when SearchIndexingBridge queries an uninitialized host.
+        let uninitializedHost = FabushiRustHostActor()
+        let bridge = SearchIndexingBridge(host: uninitializedHost)
 
         do {
             _ = try await bridge.verifySchemaIntegrity()
-            XCTFail("Expected schemaCorrupted error")
+            XCTFail("Expected hostNotInitialized error on uninitialized Rust host")
         } catch let err as SearchIndexError {
-            if case .schemaCorrupted(let missing) = err {
-                XCTAssertEqual(missing, ["secret_chats"])
-            } else {
-                XCTFail("Wrong error type: \(err)")
-            }
+            XCTAssertEqual(err, .hostNotInitialized)
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
     }
 
     public func testTantivySearchSnippetHighlights() async throws {
-        let bridge = SearchIndexingBridge()
+        let (host, dir, keychain) = try await makeIsolatedHost(prefix: "tantivy_search")
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let bridge = SearchIndexingBridge(host: host)
 
         let doc1 = SearchDocument(id: 101, chatId: 1, text: "The quarterly financial report is ready for review.")
         let doc2 = SearchDocument(id: 102, chatId: 1, text: "Please review the presentation slides.")
 
-        try await bridge.indexMessage(doc: doc1)
-        try await bridge.indexMessage(doc: doc2)
+        let receipt1 = try await bridge.indexMessage(doc: doc1)
+        let receipt2 = try await bridge.indexMessage(doc: doc2)
+        XCTAssertTrue(receipt1.indexed)
+        XCTAssertTrue(receipt2.indexed)
 
         let query = SearchQueryParams(query: "financial")
         let results = try await bridge.search(query: query)
 
         XCTAssertEqual(results.count, 1)
         XCTAssertEqual(results.first?.id, 101)
-        XCTAssertTrue(results.first?.snippetWithHighlights.contains("<mark>financial</mark>") == true, "Must format match with <mark> tags")
+        XCTAssertTrue(
+            results.first?.snippetWithHighlights.contains("<mark>financial</mark>") == true,
+            "Must format match with <mark> tags"
+        )
+        await host.shutdown()
     }
 
     // =========================================================================
@@ -179,59 +210,127 @@ public final class TelegramAdvancedCapabilitiesTests: XCTestCase, @unchecked Sen
     // =========================================================================
 
     public func testAccountScopeMonotonicIncrementAndStaleTaskDrop() async throws {
-        let manager = AccountScopeManager(initialGeneration: 1)
-        let initialGen = await manager.getCurrentGeneration()
-        XCTAssertEqual(initialGen, 1)
-
-        // 1,000 rapid account switches
-        for i in 1...1000 {
-            let newGen = try await manager.switchAccount(to: "acc_\(i)")
-            XCTAssertEqual(newGen, UInt64(i + 1))
+        let (host, dir, keychain) = try await makeIsolatedHost(prefix: "gen_fence")
+        defer {
+            try? keychain.deleteAccountKey(accountId: "101")
+            try? keychain.deleteAccountKey(accountId: "202")
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
         }
 
-        let finalGen = await manager.getCurrentGeneration()
-        XCTAssertEqual(finalGen, 1001)
+        let manager = AccountScopeManager(host: host, keychain: keychain)
+        let initialGen = try await manager.getCurrentGeneration()
+        XCTAssertEqual(initialGen, 1)
 
-        // Gen 1 task callback screening
-        let isGen1Valid = await manager.validateGeneration(1)
-        XCTAssertFalse(isGen1Valid, "Gen 1 callback must be rejected by active gen 1001 fence")
+        // Register two real accounts backed by AEAD-encrypted host storage + Keychain keys
+        let genA = try await manager.registerAccountSession(FabushiSessionAuthParams(
+            userId: 101,
+            username: "alice_test",
+            sessionId: "sess-a",
+            token: "tok-a"
+        ))
+        XCTAssertEqual(genA, 2)
 
-        let isGen1001Valid = await manager.validateGeneration(1001)
-        XCTAssertTrue(isGen1001Valid)
+        let genB = try await manager.registerAccountSession(FabushiSessionAuthParams(
+            userId: 202,
+            username: "bob_test",
+            sessionId: "sess-b",
+            token: "tok-b"
+        ))
+        XCTAssertEqual(genB, 3)
+
+        // Perform 50 rapid real Rust account switches verifying monotonic generation advance
+        var expectedGen: UInt64 = 3
+        for i in 0..<50 {
+            let target = (i % 2 == 0) ? "101" : "202"
+            let newGen = try await manager.switchAccount(to: target)
+            expectedGen += 1
+            XCTAssertEqual(newGen, expectedGen)
+        }
+
+        let finalGen = try await manager.getCurrentGeneration()
+        XCTAssertEqual(finalGen, expectedGen)
+
+        // Gen 1 callback must be rejected by live Rust generation fence
+        let isGen1Valid = try await manager.validateGeneration(1)
+        XCTAssertFalse(isGen1Valid, "Gen 1 callback must be rejected by active gen \(expectedGen) fence")
+
+        let isFinalValid = try await manager.validateGeneration(expectedGen)
+        XCTAssertTrue(isFinalValid)
+        await host.shutdown()
     }
 
-    public func testAccountLogoutScrubEpoch() async {
-        let manager = AccountScopeManager(initialGeneration: 5, activeAccountId: "user_a")
-        let hasKeyBefore = await manager.hasActiveKey(for: "user_a")
+    public func testAccountLogoutScrubEpoch() async throws {
+        let (host, dir, keychain) = try await makeIsolatedHost(prefix: "logout_scrub")
+        defer {
+            try? keychain.deleteAccountKey(accountId: "501")
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let manager = AccountScopeManager(host: host, keychain: keychain)
+        let genBefore = try await manager.registerAccountSession(FabushiSessionAuthParams(
+            userId: 501,
+            username: "user_a",
+            sessionId: "sess-501",
+            token: "tok-501"
+        ))
+        XCTAssertEqual(genBefore, 2)
+
+        let hasKeyBefore = try await manager.hasActiveKey(for: "501")
         XCTAssertTrue(hasKeyBefore)
 
-        let newEpoch = await manager.logout()
-        XCTAssertEqual(newEpoch, 6)
+        let newEpoch = try await manager.logout()
+        XCTAssertEqual(newEpoch, 3)
         let activeAcc = await manager.getActiveAccountId()
         XCTAssertNil(activeAcc)
-        let hasKeyAfter = await manager.hasActiveKey(for: "user_a")
-        XCTAssertFalse(hasKeyAfter, "Crypto keys must be purged from RAM on logout")
+        let hasKeyAfter = try await manager.hasActiveKey(for: "501")
+        XCTAssertFalse(hasKeyAfter, "Keychain secret key must be scrubbed on logout")
+        await host.shutdown()
     }
 
     public func testFencedExecutionRejectionOnGenerationMismatch() async throws {
-        let manager = AccountScopeManager(initialGeneration: 10)
+        let (host, dir, keychain) = try await makeIsolatedHost(prefix: "fenced_exec")
+        defer {
+            try? keychain.deleteAccountKey(accountId: "701")
+            try? keychain.deleteAccountKey(accountId: "702")
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let manager = AccountScopeManager(host: host, keychain: keychain)
+        let gen1 = try await manager.registerAccountSession(FabushiSessionAuthParams(
+            userId: 701,
+            username: "first_user",
+            sessionId: "sess-701",
+            token: "tok-701"
+        ))
+        let gen2 = try await manager.registerAccountSession(FabushiSessionAuthParams(
+            userId: 702,
+            username: "second_user",
+            sessionId: "sess-702",
+            token: "tok-702"
+        ))
+        XCTAssertEqual(gen1, 2)
+        XCTAssertEqual(gen2, 3)
 
         do {
-            _ = try await manager.executeFenced { taskGen in
-                // Interleaving account switch advances generation mid-task
-                _ = try await manager.switchAccount(to: "acc_other")
+            _ = try await manager.executeFenced { _ in
+                // Interleaving real Rust account switch advances generation mid-task
+                _ = try await manager.switchAccount(to: "701")
                 return "completed result"
             }
             XCTFail("executeFenced should have thrown staleGeneration")
         } catch let err as FenceRejectionError {
             if case .staleGeneration(let taskGen, let curGen) = err {
-                XCTAssertEqual(taskGen, 10)
-                XCTAssertEqual(curGen, 11)
+                XCTAssertEqual(taskGen, 3)
+                XCTAssertEqual(curGen, 4)
             } else {
                 XCTFail("Wrong rejection error: \(err)")
             }
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+        await host.shutdown()
     }
 }

@@ -264,12 +264,18 @@ private struct FabushiProductionSceneRoot: View {
                 }
             )
             .task {
+                do {
+                    try await FabushiCoordinator.shared.start()
+                } catch {
+                    // Fail-closed coordinator startup surfaces diagnostics on FabushiCoordinator.shared.lastErrorMessage
+                }
                 await runtime.start()
             }
             .onChange(of: runtime.marketplace.loggedIn) { _, loggedIn in
                 Task { await runtime.loginStateChanged(loggedIn) }
             }
             .onChange(of: scenePhase) { _, phase in
+                FabushiCoordinator.shared.handleScenePhaseChange(phase)
                 runtime.scenePhaseChanged(phase)
             }
             .onOpenURL { url in

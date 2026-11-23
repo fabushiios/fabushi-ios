@@ -231,7 +231,7 @@ struct ChatListView: View {
                     }
                 }
             }
-            .onChange(of: searchText) { newValue in
+            .onChange(of: searchText) { _, newValue in
                 viewModel.searchText = newValue
             }
         }

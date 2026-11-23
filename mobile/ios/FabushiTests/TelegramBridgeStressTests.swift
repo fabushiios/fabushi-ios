@@ -2,13 +2,13 @@ import Foundation
 import XCTest
 @testable import Fabushi
 
-final class TelegramBridgeStressTests: XCTestCase {
+final class TelegramBridgeStressTests: XCTestCase, @unchecked Sendable {
 
-    struct PingParams: Encodable {
+    struct PingParams: Encodable, Sendable {
         let nonce: Int
     }
 
-    struct PingResponse: Decodable {
+    struct PingResponse: Decodable, Sendable {
         let pong: Bool
         let nonce: Int
         let timestamp: Int64
@@ -16,13 +16,13 @@ final class TelegramBridgeStressTests: XCTestCase {
 
     @MainActor
     func testConcurrentAsyncDispatchBursts() async throws {
-        let runtime = TelegramBridgeRuntime.shared
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("test_bridge_burst_\(UUID().uuidString)")
+        let runtime = TelegramBridgeRuntime()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_bridge_burst_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        try runtime.initialize(appDataDirectory: tempDir, isTestMode: true)
-        defer { runtime.shutdown() }
+        try await runtime.initialize(appDataDirectory: tempDir, isTestMode: true)
 
         let burstCount = 100
         var successes = 0
@@ -49,22 +49,25 @@ final class TelegramBridgeStressTests: XCTestCase {
             }
         }
 
+        await runtime.shutdown()
         XCTAssertEqual(successes, burstCount, "Expected all \(burstCount) parallel dispatches to succeed without deadlock")
     }
 
     @MainActor
     func testHighFrequencyPushEventFlooding() async throws {
-        let stream = TelegramEventStream()
         let totalEvents = 5000
-        var receivedCount = 0
+        let stream = TelegramEventStream(maxBufferedEvents: totalEvents)
+        let eventSequence = stream.makeStream(bufferCapacity: totalEvents)
 
-        let consumerTask = Task {
-            for await _ in stream.stream {
-                receivedCount += 1
-                if receivedCount == totalEvents {
+        let consumerTask = Task<Int, Never> {
+            var count = 0
+            for await _ in eventSequence {
+                count += 1
+                if count == totalEvents {
                     break
                 }
             }
+            return count
         }
 
         let workerCount = 4
@@ -83,19 +86,20 @@ final class TelegramBridgeStressTests: XCTestCase {
             }
         }
 
-        _ = await consumerTask.result
+        stream.finish()
+        let receivedCount = await consumerTask.value
         XCTAssertEqual(receivedCount, totalEvents, "Expected exactly \(totalEvents) events with zero drops")
     }
 
     @MainActor
     func testTaskCancellationResilience() async throws {
-        let runtime = TelegramBridgeRuntime.shared
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("test_bridge_cancel_\(UUID().uuidString)")
+        let runtime = TelegramBridgeRuntime()
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_bridge_cancel_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        try runtime.initialize(appDataDirectory: tempDir, isTestMode: true)
-        defer { runtime.shutdown() }
+        try await runtime.initialize(appDataDirectory: tempDir, isTestMode: true)
 
         let tasksCount = 50
         await withTaskGroup(of: Void.self) { group in
@@ -126,6 +130,7 @@ final class TelegramBridgeStressTests: XCTestCase {
                 postSuccessCount += 1
             }
         }
+        await runtime.shutdown()
         XCTAssertEqual(postSuccessCount, 20, "All post-cancellation dispatches must succeed cleanly")
     }
 }

@@ -40,7 +40,7 @@ public final class ConversationStageViewModel: ObservableObject {
     @Published public var showStickerPicker: Bool = false
     @Published public var activeMediaViewerVM: MediaViewerViewModel? = nil
 
-    private var eventTask: Task<Void, Never>?
+    nonisolated(unsafe) private var eventTask: Task<Void, Never>?
     private let draftKey: String
 
     public init(
@@ -83,7 +83,7 @@ public final class ConversationStageViewModel: ObservableObject {
     // MARK: - Initial Loading
     public func loadInitialMessages() async {
         do {
-            struct GetMessagesParams: Encodable {
+            struct GetMessagesParams: Encodable, Sendable {
                 let chat_id: Int64
             }
             let fetched: [TelegramStageMessage] = try await TelegramBridgeRuntime.shared.dispatch(
@@ -128,7 +128,7 @@ public final class ConversationStageViewModel: ObservableObject {
         saveDraft()
         activeReplyMessage = nil
 
-        struct SendMessageResponse: Decodable {
+        struct SendMessageResponse: Decodable, Sendable {
             let id: Int64
             let status: String?
         }

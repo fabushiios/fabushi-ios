@@ -266,8 +266,8 @@ public final class ChatListViewModel: ObservableObject {
 
     private let runtime: TelegramBridgeRuntime
     public let ptsCoordinator: PtsSyncCoordinator
-    private var eventListenTask: Task<Void, Never>?
-    private var typingTimers: [Int64: Task<Void, Never>] = [:]
+    nonisolated(unsafe) private var eventListenTask: Task<Void, Never>?
+    nonisolated(unsafe) private var typingTimers: [Int64: Task<Void, Never>] = [:]
 
     // MARK: - Initializers
     /// Default initializer isolated to MainActor, safely evaluating .shared inside constructor body.

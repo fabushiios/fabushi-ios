@@ -200,7 +200,7 @@ public final class MediaViewerViewModel: ObservableObject, @unchecked Sendable {
     }
 
     // Handle message deletion while viewing
-    public func handleMessageDeleted(messageId: Int64, onDismiss: @escaping () -> Void) {
+    public func handleMessageDeleted(messageId: Int64, onDismiss: @escaping @MainActor () -> Void) {
         if let current = currentItem, current.messageId == messageId {
             deletedMessageToast = "Message Deleted"
             Task { @MainActor in

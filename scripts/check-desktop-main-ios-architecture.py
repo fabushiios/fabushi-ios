@@ -81,6 +81,12 @@ TEST_READY_ACTIONS_URL_RE = re.compile(
 TEST_READY_RUN_ID_RE = re.compile(r"\bGITHUB_RUN_ID\s*[:=]\s*[1-9][0-9]*\b")
 HOST_STUB_ACK_RE = re.compile(r'\\?"status\\?"\s*:\s*\\?"acknowledged\\?"')
 HOST_HARDCODED_LOCALHOST_RE = re.compile(r'https?://127\.0\.0\.1:8443')
+SWIFT_FAKE_ACCOUNT_RE = re.compile(r'"acc_primary"|"acc_work"')
+SWIFT_FAKE_CRYPTO_KEY_RE = re.compile(r'Data\s*\(\s*repeating\s*:\s*0x(?:AA|BB)\b', re.IGNORECASE)
+SWIFT_MOCK_BRIDGE_RE = re.compile(r'\bmockBridge\b|\bmockChunks\b|"mock_media_')
+PROJECT_ATS_ARBITRARY_FALSE_RE = re.compile(r'^\s*NSAllowsArbitraryLoads\s*:\s*false\b', re.MULTILINE)
+PROJECT_ATS_ARBITRARY_TRUE_RE = re.compile(r'^\s*NSAllowsArbitraryLoads\s*:\s*true\b', re.MULTILINE)
+PROJECT_ATS_LOCAL_TRUE_RE = re.compile(r'^\s*NSAllowsLocalNetworking\s*:\s*true\b', re.MULTILINE)
 DEP_TABLE_KEYS = (
     "dependencies",
     "dev-dependencies",
@@ -1109,6 +1115,52 @@ def verify_host_anti_stub(root, errors):
                 )
 
 
+def verify_ios_swift_anti_mock(root, errors):
+    app_root = root / "mobile/ios/Fabushi"
+    required_core_owners = [
+        "mobile/ios/Fabushi/Core/FabushiRustHostActor.swift",
+        "mobile/ios/Fabushi/Core/FabushiCoordinator.swift",
+    ]
+    for relative in required_core_owners:
+        if not (root / relative).is_file():
+            errors.append(f"missing canonical Swift Core owner: {relative}")
+
+    if app_root.is_dir():
+        for swift_file in sorted(app_root.rglob("*.swift")):
+            text = swift_file.read_text(encoding="utf-8")
+            rel = swift_file.relative_to(root).as_posix()
+            if SWIFT_FAKE_ACCOUNT_RE.search(text):
+                errors.append(
+                    f"{rel} contains forbidden hardcoded fake account literal (acc_primary/acc_work)"
+                )
+            if SWIFT_FAKE_CRYPTO_KEY_RE.search(text):
+                errors.append(
+                    f"{rel} contains forbidden hardcoded fake crypto key (Data(repeating: 0xAA/0xBB, ...))"
+                )
+            if SWIFT_MOCK_BRIDGE_RE.search(text):
+                errors.append(
+                    f"{rel} contains forbidden production mock bypass (mockBridge/mockChunks/mock_media_)"
+                )
+    else:
+        errors.append("missing iOS Swift app source root: mobile/ios/Fabushi")
+
+    project_yml = root / "mobile/ios/project.yml"
+    if not project_yml.is_file():
+        errors.append("missing XcodeGen spec: mobile/ios/project.yml")
+    else:
+        yml_text = project_yml.read_text(encoding="utf-8")
+        if "NSAppTransportSecurity:" not in yml_text:
+            errors.append("mobile/ios/project.yml missing NSAppTransportSecurity configuration")
+        if PROJECT_ATS_ARBITRARY_TRUE_RE.search(yml_text):
+            errors.append("mobile/ios/project.yml must not enable NSAllowsArbitraryLoads: true")
+        if not PROJECT_ATS_ARBITRARY_FALSE_RE.search(yml_text):
+            errors.append("mobile/ios/project.yml must enforce NSAllowsArbitraryLoads: false")
+        if not PROJECT_ATS_LOCAL_TRUE_RE.search(yml_text):
+            errors.append("mobile/ios/project.yml must enable NSAllowsLocalNetworking: true")
+        if "master_e2e_suite.swift" in yml_text:
+            errors.append("mobile/ios/project.yml must not compile standalone master_e2e_suite.swift")
+
+
 def verify_host_cargo_manifests(root, forbidden_deps, errors):
     host_dir = root / "source/host"
     host_toml = host_dir / "Cargo.toml"
@@ -1166,6 +1218,7 @@ def verify_ios_owners(errors, lock=None, complete=False):
         forbidden_deps |= set(lock["forbiddenMobileWorkspaceDeps"])
     verify_host_cargo_manifests(ROOT, forbidden_deps, errors)
     verify_host_anti_stub(ROOT, errors)
+    verify_ios_swift_anti_mock(ROOT, errors)
 
     verify_desktop_core_workspace(ROOT / "source/desktop_core", lock, errors)
     verify_test_ready_integrity(ROOT, errors, complete=complete)

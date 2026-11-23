@@ -58,4 +58,18 @@ final class FabushiAppDelegate: NSObject, UIApplicationDelegate {
             completionHandler: completionHandler
         )
     }
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return
+        }
+        #endif
+        Task { @MainActor in
+            await FabushiCoordinator.shared.registerAPNsDeviceToken(deviceToken)
+        }
+    }
 }

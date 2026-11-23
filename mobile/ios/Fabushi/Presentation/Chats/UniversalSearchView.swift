@@ -338,14 +338,14 @@ struct UniversalSearchView: View {
                     }
                 } else {
                     // Dispatch via TelegramBridgeRuntime JSON-RPC
-                    struct SearchHit: Decodable {
+                    struct SearchHit: Decodable, Sendable {
                         let id: String
                         let conversation_id: String
                         let title: String?
                         let snippet: String
                         let timestamp_ms: Int64?
                     }
-                    struct SearchPayload: Encodable {
+                    struct SearchPayload: Encodable, Sendable {
                         let query: String
                         let scope: String
                     }

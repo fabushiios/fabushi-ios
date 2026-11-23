@@ -86,11 +86,11 @@ public final class HeartBurstState: ObservableObject {
 }
 
 public struct HeartBurstAnimationView: View {
-    public let onFinished: () -> Void
+    public let onFinished: @MainActor () -> Void
 
     @StateObject private var state = HeartBurstState()
 
-    public init(onFinished: @escaping () -> Void) {
+    public init(onFinished: @escaping @MainActor () -> Void) {
         self.onFinished = onFinished
     }
 
@@ -109,7 +109,8 @@ public struct HeartBurstAnimationView: View {
                     state.opacity = 0.0
                     state.yOffset = -48
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 650_000_000)
                     onFinished()
                 }
             }

@@ -1,20 +1,10 @@
-import Darwin
+import Combine
 import Foundation
 import Security
 
-// MARK: - Global C-ABI Event Callback
-private let cTelegramBridgeEventCallback: TelegramBridgeEventCallback = { eventTypePtr, payloadJsonPtr, userContext in
-    guard let eventTypePtr, let payloadJsonPtr, let userContext else { return }
-    let eventType = String(cString: eventTypePtr)
-    let payloadJson = String(cString: payloadJsonPtr)
-
-    // Safely retrieve unmanaged runtime instance pointer
-    let runtime = Unmanaged<TelegramBridgeRuntime>.fromOpaque(userContext).takeUnretainedValue()
-    runtime.receivePushEvent(type: eventType, payloadJson: payloadJson)
-}
-
 // MARK: - Telegram Bridge Errors
-public enum TelegramBridgeError: LocalizedError, Sendable {
+
+public enum TelegramBridgeError: LocalizedError, Sendable, Equatable {
     case notInitialized
     case serializationFailed
     case invalidResponse(String)
@@ -25,7 +15,7 @@ public enum TelegramBridgeError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .notInitialized:
-            return "Telegram Rust core runtime is not initialized."
+            return "Fabushi Rust core runtime is not initialized."
         case .serializationFailed:
             return "Failed to serialize JSON-RPC command parameters."
         case .invalidResponse(let raw):
@@ -38,46 +28,40 @@ public enum TelegramBridgeError: LocalizedError, Sendable {
             return "Failed to access iOS Keychain storage passphrase (status: \(status))."
         }
     }
+
+    static func fromHostError(_ error: FabushiHostError) -> TelegramBridgeError {
+        switch error {
+        case .notInitialized:
+            return .notInitialized
+        case .serializationFailed:
+            return .serializationFailed
+        case .invalidResponse(let raw):
+            return .invalidResponse(raw)
+        case .rustPanic(let message):
+            return .rustPanic(message)
+        case .keychainFailed(let status):
+            return .keychainAccessFailed(status)
+        default:
+            return .serverError(code: error.code, message: error.localizedDescription)
+        }
+    }
 }
 
-// MARK: - Sendable Pointer Wrapper
-private struct SendableHostPointer: @unchecked Sendable {
-    let pointer: UnsafeMutableRawPointer
-}
+// MARK: - Swift 6 @MainActor Facade Over Canonical FabushiRustHostActor
 
-// MARK: - Generic Envelopes
-private struct BridgeRequestEnvelope<P: Encodable>: Encodable {
-    let command: String
-    let params: P
-}
-
-private struct BridgeResponseEnvelope<T: Decodable>: Decodable {
-    let ok: Bool
-    let result: T?
-    let error: BridgeErrorPayload?
-}
-
-private struct BridgeErrorPayload: Decodable {
-    let code: String?
-    let message: String?
-}
-
-// MARK: - TelegramBridgeRuntime
+/// Thin `@MainActor` facade bridging existing Presentation ViewModels onto the canonical
+/// `FabushiRustHostActor` and fail-closed `FabushiKeychainStore` with zero mocks,
+/// zero blocking main-thread sync queues, and full Swift 6 strict-concurrency compliance.
 @MainActor
 public final class TelegramBridgeRuntime: ObservableObject {
-    public static let shared = TelegramBridgeRuntime()
+    public static let shared = TelegramBridgeRuntime(host: .shared, keychain: .shared)
 
-    // Opaque handle to Rust TelegramAppHost
-    private var hostHandle: SendableHostPointer?
-
-    // Dedicated background serial queue for offloaded FFI dispatch
-    private let bridgeQueue = DispatchQueue(
-        label: "com.ombhrum.telegram.bridge-serial",
-        qos: .userInitiated
-    )
-
-    // Push event streaming engine
+    public let host: FabushiRustHostActor
+    private let keychain: FabushiKeychainStore
     private let eventPipeline = TelegramEventStream()
+
+    nonisolated(unsafe) private var eventForwardTask: Task<Void, Never>?
+
     public var eventStream: AsyncStream<TelegramEvent> {
         eventPipeline.stream
     }
@@ -85,227 +69,131 @@ public final class TelegramBridgeRuntime: ObservableObject {
     @Published public private(set) var isReady: Bool = false
     @Published public private(set) var connectionStatus: String = "Disconnected"
 
-    private init() {}
+    public init(
+        host: FabushiRustHostActor = FabushiRustHostActor(),
+        keychain: FabushiKeychainStore = .shared
+    ) {
+        self.host = host
+        self.keychain = keychain
+    }
 
     deinit {
-        if let handle = hostHandle {
-            bridgeQueue.sync {
-                telegram_app_host_destroy(handle.pointer)
-            }
-        }
+        eventForwardTask?.cancel()
         eventPipeline.finish()
     }
 
     // MARK: - Lifecycle Management
 
-    public func initialize(appDataDirectory: URL? = nil, isTestMode: Bool = false) throws {
-        guard hostHandle == nil else { return }
+    public func initialize(
+        appDataDirectory: URL? = nil,
+        serverURL: String? = nil,
+        isTestMode: Bool = false
+    ) async throws {
+        if await host.isInitialized {
+            if !isReady {
+                startEventForwarding()
+                await refreshStatusFromHost()
+                isReady = true
+            }
+            return
+        }
 
         let directory = appDataDirectory ?? FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
-        )[0].appendingPathComponent("TelegramCore", isDirectory: true)
+        )[0].appendingPathComponent("FabushiCore", isDirectory: true)
 
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let rawPointer: UnsafeMutableRawPointer?
+        let passphrase: String?
         if isTestMode {
-            rawPointer = directory.path.withCString { dirPtr in
-                telegram_app_host_create_test(dirPtr)
-            }
+            passphrase = nil
         } else {
-            let passphrase = (try? loadOrCreateStoragePassphrase()) ?? ""
-            rawPointer = directory.path.withCString { dirPtr in
-                if passphrase.isEmpty {
-                    telegram_app_host_create(dirPtr, nil)
-                } else {
-                    passphrase.withCString { passPtr in
-                        telegram_app_host_create(dirPtr, passPtr)
-                    }
+            do {
+                passphrase = try keychain.loadOrCreateStoragePassphrase()
+            } catch let kcError as FabushiKeychainError {
+                if case .osStatus(let status) = kcError {
+                    throw TelegramBridgeError.keychainAccessFailed(status)
                 }
+                throw TelegramBridgeError.serverError(
+                    code: "keychain_error",
+                    message: kcError.localizedDescription
+                )
             }
         }
 
-        guard let rawPointer else {
-            let errorMsg = telegram_app_host_last_error().map { String(cString: $0) } ?? "Unknown initialization error"
-            throw TelegramBridgeError.serverError(code: "INIT_FAILED", message: errorMsg)
-        }
-
-        let handle = SendableHostPointer(pointer: rawPointer)
-        self.hostHandle = handle
-
-        // Register push event callback
-        telegram_bridge_register_event_callback(
-            handle.pointer,
-            cTelegramBridgeEventCallback,
-            Unmanaged.passUnretained(self).toOpaque()
+        let config = FabushiHostConfig(
+            appDataDir: directory.path,
+            storagePassphrase: passphrase,
+            serverUrl: serverURL,
+            httpTimeoutSecs: FabushiHostConfig.defaultHttpTimeoutSecs,
+            testMode: isTestMode,
+            iosSandboxStrict: true
         )
 
+        do {
+            try await host.initialize(config: config)
+        } catch let hostError as FabushiHostError {
+            throw TelegramBridgeError.fromHostError(hostError)
+        }
+
+        startEventForwarding()
+        await refreshStatusFromHost()
         isReady = true
-        connectionStatus = "Connected"
     }
 
-    public func shutdown() {
+    public func shutdown() async {
+        eventForwardTask?.cancel()
+        eventForwardTask = nil
         isReady = false
         connectionStatus = "Disconnected"
-        bridgeQueue.sync {
-            if let handle = self.hostHandle {
-                telegram_app_host_destroy(handle.pointer)
-                self.hostHandle = nil
-            }
-        }
+        eventPipeline.finish()
+        await host.shutdown()
     }
 
-    // MARK: - Command Dispatch
+    // MARK: - Typed Command Dispatch
 
-    private func dispatchRawJson(_ requestString: String) async throws -> String {
-        guard let handle = hostHandle else {
-            throw TelegramBridgeError.notInitialized
-        }
-
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            bridgeQueue.async {
-                let responsePtr = requestString.withCString { cStr in
-                    telegram_app_host_dispatch(handle.pointer, cStr)
-                }
-                guard let responsePtr else {
-                    continuation.resume(throwing: TelegramBridgeError.invalidResponse("Null pointer returned by dispatch"))
-                    return
-                }
-                defer { telegram_app_host_free_string(responsePtr) }
-                let responseString = String(cString: responsePtr)
-                continuation.resume(returning: responseString)
-            }
-        }
-    }
-
-    public func dispatch<T: Decodable, R: Encodable>(command: String, params: R) async throws -> T {
-        let envelope = BridgeRequestEnvelope(command: command, params: params)
-        let encoder = JSONEncoder()
-        guard let requestData = try? encoder.encode(envelope),
-              let requestString = String(data: requestData, encoding: .utf8)
-        else {
-            throw TelegramBridgeError.serializationFailed
-        }
-
-        let rawResponse = try await dispatchRawJson(requestString)
-
-        guard let responseData = rawResponse.data(using: .utf8) else {
-            throw TelegramBridgeError.invalidResponse(rawResponse)
-        }
-
-        let decoder = JSONDecoder()
-        let resultEnvelope: BridgeResponseEnvelope<T>
+    public func dispatch<T: Decodable & Sendable, R: Encodable & Sendable>(
+        command: String,
+        params: R
+    ) async throws -> T {
         do {
-            resultEnvelope = try decoder.decode(BridgeResponseEnvelope<T>.self, from: responseData)
-        } catch {
-            throw TelegramBridgeError.invalidResponse(rawResponse)
+            return try await host.dispatch(method: command, params: params)
+        } catch let hostError as FabushiHostError {
+            throw TelegramBridgeError.fromHostError(hostError)
         }
-
-        if resultEnvelope.ok, let result = resultEnvelope.result {
-            return result
-        }
-
-        let code = resultEnvelope.error?.code ?? "UNKNOWN_ERROR"
-        let message = resultEnvelope.error?.message ?? "Operation failed"
-        if code == "HOST_PANIC" {
-            throw TelegramBridgeError.rustPanic(message)
-        }
-        throw TelegramBridgeError.serverError(code: code, message: message)
     }
 
-    public func dispatch<T: Decodable>(command: String) async throws -> T {
-        return try await dispatch(command: command, params: [String: String]())
+    public func dispatch<T: Decodable & Sendable>(command: String) async throws -> T {
+        try await dispatch(command: command, params: FabushiEmptyParams())
     }
 
     @discardableResult
-    public func dispatch(command: String) async throws -> [String: Any] {
-        let envelope = BridgeRequestEnvelope(command: command, params: [String: String]())
-        let encoder = JSONEncoder()
-        guard let requestData = try? encoder.encode(envelope),
-              let requestString = String(data: requestData, encoding: .utf8)
-        else {
-            throw TelegramBridgeError.serializationFailed
-        }
-
-        let rawResponse = try await dispatchRawJson(requestString)
-
-        guard let responseData = rawResponse.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-        else {
-            throw TelegramBridgeError.invalidResponse(rawResponse)
-        }
-
-        guard let ok = json["ok"] as? Bool else {
-            throw TelegramBridgeError.invalidResponse(rawResponse)
-        }
-
-        if ok {
-            return (json["result"] as? [String: Any]) ?? [:]
-        }
-
-        let errDict = json["error"] as? [String: Any]
-        let code = errDict?["code"] as? String ?? "UNKNOWN_ERROR"
-        let message = errDict?["message"] as? String ?? "Operation failed"
-        if code == "HOST_PANIC" {
-            throw TelegramBridgeError.rustPanic(message)
-        }
-        throw TelegramBridgeError.serverError(code: code, message: message)
+    public func dispatch(command: String) async throws -> FabushiJSONValue {
+        try await dispatch(command: command, params: FabushiEmptyParams())
     }
 
-    // MARK: - Push Event Reception
+    // MARK: - Internal Event Forwarding & Status Sync
 
-    nonisolated func receivePushEvent(type: String, payloadJson: String) {
-        eventPipeline.parseAndYield(type: type, json: payloadJson)
+    private func startEventForwarding() {
+        eventForwardTask?.cancel()
+        let domainStream = host.makeEventStream()
+        eventForwardTask = Task { @MainActor [weak self] in
+            for await domainEvent in domainStream {
+                guard !Task.isCancelled, let self else { break }
+                if case .connectionStateChanged(let status, _) = domainEvent.kind {
+                    self.connectionStatus = status
+                }
+                self.eventPipeline.yield(domainEvent: domainEvent)
+            }
+        }
     }
 
-    // MARK: - Secure Keychain Storage Passphrase
-
-    private func loadOrCreateStoragePassphrase() throws -> String {
-        let service = "com.ombhrum.fabushi.telegram-storage.v1"
-        let account = "default"
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, let data = item as? Data, data.count == 32 {
-            return data.base64EncodedString()
+    private func refreshStatusFromHost() async {
+        if let ws = try? await host.wsStatus() {
+            connectionStatus = ws.status
+        } else {
+            connectionStatus = "Disconnected"
         }
-
-        guard status == errSecItemNotFound else {
-            throw TelegramBridgeError.keychainAccessFailed(status)
-        }
-
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let randomStatus = bytes.withUnsafeMutableBytes { buf in
-            guard let baseAddress = buf.baseAddress else { return errSecParam }
-            return SecRandomCopyBytes(kSecRandomDefault, buf.count, baseAddress)
-        }
-        guard randomStatus == errSecSuccess else {
-            throw TelegramBridgeError.keychainAccessFailed(randomStatus)
-        }
-
-        let data = Data(bytes)
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecValueData as String: data,
-        ]
-
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw TelegramBridgeError.keychainAccessFailed(addStatus)
-        }
-
-        return data.base64EncodedString()
     }
 }

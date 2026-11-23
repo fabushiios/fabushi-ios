@@ -667,3 +667,326 @@ jobs:
       - name: Verify live Desktop main unchanged at job end
         if: always()
         run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  ios-sim-build-and-test:
+    name: iOS Simulator Build & Swift 6 XCTest Suite (macOS-15)
+    runs-on: macos-15
+    needs: [authority-check, rust-host-ios-staticlib]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout, Xcode 16.4 & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          swift --version
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Download verified iOS Rust staticlibs
+        uses: actions/download-artifact@v4
+        with:
+          name: fabushi-rust-host-ios-staticlibs-${{ env.IOS_EXPECTED_HEAD }}
+          path: ${{ runner.temp }}/rust-staticlibs
+
+      - name: Verify SHA-256 digests and install prebuilt staticlibs
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/rust-staticlibs"
+          diff -u source/host/include/mahayana_app_host.h "$STAGE/source/host/include/mahayana_app_host.h"
+          mkdir -p build/rust/iphonesimulator build/rust/iphoneos
+          cp "$STAGE/build/rust/iphonesimulator/libmahayana_app_host.a" build/rust/iphonesimulator/libmahayana_app_host.a
+          cp "$STAGE/build/rust/iphoneos/libmahayana_app_host.a" build/rust/iphoneos/libmahayana_app_host.a
+          cp "$STAGE/build/rust/SHA256SUMS.txt" build/rust/SHA256SUMS.txt
+          shasum -a 256 -c build/rust/SHA256SUMS.txt
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          xcodegen --version
+
+      - name: Cache SwiftPM source packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/SourcePackages
+          key: macos15-spm-${{ hashFiles('mobile/ios/project.yml') }}
+          restore-keys: |
+            macos15-spm-
+
+      - name: Generate Fabushi.xcodeproj via XcodeGen
+        working-directory: mobile/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          test -d Fabushi.xcodeproj
+
+      - name: Select and boot runtime-matched iPhone Simulator
+        id: sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_VER="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          UDID="$(xcrun simctl list devices available -j | python3 - "$SDK_VER" <<'PY'
+          import json, sys
+          sdk_tag = "iOS-" + sys.argv[1].replace(".", "-")
+          devices = json.load(sys.stdin)["devices"]
+          def pick(match_runtime):
+              for rt, xs in sorted(devices.items()):
+                  if not match_runtime(rt):
+                      continue
+                  for x in xs:
+                      if x.get("isAvailable") and x.get("name", "").startswith("iPhone"):
+                          return x["udid"], x["name"], rt
+              return None
+          chosen = (
+              pick(lambda rt: rt.endswith(sdk_tag))
+              or pick(lambda rt: "SimRuntime.iOS-18-" in rt)
+              or pick(lambda rt: "SimRuntime.iOS-" in rt)
+          )
+          if not chosen:
+              raise SystemExit("No available iPhone Simulator found")
+          print(f"Selected simulator: {chosen[1]} ({chosen[0]}) [{chosen[2]}]", file=sys.stderr)
+          print(chosen[0])
+          PY
+          )"
+          xcrun simctl shutdown "$UDID" 2>/dev/null || true
+          xcrun simctl erase "$UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Build and run FabushiTests on iOS Simulator (Swift 6 + Keychain + Loopback)
+        working-directory: mobile/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVIDENCE_DIR="${RUNNER_TEMP}/ios-sim-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          rm -rf "$EVIDENCE_DIR/FabushiTests.xcresult"
+          # NOTE: Do NOT pass CODE_SIGNING_ALLOWED=NO on iOS Simulator; Xcode ad-hoc signs
+          # Simulator binaries with Fabushi.entitlements so real Security.framework Keychain
+          # calls succeed natively without -34018 (errSecMissingEntitlement).
+          xcodebuild test \
+            -project Fabushi.xcodeproj \
+            -scheme Fabushi \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath "${RUNNER_TEMP}/FabushiSimDerivedData" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages" \
+            -resultBundlePath "$EVIDENCE_DIR/FabushiTests.xcresult" \
+            -only-testing:FabushiTests \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGN_STYLE=Automatic \
+            FABUSHI_USE_PREBUILT_RUST_HOST=1 \
+            2>&1 | tee "$EVIDENCE_DIR/xcodebuild-sim-test.log"
+
+          xcrun xcresulttool get test-results summary --path "$EVIDENCE_DIR/FabushiTests.xcresult" \
+            | tee "$EVIDENCE_DIR/test-summary.json"
+          python3 - "$EVIDENCE_DIR/test-summary.json" <<'PY'
+          import json, sys
+          summary = json.load(open(sys.argv[1], encoding="utf-8"))
+          passed = summary.get("passedTests", 0)
+          failed = summary.get("failedTests", 0)
+          skipped = summary.get("skippedTests", 0)
+          print(f"FabushiTests summary: passed={passed} failed={failed} skipped={skipped}")
+          assert passed > 0 and failed == 0 and skipped == 0, f"Unexpected XCTest summary: {summary}"
+          PY
+
+      - name: Package Simulator test results & compute SHA-256 checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVIDENCE_DIR="${RUNNER_TEMP}/ios-sim-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          cd "$EVIDENCE_DIR"
+          FILES=()
+          if [ -d "FabushiTests.xcresult" ]; then
+            rm -f FabushiTests.xcresult.zip
+            zip -rq FabushiTests.xcresult.zip FabushiTests.xcresult
+            rm -rf FabushiTests.xcresult
+            FILES+=(FabushiTests.xcresult.zip)
+          fi
+          if [ -f "test-summary.json" ]; then
+            FILES+=(test-summary.json)
+          fi
+          if [ -f "xcodebuild-sim-test.log" ]; then
+            FILES+=(xcodebuild-sim-test.log)
+          fi
+          test "${#FILES[@]}" -gt 0
+          shasum -a 256 "${FILES[@]}" | tee SHA256SUMS.txt
+          shasum -a 256 -c SHA256SUMS.txt
+
+      - name: Upload iOS Simulator test evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabushi-ios-sim-tests-${{ env.IOS_EXPECTED_HEAD }}
+          path: ${{ runner.temp }}/ios-sim-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Shutdown and erase iOS Simulator
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID="${{ steps.sim.outputs.udid }}"
+          if [ -n "$UDID" ]; then
+            xcrun simctl shutdown "$UDID" 2>/dev/null || true
+            xcrun simctl erase "$UDID" 2>/dev/null || true
+          fi
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  ios-device-archive:
+    name: Unsigned iOS Device Release Archive (arm64, macOS-15)
+    runs-on: macos-15
+    needs: [authority-check, rust-host-ios-staticlib]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout, Xcode 16.4 & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          swift --version
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Download verified iOS Rust staticlibs
+        uses: actions/download-artifact@v4
+        with:
+          name: fabushi-rust-host-ios-staticlibs-${{ env.IOS_EXPECTED_HEAD }}
+          path: ${{ runner.temp }}/rust-staticlibs
+
+      - name: Verify SHA-256 digests and install prebuilt staticlibs
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/rust-staticlibs"
+          diff -u source/host/include/mahayana_app_host.h "$STAGE/source/host/include/mahayana_app_host.h"
+          mkdir -p build/rust/iphonesimulator build/rust/iphoneos
+          cp "$STAGE/build/rust/iphonesimulator/libmahayana_app_host.a" build/rust/iphonesimulator/libmahayana_app_host.a
+          cp "$STAGE/build/rust/iphoneos/libmahayana_app_host.a" build/rust/iphoneos/libmahayana_app_host.a
+          cp "$STAGE/build/rust/SHA256SUMS.txt" build/rust/SHA256SUMS.txt
+          shasum -a 256 -c build/rust/SHA256SUMS.txt
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          xcodegen --version
+
+      - name: Cache SwiftPM source packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/SourcePackages
+          key: macos15-spm-${{ hashFiles('mobile/ios/project.yml') }}
+          restore-keys: |
+            macos15-spm-
+
+      - name: Generate Fabushi.xcodeproj via XcodeGen
+        working-directory: mobile/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          test -d Fabushi.xcodeproj
+
+      - name: Build unsigned Release iOS device archive (arm64)
+        working-directory: mobile/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE_DIR="${RUNNER_TEMP}/ios-archive-evidence"
+          mkdir -p "$ARCHIVE_DIR"
+          rm -rf "$ARCHIVE_DIR/Fabushi.xcarchive"
+          xcodebuild archive \
+            -project Fabushi.xcodeproj \
+            -scheme Fabushi \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "${RUNNER_TEMP}/FabushiArchiveDerivedData" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages" \
+            -archivePath "$ARCHIVE_DIR/Fabushi.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            FABUSHI_USE_PREBUILT_RUST_HOST=1 \
+            2>&1 | tee "$ARCHIVE_DIR/xcodebuild-device-archive.log"
+
+      - name: Verify archived Fabushi.app, Broadcast extension (arm64), Info.plist ATS & dylib hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="${RUNNER_TEMP}/ios-archive-evidence/Fabushi.xcarchive"
+          APP="$ARCHIVE/Products/Applications/Fabushi.app"
+          APPEX="$APP/PlugIns/FabushiBroadcastUpload.appex"
+          test -d "$APP" && test -x "$APP/Fabushi"
+          test -d "$APPEX" && test -x "$APPEX/FabushiBroadcastUpload"
+          lipo -info "$APP/Fabushi" | grep -q "arm64"
+          lipo -info "$APPEX/FabushiBroadcastUpload" | grep -q "arm64"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsArbitraryLoads' "$APP/Info.plist")" = "false"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$APP/Info.plist")" = "true"
+          ! otool -L "$APP/Fabushi" | grep -E "libmahayana_app_host\.dylib|/Users/|/opt/homebrew"
+          ! otool -L "$APPEX/FabushiBroadcastUpload" | grep -E "libmahayana_app_host\.dylib|/Users/|/opt/homebrew"
+          echo "PASS: Fabushi.app + FabushiBroadcastUpload.appex (arm64, ATS, dylib hygiene) verified cleanly."
+
+      - name: Package xcarchive & compute SHA-256 checksums
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE_DIR="${RUNNER_TEMP}/ios-archive-evidence"
+          mkdir -p "$ARCHIVE_DIR"
+          cd "$ARCHIVE_DIR"
+          FILES=()
+          if [ -d "Fabushi.xcarchive" ]; then
+            rm -f Fabushi.xcarchive.zip
+            zip -rq Fabushi.xcarchive.zip Fabushi.xcarchive
+            rm -rf Fabushi.xcarchive
+            FILES+=(Fabushi.xcarchive.zip)
+          fi
+          if [ -f "xcodebuild-device-archive.log" ]; then
+            FILES+=(xcodebuild-device-archive.log)
+          fi
+          test "${#FILES[@]}" -gt 0
+          shasum -a 256 "${FILES[@]}" | tee SHA256SUMS.txt
+          shasum -a 256 -c SHA256SUMS.txt
+
+      - name: Upload iOS device archive evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabushi-ios-device-archive-${{ env.IOS_EXPECTED_HEAD }}
+          path: ${{ runner.temp }}/ios-archive-evidence/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only

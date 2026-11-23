@@ -22,7 +22,7 @@ public struct SecretChatVisualTheme: Sendable {
 @MainActor
 public final class EphemeralCountdownController: ObservableObject {
     @Published public private(set) var progress: CGFloat = 1.0
-    private var timerTask: Task<Void, Never>?
+    nonisolated(unsafe) private var timerTask: Task<Void, Never>?
 
     public init() {}
 
@@ -30,7 +30,7 @@ public final class EphemeralCountdownController: ObservableObject {
         timerTask?.cancel()
     }
 
-    public func start(expiresAtMs: Int64, ttlSeconds: Int, onExpire: @escaping () -> Void) {
+    public func start(expiresAtMs: Int64, ttlSeconds: Int, onExpire: @escaping @MainActor () -> Void) {
         timerTask?.cancel()
         timerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -57,14 +57,14 @@ public final class EphemeralCountdownController: ObservableObject {
 public struct EphemeralTimerProgressBar: View {
     public let ttlSeconds: Int
     public let expiresAtMs: Int64
-    public let onExpire: () -> Void
+    public let onExpire: @MainActor () -> Void
 
     @StateObject private var controller = EphemeralCountdownController()
 
     public init(
         ttlSeconds: Int,
         expiresAtMs: Int64,
-        onExpire: @escaping () -> Void
+        onExpire: @escaping @MainActor () -> Void
     ) {
         self.ttlSeconds = ttlSeconds
         self.expiresAtMs = expiresAtMs
@@ -186,16 +186,16 @@ public struct SlidingReplayWindow: Sendable, Equatable {
 @MainActor
 public final class ScreenshotDetector: ObservableObject {
     @Published public private(set) var screenshotTakenCount: Int = 0
-    public var onScreenshotDetected: (() -> Void)?
+    public var onScreenshotDetected: (@MainActor () -> Void)?
 
-    private var observer: NSObjectProtocol?
+    nonisolated(unsafe) private var observer: NSObjectProtocol?
 
-    public init(onScreenshotDetected: (() -> Void)? = nil) {
+    public init(onScreenshotDetected: (@MainActor () -> Void)? = nil) {
         self.onScreenshotDetected = onScreenshotDetected
         setupObserver()
     }
 
-    isolated deinit {
+    deinit {
         if let observer {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -208,9 +208,11 @@ public final class ScreenshotDetector: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.screenshotTakenCount += 1
-            self.onScreenshotDetected?()
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.screenshotTakenCount += 1
+                self.onScreenshotDetected?()
+            }
         }
         #endif
     }

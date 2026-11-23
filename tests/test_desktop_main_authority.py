@@ -888,6 +888,117 @@ class DesktopMainAuthorityTests(unittest.TestCase):
                 errs,
             )
 
+    def test_ios_swift_anti_mock_rejects_fake_accounts_keys_mock_bridge_and_skips_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            core_dir = root / "mobile/ios/Fabushi/Core"
+            bridge_dir = root / "mobile/ios/Fabushi/Bridge"
+            tests_dir = root / "mobile/ios/FabushiTests"
+            core_dir.mkdir(parents=True)
+            bridge_dir.mkdir(parents=True)
+            tests_dir.mkdir(parents=True)
+
+            (core_dir / "FabushiRustHostActor.swift").write_text("public actor FabushiRustHostActor {}\n", encoding="utf-8")
+            (core_dir / "FabushiCoordinator.swift").write_text("public final class FabushiCoordinator {}\n", encoding="utf-8")
+            (bridge_dir / "AccountScopeManager.swift").write_text("public actor AccountScopeManager {}\n", encoding="utf-8")
+            # Negative fixtures inside FabushiTests MUST NOT trigger production Swift anti-mock errors
+            (tests_dir / "NegativeFixtureTests.swift").write_text(
+                'let a = "acc_primary"; let k = Data(repeating: 0xAA, count: 32); let m = mockBridge\n',
+                encoding="utf-8",
+            )
+            (root / "mobile/ios/project.yml").write_text(
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: false\n  NSAllowsLocalNetworking: true\n",
+                encoding="utf-8",
+            )
+
+            clean_errs = []
+            validator.verify_ios_swift_anti_mock(root, clean_errs)
+            self.assertEqual(clean_errs, [])
+
+            for label, bad_snippet, expected_substr in [
+                ("acc_primary", 'let a = "acc_primary"\n', "acc_primary/acc_work"),
+                ("acc_work", 'let b = "acc_work"\n', "acc_primary/acc_work"),
+                ("0xAA", "let k = Data(repeating: 0xAA, count: 32)\n", "0xAA/0xBB"),
+                ("0xbb", "let k = Data(repeating: 0xbb, count: 32)\n", "0xAA/0xBB"),
+                ("mockBridge", "func upload(mockBridge: Bool = false) {}\n", "mockBridge/mockChunks/mock_media_"),
+                ("mockChunks", "func download(mockChunks: [Data]? = nil) {}\n", "mockBridge/mockChunks/mock_media_"),
+                ("mock_media_", 'let id = "mock_media_1234"\n', "mockBridge/mockChunks/mock_media_"),
+            ]:
+                (bridge_dir / "AccountScopeManager.swift").write_text(bad_snippet, encoding="utf-8")
+                errs = []
+                validator.verify_ios_swift_anti_mock(root, errs)
+                self.assertTrue(
+                    any(expected_substr in e for e in errs),
+                    f"case {label} unexpectedly passed: {errs}",
+                )
+
+            # Missing required Core owner fails closed
+            (bridge_dir / "AccountScopeManager.swift").write_text("public actor AccountScopeManager {}\n", encoding="utf-8")
+            (core_dir / "FabushiCoordinator.swift").unlink()
+            missing_errs = []
+            validator.verify_ios_swift_anti_mock(root, missing_errs)
+            self.assertTrue(
+                any("FabushiCoordinator.swift" in e for e in missing_errs),
+                missing_errs,
+            )
+
+    def test_ios_swift_anti_mock_enforces_project_yml_ats_and_excludes_master_e2e(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            core_dir = root / "mobile/ios/Fabushi/Core"
+            core_dir.mkdir(parents=True)
+            (core_dir / "FabushiRustHostActor.swift").write_text("public actor FabushiRustHostActor {}\n", encoding="utf-8")
+            (core_dir / "FabushiCoordinator.swift").write_text("public final class FabushiCoordinator {}\n", encoding="utf-8")
+
+            yml = root / "mobile/ios/project.yml"
+
+            # Missing NSAllowsLocalNetworking: true fails closed
+            yml.write_text("NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: false\n", encoding="utf-8")
+            errs_local = []
+            validator.verify_ios_swift_anti_mock(root, errs_local)
+            self.assertTrue(any("NSAllowsLocalNetworking: true" in e for e in errs_local), errs_local)
+
+            # NSAllowsArbitraryLoads: true fails closed
+            yml.write_text(
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: true\n  NSAllowsLocalNetworking: true\n",
+                encoding="utf-8",
+            )
+            errs_arb = []
+            validator.verify_ios_swift_anti_mock(root, errs_arb)
+            self.assertTrue(any("NSAllowsArbitraryLoads: true" in e for e in errs_arb), errs_arb)
+
+            # Re-introducing master_e2e_suite.swift in project.yml fails closed
+            yml.write_text(
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: false\n  NSAllowsLocalNetworking: true\n"
+                "sources:\n  - path: ../../tests/e2e/master_e2e_suite.swift\n",
+                encoding="utf-8",
+            )
+            errs_e2e = []
+            validator.verify_ios_swift_anti_mock(root, errs_e2e)
+            self.assertTrue(any("master_e2e_suite.swift" in e for e in errs_e2e), errs_e2e)
+
+    def test_strict_authority_only_invokes_verify_ios_swift_anti_mock(self):
+        real_lock = validator.document(validator.LOCK)
+        real_swift_check = validator.verify_ios_swift_anti_mock
+
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--strict", "--authority-only"]), \
+             mock.patch.object(validator, "live_head", return_value=real_lock["commit"]), \
+             mock.patch.object(validator, "verify_ios_swift_anti_mock", wraps=real_swift_check) as spy_swift, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = validator.run()
+        self.assertEqual(rc, 0)
+        spy_swift.assert_called_once()
+
+        def inject_swift_mock_error(_root, errs):
+            errs.append("injected swift anti-mock error")
+
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--strict", "--authority-only"]), \
+             mock.patch.object(validator, "live_head", return_value=real_lock["commit"]), \
+             mock.patch.object(validator, "verify_ios_swift_anti_mock", side_effect=inject_swift_mock_error), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc_fail = validator.run()
+        self.assertEqual(rc_fail, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

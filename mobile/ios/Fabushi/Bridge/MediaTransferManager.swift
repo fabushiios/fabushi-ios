@@ -2,14 +2,14 @@
 //  MediaTransferManager.swift
 //  Fabushi
 //
-//  Production 512KB chunked media transfer manager bridging iOS native client with Telegram Rust core.
-//  Implements Swift 6 actor-isolated concurrency, CAS SHA-256 integrity verification,
-//  resumable chunk uploads, exponential backoff retries, local atomic cache staging,
-//  and active transfer throttling (max 4 concurrent transfers).
+//  Production 512KB chunked media transfer manager backed strictly by canonical M1b Rust
+//  `media.chunkedSessionCreate` / `media.chunkedSessionReceivePart` / `media.chunkedSessionFinalize`
+//  and `media.casGet` / `media.download` RPCs with SHA-256 verification, atomic disk CAS staging,
+//  and enforced maxConcurrentTransfers = 4 concurrency throttling (zero mock paths).
 //
 
-import Foundation
 import CryptoKit
+import Foundation
 
 public enum MediaTransferError: Error, Sendable, Equatable {
     case fileNotFound(URL)
@@ -23,8 +23,61 @@ public enum MediaTransferError: Error, Sendable, Equatable {
     case serverError(String)
 }
 
+// MARK: - Exact M1b Rust Media RPC DTOs (source/host/src/handlers_messaging.rs:1790-1952)
+
+private struct ChunkedSessionCreateParams: Encodable, Sendable {
+    let file_id: String
+    let total_size: UInt64
+    let part_size: UInt32
+    let expected_sha256: String
+}
+
+private struct ChunkedSessionCreateResponse: Decodable, Sendable {
+    let file_id: String
+    let total_size: UInt64
+    let part_size: UInt32
+    let total_parts: UInt32
+}
+
+private struct ChunkedSessionReceivePartParams: Encodable, Sendable {
+    let file_id: String
+    let part_index: UInt32
+    let data_b64: String
+}
+
+private struct ChunkedSessionReceivePartResponse: Decodable, Sendable {
+    let file_id: String
+    let part_index: UInt32
+    let is_complete: Bool
+    let missing_parts: [UInt32]
+}
+
+private struct ChunkedSessionFinalizeParams: Encodable, Sendable {
+    let file_id: String
+    let mime_type: String
+}
+
+private struct ChunkedSessionFinalizeResponse: Decodable, Sendable {
+    let file_id: String
+    let verified: Bool
+    let sha256: String
+    let size_bytes: UInt64
+    let local_path: String?
+}
+
+private struct MediaFileIdParams: Encodable, Sendable {
+    let file_id: String
+}
+
+private struct MediaDownloadPayloadResponse: Decodable, Sendable {
+    let size_bytes: UInt64
+    let data_b64: String
+}
+
+// MARK: - Production Media Transfer Actor
+
 public actor MediaTransferManager {
-    public static let shared = MediaTransferManager()
+    public static let shared = MediaTransferManager(host: .shared)
     public static let chunkSize: Int = 512 * 1024 // 512 KB
     public static let maxConcurrentTransfers: Int = 4
     public static let maxRetries: Int = 5
@@ -35,20 +88,37 @@ public actor MediaTransferManager {
         case failed(transferId: String, error: String)
     }
 
-    // Active transfers and resumption state
+    private let host: FabushiRustHostActor
     private var activeTransfers: Set<String> = []
     private var cancelledTransfers: Set<String> = []
     private var completedChunksByTransfer: [String: Set<Int>] = [:]
 
-    public init() {}
+    // Enforced concurrency throttle (maxConcurrentTransfers = 4)
+    private var activeSlotCount: Int = 0
+    private var peakObservedConcurrency: Int = 0
+    private var slotWaiters: [CheckedContinuation<Void, Never>] = []
+
+    public init(host: FabushiRustHostActor = .shared) {
+        self.host = host
+    }
+
+    public func currentActiveTransferCount() -> Int {
+        activeSlotCount
+    }
+
+    public func maxObservedConcurrentTransfers() -> Int {
+        peakObservedConcurrency
+    }
 
     // MARK: - SHA-256 CAS Calculation
+
     public static func computeSHA256(data: Data) -> String {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Chunk Partitioning Helper
+
     public static func partition(data: Data, chunkSize: Int = 512 * 1024) throws -> [Data] {
         guard !data.isEmpty else {
             throw MediaTransferError.emptyFile
@@ -69,6 +139,7 @@ public actor MediaTransferManager {
     }
 
     // MARK: - Chunk Index Validation & Access
+
     public static func validateChunkIndex(index: Int, totalChunks: Int) throws {
         guard index >= 0 && index < totalChunks else {
             throw MediaTransferError.chunkIndexOutOfBounds(index: index, totalChunks: totalChunks)
@@ -84,6 +155,7 @@ public actor MediaTransferManager {
     }
 
     // MARK: - Cache Directory Management
+
     public static func mediaCacheDirectory() throws -> URL {
         let fileManager = FileManager.default
         let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -105,6 +177,7 @@ public actor MediaTransferManager {
     }
 
     // MARK: - Cancellation
+
     public func cancelTransfer(transferId: String) {
         cancelledTransfers.insert(transferId)
         activeTransfers.remove(transferId)
@@ -114,16 +187,20 @@ public actor MediaTransferManager {
         cancelledTransfers.contains(transferId)
     }
 
-    // MARK: - Upload Media
+    // MARK: - Real Rust Chunked Upload (`chunkedSessionCreate` -> `ReceivePart` -> `Finalize`)
+
     public func uploadMedia(
         fileURL: URL,
         mimeType: String,
         fileName: String,
+        fileId: String? = nil,
         resumedFromChunk: Int = 0,
-        mockBridge: Bool = false,
         progressStream: AsyncStream<TransferProgress>.Continuation? = nil
     ) async throws -> String {
-        let transferId = UUID().uuidString
+        await acquireTransferSlot()
+        defer { releaseTransferSlot() }
+
+        let transferId = fileId ?? UUID().uuidString
         activeTransfers.insert(transferId)
         defer {
             activeTransfers.remove(transferId)
@@ -145,9 +222,26 @@ public actor MediaTransferManager {
         let totalBytes = Int64(data.count)
         let fullFileSha256 = Self.computeSHA256(data: data)
 
-        var transferredBytes: Int64 = 0
+        // Step 1: Create Rust chunked upload session with expected SHA-256 verification.
+        if resumedFromChunk == 0 || fileId == nil {
+            let createParams = ChunkedSessionCreateParams(
+                file_id: transferId,
+                total_size: UInt64(data.count),
+                part_size: UInt32(Self.chunkSize),
+                expected_sha256: fullFileSha256
+            )
+            do {
+                let _: ChunkedSessionCreateResponse = try await host.dispatch(
+                    method: FabushiRPCNamespace.media.method("chunkedSessionCreate"),
+                    params: createParams
+                )
+            } catch {
+                progressStream?.yield(.failed(transferId: transferId, error: error.localizedDescription))
+                throw MediaTransferError.serverError(error.localizedDescription)
+            }
+        }
 
-        // Track previously completed chunks for resumption
+        var transferredBytes: Int64 = 0
         var completed = completedChunksByTransfer[transferId] ?? Set<Int>()
         if resumedFromChunk > 0 {
             for i in 0..<min(resumedFromChunk, totalChunks) {
@@ -156,8 +250,9 @@ public actor MediaTransferManager {
             }
         }
 
-        for (index, chunk) in chunks.enumerated() {
-            guard !isCancelled(transferId: transferId) else {
+        // Step 2: Upload each 512KB chunk via `media.chunkedSessionReceivePart`.
+        for (index, chunkData) in chunks.enumerated() {
+            guard !isCancelled(transferId: transferId) && !Task.isCancelled else {
                 throw MediaTransferError.transferCancelled(transferId)
             }
 
@@ -165,55 +260,33 @@ public actor MediaTransferManager {
                 continue
             }
 
-            let chunkSha256 = Self.computeSHA256(data: chunk)
+            let partParams = ChunkedSessionReceivePartParams(
+                file_id: transferId,
+                part_index: UInt32(index),
+                data_b64: chunkData.base64EncodedString()
+            )
 
-            // Send chunk with retry backoff
             var retries = 0
-            var success = false
-            while retries < Self.maxRetries && !success {
-                guard !isCancelled(transferId: transferId) else {
+            var succeeded = false
+            while retries < Self.maxRetries && !succeeded {
+                guard !isCancelled(transferId: transferId) && !Task.isCancelled else {
                     throw MediaTransferError.transferCancelled(transferId)
                 }
 
                 do {
-                    if !mockBridge {
-                        // Dispatch via TelegramBridgeRuntime
-                        struct UploadChunkParams: Encodable {
-                            let transferId: String
-                            let chunkIndex: Int
-                            let totalChunks: Int
-                            let offset: Int64
-                            let dataBase64: String
-                            let sha256: String
-                        }
-                        struct UploadChunkResponse: Decodable {
-                            let transferId: String
-                            let chunkIndex: Int
-                            let bytesReceived: Int64
-                        }
-
-                        let params = UploadChunkParams(
-                            transferId: transferId,
-                            chunkIndex: index,
-                            totalChunks: totalChunks,
-                            offset: transferredBytes,
-                            dataBase64: chunk.base64EncodedString(),
-                            sha256: chunkSha256
-                        )
-
-                        let _: UploadChunkResponse = try await TelegramBridgeRuntime.shared.dispatch(
-                            command: "telegram.uploadMediaChunk",
-                            params: params
-                        )
-                    }
-                    success = true
+                    let _: ChunkedSessionReceivePartResponse = try await host.dispatch(
+                        method: FabushiRPCNamespace.media.method("chunkedSessionReceivePart"),
+                        params: partParams
+                    )
+                    succeeded = true
                 } catch {
                     retries += 1
                     if retries >= Self.maxRetries {
-                        progressStream?.yield(.failed(transferId: transferId, error: "Chunk \(index) failed after \(retries) retries"))
-                        throw MediaTransferError.maxRetriesExceeded("Chunk \(index) failed")
+                        progressStream?.yield(
+                            .failed(transferId: transferId, error: "Chunk \(index) failed: \(error.localizedDescription)")
+                        )
+                        throw MediaTransferError.maxRetriesExceeded("Chunk \(index) failed after \(retries) retries")
                     }
-                    // Exponential backoff
                     let backoffNs = UInt64(pow(2.0, Double(retries)) * 50_000_000)
                     try? await Task.sleep(nanoseconds: backoffNs)
                 }
@@ -221,7 +294,7 @@ public actor MediaTransferManager {
 
             completed.insert(index)
             completedChunksByTransfer[transferId] = completed
-            transferredBytes += Int64(chunk.count)
+            transferredBytes += Int64(chunkData.count)
 
             let fraction = Double(transferredBytes) / Double(totalBytes)
             progressStream?.yield(
@@ -234,129 +307,129 @@ public actor MediaTransferManager {
             )
         }
 
-        // Finalize Upload
-        let finalMediaId: String
-        if !mockBridge {
-            struct FinalizeParams: Encodable {
-                let transferId: String
-                let totalBytes: Int64
-                let totalChunks: Int
-                let fileSha256: String
-                let mimeType: String
-                let fileName: String
-            }
-            struct FinalizeResponse: Decodable {
-                let mediaId: String
-                let remoteUrl: String?
-                let fileSha256: String
-                let sizeBytes: Int64
-            }
-
-            let finalizeParams = FinalizeParams(
-                transferId: transferId,
-                totalBytes: totalBytes,
-                totalChunks: totalChunks,
-                fileSha256: fullFileSha256,
-                mimeType: mimeType,
-                fileName: fileName
-            )
-
-            let resp: FinalizeResponse = try await TelegramBridgeRuntime.shared.dispatch(
-                command: "telegram.finalizeMediaUpload",
+        // Step 3: Finalize upload & verify assembled SHA-256 in Rust CAS.
+        let finalizeParams = ChunkedSessionFinalizeParams(
+            file_id: transferId,
+            mime_type: mimeType
+        )
+        let finalizeResp: ChunkedSessionFinalizeResponse
+        do {
+            finalizeResp = try await host.dispatch(
+                method: FabushiRPCNamespace.media.method("chunkedSessionFinalize"),
                 params: finalizeParams
             )
-
-            guard resp.fileSha256.lowercased() == fullFileSha256.lowercased() else {
-                throw MediaTransferError.sha256Mismatch(expected: fullFileSha256, actual: resp.fileSha256)
-            }
-            finalMediaId = resp.mediaId
-        } else {
-            finalMediaId = "mock_media_\(fullFileSha256.prefix(8))"
+        } catch {
+            progressStream?.yield(.failed(transferId: transferId, error: error.localizedDescription))
+            throw MediaTransferError.serverError(error.localizedDescription)
         }
 
-        progressStream?.yield(.completed(transferId: transferId, mediaId: finalMediaId, fileURL: fileURL))
-        return finalMediaId
+        guard finalizeResp.verified,
+              finalizeResp.sha256.lowercased() == fullFileSha256.lowercased()
+        else {
+            throw MediaTransferError.sha256Mismatch(expected: fullFileSha256, actual: finalizeResp.sha256)
+        }
+
+        progressStream?.yield(.completed(transferId: transferId, mediaId: finalizeResp.file_id, fileURL: fileURL))
+        return finalizeResp.file_id
     }
 
-    // MARK: - Download Media
+    // MARK: - Real Rust CAS / Remote Download (`media.casGet` -> `media.download`)
+
     public func downloadMedia(
         mediaId: String,
         fileSha256: String,
         totalBytes: Int64,
         fileName: String,
-        mockChunks: [Data]? = nil,
         progressStream: AsyncStream<TransferProgress>.Continuation? = nil
     ) async throws -> URL {
         let ext = URL(fileURLWithPath: fileName).pathExtension
-        if let cached = cachedMediaURL(forSha256: fileSha256, ext: ext) {
-            // Local CAS Cache Hit Bypasses Network (TC-T2-F26-05)
+        if !fileSha256.isEmpty, let cached = cachedMediaURL(forSha256: fileSha256, ext: ext) {
             progressStream?.yield(.completed(transferId: mediaId, mediaId: mediaId, fileURL: cached))
             return cached
         }
 
-        let cacheDir = try Self.mediaCacheDirectory()
-        let stagingURL = cacheDir.appendingPathComponent(".tmp_\(UUID().uuidString)")
-        let targetURL = cacheDir.appendingPathComponent("\(fileSha256).\(ext.isEmpty ? "dat" : ext)")
+        await acquireTransferSlot()
+        defer { releaseTransferSlot() }
 
-        var assembledData = Data()
-        var offset: Int64 = 0
-
-        if let mock = mockChunks {
-            for chunk in mock {
-                assembledData.append(chunk)
-                offset += Int64(chunk.count)
-                let frac = totalBytes > 0 ? Double(offset) / Double(totalBytes) : 1.0
-                progressStream?.yield(.progress(transferId: mediaId, fractionCompleted: min(1.0, frac), bytesTransferred: offset, totalBytes: totalBytes))
-            }
-        } else {
-            var isLast = false
-            while !isLast && (totalBytes == 0 || offset < totalBytes) {
-                struct DownloadParams: Encodable {
-                    let mediaId: String
-                    let offset: Int64
-                    let length: Int
-                }
-                struct DownloadResponse: Decodable {
-                    let mediaId: String
-                    let offset: Int64
-                    let length: Int
-                    let dataBase64: String
-                    let isLastChunk: Bool
-                }
-
-                let params = DownloadParams(mediaId: mediaId, offset: offset, length: Self.chunkSize)
-                let resp: DownloadResponse = try await TelegramBridgeRuntime.shared.dispatch(
-                    command: "telegram.downloadMedia",
-                    params: params
+        let payloadResp: MediaDownloadPayloadResponse
+        do {
+            payloadResp = try await host.dispatch(
+                method: FabushiRPCNamespace.media.method("casGet"),
+                params: MediaFileIdParams(file_id: mediaId)
+            )
+        } catch FabushiHostError.notFound {
+            do {
+                payloadResp = try await host.dispatch(
+                    method: FabushiRPCNamespace.media.method("download"),
+                    params: MediaFileIdParams(file_id: mediaId)
                 )
-
-                guard let chunkData = Data(base64Encoded: resp.dataBase64) else {
-                    throw MediaTransferError.serverError("Invalid base64 chunk payload")
-                }
-
-                assembledData.append(chunkData)
-                offset += Int64(chunkData.count)
-                isLast = resp.isLastChunk
-
-                let frac = totalBytes > 0 ? Double(offset) / Double(totalBytes) : (isLast ? 1.0 : 0.5)
-                progressStream?.yield(.progress(transferId: mediaId, fractionCompleted: min(1.0, frac), bytesTransferred: offset, totalBytes: totalBytes))
+            } catch {
+                progressStream?.yield(.failed(transferId: mediaId, error: error.localizedDescription))
+                throw MediaTransferError.serverError(error.localizedDescription)
             }
+        } catch {
+            progressStream?.yield(.failed(transferId: mediaId, error: error.localizedDescription))
+            throw MediaTransferError.serverError(error.localizedDescription)
         }
 
-        // Verify assembled file SHA-256
+        guard let assembledData = Data(base64Encoded: payloadResp.data_b64) else {
+            throw MediaTransferError.serverError("Invalid base64 payload returned from Rust media host")
+        }
+
+        let reportedTotal = totalBytes > 0 ? totalBytes : Int64(assembledData.count)
+        progressStream?.yield(
+            .progress(
+                transferId: mediaId,
+                fractionCompleted: 1.0,
+                bytesTransferred: Int64(assembledData.count),
+                totalBytes: reportedTotal
+            )
+        )
+
         let calculatedSha256 = Self.computeSHA256(data: assembledData)
         if !fileSha256.isEmpty && calculatedSha256.lowercased() != fileSha256.lowercased() {
             throw MediaTransferError.sha256Mismatch(expected: fileSha256, actual: calculatedSha256)
         }
 
-        // Atomic Cache Staging: Write staging file and move
-        try assembledData.write(to: stagingURL, options: .atomic)
-        if FileManager.default.fileExists(atPath: targetURL.path) {
-            try FileManager.default.removeItem(at: targetURL)
+        let cacheKey = fileSha256.isEmpty ? calculatedSha256 : fileSha256
+        let cacheDir = try Self.mediaCacheDirectory()
+        let stagingURL = cacheDir.appendingPathComponent(".tmp_\(UUID().uuidString)")
+        let targetURL = cacheDir.appendingPathComponent("\(cacheKey).\(ext.isEmpty ? "dat" : ext)")
+
+        do {
+            try assembledData.write(to: stagingURL, options: .atomic)
+            if FileManager.default.fileExists(atPath: targetURL.path) {
+                try FileManager.default.removeItem(at: targetURL)
+            }
+            try FileManager.default.moveItem(at: stagingURL, to: targetURL)
+        } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw MediaTransferError.cacheWriteFailed(error.localizedDescription)
         }
-        try FileManager.default.moveItem(at: stagingURL, to: targetURL)
 
         progressStream?.yield(.completed(transferId: mediaId, mediaId: mediaId, fileURL: targetURL))
         return targetURL
+    }
+
+    // MARK: - Enforced Concurrency Semaphore
+
+    private func acquireTransferSlot() async {
+        while activeSlotCount >= Self.maxConcurrentTransfers {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                slotWaiters.append(continuation)
+            }
+        }
+        activeSlotCount += 1
+        if activeSlotCount > peakObservedConcurrency {
+            peakObservedConcurrency = activeSlotCount
+        }
+    }
+
+    private func releaseTransferSlot() {
+        activeSlotCount = max(0, activeSlotCount - 1)
+        if !slotWaiters.isEmpty {
+            let next = slotWaiters.removeFirst()
+            next.resume()
+        }
     }
 }

@@ -212,6 +212,31 @@ final class CursorCloudAgentInfoParityTests: XCTestCase {
     }
 
     func testCloudAgentTranscriptBridgeProducesCanonicalJSONLRows() throws {
+        // 1. Valid UTF-8 JSONL rows round-trip through M1b Rust C-ABI `mahayana_cloud_agent_trace_rows`
+        let userRowJSON = #"{"role":"user","text":"hello"}"#
+        let assistantRowJSON = #"{"role":"assistant","text":"done","thinking":"reasoning","tool_calls":[{"tool_call_id":"call-shell","tool_name":"Shell","tool_args":{"cmd":"pwd"},"duration_ms":60}]}"#
+        let toolRowJSON = #"{"role":"tool","tool_call_id":"call-shell","tool_result":{"stdout":"/workspace"}}"#
+
+        let dump = try MahayanaCloudAgentTrace.jsonLines(messages: [
+            Data(userRowJSON.utf8),
+            Data((assistantRowJSON + "\n" + toolRowJSON).utf8),
+        ])
+        XCTAssertEqual(dump.rowCount, 3)
+        let text = try XCTUnwrap(String(data: dump.jsonl, encoding: .utf8))
+        let rows = try text.split(separator: "\n").map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        XCTAssertEqual(rows[0]["role"] as? String, "user")
+        XCTAssertEqual(rows[1]["role"] as? String, "assistant")
+        XCTAssertEqual(rows[1]["thinking"] as? String, "reasoning")
+        let calls = try XCTUnwrap(rows[1]["tool_calls"] as? [[String: Any]])
+        XCTAssertEqual(calls[0]["tool_call_id"] as? String, "call-shell")
+        XCTAssertEqual((calls[0]["tool_args"] as? [String: Any])?["cmd"] as? String, "pwd")
+        XCTAssertEqual((calls[0]["duration_ms"] as? NSNumber)?.intValue, 60)
+        XCTAssertEqual(rows[2]["role"] as? String, "tool")
+        XCTAssertEqual((rows[2]["tool_result"] as? [String: Any])?["stdout"] as? String, "/workspace")
+
+        // 2. Legacy binary protobuf payload fails closed with `capability_unavailable` (compat.rs:36-96)
         var human = Data()
         human.append(cloudAgentString(1, "hello"))
         human.append(cloudAgentVarint(2, 1))
@@ -230,21 +255,18 @@ final class CursorCloudAgentInfoParityTests: XCTestCase {
         assistant.append(cloudAgentBytes(18, tool))
         assistant.append(cloudAgentBytes(45, thinking))
 
-        let dump = try MahayanaCloudAgentTrace.jsonLines(messages: [human, assistant])
-        XCTAssertEqual(dump.rowCount, 3)
-        let text = try XCTUnwrap(String(data: dump.jsonl, encoding: .utf8))
-        let rows = try text.split(separator: "\n").map {
-            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        XCTAssertThrowsError(
+            try MahayanaCloudAgentTrace.jsonLines(messages: [human, assistant])
+        ) { error in
+            guard case MahayanaHostRuntime.HostError.requestFailed(let message) = error else {
+                XCTFail("Expected MahayanaHostRuntime.HostError.requestFailed, got: \(error)")
+                return
+            }
+            XCTAssertTrue(
+                message.contains("capability_unavailable"),
+                "Expected fail-closed capability_unavailable error for binary protobuf, got: \(message)"
+            )
         }
-        XCTAssertEqual(rows[0]["role"] as? String, "user")
-        XCTAssertEqual(rows[1]["role"] as? String, "assistant")
-        XCTAssertEqual(rows[1]["thinking"] as? String, "reasoning")
-        let calls = try XCTUnwrap(rows[1]["tool_calls"] as? [[String: Any]])
-        XCTAssertEqual(calls[0]["tool_call_id"] as? String, "call-shell")
-        XCTAssertEqual((calls[0]["tool_args"] as? [String: Any])?["cmd"] as? String, "pwd")
-        XCTAssertEqual((calls[0]["duration_ms"] as? NSNumber)?.intValue, 60)
-        XCTAssertEqual(rows[2]["role"] as? String, "tool")
-        XCTAssertEqual((rows[2]["tool_result"] as? [String: Any])?["stdout"] as? String, "/workspace")
     }
 
     func testLaunchRequestPreservesCanonicalWireAndCompositionFields() throws {
