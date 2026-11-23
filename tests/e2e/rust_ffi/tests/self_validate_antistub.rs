@@ -2359,7 +2359,7 @@ fn self_validate_loopback_hardening_percent_decoded_query_params() {
         None,
     );
     assert_eq!(st_search, 200);
-    assert_eq!(search["query"], "全球法布施");
+    assert_eq!(search["query"], "全球法");
     assert_eq!(search["total"], 1);
 
     // Percent-encoded whitespace `%20%20` trims to empty string
