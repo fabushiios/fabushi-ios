@@ -119,7 +119,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_TEST_STRIP: debuginfo
       SCCACHE_GHA_ENABLED: "true"
-      EVIDENCE_DIR: ${{ runner.temp }}/e2e-ubuntu-evidence
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@v5
@@ -135,6 +134,8 @@ jobs:
           ACTUAL_HEAD="$(git rev-parse HEAD)"
           test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
           TREE_SHA="$(git rev-parse HEAD^{tree})"
+          EVIDENCE_DIR="${RUNNER_TEMP}/e2e-ubuntu-evidence"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           cat > "$EVIDENCE_DIR/source.env" <<EOF
           IOS_HEAD_SHA=$ACTUAL_HEAD
@@ -258,7 +259,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     env:
-      EVIDENCE_DIR: ${{ runner.temp }}/e2e-macos-evidence
       XCODE_APP: ${{ needs.detect-mode.outputs.xcode_app }}
     steps:
       - name: Checkout exact commit
@@ -282,6 +282,8 @@ jobs:
           SWIFT_VER="$(swift --version | head -n 1)"
           echo "Active Xcode: $XCODE_VER"
           echo "Active Swift: $SWIFT_VER"
+          EVIDENCE_DIR="${RUNNER_TEMP}/e2e-macos-evidence"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           cat > "$EVIDENCE_DIR/source.env" <<EOF
           IOS_HEAD_SHA=$ACTUAL_HEAD
@@ -507,7 +509,6 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
-      EVIDENCE_DIR: ${{ runner.temp }}/e2e-prod-ubuntu-evidence
     steps:
       - name: Checkout exact commit
         uses: actions/checkout@v5
@@ -523,6 +524,8 @@ jobs:
           set -euo pipefail
           ACTUAL_HEAD="$(git rev-parse HEAD)"
           test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
+          EVIDENCE_DIR="${RUNNER_TEMP}/e2e-prod-ubuntu-evidence"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           cat > "$EVIDENCE_DIR/source.env" <<EOF
           IOS_HEAD_SHA=$ACTUAL_HEAD
@@ -644,8 +647,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      EVIDENCE_DIR: ${{ runner.temp }}/e2e-prod-macos-evidence
-      DERIVED_DATA: ${{ runner.temp }}/FabushiE2EDerivedData
       XCODE_APP: ${{ needs.detect-mode.outputs.xcode_app }}
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -666,6 +667,10 @@ jobs:
           if [[ -d "$XCODE_APP" ]]; then
             sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           fi
+          EVIDENCE_DIR="${RUNNER_TEMP}/e2e-prod-macos-evidence"
+          DERIVED_DATA="${RUNNER_TEMP}/FabushiE2EDerivedData"
+          echo "EVIDENCE_DIR=$EVIDENCE_DIR" >> "$GITHUB_ENV"
+          echo "DERIVED_DATA=$DERIVED_DATA" >> "$GITHUB_ENV"
           mkdir -p "$EVIDENCE_DIR"
           cat > "$EVIDENCE_DIR/source.env" <<EOF
           IOS_HEAD_SHA=$ACTUAL_HEAD
