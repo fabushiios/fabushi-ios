@@ -1098,7 +1098,7 @@ fn test_b2_01_reentrant_set_server_url_from_event_pump_callback_fails_closed_no_
                     }))
                 }),
             )
-            .route("/ws", get(ws_handler));
+            .route("/api/v1/ws", get(ws_handler));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_addr = listener.local_addr().unwrap();
