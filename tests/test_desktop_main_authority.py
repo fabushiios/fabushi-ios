@@ -999,6 +999,67 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             rc_fail = validator.run()
         self.assertEqual(rc_fail, 1)
 
+    def test_ios_swift_anti_mock_hardened_yaml_comments_booleans_e2e_dir_and_frontend_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            core_dir = root / "mobile/ios/Fabushi/Core"
+            frontend_dir = root / "frontend/src/production"
+            core_dir.mkdir(parents=True)
+            frontend_dir.mkdir(parents=True)
+            (core_dir / "FabushiRustHostActor.swift").write_text("public actor FabushiRustHostActor {}\n", encoding="utf-8")
+            (core_dir / "FabushiCoordinator.swift").write_text("public final class FabushiCoordinator {}\n", encoding="utf-8")
+            (frontend_dir / "CleanView.swift").write_text("struct CleanView {}\n", encoding="utf-8")
+
+            yml = root / "mobile/ios/project.yml"
+            valid_yml = "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: false\n  NSAllowsLocalNetworking: true\n"
+
+            # 1. Commented-out ATS keys MUST NOT satisfy ATS validation
+            yml.write_text(
+                "# NSAppTransportSecurity:\n#   NSAllowsArbitraryLoads: false\n#   NSAllowsLocalNetworking: true\n",
+                encoding="utf-8",
+            )
+            errs_comment = []
+            validator.verify_ios_swift_anti_mock(root, errs_comment)
+            self.assertTrue(any("missing NSAppTransportSecurity" in e for e in errs_comment), errs_comment)
+            self.assertTrue(any("NSAllowsArbitraryLoads: false" in e for e in errs_comment), errs_comment)
+            self.assertTrue(any("NSAllowsLocalNetworking: true" in e for e in errs_comment), errs_comment)
+
+            # 2. Case-insensitive YAML truthy booleans & inline flow maps MUST fail closed
+            for truthy_yaml in [
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: True\n  NSAllowsLocalNetworking: true\n",
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: YES\n  NSAllowsLocalNetworking: true\n",
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: on\n  NSAllowsLocalNetworking: true\n",
+                "NSAppTransportSecurity:\n  NSAllowsArbitraryLoads: 1\n  NSAllowsLocalNetworking: true\n",
+                "NSAppTransportSecurity: { NSAllowsArbitraryLoads: true, NSAllowsLocalNetworking: true }\n",
+            ]:
+                yml.write_text(truthy_yaml, encoding="utf-8")
+                errs_truthy = []
+                validator.verify_ios_swift_anti_mock(root, errs_truthy)
+                self.assertTrue(
+                    any("NSAllowsArbitraryLoads: true" in e for e in errs_truthy),
+                    f"truthy YAML bypassed check: {truthy_yaml!r} -> {errs_truthy}",
+                )
+
+            # 3. Directory-level tests/e2e path inclusion in project.yml MUST fail closed
+            yml.write_text(
+                valid_yml + "sources:\n  - path: ../../tests/e2e\n",
+                encoding="utf-8",
+            )
+            errs_e2e_dir = []
+            validator.verify_ios_swift_anti_mock(root, errs_e2e_dir)
+            self.assertTrue(any("tests/e2e" in e for e in errs_e2e_dir), errs_e2e_dir)
+
+            # 4. Forbidden mock tokens & [UInt8] fake keys inside frontend/**/*.swift MUST fail closed
+            yml.write_text(valid_yml, encoding="utf-8")
+            (frontend_dir / "CleanView.swift").write_text(
+                'let k = [UInt8](repeating: 0xAA, count: 32)\nlet acc = "acc_primary"\n',
+                encoding="utf-8",
+            )
+            errs_frontend = []
+            validator.verify_ios_swift_anti_mock(root, errs_frontend)
+            self.assertTrue(any("frontend/src/production/CleanView.swift" in e and "0xAA/0xBB" in e for e in errs_frontend), errs_frontend)
+            self.assertTrue(any("frontend/src/production/CleanView.swift" in e and "acc_primary/acc_work" in e for e in errs_frontend), errs_frontend)
+
 
 if __name__ == "__main__":
     unittest.main()

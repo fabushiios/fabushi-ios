@@ -167,56 +167,64 @@ public final class TelegramMediaTests: XCTestCase, @unchecked Sendable {
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("fabushi_media_upload_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempRoot) }
 
-        try await host.initialize(config: FabushiHostConfig(
-            appDataDir: tempRoot.appendingPathComponent("host_data", isDirectory: true).path,
-            storagePassphrase: nil,
-            testMode: true,
-            iosSandboxStrict: true
-        ))
-        defer { Task { await host.shutdown() } }
+        var caughtError: Error?
+        do {
+            try await host.initialize(config: FabushiHostConfig(
+                appDataDir: tempRoot.appendingPathComponent("host_data", isDirectory: true).path,
+                storagePassphrase: nil,
+                testMode: true,
+                iosSandboxStrict: true
+            ))
 
-        let manager = MediaTransferManager(host: host)
-        let testFileURL = tempRoot.appendingPathComponent("test_5chunk.dat")
-        let totalSize = 5 * 512 * 1024
-        let payload = Data(repeating: 0x42, count: totalSize)
-        try payload.write(to: testFileURL)
+            let manager = MediaTransferManager(host: host)
+            let testFileURL = tempRoot.appendingPathComponent("test_5chunk.dat")
+            let totalSize = 5 * 512 * 1024
+            let payload = Data(repeating: 0x42, count: totalSize)
+            try payload.write(to: testFileURL)
 
-        var reportedFractions: [Double] = []
-        var completedMediaId: String?
+            var reportedFractions: [Double] = []
+            var completedMediaId: String?
 
-        let stream = AsyncStream<MediaTransferManager.TransferProgress> { continuation in
-            Task {
-                do {
-                    _ = try await manager.uploadMedia(
-                        fileURL: testFileURL,
-                        mimeType: "application/octet-stream",
-                        fileName: "test_5chunk.dat",
-                        progressStream: continuation
-                    )
-                } catch {
-                    continuation.yield(.failed(transferId: "upload", error: error.localizedDescription))
+            let stream = AsyncStream<MediaTransferManager.TransferProgress> { continuation in
+                Task {
+                    do {
+                        _ = try await manager.uploadMedia(
+                            fileURL: testFileURL,
+                            mimeType: "application/octet-stream",
+                            fileName: "test_5chunk.dat",
+                            progressStream: continuation
+                        )
+                    } catch {
+                        continuation.yield(.failed(transferId: "upload", error: error.localizedDescription))
+                    }
+                    continuation.finish()
                 }
-                continuation.finish()
             }
+
+            for await event in stream {
+                switch event {
+                case .progress(_, let frac, _, _):
+                    reportedFractions.append(frac)
+                case .completed(_, let mediaId, _):
+                    completedMediaId = mediaId
+                case .failed(_, let err):
+                    XCTFail("Real Rust chunked media upload failed unexpectedly: \(err)")
+                }
+            }
+
+            XCTAssertNotNil(completedMediaId, "Real Rust chunked CAS finalize must return a media file_id")
+            XCTAssertEqual(reportedFractions.count, 5, "Must emit 5 progress updates for 5 chunks")
+            XCTAssertEqual(reportedFractions, [0.2, 0.4, 0.6, 0.8, 1.0])
+        } catch {
+            caughtError = error
         }
 
-        for await event in stream {
-            switch event {
-            case .progress(_, let frac, _, _):
-                reportedFractions.append(frac)
-            case .completed(_, let mediaId, _):
-                completedMediaId = mediaId
-            case .failed(_, let err):
-                XCTFail("Real Rust chunked media upload failed unexpectedly: \(err)")
-            }
-        }
-
-        XCTAssertNotNil(completedMediaId, "Real Rust chunked CAS finalize must return a media file_id")
-        XCTAssertEqual(reportedFractions.count, 5, "Must emit 5 progress updates for 5 chunks")
-        XCTAssertEqual(reportedFractions, [0.2, 0.4, 0.6, 0.8, 1.0])
         await host.shutdown()
+        try? FileManager.default.removeItem(at: tempRoot)
+        if let caughtError {
+            throw caughtError
+        }
     }
 
     public func testTC_T2_F26_03_ZeroLengthChunkHandlingThrows() {

@@ -125,6 +125,11 @@ public final class FabushiKeychainStore: Sendable {
         }
 
         var bytes = [UInt8](repeating: 0, count: Self.passphraseByteLength)
+        defer {
+            bytes.withUnsafeMutableBytes { rawBuffer in
+                _ = rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+            }
+        }
         let randomStatus = bytes.withUnsafeMutableBytes { rawBuffer -> OSStatus in
             guard let baseAddress = rawBuffer.baseAddress else {
                 return errSecParam

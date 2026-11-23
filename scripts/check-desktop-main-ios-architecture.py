@@ -82,11 +82,25 @@ TEST_READY_RUN_ID_RE = re.compile(r"\bGITHUB_RUN_ID\s*[:=]\s*[1-9][0-9]*\b")
 HOST_STUB_ACK_RE = re.compile(r'\\?"status\\?"\s*:\s*\\?"acknowledged\\?"')
 HOST_HARDCODED_LOCALHOST_RE = re.compile(r'https?://127\.0\.0\.1:8443')
 SWIFT_FAKE_ACCOUNT_RE = re.compile(r'"acc_primary"|"acc_work"')
-SWIFT_FAKE_CRYPTO_KEY_RE = re.compile(r'Data\s*\(\s*repeating\s*:\s*0x(?:AA|BB)\b', re.IGNORECASE)
+SWIFT_FAKE_CRYPTO_KEY_RE = re.compile(
+    r'(?:Data|\[UInt8\])\s*\(\s*repeating\s*:\s*(?:UInt8\s*\(\s*)?0x(?:AA|BB)\b',
+    re.IGNORECASE,
+)
 SWIFT_MOCK_BRIDGE_RE = re.compile(r'\bmockBridge\b|\bmockChunks\b|"mock_media_')
-PROJECT_ATS_ARBITRARY_FALSE_RE = re.compile(r'^\s*NSAllowsArbitraryLoads\s*:\s*false\b', re.MULTILINE)
-PROJECT_ATS_ARBITRARY_TRUE_RE = re.compile(r'^\s*NSAllowsArbitraryLoads\s*:\s*true\b', re.MULTILINE)
-PROJECT_ATS_LOCAL_TRUE_RE = re.compile(r'^\s*NSAllowsLocalNetworking\s*:\s*true\b', re.MULTILINE)
+PROJECT_ATS_SECTION_RE = re.compile(r'(?:^|\s)NSAppTransportSecurity\s*:', re.MULTILINE)
+PROJECT_ATS_ARBITRARY_FALSE_RE = re.compile(
+    r'(?:^|[\s{,])NSAllowsArbitraryLoads\s*:\s*["\']?(?:false|no|off|0)["\']?(?=\s|$|[},])',
+    re.IGNORECASE | re.MULTILINE,
+)
+PROJECT_ATS_ARBITRARY_TRUE_RE = re.compile(
+    r'(?:^|[\s{,])NSAllowsArbitraryLoads\s*:\s*["\']?(?:true|yes|on|1)["\']?(?=\s|$|[},])',
+    re.IGNORECASE | re.MULTILINE,
+)
+PROJECT_ATS_LOCAL_TRUE_RE = re.compile(
+    r'(?:^|[\s{,])NSAllowsLocalNetworking\s*:\s*["\']?(?:true|yes|on|1)["\']?(?=\s|$|[},])',
+    re.IGNORECASE | re.MULTILINE,
+)
+PROJECT_TESTS_E2E_PATH_RE = re.compile(r'(?:^|[\s/"\'])tests/e2e(?:/|\b|$)')
 DEP_TABLE_KEYS = (
     "dependencies",
     "dev-dependencies",
@@ -1115,8 +1129,27 @@ def verify_host_anti_stub(root, errors):
                 )
 
 
+def _strip_yaml_comments(text: str) -> str:
+    cleaned_lines = []
+    for line in text.splitlines():
+        in_single = False
+        in_double = False
+        out = []
+        for ch in line:
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == "#" and not in_single and not in_double:
+                break
+            out.append(ch)
+        cleaned_lines.append("".join(out))
+    return "\n".join(cleaned_lines)
+
+
 def verify_ios_swift_anti_mock(root, errors):
     app_root = root / "mobile/ios/Fabushi"
+    frontend_root = root / "frontend"
     required_core_owners = [
         "mobile/ios/Fabushi/Core/FabushiRustHostActor.swift",
         "mobile/ios/Fabushi/Core/FabushiCoordinator.swift",
@@ -1125,8 +1158,16 @@ def verify_ios_swift_anti_mock(root, errors):
         if not (root / relative).is_file():
             errors.append(f"missing canonical Swift Core owner: {relative}")
 
+    swift_roots = []
     if app_root.is_dir():
-        for swift_file in sorted(app_root.rglob("*.swift")):
+        swift_roots.append(app_root)
+    else:
+        errors.append("missing iOS Swift app source root: mobile/ios/Fabushi")
+    if frontend_root.is_dir():
+        swift_roots.append(frontend_root)
+
+    for scan_root in swift_roots:
+        for swift_file in sorted(scan_root.rglob("*.swift")):
             text = swift_file.read_text(encoding="utf-8")
             rel = swift_file.relative_to(root).as_posix()
             if SWIFT_FAKE_ACCOUNT_RE.search(text):
@@ -1141,15 +1182,13 @@ def verify_ios_swift_anti_mock(root, errors):
                 errors.append(
                     f"{rel} contains forbidden production mock bypass (mockBridge/mockChunks/mock_media_)"
                 )
-    else:
-        errors.append("missing iOS Swift app source root: mobile/ios/Fabushi")
 
     project_yml = root / "mobile/ios/project.yml"
     if not project_yml.is_file():
         errors.append("missing XcodeGen spec: mobile/ios/project.yml")
     else:
-        yml_text = project_yml.read_text(encoding="utf-8")
-        if "NSAppTransportSecurity:" not in yml_text:
+        yml_text = _strip_yaml_comments(project_yml.read_text(encoding="utf-8"))
+        if not PROJECT_ATS_SECTION_RE.search(yml_text):
             errors.append("mobile/ios/project.yml missing NSAppTransportSecurity configuration")
         if PROJECT_ATS_ARBITRARY_TRUE_RE.search(yml_text):
             errors.append("mobile/ios/project.yml must not enable NSAllowsArbitraryLoads: true")
@@ -1157,8 +1196,8 @@ def verify_ios_swift_anti_mock(root, errors):
             errors.append("mobile/ios/project.yml must enforce NSAllowsArbitraryLoads: false")
         if not PROJECT_ATS_LOCAL_TRUE_RE.search(yml_text):
             errors.append("mobile/ios/project.yml must enable NSAllowsLocalNetworking: true")
-        if "master_e2e_suite.swift" in yml_text:
-            errors.append("mobile/ios/project.yml must not compile standalone master_e2e_suite.swift")
+        if "master_e2e_suite.swift" in yml_text or PROJECT_TESTS_E2E_PATH_RE.search(yml_text):
+            errors.append("mobile/ios/project.yml must not compile standalone tests/e2e sources (master_e2e_suite.swift)")
 
 
 def verify_host_cargo_manifests(root, forbidden_deps, errors):

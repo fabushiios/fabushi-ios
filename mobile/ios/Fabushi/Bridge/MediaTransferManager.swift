@@ -208,6 +208,10 @@ public actor MediaTransferManager {
             completedChunksByTransfer.removeValue(forKey: transferId)
         }
 
+        guard !Task.isCancelled && !isCancelled(transferId: transferId) else {
+            throw MediaTransferError.transferCancelled(transferId)
+        }
+
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             throw MediaTransferError.fileNotFound(fileURL)
         }
@@ -279,7 +283,31 @@ public actor MediaTransferManager {
                         params: partParams
                     )
                     succeeded = true
+                } catch is CancellationError {
+                    throw MediaTransferError.transferCancelled(transferId)
+                } catch let hostError as FabushiHostError {
+                    if hostError.isCancelled || isCancelled(transferId: transferId) || Task.isCancelled {
+                        throw MediaTransferError.transferCancelled(transferId)
+                    }
+                    if isNonRetryableHostError(hostError) {
+                        progressStream?.yield(
+                            .failed(transferId: transferId, error: "Chunk \(index) failed: \(hostError.localizedDescription)")
+                        )
+                        throw MediaTransferError.serverError(hostError.localizedDescription)
+                    }
+                    retries += 1
+                    if retries >= Self.maxRetries {
+                        progressStream?.yield(
+                            .failed(transferId: transferId, error: "Chunk \(index) failed: \(hostError.localizedDescription)")
+                        )
+                        throw MediaTransferError.maxRetriesExceeded("Chunk \(index) failed after \(retries) retries")
+                    }
+                    let backoffNs = UInt64(pow(2.0, Double(retries)) * 50_000_000)
+                    try? await Task.sleep(nanoseconds: backoffNs)
                 } catch {
+                    if isCancelled(transferId: transferId) || Task.isCancelled {
+                        throw MediaTransferError.transferCancelled(transferId)
+                    }
                     retries += 1
                     if retries >= Self.maxRetries {
                         progressStream?.yield(
@@ -430,6 +458,25 @@ public actor MediaTransferManager {
         if !slotWaiters.isEmpty {
             let next = slotWaiters.removeFirst()
             next.resume()
+        }
+    }
+
+    private func isNonRetryableHostError(_ error: FabushiHostError) -> Bool {
+        switch error {
+        case .notFound,
+             .invalidArguments,
+             .hostClosed,
+             .notInitialized,
+             .cryptoError,
+             .unknownCommand,
+             .capabilityUnavailable,
+             .upstreamNotImplemented,
+             .unauthorized,
+             .permissionDenied,
+             .rustPanic:
+            return true
+        default:
+            return false
         }
     }
 }

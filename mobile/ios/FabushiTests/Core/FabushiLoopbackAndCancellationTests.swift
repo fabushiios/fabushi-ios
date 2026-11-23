@@ -6,7 +6,7 @@ import XCTest
 
 // MARK: - Minimal POSIX 127.0.0.1:0 Loopback HTTP Server (Zero External Dependencies)
 
-private final class LoopbackHTTPTestServer: Sendable {
+internal final class LoopbackHTTPTestServer: Sendable {
     private struct ServerState: Sendable {
         var listenFD: Int32 = -1
         var stopped: Bool = false

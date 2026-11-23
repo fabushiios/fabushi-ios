@@ -93,6 +93,38 @@ private final class DispatchCancelState: Sendable {
     }
 }
 
+private func dispatchCancelAttempt(
+    attempt: Int,
+    maxAttempts: Int,
+    requestId: String,
+    cancelState: DispatchCancelState,
+    handleBox: HostHandleBox,
+    cancelQueue: DispatchQueue
+) {
+    if cancelState.isFinished {
+        return
+    }
+    guard let handle = handleBox.current() else {
+        return
+    }
+    let didCancel = requestId.withCString { cReqId in
+        fabushi_host_cancel(handle.pointer, cReqId)
+    }
+    if didCancel || attempt + 1 >= maxAttempts {
+        return
+    }
+    cancelQueue.asyncAfter(deadline: .now() + .milliseconds(5)) {
+        dispatchCancelAttempt(
+            attempt: attempt + 1,
+            maxAttempts: maxAttempts,
+            requestId: requestId,
+            cancelState: cancelState,
+            handleBox: handleBox,
+            cancelQueue: cancelQueue
+        )
+    }
+}
+
 private final class PollControlBox: Sendable {
     private struct State: Sendable {
         var token: UInt64 = 0
@@ -189,6 +221,7 @@ public actor FabushiRustHostActor {
     private let handleBox = HostHandleBox()
     private let pollControl = PollControlBox()
     private let pollGroup = DispatchGroup()
+    private let rpcGroup = DispatchGroup()
     private let eventBroadcaster = DomainEventBroadcaster()
 
     private let lifecycleQueue = DispatchQueue(
@@ -206,8 +239,14 @@ public actor FabushiRustHostActor {
     )
     private let cancelQueue = DispatchQueue(
         label: "com.ombhrum.fabushi.host.cancel",
-        qos: .userInteractive
+        qos: .userInteractive,
+        attributes: .concurrent
     )
+
+    private var lifecycleEpoch: UInt64 = 0
+    private var lifecycleTaskCounter: UInt64 = 0
+    private var inFlightInit: (id: UInt64, task: Task<Void, Error>)? = nil
+    private var inFlightShutdown: (id: UInt64, task: Task<Void, Never>)? = nil
 
     public private(set) var latestObservedGeneration: UInt64 = 1
     public private(set) var activeConfig: FabushiHostConfig? = nil
@@ -240,9 +279,56 @@ public actor FabushiRustHostActor {
         handleBox.current() != nil
     }
 
+    internal var hasInFlightInitialization: Bool {
+        inFlightInit != nil
+    }
+
     // MARK: - Lifecycle
 
     public func initialize(config: FabushiHostConfig) async throws {
+        while true {
+            if let shutdownEntry = inFlightShutdown {
+                await shutdownEntry.task.value
+                continue
+            }
+            if handleBox.current() != nil {
+                return
+            }
+            if let initEntry = inFlightInit {
+                try await initEntry.task.value
+                return
+            }
+
+            lifecycleTaskCounter &+= 1
+            let taskId = lifecycleTaskCounter
+            let expectedEpoch = lifecycleEpoch
+            let task = Task<Void, Error> {
+                try await self.performInitialize(
+                    config: config,
+                    expectedEpoch: expectedEpoch,
+                    taskId: taskId
+                )
+            }
+            inFlightInit = (id: taskId, task: task)
+            try await task.value
+            return
+        }
+    }
+
+    private func performInitialize(
+        config: FabushiHostConfig,
+        expectedEpoch: UInt64,
+        taskId: UInt64
+    ) async throws {
+        defer {
+            if inFlightInit?.id == taskId {
+                inFlightInit = nil
+            }
+        }
+
+        guard lifecycleEpoch == expectedEpoch else {
+            throw FabushiHostError.hostClosed(message: "Rust host shut down before initialization started")
+        }
         if handleBox.current() != nil {
             return
         }
@@ -279,6 +365,13 @@ public actor FabushiRustHostActor {
             }
         }
 
+        // If shutdown() arrived while fabushi_host_create ran on lifecycleQueue, destroy the
+        // created handle immediately off-actor WITHOUT installing it or starting pollQueue.
+        guard lifecycleEpoch == expectedEpoch else {
+            await destroyRawHandleOffActor(createdHandle)
+            throw FabushiHostError.hostClosed(message: "Rust host shut down during initialization")
+        }
+
         handleBox.install(createdHandle)
         activeConfig = config
 
@@ -286,25 +379,71 @@ public actor FabushiRustHostActor {
         startEventPollLoop(handle: createdHandle, pollToken: pollToken)
 
         if let gen = try? await currentGeneration() {
-            latestObservedGeneration = max(1, gen)
+            if lifecycleEpoch == expectedEpoch {
+                latestObservedGeneration = max(1, gen)
+            }
+        }
+
+        if lifecycleEpoch != expectedEpoch {
+            throw FabushiHostError.hostClosed(message: "Rust host shut down during initialization")
+        }
+    }
+
+    private func destroyRawHandleOffActor(_ handle: SendableRawHandle) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lifecycleQueue.async {
+                fabushi_host_destroy(handle.pointer)
+                continuation.resume()
+            }
         }
     }
 
     public func shutdown() async {
+        lifecycleEpoch &+= 1
+        if let shutdownEntry = inFlightShutdown {
+            await shutdownEntry.task.value
+            return
+        }
+
+        lifecycleTaskCounter &+= 1
+        let taskId = lifecycleTaskCounter
+        let task = Task<Void, Never> {
+            await self.performShutdown(taskId: taskId)
+        }
+        inFlightShutdown = (id: taskId, task: task)
+        await task.value
+    }
+
+    private func performShutdown(taskId: UInt64) async {
+        defer {
+            if inFlightShutdown?.id == taskId {
+                inFlightShutdown = nil
+            }
+        }
+
+        // Wait for any in-flight initialize() to settle first so it cannot resurrect a handle post-shutdown.
+        while let initEntry = inFlightInit {
+            _ = try? await initEntry.task.value
+        }
+
         pollControl.stop()
         let removed = handleBox.takeAndMarkClosed()
         eventBroadcaster.finishAll()
         activeConfig = nil
+        latestObservedGeneration = 1
 
-        guard let removed else { return }
-        let group = pollGroup
+        let pGroup = pollGroup
+        let rGroup = rpcGroup
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             lifecycleQueue.async {
-                fabushi_host_destroy(removed.pointer)
-                // Wait off the Swift cooperative pool until the woken pollQueue exits
-                // fabushi_host_poll_events and drops the final Rust Arc<FabushiAppHost>
+                if let removed {
+                    fabushi_host_destroy(removed.pointer)
+                }
+                // Wait off the Swift cooperative pool until both pollQueue and all in-flight
+                // rpcQueue dispatches exit and drop every Rust Arc<FabushiAppHost> clone
                 // (releasing SQLite WAL & Tantivy IndexWriter file locks deterministically).
-                group.wait()
+                pGroup.wait()
+                rGroup.wait()
                 continuation.resume()
             }
         }
@@ -589,11 +728,14 @@ public actor FabushiRustHostActor {
         let cancelState = DispatchCancelState()
         let box = handleBox
         let rQueue = rpcQueue
+        let rGroup = rpcGroup
         let cQueue = cancelQueue
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                rGroup.enter()
                 rQueue.async {
+                    defer { rGroup.leave() }
                     guard cancelState.beginDispatchIfNotCancelled() else {
                         continuation.resume(throwing: CancellationError())
                         return
@@ -624,25 +766,16 @@ public actor FabushiRustHostActor {
             let shouldInvokeRustCancel = cancelState.markCancelled()
             guard shouldInvokeRustCancel else { return }
             cQueue.async {
-                // Bounded retry closes the narrow race window between entering C-ABI dispatch
-                // and Rust inserting `requestId` into `in_flight_cancels`.
-                for attempt in 0..<40 {
-                    if cancelState.isFinished {
-                        return
-                    }
-                    guard let handle = box.current() else {
-                        return
-                    }
-                    let didCancel = requestId.withCString { cReqId in
-                        fabushi_host_cancel(handle.pointer, cReqId)
-                    }
-                    if didCancel {
-                        return
-                    }
-                    if attempt < 39 {
-                        Thread.sleep(forTimeInterval: 0.005)
-                    }
-                }
+                // Bounded non-blocking retry closes the narrow race window between entering
+                // C-ABI dispatch and Rust inserting `requestId` into `in_flight_cancels`.
+                dispatchCancelAttempt(
+                    attempt: 0,
+                    maxAttempts: 40,
+                    requestId: requestId,
+                    cancelState: cancelState,
+                    handleBox: box,
+                    cancelQueue: cQueue
+                )
             }
         }
     }

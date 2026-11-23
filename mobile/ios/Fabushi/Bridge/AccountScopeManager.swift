@@ -73,12 +73,28 @@ public actor AccountScopeManager {
     }
 
     /// Installs an authenticated account session into Rust (`session.setAuthSession`),
-    /// provisions a real 32-byte random Keychain key for that account, and updates generation.
+    /// then provisions a real 32-byte random Keychain key for that account and updates generation.
     @discardableResult
     public func registerAccountSession(_ params: FabushiSessionAuthParams) async throws -> UInt64 {
+        guard params.userId > 0 else {
+            throw FabushiHostError.invalidArguments(message: "user_id must be greater than 0")
+        }
+
         let accountId = String(params.userId)
+        let result: FabushiSessionAuthResult
         do {
-            _ = try keychain.loadOrCreateAccountKey(accountId: accountId)
+            let gen = try await fetchHostGeneration()
+            result = try await host.setAuthSession(params, generation: gen)
+        } catch let hostError as FabushiHostError {
+            throw mapHostError(hostError, accountId: accountId)
+        }
+
+        let resolvedAccountId = String(result.userId)
+        currentGeneration = result.generation
+        activeAccountId = resolvedAccountId
+
+        do {
+            _ = try keychain.loadOrCreateAccountKey(accountId: resolvedAccountId)
         } catch let kcError as FabushiKeychainError {
             if case .osStatus(let status) = kcError {
                 throw FenceRejectionError.keychainFailed(status)
@@ -86,15 +102,7 @@ public actor AccountScopeManager {
             throw kcError
         }
 
-        do {
-            let gen = try await fetchHostGeneration()
-            let result = try await host.setAuthSession(params, generation: gen)
-            currentGeneration = result.generation
-            activeAccountId = String(result.userId)
-            return result.generation
-        } catch let hostError as FabushiHostError {
-            throw mapHostError(hostError, accountId: accountId)
-        }
+        return result.generation
     }
 
     /// Switches active account via authoritative Rust `session.switchAccount` and advances generation fence.
@@ -140,16 +148,31 @@ public actor AccountScopeManager {
     /// Clears active Rust session (`session.clearSession`), increments epoch, and scrubs real Keychain account key.
     @discardableResult
     public func logout() async throws -> UInt64 {
-        let previousAccount = await getActiveAccountId()
         let currentGen = try await fetchHostGeneration()
-        let result = try await host.clearSession(generation: currentGen)
+        let listed = try? await host.listAccounts(generation: currentGen)
+        let targetAccount = listed?.activeAccountId ?? activeAccountId
 
-        if let previousAccount {
-            try keychain.deleteAccountKey(accountId: previousAccount)
+        let result: FabushiClearSessionResult
+        do {
+            result = try await host.clearSession(generation: currentGen)
+        } catch let hostError as FabushiHostError {
+            throw mapHostError(hostError, accountId: targetAccount ?? "")
         }
 
         activeAccountId = nil
         currentGeneration = result.generation
+
+        if let targetAccount, !targetAccount.isEmpty {
+            do {
+                try keychain.deleteAccountKey(accountId: targetAccount)
+            } catch let kcError as FabushiKeychainError {
+                if case .osStatus(let status) = kcError {
+                    throw FenceRejectionError.keychainFailed(status)
+                }
+                throw kcError
+            }
+        }
+
         return result.generation
     }
 

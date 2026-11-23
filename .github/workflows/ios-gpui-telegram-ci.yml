@@ -832,8 +832,14 @@ jobs:
           passed = summary.get("passedTests", 0)
           failed = summary.get("failedTests", 0)
           skipped = summary.get("skippedTests", 0)
-          print(f"FabushiTests summary: passed={passed} failed={failed} skipped={skipped}")
-          assert passed > 0 and failed == 0 and skipped == 0, f"Unexpected XCTest summary: {summary}"
+          expected_failures = summary.get("expectedFailures", 0)
+          print(
+              f"FabushiTests summary: passed={passed} failed={failed} "
+              f"skipped={skipped} expectedFailures={expected_failures}"
+          )
+          assert (
+              passed > 0 and failed == 0 and skipped == 0 and expected_failures == 0
+          ), f"Unexpected XCTest summary: {summary}"
           PY
 
       - name: Package Simulator test results & compute SHA-256 checksums
@@ -982,11 +988,21 @@ jobs:
           test -d "$APPEX" && test -x "$APPEX/FabushiBroadcastUpload"
           lipo -info "$APP/Fabushi" | grep -q "arm64"
           lipo -info "$APPEX/FabushiBroadcastUpload" | grep -q "arm64"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")" = "17.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APPEX/Info.plist")" = "17.0"
           test "$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsArbitraryLoads' "$APP/Info.plist")" = "false"
           test "$(/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$APP/Info.plist")" = "true"
-          ! otool -L "$APP/Fabushi" | grep -E "libmahayana_app_host\.dylib|/Users/|/opt/homebrew"
-          ! otool -L "$APPEX/FabushiBroadcastUpload" | grep -E "libmahayana_app_host\.dylib|/Users/|/opt/homebrew"
-          echo "PASS: Fabushi.app + FabushiBroadcastUpload.appex (arm64, ATS, dylib hygiene) verified cleanly."
+          for bin in "$APP/Fabushi" "$APPEX/FabushiBroadcastUpload"; do
+            OTOOL_OUT="$(otool -L "$bin")"
+            DEPS="$(printf '%s\n' "$OTOOL_OUT" | tail -n +2)"
+            test -n "$DEPS"
+            if grep -Eq "libmahayana_app_host\.dylib|/Users/|/opt/homebrew" <<< "$DEPS"; then
+              echo "ERROR: Forbidden dynamic library reference in $bin:" >&2
+              printf '%s\n' "$DEPS" >&2
+              exit 1
+            fi
+          done
+          echo "PASS: Fabushi.app + FabushiBroadcastUpload.appex (arm64, MinimumOSVersion=17.0, ATS, dylib hygiene) verified cleanly."
 
       - name: Package xcarchive & compute SHA-256 checksums
         if: always()

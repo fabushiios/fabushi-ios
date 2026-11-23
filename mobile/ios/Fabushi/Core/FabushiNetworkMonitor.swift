@@ -58,13 +58,18 @@ private struct MonitorTransfer: @unchecked Sendable {
 }
 
 private struct MonitorState: @unchecked Sendable {
+    var sessionToken: UInt64 = 0
     var monitor: NWPathMonitor?
     var lastSnapshot: FabushiNetworkSnapshot?
     var lastForwardedOnline: Bool?
+    var onTransition: (@Sendable (FabushiNetworkSnapshot) -> Void)?
+    var forwardContinuation: AsyncStream<Bool>.Continuation?
+    var forwardTask: Task<Void, Never>?
 }
 
 /// Thread-safe Apple `Network.NWPathMonitor` bridge running on a dedicated serial utility queue.
-/// Deduplicates reachability transitions and forwards connectivity state directly to
+/// Deduplicates reachability transitions, fences stale callbacks across `stop()`/`start()` via
+/// a monotonic session token, and forwards connectivity changes in strict serial order to
 /// `FabushiRustHostActor.setNetworkOnline(_:)` (`outbox.setNetworkState`).
 public final class FabushiNetworkMonitor: Sendable {
     private let queue = DispatchQueue(
@@ -87,53 +92,128 @@ public final class FabushiNetworkMonitor: Sendable {
         host: FabushiRustHostActor,
         onTransition: (@Sendable (FabushiNetworkSnapshot) -> Void)? = nil
     ) {
-        let newTransfer = MonitorTransfer(monitor: NWPathMonitor())
-        let previous = lock.withLock { state -> MonitorTransfer? in
-            let old = state.monitor.map(MonitorTransfer.init(monitor:))
-            state.monitor = newTransfer.monitor
-            return old
-        }
-        previous?.monitor.cancel()
+        _ = startSession(host: host, startPathMonitor: true, onTransition: onTransition)
+    }
 
-        newTransfer.monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let snapshot = FabushiNetworkSnapshot(path: path)
-            let (snapshotChanged, shouldNotifyHost) = self.recordTransition(snapshot)
-            guard snapshotChanged else { return }
-
-            if shouldNotifyHost {
-                Task {
-                    _ = try? await host.setNetworkOnline(snapshot.isOnline)
-                }
+    @discardableResult
+    internal func startSession(
+        host: FabushiRustHostActor,
+        startPathMonitor: Bool,
+        onTransition: (@Sendable (FabushiNetworkSnapshot) -> Void)? = nil
+    ) -> UInt64 {
+        let newTransfer: MonitorTransfer? = startPathMonitor ? MonitorTransfer(monitor: NWPathMonitor()) : nil
+        let (onlineStream, onlineContinuation) = AsyncStream<Bool>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let forwardTask = Task<Void, Never> {
+            for await isOnline in onlineStream {
+                guard !Task.isCancelled else { break }
+                _ = try? await host.setNetworkOnline(isOnline)
             }
-            onTransition?(snapshot)
         }
-        newTransfer.monitor.start(queue: queue)
+
+        let (oldMonitor, oldCont, oldTask, activeToken) = lock.withLock {
+            state -> (
+                MonitorTransfer?,
+                AsyncStream<Bool>.Continuation?,
+                Task<Void, Never>?,
+                UInt64
+            ) in
+            let prevMonitor = state.monitor.map(MonitorTransfer.init(monitor:))
+            let prevCont = state.forwardContinuation
+            let prevTask = state.forwardTask
+
+            state.sessionToken &+= 1
+            let token = state.sessionToken
+            state.monitor = newTransfer?.monitor
+            state.lastSnapshot = nil
+            state.lastForwardedOnline = nil
+            state.onTransition = onTransition
+            state.forwardContinuation = onlineContinuation
+            state.forwardTask = forwardTask
+            return (prevMonitor, prevCont, prevTask, token)
+        }
+
+        oldMonitor?.monitor.cancel()
+        oldCont?.finish()
+        oldTask?.cancel()
+
+        if let transfer = newTransfer {
+            transfer.monitor.pathUpdateHandler = { [weak self] path in
+                self?.processSnapshot(FabushiNetworkSnapshot(path: path), expectedToken: activeToken)
+            }
+            transfer.monitor.start(queue: queue)
+        }
+
+        return activeToken
     }
 
     public func stop() {
-        let existing = lock.withLock { state -> MonitorTransfer? in
+        let (existingMonitor, existingCont, existingTask) = lock.withLock {
+            state -> (
+                MonitorTransfer?,
+                AsyncStream<Bool>.Continuation?,
+                Task<Void, Never>?
+            ) in
             let mon = state.monitor.map(MonitorTransfer.init(monitor:))
+            let cont = state.forwardContinuation
+            let task = state.forwardTask
+
+            state.sessionToken &+= 1
             state.monitor = nil
-            return mon
+            state.lastSnapshot = nil
+            state.lastForwardedOnline = nil
+            state.onTransition = nil
+            state.forwardContinuation = nil
+            state.forwardTask = nil
+            return (mon, cont, task)
         }
-        existing?.monitor.cancel()
+        existingMonitor?.monitor.cancel()
+        existingCont?.finish()
+        existingTask?.cancel()
     }
 
-    /// Applies an observed network snapshot directly to the Rust outbox state and records it.
+    /// Finishes the current forwarding stream without cancelling in-flight delivery, awaits
+    /// convergence to the latest queued reachability state, and resets monitor session state.
+    internal func drainAndStopForTesting() async {
+        let (existingMonitor, existingCont, existingTask) = lock.withLock {
+            state -> (
+                MonitorTransfer?,
+                AsyncStream<Bool>.Continuation?,
+                Task<Void, Never>?
+            ) in
+            let mon = state.monitor.map(MonitorTransfer.init(monitor:))
+            let cont = state.forwardContinuation
+            let task = state.forwardTask
+
+            state.sessionToken &+= 1
+            state.monitor = nil
+            state.lastSnapshot = nil
+            state.lastForwardedOnline = nil
+            state.onTransition = nil
+            state.forwardContinuation = nil
+            state.forwardTask = nil
+            return (mon, cont, task)
+        }
+        existingMonitor?.monitor.cancel()
+        existingCont?.finish()
+        await existingTask?.value
+    }
+
     @discardableResult
-    public func applyObservedSnapshot(
+    internal func processSnapshot(
         _ snapshot: FabushiNetworkSnapshot,
-        host: FabushiRustHostActor
-    ) async throws -> FabushiNetworkStateResult {
-        _ = recordTransition(snapshot)
-        return try await host.setNetworkOnline(snapshot.isOnline)
-    }
-
-    private func recordTransition(
-        _ snapshot: FabushiNetworkSnapshot
-    ) -> (snapshotChanged: Bool, shouldNotifyHost: Bool) {
-        lock.withLock { state in
+        expectedToken: UInt64
+    ) -> Bool {
+        let outcome = lock.withLock {
+            state -> (
+                accepted: Bool,
+                continuation: AsyncStream<Bool>.Continuation?,
+                transition: (@Sendable (FabushiNetworkSnapshot) -> Void)?
+            ) in
+            guard state.sessionToken == expectedToken else {
+                return (false, nil, nil)
+            }
             let snapshotChanged = state.lastSnapshot != snapshot
             let shouldNotifyHost = state.lastForwardedOnline != snapshot.isOnline
             if snapshotChanged {
@@ -142,7 +222,34 @@ public final class FabushiNetworkMonitor: Sendable {
             if shouldNotifyHost {
                 state.lastForwardedOnline = snapshot.isOnline
             }
-            return (snapshotChanged, shouldNotifyHost)
+            guard snapshotChanged || shouldNotifyHost else {
+                return (true, nil, nil)
+            }
+            return (
+                true,
+                shouldNotifyHost ? state.forwardContinuation : nil,
+                snapshotChanged ? state.onTransition : nil
+            )
         }
+
+        guard outcome.accepted else { return false }
+        if let continuation = outcome.continuation {
+            continuation.yield(snapshot.isOnline)
+        }
+        outcome.transition?(snapshot)
+        return true
+    }
+
+    /// Applies an observed network snapshot directly to the Rust outbox state and records it.
+    @discardableResult
+    public func applyObservedSnapshot(
+        _ snapshot: FabushiNetworkSnapshot,
+        host: FabushiRustHostActor
+    ) async throws -> FabushiNetworkStateResult {
+        lock.withLock { state in
+            state.lastSnapshot = snapshot
+            state.lastForwardedOnline = snapshot.isOnline
+        }
+        return try await host.setNetworkOnline(snapshot.isOnline)
     }
 }
