@@ -148,6 +148,25 @@ impl HostSearchEngine {
         Ok(messages.len())
     }
 
+    pub fn clear_all(&self) -> HostResult<()> {
+        let mut writer = self.writer.lock();
+        if let Err(e) = writer.delete_all_documents() {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!(
+                "Tantivy clear_all delete_all_documents failed: {e}"
+            )));
+        }
+        if let Err(e) = writer.commit() {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!("Tantivy clear_all commit failed: {e}")));
+        }
+        drop(writer);
+        self.reader
+            .reload()
+            .map_err(|e| HostError::storage(format!("Tantivy clear_all reload failed: {e}")))?;
+        Ok(())
+    }
+
     pub fn doc_count(&self) -> u64 {
         self.reader.searcher().num_docs()
     }

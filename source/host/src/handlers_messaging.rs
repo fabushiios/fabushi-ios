@@ -398,7 +398,7 @@ pub fn handle_chats(
         }
         "draftGet" => {
             let chat_id = req_i64(params, "chat_id")?;
-            if client.token().is_some() {
+            if host.fenced_client_token(&client)?.is_some() {
                 let res = host.run_cancellable(req_id, async move {
                     client.get_draft(chat_id).await.map_err(HostError::from)
                 })?;
@@ -1164,8 +1164,10 @@ pub fn handle_sync(
         "setPts" => {
             let chat_id = req_i64(params, "chat_id")?;
             let pts = req_u64(params, "pts")?;
-            client.sync_coordinator.set_pts(ChatId(chat_id), pts);
-            host.host_db.save_pts(chat_id, pts)?;
+            host.with_fenced_session_read(&client, || {
+                client.sync_coordinator.set_pts(ChatId(chat_id), pts);
+                host.host_db.save_pts(chat_id, pts)
+            })?;
             Ok(json!({ "chat_id": chat_id, "pts": pts }))
         }
         "pendingGaps" => {
@@ -1178,40 +1180,60 @@ pub fn handle_sync(
         }
         "evaluatePtsUpdate" => {
             let update: PtsUpdate = parse_req(params)?;
-            let outcome = client.sync_coordinator.evaluate_update(&update);
-            let pts_now = client.sync_coordinator.last_pts(update.chat_id);
-            let _ = host.host_db.save_pts(update.chat_id.0, pts_now);
-            match outcome {
-                SyncOutcome::Contiguous => Ok(json!({
-                    "outcome": "contiguous",
-                    "last_pts": pts_now
-                })),
-                SyncOutcome::Duplicate => Ok(json!({
-                    "outcome": "duplicate",
-                    "last_pts": pts_now
-                })),
-                SyncOutcome::GapDetected {
-                    last_seen,
-                    incoming,
-                    missing_range,
-                } => {
-                    client.sync_coordinator.buffer_gap_update(update);
-                    Ok(json!({
-                        "outcome": "gap_detected",
-                        "last_seen": last_seen,
-                        "incoming": incoming,
-                        "missing_start": *missing_range.start(),
-                        "missing_end": *missing_range.end(),
-                    }))
+            host.with_fenced_session_read(&client, || {
+                let outcome = client.sync_coordinator.evaluate_update(&update);
+                let pts_now = client.sync_coordinator.last_pts(update.chat_id);
+                let _ = host.host_db.save_pts(update.chat_id.0, pts_now);
+                match outcome {
+                    SyncOutcome::Contiguous => Ok(json!({
+                        "outcome": "contiguous",
+                        "last_pts": pts_now
+                    })),
+                    SyncOutcome::Duplicate => Ok(json!({
+                        "outcome": "duplicate",
+                        "last_pts": pts_now
+                    })),
+                    SyncOutcome::GapDetected {
+                        last_seen,
+                        incoming,
+                        missing_range,
+                    } => {
+                        client.sync_coordinator.buffer_gap_update(update);
+                        Ok(json!({
+                            "outcome": "gap_detected",
+                            "last_seen": last_seen,
+                            "incoming": incoming,
+                            "missing_start": *missing_range.start(),
+                            "missing_end": *missing_range.end(),
+                        }))
+                    }
                 }
-            }
+            })
         }
         "applyWsFrame" => {
             let frame: WsServerFrame = parse_req(params)?;
-            let events = client.process_ws_frame(frame);
-            let mut mapped = Vec::with_capacity(events.len());
-            for ev in events {
-                let (ev_type, payload) = domain_event_to_host_event(ev);
+            // Fence WS frame application + SQLite PTS persistence under session_lock.read(),
+            // strictly dropping _sess_read BEFORE host.emit_event (NB6-04).
+            let mapped_events: Vec<(String, Value)> =
+                host.with_fenced_session_read(&client, || {
+                    let events = client.process_ws_frame(frame);
+                    let mut out = Vec::with_capacity(events.len());
+                    for ev in events {
+                        let (ev_type, payload) = domain_event_to_host_event(ev);
+                        if ev_type == "newMessage" {
+                            if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
+                                let pts = client.sync_coordinator.last_pts(ChatId(cid));
+                                if pts > 0 {
+                                    let _ = host.host_db.save_pts(cid, pts);
+                                }
+                            }
+                        }
+                        out.push((ev_type, payload));
+                    }
+                    Ok(out)
+                })?;
+            let mut mapped = Vec::with_capacity(mapped_events.len());
+            for (ev_type, payload) in mapped_events {
                 host.emit_event(&ev_type, payload.clone());
                 mapped.push(json!({ "type": ev_type, "payload": payload }));
             }
@@ -1599,15 +1621,18 @@ pub fn handle_search(
                 .and_then(|v| v.as_i64())
                 .unwrap_or_else(|| Utc::now().timestamp_millis());
             let body = req_raw_str(params, "body")?;
-            host.host_db
-                .index_message_fts(message_id, chat_id, sender_id, timestamp_ms, body)?;
-            host.search_engine
-                .index_message(message_id, chat_id, sender_id, timestamp_ms, body)?;
+            let (tantivy_docs, fts5_enabled) = host.with_fenced_session_read(&client, || {
+                host.host_db
+                    .index_message_fts(message_id, chat_id, sender_id, timestamp_ms, body)?;
+                host.search_engine
+                    .index_message(message_id, chat_id, sender_id, timestamp_ms, body)?;
+                Ok((host.search_engine.doc_count(), host.host_db.fts5_enabled()))
+            })?;
             Ok(json!({
                 "indexed": true,
                 "message_id": message_id,
-                "tantivy_docs": host.search_engine.doc_count(),
-                "fts5_enabled": host.host_db.fts5_enabled(),
+                "tantivy_docs": tantivy_docs,
+                "fts5_enabled": fts5_enabled,
             }))
         }
         "localMessages" | "query" => {
@@ -1636,8 +1661,10 @@ pub fn handle_search(
             }))
         }
         "rebuildLocalIndex" => {
-            let all = host.host_db.list_all_indexed_messages()?;
-            let count = host.search_engine.rebuild(&all)?;
+            let count = host.with_fenced_session_read(&client, || {
+                let all = host.host_db.list_all_indexed_messages()?;
+                host.search_engine.rebuild(&all)
+            })?;
             Ok(json!({ "rebuilt": true, "indexed_docs": count }))
         }
         "sessions" => {
@@ -1746,7 +1773,9 @@ pub fn handle_media(
                 return Err(HostError::invalid_arguments("Missing base64 'data_b64'"));
             };
             let mime = params.get("mime_type").and_then(|v| v.as_str());
-            let path = client.local_store.put_media_cas(file_id, &bytes, mime)?;
+            let path = host.with_fenced_session_read(&client, || {
+                Ok(client.local_store.put_media_cas(file_id, &bytes, mime)?)
+            })?;
             let sha256 = {
                 use sha2::{Digest, Sha256};
                 hex::encode(Sha256::digest(&bytes))
@@ -1787,7 +1816,9 @@ pub fn handle_media(
             }))
         }
         "casPurge" => {
-            let (freed_bytes, removed_files) = purge_media_cas_dir(&host.storage_dir)?;
+            let (freed_bytes, removed_files) = host.with_fenced_session_read(&client, || {
+                purge_media_cas_dir(&host.storage_dir)
+            })?;
             Ok(json!({ "freed_bytes": freed_bytes, "removed_files": removed_files }))
         }
         "recommendPartSize" => {
@@ -1841,26 +1872,30 @@ pub fn handle_media(
         }
         "chunkedSessionFinalize" => {
             let file_id = req_str(params, "file_id")?;
-            let mut guard = host.chunked_sessions.lock();
-            let sess = guard
-                .get(file_id)
-                .ok_or_else(|| HostError::not_found(format!("Chunked session '{file_id}' not found")))?;
-            let verified = sess.finalize_and_verify()?;
-            if !verified {
-                return Err(HostError::crypto(
-                    "Chunked upload incomplete or SHA-256 verification failed",
-                ));
-            }
-            let sha256 = sess.compute_sha256()?;
-            let assembled = sess.assemble_payload()?;
             let mime = params.get("mime_type").and_then(|v| v.as_str());
-            let path = client.local_store.put_media_cas(file_id, &assembled, mime)?;
-            guard.remove(file_id);
+            let (sha256, size_bytes, path) = host.with_fenced_session_read(&client, || {
+                let mut guard = host.chunked_sessions.lock();
+                let sess = guard.get(file_id).ok_or_else(|| {
+                    HostError::not_found(format!("Chunked session '{file_id}' not found"))
+                })?;
+                let verified = sess.finalize_and_verify()?;
+                if !verified {
+                    return Err(HostError::crypto(
+                        "Chunked upload incomplete or SHA-256 verification failed",
+                    ));
+                }
+                let sha = sess.compute_sha256()?;
+                let assembled = sess.assemble_payload()?;
+                let p = client.local_store.put_media_cas(file_id, &assembled, mime)?;
+                let len = assembled.len();
+                guard.remove(file_id);
+                Ok((sha, len, p))
+            })?;
             Ok(json!({
                 "file_id": file_id,
                 "verified": true,
                 "sha256": sha256,
-                "size_bytes": assembled.len(),
+                "size_bytes": size_bytes,
                 "local_path": path.map(|p| p.to_string_lossy().into_owned()),
             }))
         }

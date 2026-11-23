@@ -291,7 +291,6 @@ pub fn handle_vault(
             "has_envelope": host.vault_envelope.lock().is_some(),
         })),
         "storeCredential" => {
-            let vault = open_unlocked_vault(host)?;
             let origin = req_str(params, "origin")?;
             let username = req_str(params, "username")?;
             let password = req_raw_str(params, "password")?;
@@ -301,16 +300,19 @@ pub fn handle_vault(
                 .get("reuse_policy")
                 .cloned()
                 .and_then(|v| serde_json::from_value(v).ok());
-            let meta = vault
-                .store_credential(
-                    origin,
-                    username,
-                    password,
-                    totp_secret,
-                    account_hint,
-                    reuse_policy,
-                )
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let meta = host.with_fenced_session_read(&client, || {
+                let vault = open_unlocked_vault(host)?;
+                vault
+                    .store_credential(
+                        origin,
+                        username,
+                        password,
+                        totp_secret,
+                        account_hint,
+                        reuse_policy,
+                    )
+                    .map_err(|e| HostError::crypto(e.to_string()))
+            })?;
             to_val(meta)
         }
         "listForOrigin" => {
@@ -352,11 +354,13 @@ pub fn handle_vault(
             }))
         }
         "deleteCredential" => {
-            let vault = open_unlocked_vault(host)?;
             let cred_id = req_str(params, "credential_id")?;
-            vault
-                .delete_credential(cred_id)
-                .map_err(|e| HostError::not_found(e.to_string()))?;
+            host.with_fenced_session_read(&client, || {
+                let vault = open_unlocked_vault(host)?;
+                vault
+                    .delete_credential(cred_id)
+                    .map_err(|e| HostError::not_found(e.to_string()))
+            })?;
             Ok(json!({ "deleted": true, "credential_id": cred_id }))
         }
         "sealItem" => {
@@ -1290,16 +1294,18 @@ pub fn handle_miniapp(
                 .get("display_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Practitioner");
-            let conn = host.miniapp_db.lock();
-            let bundle = fabushi_miniapp::storage::get_bootstrap_bundle(
-                &conn,
-                user_id,
-                username,
-                display_name,
-                "",
-                false,
-            )
-            .map_err(|e| HostError::storage(e.to_string()))?;
+            let bundle = host.with_fenced_session_read(&client, || {
+                let conn = host.miniapp_db.lock();
+                fabushi_miniapp::storage::get_bootstrap_bundle(
+                    &conn,
+                    user_id,
+                    username,
+                    display_name,
+                    "",
+                    false,
+                )
+                .map_err(|e| HostError::storage(e.to_string()))
+            })?;
             to_val(bundle)
         }
         "dharmaRecordPractice" => {
@@ -1314,26 +1320,28 @@ pub fn handle_miniapp(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
             let notes = params.get("notes").and_then(|v| v.as_str());
-            let conn = host.miniapp_db.lock();
-            let _ = fabushi_miniapp::storage::ensure_profile(
-                &conn,
-                user_id,
-                "practitioner",
-                "Practitioner",
-                "",
-                false,
-            );
-            let res = fabushi_miniapp::storage::record_practice_session(
-                &conn,
-                user_id,
-                sutra,
-                duration_minutes,
-                chant_count,
-                None,
-                None,
-                notes,
-            )
-            .map_err(|e| HostError::storage(e.to_string()))?;
+            let res = host.with_fenced_session_read(&client, || {
+                let conn = host.miniapp_db.lock();
+                let _ = fabushi_miniapp::storage::ensure_profile(
+                    &conn,
+                    user_id,
+                    "practitioner",
+                    "Practitioner",
+                    "",
+                    false,
+                );
+                fabushi_miniapp::storage::record_practice_session(
+                    &conn,
+                    user_id,
+                    sutra,
+                    duration_minutes,
+                    chant_count,
+                    None,
+                    None,
+                    notes,
+                )
+                .map_err(|e| HostError::storage(e.to_string()))
+            })?;
             to_val(res)
         }
         "dharmaLeaderboard" => {

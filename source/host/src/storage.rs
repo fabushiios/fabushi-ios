@@ -160,6 +160,25 @@ impl HostSqliteStore {
         Ok(())
     }
 
+    /// Wipes account-scoped host tables (`host_messages_index`, `host_messages_fts`, `nonce_dedup`,
+    /// `chat_pts`, and `host_kv` namespace `multi_agent_workspace`) while strictly preserving
+    /// device/app-scoped namespaces (`accounts`, `settings`, `proxies`, `push`, `magpie_groups`)
+    /// and metadata (`server_url`, `passcode_*`, `account_generation`, `active_proxy_id`).
+    pub fn clear_account_scoped_data(&self) -> HostResult<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch(
+            "DELETE FROM host_messages_index;
+             DELETE FROM nonce_dedup;
+             DELETE FROM chat_pts;
+             DELETE FROM host_kv WHERE namespace = 'multi_agent_workspace';",
+        )
+        .map_err(|e| HostError::storage(format!("clear_account_scoped_data failed: {e}")))?;
+        if self.fts5_enabled {
+            let _ = conn.execute("DELETE FROM host_messages_fts", []);
+        }
+        Ok(())
+    }
+
     pub fn kv_get(&self, namespace: &str, key: &str) -> HostResult<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(

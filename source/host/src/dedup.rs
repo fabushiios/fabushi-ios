@@ -249,6 +249,14 @@ impl MessageDedupStore {
         });
     }
 
+    pub fn clear_all(&mut self) {
+        for (_, v) in self.entries.drain() {
+            if let DedupEntry::InFlight(slot) = v {
+                slot.abort();
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

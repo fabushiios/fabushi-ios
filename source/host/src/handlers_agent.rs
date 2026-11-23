@@ -94,11 +94,11 @@ pub fn handle_fabushi(
     let client = host.client();
     match action {
         "status" => {
-            if client.token().is_some()
-                && params
-                    .get("remote")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+            if params
+                .get("remote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && host.fenced_client_token(&client)?.is_some()
             {
                 let res = host.run_cancellable(req_id, async move {
                     client.hermes_status().await.map_err(HostError::from)
@@ -266,11 +266,11 @@ pub fn handle_fabushi(
                 .get("approved")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            if client.token().is_some()
-                && params
-                    .get("remote")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+            if params
+                .get("remote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && host.fenced_client_token(&client)?.is_some()
             {
                 return host.run_cancellable(req_id, async move {
                     client
@@ -305,12 +305,16 @@ pub fn handle_fabushi(
                 .get("columns")
                 .cloned()
                 .and_then(|v| serde_json::from_value(v).ok());
-            let board = host.hermes.store().create_kanban_board(name, desc, cols)?;
+            let board = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().create_kanban_board(name, desc, cols)?)
+            })?;
             to_val(board)
         }
         "kanbanCreateCard" => {
             let req: CreateKanbanCardRequest = parse_req(params)?;
-            let card = host.hermes.store().create_kanban_card(req)?;
+            let card = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().create_kanban_card(req)?)
+            })?;
             to_val(card)
         }
         "kanbanListCards" => {
@@ -323,15 +327,19 @@ pub fn handle_fabushi(
             let card_id = req_str(params, "card_id")?;
             let target_col = req_str(params, "target_column")?;
             let position = params.get("position").and_then(|v| v.as_i64());
-            let card = host
-                .hermes
-                .store()
-                .move_kanban_card(card_id, target_col, position)?;
+            let card = host.with_fenced_session_read(&client, || {
+                Ok(host
+                    .hermes
+                    .store()
+                    .move_kanban_card(card_id, target_col, position)?)
+            })?;
             to_val(card)
         }
         "kanbanDeleteCard" => {
             let card_id = req_str(params, "card_id")?;
-            let deleted = host.hermes.store().delete_kanban_card(card_id)?;
+            let deleted = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().delete_kanban_card(card_id)?)
+            })?;
             Ok(json!({ "deleted": deleted, "card_id": card_id }))
         }
         // --- Skills (SKILL.md) ---
@@ -461,7 +469,9 @@ pub fn handle_fabushi(
                     req.schedule
                 )));
             }
-            let job = host.hermes.store().create_cron_job(req)?;
+            let job = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().create_cron_job(req)?)
+            })?;
             to_val(job)
         }
         "cronPreview" => {
@@ -487,7 +497,9 @@ pub fn handle_fabushi(
         }
         "cronDelete" => {
             let job_id = req_str(params, "job_id")?;
-            let deleted = host.hermes.store().delete_cron_job(job_id)?;
+            let deleted = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().delete_cron_job(job_id)?)
+            })?;
             Ok(json!({ "deleted": deleted, "job_id": job_id }))
         }
         // --- Sessions ---
@@ -502,7 +514,9 @@ pub fn handle_fabushi(
         }
         "sessionCreate" => {
             let req: CreateSessionRequest = parse_req(params)?;
-            let rec = host.hermes.store().create_session(req)?;
+            let rec = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().create_session(req)?)
+            })?;
             to_val(rec)
         }
         "sessionGet" => {
@@ -528,15 +542,17 @@ pub fn handle_fabushi(
         }
         "approvalEnqueue" => {
             let req: CreateApprovalRequest = parse_req(params)?;
-            let rec = host.hermes.store().enqueue_approval(req)?;
+            let rec = host.with_fenced_session_read(&client, || {
+                Ok(host.hermes.store().enqueue_approval(req)?)
+            })?;
             to_val(rec)
         }
         "approvalDecide" => {
-            if client.token().is_some()
-                && params
-                    .get("remote")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+            if params
+                .get("remote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && host.fenced_client_token(&client)?.is_some()
             {
                 let approval_id = req_str(params, "approval_id")?.to_string();
                 let req: HermesApprovalDecisionRequest = parse_req(params)?;
@@ -570,10 +586,12 @@ pub fn handle_fabushi(
                 .get("decided_by")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
-            let rec = host
-                .hermes
-                .store()
-                .decide_approval(approval_id, status, decided_by)?;
+            let rec = host.with_fenced_session_read(&client, || {
+                Ok(host
+                    .hermes
+                    .store()
+                    .decide_approval(approval_id, status, decided_by)?)
+            })?;
             to_val(rec)
         }
         "approvalIssueValueBound" => {
@@ -828,20 +846,26 @@ pub fn handle_multi_agent(
                 .and_then(|v| v.as_str())
                 .unwrap_or("user");
             let expected_revision = params.get("expected_revision").and_then(|v| v.as_u64());
-            let mut wss = host.group_workspaces.lock();
-            let ws = wss
-                .entry(chat_id)
-                .or_insert_with(|| SharedGroupWorkspace::new(chat_id));
-            let revision = if let Some(exp) = expected_revision {
-                ws.set_with_expected_revision(exp, key, value, updated_by)
-                    .map_err(|e| HostError::conflict(e.to_string()))?
-            } else {
-                ws.set(key, value, updated_by)
-            };
-            let snap = ws.snapshot();
-            let _ = host
-                .host_db
-                .kv_set("multi_agent_workspace", &chat_id.to_string(), &snap.to_string());
+            let client = host.client();
+            let (revision, snap) = host.with_fenced_session_read(&client, || {
+                let mut wss = host.group_workspaces.lock();
+                let ws = wss
+                    .entry(chat_id)
+                    .or_insert_with(|| SharedGroupWorkspace::new(chat_id));
+                let rev = if let Some(exp) = expected_revision {
+                    ws.set_with_expected_revision(exp, key, value, updated_by)
+                        .map_err(|e| HostError::conflict(e.to_string()))?
+                } else {
+                    ws.set(key, value, updated_by)
+                };
+                let snapshot = ws.snapshot();
+                let _ = host.host_db.kv_set(
+                    "multi_agent_workspace",
+                    &chat_id.to_string(),
+                    &snapshot.to_string(),
+                );
+                Ok((rev, snapshot))
+            })?;
             Ok(json!({ "revision": revision, "snapshot": snap }))
         }
         "workspaceGet" => {
@@ -863,20 +887,24 @@ pub fn handle_multi_agent(
         "workspaceRemove" => {
             let chat_id = req_i64(params, "chat_id")?;
             let key = req_str(params, "key")?;
-            let mut wss = host.group_workspaces.lock();
-            let removed = if let Some(ws) = wss.get_mut(&chat_id) {
-                let r = ws.remove(key);
-                if r.is_some() {
-                    let _ = host.host_db.kv_set(
-                        "multi_agent_workspace",
-                        &chat_id.to_string(),
-                        &ws.snapshot().to_string(),
-                    );
-                }
-                r
-            } else {
-                None
-            };
+            let client = host.client();
+            let removed = host.with_fenced_session_read(&client, || {
+                let mut wss = host.group_workspaces.lock();
+                let res = if let Some(ws) = wss.get_mut(&chat_id) {
+                    let r = ws.remove(key);
+                    if r.is_some() {
+                        let _ = host.host_db.kv_set(
+                            "multi_agent_workspace",
+                            &chat_id.to_string(),
+                            &ws.snapshot().to_string(),
+                        );
+                    }
+                    r
+                } else {
+                    None
+                };
+                Ok(res)
+            })?;
             Ok(json!({ "removed": removed }))
         }
         "evaluateWakeGate" => {
@@ -1026,18 +1054,21 @@ pub fn handle_magpie(
         "upsertGroup" => {
             let group: RoutingGroup = parse_req(params)?;
             let id = group.id.clone();
-            host.magpie_groups.lock().insert(id.clone(), group.clone());
-            let _ = host.host_db.kv_set(
-                "magpie_groups",
-                &id,
-                &serde_json::to_string(&group).unwrap_or_default(),
-            );
+            let encoded = serde_json::to_string(&group).unwrap_or_default();
+            host.with_fenced_session_read(&client, || {
+                host.magpie_groups.lock().insert(id.clone(), group.clone());
+                let _ = host.host_db.kv_set("magpie_groups", &id, &encoded);
+                Ok(())
+            })?;
             to_val(group)
         }
         "deleteGroup" => {
             let id = req_str(params, "id")?;
-            let removed = host.magpie_groups.lock().remove(id).is_some();
-            let _ = host.host_db.kv_delete("magpie_groups", id);
+            let removed = host.with_fenced_session_read(&client, || {
+                let r = host.magpie_groups.lock().remove(id).is_some();
+                let _ = host.host_db.kv_delete("magpie_groups", id);
+                Ok(r)
+            })?;
             Ok(json!({ "deleted": removed, "id": id }))
         }
         "resolveRoute" => {
@@ -1274,10 +1305,12 @@ pub fn handle_coding(
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok()),
             };
-            host.coding_store
-                .lock()
-                .upsert_thread(&rec)
-                .map_err(HostError::storage)?;
+            host.with_fenced_session_read(&client, || {
+                host.coding_store
+                    .lock()
+                    .upsert_thread(&rec)
+                    .map_err(HostError::storage)
+            })?;
             Ok(json!({
                 "thread_id": rec.thread_id,
                 "bot_user_id": rec.bot_user_id,
@@ -1335,10 +1368,12 @@ pub fn handle_coding(
                     .and_then(|v| v.as_i64())
                     .unwrap_or_else(|| Utc::now().timestamp_millis()),
             };
-            host.coding_store
-                .lock()
-                .save_checkpoint(&cp)
-                .map_err(HostError::storage)?;
+            host.with_fenced_session_read(&client, || {
+                host.coding_store
+                    .lock()
+                    .save_checkpoint(&cp)
+                    .map_err(HostError::storage)
+            })?;
             Ok(json!({
                 "thread_id": cp.thread_id,
                 "turn_idx": cp.turn_idx,

@@ -5,11 +5,13 @@ use crate::outbox::store::{OutboxMessageRecord, OutboxStatus, OutboxStore};
 use crate::sync::ClientSyncCoordinator;
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify};
+use tokio::task::AbortHandle;
 
 pub const DEFAULT_OUTBOX_MAX_RETRIES: u32 = 10;
 
@@ -41,6 +43,17 @@ pub struct OutboxStatusEvent {
 enum FailureClass {
     Transient(String),
     Permanent(String),
+}
+
+enum PreHttpStep {
+    NoDue,
+    Stopped,
+    EarlyOutcome(OutboxMessageRecord),
+    ReadyToSend {
+        record: OutboxMessageRecord,
+        req: RichSendMessageRequest,
+        token: String,
+    },
 }
 
 fn classify_http_error(err: &HttpClientError) -> FailureClass {
@@ -75,6 +88,11 @@ pub struct OutboxWorker {
     flush_mutex: AsyncMutex<()>,
     max_retries: u32,
     is_running: Arc<RwLock<bool>>,
+    run_generation: Arc<AtomicU64>,
+    generation_tx: watch::Sender<u64>,
+    active_task: Arc<Mutex<Option<AbortHandle>>>,
+    lifecycle_lock: Mutex<()>,
+    op_fence: Arc<RwLock<()>>,
     events_tx: broadcast::Sender<OutboxStatusEvent>,
 }
 
@@ -83,6 +101,7 @@ impl std::fmt::Debug for OutboxWorker {
         f.debug_struct("OutboxWorker")
             .field("max_retries", &self.max_retries)
             .field("is_running", &*self.is_running.read())
+            .field("run_generation", &self.run_generation.load(Ordering::SeqCst))
             .finish()
     }
 }
@@ -97,6 +116,7 @@ impl OutboxWorker {
         sync_coordinator: ClientSyncCoordinator,
     ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(256);
+        let (generation_tx, _) = watch::channel(0u64);
         Arc::new(Self {
             store,
             network,
@@ -108,6 +128,11 @@ impl OutboxWorker {
             flush_mutex: AsyncMutex::new(()),
             max_retries: DEFAULT_OUTBOX_MAX_RETRIES,
             is_running: Arc::new(RwLock::new(false)),
+            run_generation: Arc::new(AtomicU64::new(0)),
+            generation_tx,
+            active_task: Arc::new(Mutex::new(None)),
+            lifecycle_lock: Mutex::new(()),
+            op_fence: Arc::new(RwLock::new(())),
             events_tx,
         })
     }
@@ -133,6 +158,19 @@ impl OutboxWorker {
         self.wake_notify.notify_one();
     }
 
+    fn is_active(&self, expected_gen: u64) -> bool {
+        *self.is_running.read() && self.run_generation.load(Ordering::SeqCst) == expected_gen
+    }
+
+    fn reset_pending_retry_times_fenced(&self, expected_gen: u64) {
+        let _op = self.op_fence.read();
+        if !self.is_active(expected_gen) {
+            return;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let _ = self.store.reset_all_pending_retry_times(now_ms);
+    }
+
     pub fn enqueue(&self, req: &RichSendMessageRequest, nonce: u64) -> Result<OutboxMessageRecord> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let rec = self.store.enqueue(req, nonce, now_ms)?;
@@ -154,12 +192,19 @@ impl OutboxWorker {
     }
 
     pub fn start(self: &Arc<Self>, handle: &Handle) {
-        let mut running = self.is_running.write();
-        if *running {
+        let _lifecycle = self.lifecycle_lock.lock();
+        if *self.is_running.read() {
             return;
         }
-        *running = true;
-        drop(running);
+        if let Some(prev_abort) = self.active_task.lock().take() {
+            prev_abort.abort();
+        }
+        let my_gen = self.run_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.generation_tx.send(my_gen);
+        *self.is_running.write() = true;
+        // Drain any in-progress synchronous SQLite/token step of a prior worker task cleanly.
+        let _drain = self.op_fence.write();
+        drop(_drain);
 
         let _ = self.recover_in_flight();
 
@@ -168,22 +213,24 @@ impl OutboxWorker {
         let mut epoch_rx = self.network.subscribe_reconnect_epoch();
         let mut last_seen_epoch = self.network.reconnect_epoch();
         let wake_notify = Arc::clone(&self.wake_notify);
-        let is_running = Arc::clone(&self.is_running);
+        let mut gen_rx = self.generation_tx.subscribe();
 
-        handle.spawn(async move {
-            while *is_running.read() {
+        let join_handle = handle.spawn(async move {
+            while worker.is_active(my_gen) {
                 let pre_flush_epoch = worker.network.reconnect_epoch();
                 if pre_flush_epoch != last_seen_epoch {
                     last_seen_epoch = pre_flush_epoch;
                     let _ = *epoch_rx.borrow_and_update();
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let _ = worker.store.reset_all_pending_retry_times(now_ms);
+                    worker.reset_pending_retry_times_fenced(my_gen);
+                }
+                if !worker.is_active(my_gen) {
+                    break;
                 }
 
                 if worker.network.is_online() {
-                    let _ = worker.flush_due().await;
+                    let _ = worker.flush_due_internal(Some((my_gen, &mut gen_rx))).await;
                 }
-                if !*is_running.read() {
+                if !worker.is_active(my_gen) {
                     break;
                 }
 
@@ -191,38 +238,51 @@ impl OutboxWorker {
                 if post_flush_epoch != last_seen_epoch {
                     last_seen_epoch = post_flush_epoch;
                     let _ = *epoch_rx.borrow_and_update();
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let _ = worker.store.reset_all_pending_retry_times(now_ms);
+                    worker.reset_pending_retry_times_fenced(my_gen);
                     continue;
                 }
 
                 tokio::select! {
+                    biased;
+                    _ = gen_rx.changed() => {
+                        break;
+                    }
                     res = epoch_rx.changed() => {
                         if res.is_ok() {
                             let new_epoch = *epoch_rx.borrow_and_update();
                             if new_epoch != last_seen_epoch {
                                 last_seen_epoch = new_epoch;
-                                let now_ms = chrono::Utc::now().timestamp_millis();
-                                let _ = worker.store.reset_all_pending_retry_times(now_ms);
+                                worker.reset_pending_retry_times_fenced(my_gen);
                             }
                         }
                     }
                     _ = reconnect_notify.notified() => {
                         last_seen_epoch = worker.network.reconnect_epoch();
                         let _ = *epoch_rx.borrow_and_update();
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        let _ = worker.store.reset_all_pending_retry_times(now_ms);
+                        worker.reset_pending_retry_times_fenced(my_gen);
                     }
                     _ = wake_notify.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                 }
             }
         });
+        *self.active_task.lock() = Some(join_handle.abort_handle());
     }
 
     pub fn stop(&self) {
+        let _lifecycle = self.lifecycle_lock.lock();
         *self.is_running.write() = false;
+        let next_gen = self.run_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.generation_tx.send(next_gen);
+        if let Some(abort) = self.active_task.lock().take() {
+            abort.abort();
+        }
         self.wake_notify.notify_waiters();
+        // Strictly drain any in-progress synchronous claim->token_provider or post-HTTP SQLite
+        // write before stop() returns so zero cross-account token reads or post-shutdown WAL
+        // writes can ever occur.
+        let _drain = self.op_fence.write();
+        drop(_drain);
     }
 
     pub async fn notify_reconnected_and_flush(&self) -> Result<Vec<OutboxMessageRecord>> {
@@ -233,14 +293,69 @@ impl OutboxWorker {
     }
 
     pub async fn flush_due(&self) -> Result<Vec<OutboxMessageRecord>> {
-        let _flush_guard = self.flush_mutex.lock().await;
+        self.flush_due_internal(None).await
+    }
+
+    async fn flush_due_internal(
+        &self,
+        mut fence: Option<(u64, &mut watch::Receiver<u64>)>,
+    ) -> Result<Vec<OutboxMessageRecord>> {
+        let _flush_guard = match fence.as_mut() {
+            Some((expected_gen, gen_rx)) => {
+                let exp = *expected_gen;
+                if !self.is_active(exp) {
+                    return Ok(Vec::new());
+                }
+                tokio::select! {
+                    biased;
+                    _ = gen_rx.changed() => return Ok(Vec::new()),
+                    guard = self.flush_mutex.lock() => guard,
+                }
+            }
+            None => self.flush_mutex.lock().await,
+        };
+
         let mut processed = Vec::new();
         while self.network.is_online() {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let Some(claimed) = self.store.claim_next_due(now_ms)? else {
+            let expected_gen = fence.as_ref().map(|(g, _)| *g);
+            if let Some(exp) = expected_gen {
+                if !self.is_active(exp) {
+                    break;
+                }
+            }
+            let (record, req, token) = match self.prepare_next_due(expected_gen)? {
+                PreHttpStep::NoDue | PreHttpStep::Stopped => break,
+                PreHttpStep::EarlyOutcome(outcome) => {
+                    processed.push(outcome);
+                    continue;
+                }
+                PreHttpStep::ReadyToSend { record, req, token } => (record, req, token),
+            };
+
+            if let Some(exp) = expected_gen {
+                if !self.is_active(exp) {
+                    break;
+                }
+            }
+
+            // HTTP Phase: strictly zero synchronous locks held across `.await`.
+            let http_res = match fence.as_mut() {
+                Some((expected_gen_ref, gen_rx)) => {
+                    if !self.is_active(*expected_gen_ref) {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = gen_rx.changed() => break,
+                        res = self.http_client.send_message_rich(&token, &req) => res,
+                    }
+                }
+                None => self.http_client.send_message_rich(&token, &req).await,
+            };
+
+            let Some(outcome) = self.finalize_http_result(expected_gen, &record, http_res) else {
                 break;
             };
-            let outcome = self.dispatch_claimed(&claimed).await;
             processed.push(outcome);
         }
         Ok(processed)
@@ -298,21 +413,40 @@ impl OutboxWorker {
         }
     }
 
-    async fn dispatch_claimed(&self, record: &OutboxMessageRecord) -> OutboxMessageRecord {
+    fn prepare_next_due(&self, expected_gen: Option<u64>) -> Result<PreHttpStep> {
+        let _op = expected_gen.map(|_| self.op_fence.read());
+        if let Some(exp) = expected_gen {
+            if !self.is_active(exp) {
+                return Ok(PreHttpStep::Stopped);
+            }
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let Some(record) = self.store.claim_next_due(now_ms)? else {
+            return Ok(PreHttpStep::NoDue);
+        };
         let req = match record.decode_request() {
             Ok(r) => r,
             Err(e) => {
+                if let Some(exp) = expected_gen {
+                    if !self.is_active(exp) {
+                        return Ok(PreHttpStep::Stopped);
+                    }
+                }
                 let updated = self
                     .store
                     .mark_failed(record.client_nonce, &e.to_string(), now_ms)
                     .unwrap_or_else(|_| record.clone());
                 self.emit_event(&updated);
-                return updated;
+                return Ok(PreHttpStep::EarlyOutcome(updated));
             }
         };
 
         let Some(token) = (self.token_provider)().filter(|t| !t.trim().is_empty()) else {
+            if let Some(exp) = expected_gen {
+                if !self.is_active(exp) {
+                    return Ok(PreHttpStep::Stopped);
+                }
+            }
             let next_retry_count = record.retry_count.saturating_add(1);
             let updated = if next_retry_count >= self.max_retries {
                 self.store
@@ -335,10 +469,30 @@ impl OutboxWorker {
                     .unwrap_or_else(|_| record.clone())
             };
             self.emit_event(&updated);
-            return updated;
+            return Ok(PreHttpStep::EarlyOutcome(updated));
         };
 
-        match self.http_client.send_message_rich(&token, &req).await {
+        if let Some(exp) = expected_gen {
+            if !self.is_active(exp) {
+                return Ok(PreHttpStep::Stopped);
+            }
+        }
+        Ok(PreHttpStep::ReadyToSend { record, req, token })
+    }
+
+    fn finalize_http_result(
+        &self,
+        expected_gen: Option<u64>,
+        record: &OutboxMessageRecord,
+        http_res: std::result::Result<RichSendMessageResponse, HttpClientError>,
+    ) -> Option<OutboxMessageRecord> {
+        let _op = expected_gen.map(|_| self.op_fence.read());
+        if let Some(exp) = expected_gen {
+            if !self.is_active(exp) {
+                return None;
+            }
+        }
+        let outcome = match http_res {
             Ok(resp) => {
                 let done_ms = chrono::Utc::now().timestamp_millis();
                 let updated = self
@@ -354,7 +508,8 @@ impl OutboxWorker {
                 self.record_dispatch_error(record.client_nonce, record.retry_count, &err, fail_ms)
                     .unwrap_or_else(|_| record.clone())
             }
-        }
+        };
+        Some(outcome)
     }
 
     fn record_dispatch_error(

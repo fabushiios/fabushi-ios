@@ -396,6 +396,13 @@ impl FabushiAppHost {
 
         let host_db = Arc::new(HostSqliteStore::open(&storage_dir).map_err(|e| e.to_string())?);
 
+        let prev_saved_url = host_db
+            .get_meta("server_url")
+            .ok()
+            .flatten()
+            .map(|s| ClientConfig::normalize_url(s.trim()))
+            .filter(|s| !s.is_empty());
+
         let initial_url = if let Some(ref explicit) = config.server_url {
             let trimmed = explicit.trim();
             if trimmed.is_empty() {
@@ -403,16 +410,14 @@ impl FabushiAppHost {
             } else {
                 validate_server_url_input(trimmed).map_err(|e| e.to_string())?
             }
-        } else if let Ok(Some(saved)) = host_db.get_meta("server_url") {
-            let trimmed = saved.trim();
-            if trimmed.is_empty() {
-                DEFAULT_SERVER_URL.to_string()
-            } else {
-                ClientConfig::normalize_url(trimmed)
-            }
+        } else if let Some(ref saved) = prev_saved_url {
+            saved.clone()
         } else {
             DEFAULT_SERVER_URL.to_string()
         };
+        let server_url_changed = prev_saved_url
+            .as_deref()
+            .is_some_and(|prev| prev != initial_url.as_str());
         let _ = host_db.set_meta("server_url", &initial_url);
 
         let http_timeout_secs = config
@@ -431,17 +436,36 @@ impl FabushiAppHost {
                 .map_err(|e| format!("Failed to open TelegramClient store: {e}"))?,
         );
 
+        // Open persistent Tantivy 0.22 local search index (lock-free IndexReader, inner writer lock)
+        let tantivy_dir = storage_dir.join("tantivy_index");
+        let search_engine =
+            Arc::new(HostSearchEngine::open(&tantivy_dir).map_err(|e| e.to_string())?);
+
+        // Cold-restart explicit server_url switch: wipe Server A's LocalStore, media CAS,
+        // search/FTS5/Tantivy/dedup/PTS/workspace, and active session markers BEFORE hydrating
+        // any state so Server A data is never visible under Server B (B6-01, NB6-01).
+        if server_url_changed {
+            let _ = client.poll_events();
+            client.local_store.clear_all();
+            let cache_db_path = storage_dir.join("client_cache.db");
+            if cache_db_path.exists() {
+                if let Ok(conn) = Connection::open(&cache_db_path) {
+                    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000; DELETE FROM media_cas;");
+                }
+            }
+            let _ = crate::storage::purge_media_cas_dir(&storage_dir);
+            let _ = host_db.clear_account_scoped_data();
+            let _ = host_db.delete_meta("active_account_id");
+            let _ = host_db.delete_meta("local_store_owner_scope");
+            let _ = search_engine.clear_all();
+        }
+
         // Restore persisted PTS cursors into ClientSyncCoordinator
         if let Ok(pts_rows) = host_db.load_all_pts() {
             for (cid, pts) in pts_rows {
                 client.sync_coordinator.set_pts(ChatId(cid), pts);
             }
         }
-
-        // Open persistent Tantivy 0.22 local search index (lock-free IndexReader, inner writer lock)
-        let tantivy_dir = storage_dir.join("tantivy_index");
-        let search_engine =
-            Arc::new(HostSearchEngine::open(&tantivy_dir).map_err(|e| e.to_string())?);
 
         // Open embedded Hermes/Fabushi agent runtime (SQLite WAL).
         // Under iOS sandbox policy, skip local CLI dotfile / loopback discovery and default to Safe preset.
@@ -937,6 +961,44 @@ impl FabushiAppHost {
         *self.dharma_state.lock() = FabushiClientState::new(Utc::now().timestamp_millis() as f64);
     }
 
+    /// Wipes all account-scoped local caches and persistent stores (client_cache.db / LocalStore,
+    /// media CAS table + files, host_state.db search/FTS5/nonce_dedup/chat_pts/multi_agent_workspace,
+    /// Tantivy index, RAM dedup_store, and ClientSyncCoordinator PTS cursors) while strictly
+    /// preserving device/app-scoped settings, accounts, passcode, proxy, and server_url.
+    ///
+    /// MUST be called strictly inside `session_lock.write()` AFTER `client.clear_session()` so
+    /// zero buffered WS frames, background `OutboxWorker` tasks, or fenced RPCs can repopulate
+    /// account caches across boundaries (B6-01, NB6-01, NB6-02).
+    pub fn clear_account_local_data(&self, client: &TelegramClient) {
+        // 1. Drain any already-buffered WS inbound frames & pending_events BEFORE clearing LocalStore (NB6-02)
+        let _ = client.poll_events();
+        // 2. Reset in-memory ClientSyncCoordinator PTS cursors for all persisted and gap chats
+        if let Ok(pts_rows) = self.host_db.load_all_pts() {
+            for (cid, _) in pts_rows {
+                client.sync_coordinator.set_pts(ChatId(cid), 0);
+            }
+        }
+        for cid in client.pending_gap_chats() {
+            client.sync_coordinator.set_pts(cid, 0);
+        }
+        // 3. Wipe TelegramClient LocalStore (RAM + all 17 client_cache.db tables including outbox & e2ee_*)
+        client.local_store.clear_all();
+        // 4. Wipe media_cas index table in client_cache.db and purge on-disk media CAS blobs
+        let cache_db_path = self.storage_dir.join("client_cache.db");
+        if cache_db_path.exists() {
+            if let Ok(conn) = Connection::open(&cache_db_path) {
+                let _ = conn.execute_batch("PRAGMA busy_timeout = 5000; DELETE FROM media_cas;");
+            }
+        }
+        let _ = crate::storage::purge_media_cas_dir(&self.storage_dir);
+        // 5. Wipe account-scoped tables in host_state.db (preserving accounts/settings/passcode/proxies/server_url)
+        let _ = self.host_db.clear_account_scoped_data();
+        // 6. Wipe RAM dedup store (aborting waiting in-flight followers), workspaces, and Tantivy index
+        self.dedup_store.lock().clear_all();
+        self.group_workspaces.lock().clear();
+        let _ = self.search_engine.clear_all();
+    }
+
     /// Checkpoints all 5 SQLite WAL databases cleanly for iOS `0xdead10cc` background & shutdown safety.
     pub fn checkpoint_all_wals(&self) -> HostResult<(i32, i32, i32)> {
         let host_ckpt = self.host_db.wal_checkpoint_truncate()?;
@@ -1001,11 +1063,6 @@ impl FabushiAppHost {
             TelegramClient::open_with_dir(new_cfg, &self.storage_dir)
                 .map_err(|e| HostError::storage(format!("Failed to reopen client: {e}")))?,
         );
-        if let Ok(pts_rows) = self.host_db.load_all_pts() {
-            for (cid, pts) in pts_rows {
-                new_client.sync_coordinator.set_pts(ChatId(cid), pts);
-            }
-        }
 
         // 2. Stop & join old pump synchronously so no old callbacks/client handles remain
         self.stop_event_pump(false);
@@ -1034,10 +1091,13 @@ impl FabushiAppHost {
             self.host_db.set_meta("server_url", &normalized)?;
             old_client.clear_session();
             let _ = self.host_db.delete_meta("active_account_id");
+            let _ = self.host_db.delete_meta("local_store_owner_scope");
             self.reset_account_scope();
-            // Wipe both old_client and new_client LocalStores (RAM + client_cache.db) so Server A's
-            // outbox_messages, cached messages, drafts, and E2EE keys never carry over to Server B (B5-02).
-            old_client.local_store.clear_all();
+            // Drain & wipe BOTH old_client and new_client LocalStores plus host account-scoped
+            // search/FTS5/Tantivy/dedup/PTS/workspace/CAS state so Server A data never carries over
+            // to Server B (B5-02, B6-01, NB6-01, NB6-02).
+            self.clear_account_local_data(&old_client);
+            let _ = new_client.poll_events();
             new_client.local_store.clear_all();
             *self.client.write() = Arc::clone(&new_client);
             *self.server_url.write() = normalized.clone();
@@ -1136,27 +1196,39 @@ impl FabushiAppHost {
         }
         // Opportunistically drain any pending WS events immediately before polling,
         // persisting PTS cursors consistently with the background event pump.
-        let client = self.client();
-        let drained = client.poll_events();
-        if !drained.is_empty() {
-            for ev in drained {
-                if self.is_shutdown() {
-                    break;
-                }
-                let (ev_type, payload) = domain_event_to_host_event(ev);
-                if ev_type == "newMessage" && !self.is_shutdown() {
-                    if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
-                        let pts = client.sync_coordinator.last_pts(ChatId(cid));
-                        if pts > 0 && !self.is_shutdown() {
-                            let _ = self.host_db.save_pts(cid, pts);
+        // Strictly fenced under session_lock.read() and dropped BEFORE emit_event and
+        // event_queue.poll so concurrent shutdown() cannot race WAL checkpoints (NB6-03).
+        let to_emit: Vec<(String, Value)> = {
+            let _sess_read = self.session_lock.read();
+            if self.is_shutdown() {
+                Vec::new()
+            } else {
+                let client = self.client();
+                let drained = client.poll_events();
+                let mut out = Vec::with_capacity(drained.len());
+                for ev in drained {
+                    if self.is_shutdown() {
+                        break;
+                    }
+                    let (ev_type, payload) = domain_event_to_host_event(ev);
+                    if ev_type == "newMessage" && !self.is_shutdown() {
+                        if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
+                            let pts = client.sync_coordinator.last_pts(ChatId(cid));
+                            if pts > 0 && !self.is_shutdown() {
+                                let _ = self.host_db.save_pts(cid, pts);
+                            }
                         }
                     }
+                    out.push((ev_type, payload));
                 }
-                if self.is_shutdown() {
-                    break;
-                }
-                self.emit_event(&ev_type, payload);
+                out
             }
+        };
+        for (ev_type, payload) in to_emit {
+            if self.is_shutdown() {
+                break;
+            }
+            self.emit_event(&ev_type, payload);
         }
         self.event_queue.poll(max_count as usize, timeout_ms)
     }
@@ -1338,10 +1410,19 @@ impl FabushiAppHost {
         //    Lock DAG: reconfig_lock -> swapping == false -> session_lock -> leaf locks (acyclic).
         {
             let _sess_guard = self.session_lock.write();
+            let client = self.client();
+            let is_token_only = client.current_user_id().is_none() && client.token().is_some();
             self.reset_account_scope();
             self.account_tokens.lock().clear();
-            let client = self.client();
             client.clear_session();
+            let _ = client.poll_events();
+            // Token-only sessions have no verified user_id ownership; wipe account-scoped local
+            // caches on shutdown so they can never be adopted on cold restart while preserving
+            // authenticated same-account and unauthenticated offline restart persistence (B6-01).
+            if is_token_only {
+                let _ = self.host_db.delete_meta("local_store_owner_scope");
+                self.clear_account_local_data(&client);
+            }
             let _ = self.checkpoint_all_wals();
         }
     }

@@ -3792,6 +3792,26 @@ fn test_b5_02_local_store_outbox_and_e2ee_wiped_across_token_logout_clear_and_se
         let id_tok = dispatch(host, &json!({"method": "e2ee.identity"}));
         let x_tok = id_tok["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
         let e_tok = id_tok["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+        assert!(
+            dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "Precondition (CI NB6-01): token-only Account A must have >= 1 pending outbox message"
+        );
+        let local_tok = dispatch(
+            host,
+            &json!({"method": "messages.localList", "params": {"chat_id": 8102}}),
+        );
+        assert!(
+            !local_tok["result"].as_array().unwrap().is_empty(),
+            "Precondition (CI NB6-01): token-only Account A messages.localList must be non-empty: {local_tok}"
+        );
+        let (ob_tok, msg_tok, e2ee_tok) = query_cache_counts(&cache_db_path);
+        assert!(
+            ob_tok >= 1 && msg_tok >= 1 && e2ee_tok == 1,
+            "Precondition (CI NB6-01): token-only Account A client_cache.db must be populated: ({ob_tok}, {msg_tok}, {e2ee_tok})"
+        );
         assert_eq!(
             dispatch(host, &json!({"method": "auth.login", "params": {"username": "bob_b502", "password": "pw"}}))["ok"],
             true
@@ -3821,6 +3841,16 @@ fn test_b5_02_local_store_outbox_and_e2ee_wiped_across_token_logout_clear_and_se
         let (x4, e4) = stage_account_a(host, 8104, 81_004, "SECRET_A_CLEAR");
         assert_eq!(dispatch(host, &json!({"method": "session.clearSession"}))["ok"], true);
         assert_wiped(host, 8104, &x4, &e4, "session.clearSession");
+
+        // 4b. session.setToken(null) wipes outbox, messages, and E2EE identity (CI NB6-01)
+        let (x4b, e4b) = stage_account_a(host, 81041, 81_0041, "SECRET_A_SET_TOKEN_NULL");
+        let tok_null = dispatch(
+            host,
+            &json!({"method": "session.setToken", "params": {"token": Value::Null}}),
+        );
+        assert_eq!(tok_null["ok"], true, "session.setToken(null) failed: {tok_null}");
+        assert_eq!(tok_null["result"]["has_token"], false);
+        assert_wiped(host, 81041, &x4b, &e4b, "session.setToken(null)");
 
         // 5. session.setServerUrl (Server A -> Server B) wipes both old and new LocalStores;
         //    authenticating on Server B with TOK_SERVER_B transmits ZERO Server A messages!
@@ -3901,5 +3931,1039 @@ fn test_b5_02_local_store_outbox_and_e2ee_wiped_across_token_logout_clear_and_se
         fabushi_host_destroy(host2);
     }
 }
+
+#[test]
+fn test_b6_01_cold_restart_token_only_unauth_staging_and_server_switch_wipe_local_store_and_search()
+{
+    let dir = tempdir().unwrap();
+    let sent_log: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    async fn quiet_ws_b601(
+        ws: WebSocketUpgrade,
+        Query(_q): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(|mut socket: WebSocket| async move {
+            while let Some(Ok(_)) = socket.recv().await {}
+        })
+    }
+
+    let spawn_server = |label: &'static str,
+                        sent_log_ref: Arc<std::sync::Mutex<Vec<(String, String, String)>>>| {
+        async move {
+            let log_send = Arc::clone(&sent_log_ref);
+            let app = Router::new()
+                .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+                .route(
+                    "/api/v1/auth/login",
+                    post(|Json(body): Json<Value>| async move {
+                        if body["username"].as_str() == Some("bob_b601") {
+                            Json(json!({
+                                "user_id": 202,
+                                "username": "bob_b601",
+                                "session_id": "sess-bob-b601",
+                                "token": "TOK_B",
+                                "first_name": "Bob"
+                            }))
+                        } else {
+                            Json(json!({
+                                "user_id": 101,
+                                "username": "alice_b601",
+                                "session_id": "sess-alice-b601",
+                                "token": "TOK_A",
+                                "first_name": "Alice"
+                            }))
+                        }
+                    }),
+                )
+                .route("/api/v1/auth/logout", post(|| async { StatusCode::OK }))
+                .route("/api/v1/ws", get(quiet_ws_b601))
+                .route(
+                    "/api/v1/messages/send",
+                    post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let log = Arc::clone(&log_send);
+                        async move {
+                            let auth_val = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let chat_id = body["chat_id"].as_i64().unwrap_or(0);
+                            let text = body["text"].as_str().unwrap_or("").to_string();
+                            let nonce = body["client_nonce"].as_u64();
+                            log.lock().unwrap().push((
+                                label.to_string(),
+                                auth_val,
+                                text.clone(),
+                            ));
+                            let now = Utc::now();
+                            Json(json!({
+                                "message_id": 9301,
+                                "id": 9301,
+                                "pts": 25,
+                                "pts_count": 1,
+                                "duplicate": false,
+                                "date_ms": now.timestamp_millis(),
+                                "date": now.to_rfc3339(),
+                                "sender_id": 202,
+                                "chat_id": chat_id,
+                                "text": text,
+                                "client_nonce": nonce,
+                                "status": "sent"
+                            }))
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local_addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            local_addr
+        }
+    };
+
+    let addr_a = server_rt.block_on(spawn_server("server_a", Arc::clone(&sent_log)));
+    let addr_b = server_rt.block_on(spawn_server("server_b", Arc::clone(&sent_log)));
+
+    let cache_db_path = dir.path().join("client_cache.db");
+    let host_db_path = dir.path().join("host_state.db");
+
+    let query_cache_counts = |db_path: &std::path::Path| -> (i64, i64, i64) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let ob: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbox_messages", [], |r| r.get(0))
+            .unwrap();
+        let msg: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let e2ee: i64 = conn
+            .query_row("SELECT COUNT(*) FROM e2ee_identity", [], |r| r.get(0))
+            .unwrap();
+        (ob, msg, e2ee)
+    };
+
+    let query_host_counts = |db_path: &std::path::Path| -> (i64, i64, i64) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let idx: i64 = conn
+            .query_row("SELECT COUNT(*) FROM host_messages_index", [], |r| r.get(0))
+            .unwrap();
+        let dedup: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nonce_dedup", [], |r| r.get(0))
+            .unwrap();
+        let pts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_pts", [], |r| r.get(0))
+            .unwrap();
+        (idx, dedup, pts)
+    };
+
+    let make_cfg = |srv_addr: std::net::SocketAddr| {
+        CString::new(
+            json!({
+                "app_data_dir": dir.path().to_string_lossy(),
+                "server_url": format!("http://{srv_addr}"),
+                "test_mode": true
+            })
+            .to_string(),
+        )
+        .unwrap()
+    };
+
+    let cfg_a = make_cfg(addr_a);
+    let cfg_b = make_cfg(addr_b);
+
+    unsafe {
+        // =========================================================================
+        // 1A. Trace 6A (Clean Token-Only Shutdown): shutdown() MUST wipe client_cache.db
+        //     and account-scoped host tables immediately when active session is token-only.
+        // =========================================================================
+        let host1 = fabushi_host_create(cfg_a.as_ptr());
+        assert!(!host1.is_null());
+        assert_eq!(
+            dispatch(host1, &json!({"method": "session.setToken", "params": {"token": "TOK_A"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host1, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host1,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": 9101, "text": "SECRET_TOK_A_SHUTDOWN", "client_nonce": 91_001}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host1,
+                &json!({
+                    "method": "messages.send",
+                    "params": {
+                        "chat_id": 9101,
+                        "text": "SECRET_SEARCH_TOK_A_SHUTDOWN",
+                        "client_nonce": 91_002,
+                        "local_only": true
+                    }
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch(host1, &json!({"method": "e2ee.identity"}))["ok"], true);
+        assert_eq!(
+            dispatch(
+                host1,
+                &json!({
+                    "method": "media.casPut",
+                    "params": {"file_id": "tok_a_file", "data_b64": "c2VjcmV0LW1lZGlhLWJsb2I="}
+                })
+            )["ok"],
+            true
+        );
+        let (ob1, msg1, e2ee1) = query_cache_counts(&cache_db_path);
+        assert!(ob1 >= 1 && msg1 >= 1 && e2ee1 == 1);
+        assert!(
+            dispatch(
+                host1,
+                &json!({"method": "search.localMessages", "params": {"query": "SECRET_SEARCH_TOK_A_SHUTDOWN"}})
+            )["result"]["total"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        fabushi_host_destroy(host1);
+
+        // Immediately after token-only shutdown, both client_cache.db and host_state.db account tables MUST be wiped!
+        assert_eq!(
+            query_cache_counts(&cache_db_path),
+            (0, 0, 0),
+            "Token-only shutdown() MUST wipe client_cache.db (B6-01)"
+        );
+        assert_eq!(
+            query_host_counts(&host_db_path),
+            (0, 0, 0),
+            "Token-only shutdown() MUST wipe account-scoped host tables (NB6-01)"
+        );
+
+        // =========================================================================
+        // 1B. Trace 6A (Simulated iOS Jetsam / SIGKILL during token-only session):
+        //     client_cache.db retains Account A's pending outbox/messages/E2EE with
+        //     cache_meta owner_scope absent and host_meta local_store_owner_scope absent.
+        //     Cold-restarted host2 logging in Bob MUST wipe everything BEFORE OutboxWorker starts!
+        // =========================================================================
+        let host_jet = fabushi_host_create(cfg_a.as_ptr());
+        assert!(!host_jet.is_null());
+        assert_eq!(
+            dispatch(host_jet, &json!({"method": "auth.login", "params": {"username": "alice_b601", "password": "pw"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host_jet, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host_jet,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": 9102, "text": "SECRET_JETSAM_TOK_A", "client_nonce": 91_003}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host_jet,
+                &json!({
+                    "method": "messages.send",
+                    "params": {
+                        "chat_id": 9102,
+                        "text": "SECRET_JETSAM_SEARCH_A",
+                        "client_nonce": 91_004,
+                        "local_only": true
+                    }
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host_jet, &json!({"method": "sync.setPts", "params": {"chat_id": 9102, "pts": 77}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host_jet,
+                &json!({
+                    "method": "multi_agent.workspaceSet",
+                    "params": {"chat_id": 9102, "key": "plan", "value": {"secret": "alice_plan"}}
+                })
+            )["ok"],
+            true
+        );
+        let id_jet = dispatch(host_jet, &json!({"method": "e2ee.identity"}));
+        let x_jet = id_jet["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
+        let e_jet = id_jet["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+        fabushi_host_destroy(host_jet);
+
+        // Reproduce exact on-disk state after iOS Jetsam kills a token-only session:
+        // cache_meta owner_scope is absent AND host_meta local_store_owner_scope is absent,
+        // while outbox_messages / messages / e2ee_identity / search remain populated on disk!
+        {
+            let c_conn = rusqlite::Connection::open(&cache_db_path).unwrap();
+            c_conn.execute("DELETE FROM cache_meta", []).unwrap();
+            let h_conn = rusqlite::Connection::open(&host_db_path).unwrap();
+            h_conn
+                .execute(
+                    "DELETE FROM host_meta WHERE key IN ('local_store_owner_scope', 'active_account_id')",
+                    [],
+                )
+                .unwrap();
+        }
+        let (ob_pre, msg_pre, e2ee_pre) = query_cache_counts(&cache_db_path);
+        assert!(
+            ob_pre >= 1 && msg_pre >= 1 && e2ee_pre == 1,
+            "Precondition: simulated Jetsam client_cache.db must hold pending Account A rows"
+        );
+
+        let host2 = fabushi_host_create(cfg_a.as_ptr());
+        assert!(!host2.is_null());
+        // Login Bob directly (WITHOUT connectWs — set_auth_session immediately starts OutboxWorker online!)
+        let bob_login = dispatch(
+            host2,
+            &json!({"method": "auth.login", "params": {"username": "bob_b601", "password": "pw"}}),
+        );
+        assert_eq!(bob_login["ok"], true, "Bob login failed: {bob_login}");
+        thread::sleep(Duration::from_millis(160));
+
+        {
+            let log = sent_log.lock().unwrap();
+            assert!(
+                !log.iter().any(|(_, _, txt)| txt == "SECRET_JETSAM_TOK_A"),
+                "Account A Jetsam outbox message MUST NEVER transmit under Bob's Bearer TOK_B (B6-01): {log:?}"
+            );
+        }
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            0,
+            "Jetsam Account A outbox MUST be wiped on Bob login (B6-01)"
+        );
+        assert!(
+            dispatch(host2, &json!({"method": "messages.localList", "params": {"chat_id": 9102}}))["result"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "Jetsam Account A cached messages MUST be wiped on Bob login (B6-01)"
+        );
+        assert_eq!(
+            query_cache_counts(&cache_db_path),
+            (0, 0, 0),
+            "Jetsam client_cache.db tables MUST be empty before Bob generates fresh E2EE identity"
+        );
+        let id_bob = dispatch(host2, &json!({"method": "e2ee.identity"}));
+        assert_ne!(id_bob["result"]["x25519_pub_b64"].as_str().unwrap(), x_jet);
+        assert_ne!(id_bob["result"]["ed25519_pub_b64"].as_str().unwrap(), e_jet);
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "search.localMessages", "params": {"query": "SECRET_JETSAM_SEARCH_A"}})
+            )["result"]["total"],
+            0,
+            "Account A local search (Tantivy + FTS5) MUST be wiped on Bob login (NB6-01)"
+        );
+        assert_eq!(
+            dispatch(host2, &json!({"method": "sync.lastPts", "params": {"chat_id": 9102}}))["result"]["pts"],
+            0,
+            "Account A chat PTS MUST be cleared on Bob login (NB6-01)"
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "multi_agent.workspaceGet", "params": {"chat_id": 9102, "key": "plan"}})
+            )["result"],
+            Value::Null,
+            "Account A multi_agent_workspace MUST be cleared on Bob login (NB6-01)"
+        );
+
+        // Anti-tautology: verify Bob's own message delivers cleanly with Bearer TOK_B,
+        // AND same-user re-login preserves Bob's local search index!
+        let bob_send = dispatch(
+            host2,
+            &json!({"method": "messages.send", "params": {"chat_id": 9102, "text": "GENUINE_BOB_AFTER_JETSAM"}}),
+        );
+        assert_eq!(bob_send["ok"], true, "Genuine Bob send failed: {bob_send}");
+        assert!(
+            sent_log.lock().unwrap().iter().any(|(srv, auth, txt)| {
+                srv == "server_a" && auth == "Bearer TOK_B" && txt == "GENUINE_BOB_AFTER_JETSAM"
+            }),
+            "Anti-tautology: Bob's own message must arrive carrying Bearer TOK_B"
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "search.indexMessage",
+                    "params": {"message_id": 9901, "chat_id": 9102, "sender_id": 202, "body": "BOB_KEEP_SAME_USER_RELOGIN"}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host2, &json!({"method": "auth.login", "params": {"username": "bob_b601", "password": "pw"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "search.localMessages", "params": {"query": "BOB_KEEP_SAME_USER_RELOGIN"}})
+            )["result"]["total"],
+            1,
+            "Same-user re-login MUST preserve Bob's local search cache"
+        );
+
+        // =========================================================================
+        // 1C. Trace 6B (Single-Process Post-Logout Unauthenticated Staging -> auth.login(Bob))
+        // =========================================================================
+        assert_eq!(dispatch(host2, &json!({"method": "auth.logout"}))["ok"], true);
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": 9103, "text": "SECRET_UNAUTH_STAGED", "client_nonce": 91_005}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "messages.send",
+                    "params": {
+                        "chat_id": 9103,
+                        "text": "SECRET_UNAUTH_SEARCH",
+                        "client_nonce": 91_006,
+                        "local_only": true
+                    }
+                })
+            )["ok"],
+            true
+        );
+        let id_unauth = dispatch(host2, &json!({"method": "e2ee.identity"}));
+        let x_unauth = id_unauth["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
+        let e_unauth = id_unauth["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+        let (ob_u, msg_u, e2ee_u) = query_cache_counts(&cache_db_path);
+        assert!(ob_u >= 1 && msg_u >= 1 && e2ee_u == 1);
+
+        assert_eq!(
+            dispatch(host2, &json!({"method": "auth.login", "params": {"username": "bob_b601", "password": "pw"}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+            true
+        );
+        assert_eq!(dispatch(host2, &json!({"method": "outbox.retryNow"}))["ok"], true);
+        thread::sleep(Duration::from_millis(120));
+
+        assert!(
+            !sent_log.lock().unwrap().iter().any(|(_, _, txt)| txt == "SECRET_UNAUTH_STAGED"),
+            "Unauthenticated staged outbox message MUST NEVER transmit under Bob's Bearer TOK_B (B6-01)"
+        );
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            0
+        );
+        assert!(
+            dispatch(host2, &json!({"method": "messages.localList", "params": {"chat_id": 9103}}))["result"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let id_after_unauth = dispatch(host2, &json!({"method": "e2ee.identity"}));
+        assert_ne!(id_after_unauth["result"]["x25519_pub_b64"].as_str().unwrap(), x_unauth);
+        assert_ne!(id_after_unauth["result"]["ed25519_pub_b64"].as_str().unwrap(), e_unauth);
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "search.localMessages", "params": {"query": "SECRET_UNAUTH_SEARCH"}})
+            )["result"]["total"],
+            0
+        );
+
+        // =========================================================================
+        // 1D. Synthetic user_id == 0 Guard on session.setAuthSession
+        // =========================================================================
+        let zero_uid = dispatch(
+            host2,
+            &json!({
+                "method": "session.setAuthSession",
+                "params": {
+                    "user_id": 0,
+                    "username": "synthetic_zero",
+                    "session_id": "sess-zero",
+                    "token": "TOK_ZERO"
+                }
+            }),
+        );
+        assert_eq!(zero_uid["ok"], false, "Synthetic user_id == 0 must fail closed: {zero_uid}");
+        assert_eq!(zero_uid["error"]["code"], "invalid_arguments");
+
+        // =========================================================================
+        // 1E. Trace 6C (Cold Restart with Different config.server_url):
+        //     Launching host3 against Server B on same app_data_dir MUST wipe Server A
+        //     LocalStore, search, media CAS, and active_account_id BEFORE any login,
+        //     while preserving device settings!
+        // =========================================================================
+        assert_eq!(
+            dispatch(host2, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": {"chat_id": 9104, "text": "SECRET_SERVER_A_COLD", "client_nonce": 91_007}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "messages.send",
+                    "params": {
+                        "chat_id": 9104,
+                        "text": "SECRET_SERVER_A_SEARCH",
+                        "client_nonce": 91_008,
+                        "local_only": true
+                    }
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({
+                    "method": "media.casPut",
+                    "params": {"file_id": "file_sa", "data_b64": "c2VjcmV0LW1lZGlhLWJsb2I="}
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "settings.localSet", "params": {"key": "theme", "value": "Solarized"}})
+            )["ok"],
+            true
+        );
+        let id_sa = dispatch(host2, &json!({"method": "e2ee.identity"}));
+        let x_sa = id_sa["result"]["x25519_pub_b64"].as_str().unwrap().to_string();
+        let e_sa = id_sa["result"]["ed25519_pub_b64"].as_str().unwrap().to_string();
+        fabushi_host_destroy(host2);
+
+        let host3 = fabushi_host_create(cfg_b.as_ptr());
+        assert!(!host3.is_null());
+        // BEFORE ANY LOGIN on Server B:
+        assert_eq!(
+            dispatch(host3, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            0,
+            "Cold-restart server switch MUST wipe Server A outbox (B6-01)"
+        );
+        assert!(
+            dispatch(host3, &json!({"method": "messages.localList", "params": {"chat_id": 9104}}))["result"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "Cold-restart server switch MUST wipe Server A cached messages (B6-01)"
+        );
+        assert_eq!(
+            dispatch(
+                host3,
+                &json!({"method": "search.localMessages", "params": {"query": "SECRET_SERVER_A_SEARCH"}})
+            )["result"]["total"],
+            0,
+            "Cold-restart server switch MUST wipe Server A local search (NB6-01)"
+        );
+        let cas_after = dispatch(
+            host3,
+            &json!({"method": "media.casGet", "params": {"file_id": "file_sa"}}),
+        );
+        assert_eq!(cas_after["ok"], false);
+        assert_eq!(cas_after["error"]["code"], "not_found");
+        assert_eq!(
+            dispatch(host3, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            Value::Null,
+            "Cold-restart server switch MUST clear active_account_id (B6-01)"
+        );
+        let id_sb = dispatch(host3, &json!({"method": "e2ee.identity"}));
+        assert_ne!(id_sb["result"]["x25519_pub_b64"].as_str().unwrap(), x_sa);
+        assert_ne!(id_sb["result"]["ed25519_pub_b64"].as_str().unwrap(), e_sa);
+        // Device settings MUST be preserved across server switch!
+        assert_eq!(
+            dispatch(host3, &json!({"method": "settings.localGet", "params": {"key": "theme"}}))["result"]["value"],
+            "Solarized"
+        );
+
+        fabushi_host_destroy(host3);
+    }
+}
+
+#[test]
+fn test_b6_02_outbox_worker_fenced_against_account_switch_and_shutdown_wal_writes() {
+    use mahayana_app_host::{FabushiAppHost, HostConfig};
+
+    let dir = tempdir().unwrap();
+    let wire_log: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let m1_entered = Arc::new(AtomicBool::new(false));
+    let m1_release = Arc::new(AtomicBool::new(false));
+    let next_msg_id = Arc::new(AtomicUsize::new(9500));
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    async fn quiet_ws_b602(
+        ws: WebSocketUpgrade,
+        Query(_q): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(|mut socket: WebSocket| async move {
+            while let Some(Ok(_)) = socket.recv().await {}
+        })
+    }
+
+    let addr = server_rt.block_on({
+        let log_send = Arc::clone(&wire_log);
+        let entered = Arc::clone(&m1_entered);
+        let release = Arc::clone(&m1_release);
+        let msg_seq = Arc::clone(&next_msg_id);
+        async move {
+            let app = Router::new()
+                .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+                .route(
+                    "/api/v1/auth/login",
+                    post(|Json(body): Json<Value>| async move {
+                        if body["username"].as_str() == Some("bob_b602") {
+                            Json(json!({
+                                "user_id": 202,
+                                "username": "bob_b602",
+                                "session_id": "sess-bob-b602",
+                                "token": "TOK_B",
+                                "first_name": "Bob"
+                            }))
+                        } else {
+                            Json(json!({
+                                "user_id": 101,
+                                "username": "alice_b602",
+                                "session_id": "sess-alice-b602",
+                                "token": "TOK_A",
+                                "first_name": "Alice"
+                            }))
+                        }
+                    }),
+                )
+                .route("/api/v1/auth/logout", post(|| async { StatusCode::OK }))
+                .route("/api/v1/ws", get(quiet_ws_b602))
+                .route(
+                    "/api/v1/messages/send",
+                    post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let log = Arc::clone(&log_send);
+                        let ent = Arc::clone(&entered);
+                        let rel = Arc::clone(&release);
+                        let seq = Arc::clone(&msg_seq);
+                        async move {
+                            let auth_val = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let chat_id = body["chat_id"].as_i64().unwrap_or(0);
+                            let text = body["text"].as_str().unwrap_or("").to_string();
+                            let nonce = body["client_nonce"].as_u64();
+                            log.lock().unwrap().push((auth_val, text.clone()));
+
+                            if text.starts_with("HOLD_M1_") {
+                                ent.store(true, Ordering::SeqCst);
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                while !rel.load(Ordering::SeqCst) && Instant::now() < deadline {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
+
+                            let mid = seq.fetch_add(1, Ordering::SeqCst) as i64;
+                            let now = Utc::now();
+                            Json(json!({
+                                "message_id": mid,
+                                "id": mid,
+                                "pts": mid,
+                                "pts_count": 1,
+                                "duplicate": false,
+                                "date_ms": now.timestamp_millis(),
+                                "date": now.to_rfc3339(),
+                                "sender_id": 101,
+                                "chat_id": chat_id,
+                                "text": text,
+                                "client_nonce": nonce,
+                                "status": "sent"
+                            }))
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local_addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            local_addr
+        }
+    });
+
+    // =========================================================================
+    // 2A. Multi-Message OutboxWorker Background Race Across ALL 3 Account Transitions
+    //     (auth.login(Bob), session.switchAccount("202"), session.setToken("TOK_B"))
+    // =========================================================================
+    let cfg = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "storage_passphrase": "b602-test-passphrase",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg.as_ptr());
+        assert!(!host.is_null());
+
+        // Pre-seed Bob's encrypted account record so session.switchAccount("202") succeeds cleanly.
+        assert_eq!(
+            dispatch(host, &json!({"method": "auth.login", "params": {"username": "bob_b602", "password": "pw"}}))["ok"],
+            true
+        );
+
+        let transitions = [
+            ("auth_login", 0u8),
+            ("switch_account", 1u8),
+            ("set_token", 2u8),
+        ];
+
+        for (label, mode) in transitions {
+            m1_entered.store(false, Ordering::SeqCst);
+            m1_release.store(false, Ordering::SeqCst);
+
+            let base_nonce = 920_000u64 + (mode as u64) * 100;
+            let chat_id = 9200i64 + (mode as i64);
+
+            assert_eq!(
+                dispatch(host, &json!({"method": "auth.login", "params": {"username": "alice_b602", "password": "pw"}}))["ok"],
+                true
+            );
+            assert_eq!(
+                dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": false}}))["ok"],
+                true
+            );
+            assert_eq!(
+                dispatch(
+                    host,
+                    &json!({
+                        "method": "outbox.enqueue",
+                        "params": {
+                            "chat_id": chat_id,
+                            "text": format!("HOLD_M1_{label}"),
+                            "client_nonce": base_nonce + 1
+                        }
+                    })
+                )["ok"],
+                true
+            );
+            assert_eq!(
+                dispatch(
+                    host,
+                    &json!({
+                        "method": "outbox.enqueue",
+                        "params": {
+                            "chat_id": chat_id,
+                            "text": format!("SECRET_M2_{label}"),
+                            "client_nonce": base_nonce + 2
+                        }
+                    })
+                )["ok"],
+                true
+            );
+
+            // Go online + wake OutboxWorker (already started by auth.login -> set_auth_session)
+            // so background Task 1 picks up M1 and parks at barrier with network_listener staying
+            // continuously Online across the account transition!
+            assert_eq!(
+                dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+                true
+            );
+            assert_eq!(dispatch(host, &json!({"method": "outbox.retryNow"}))["ok"], true);
+
+            let wait_start = Instant::now();
+            while !m1_entered.load(Ordering::SeqCst) {
+                assert!(
+                    wait_start.elapsed() < Duration::from_secs(4),
+                    "[{label}] Timed out waiting for background OutboxWorker M1 to enter barrier"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            // While Task 1 is mid-HTTP on M1 (with M2 still Pending behind it), execute account transition!
+            let switch_res = match mode {
+                0 => dispatch(
+                    host,
+                    &json!({"method": "auth.login", "params": {"username": "bob_b602", "password": "pw"}}),
+                ),
+                1 => dispatch(
+                    host,
+                    &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+                ),
+                _ => dispatch(
+                    host,
+                    &json!({"method": "session.setToken", "params": {"token": "TOK_B"}}),
+                ),
+            };
+            assert_eq!(
+                switch_res["ok"], true,
+                "[{label}] Account transition failed: {switch_res}"
+            );
+            if mode == 2 {
+                // Start Bob's OutboxWorker & wait for WS Connected BEFORE releasing M1 barrier
+                // so network_listener is Online and Bob's worker is live during M1 completion!
+                assert_eq!(dispatch(host, &json!({"method": "session.connectWs"}))["ok"], true);
+                let ws_wait = Instant::now();
+                while dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["connected"]
+                    != true
+                {
+                    assert!(
+                        ws_wait.elapsed() < Duration::from_secs(4),
+                        "[{label}] Timed out waiting for WS Connected before releasing M1"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert_eq!(
+                dispatch(host, &json!({"method": "outbox.setNetworkState", "params": {"online": true}}))["ok"],
+                true
+            );
+
+            // Release M1 HTTP response so any unfenced Task 1 would wake, loop to claim M2, and leak TOK_B!
+            m1_release.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(250));
+
+            // Anti-tautology: verify Bob's own background OutboxWorker genuinely delivers M_BOB with Bearer TOK_B!
+            let bob_msg = format!("GENUINE_M_BOB_{label}");
+            assert_eq!(
+                dispatch(
+                    host,
+                    &json!({
+                        "method": "outbox.enqueue",
+                        "params": {
+                            "chat_id": chat_id,
+                            "text": bob_msg,
+                            "client_nonce": base_nonce + 50
+                        }
+                    })
+                )["ok"],
+                true
+            );
+            assert_eq!(dispatch(host, &json!({"method": "outbox.retryNow"}))["ok"], true);
+
+            let bob_wait = Instant::now();
+            loop {
+                let delivered = wire_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(auth, txt)| auth == "Bearer TOK_B" && txt == &bob_msg);
+                if delivered {
+                    break;
+                }
+                assert!(
+                    bob_wait.elapsed() < Duration::from_secs(4),
+                    "[{label}] Anti-tautology: Bob's own background outbox message failed to deliver with Bearer TOK_B: {:?}",
+                    wire_log.lock().unwrap()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // Strict zero-leak verification across ALL wire entries:
+            let entries = wire_log.lock().unwrap().clone();
+            assert!(
+                !entries.iter().any(|(auth, txt)| {
+                    auth == "Bearer TOK_B"
+                        && (txt.starts_with("HOLD_M1_") || txt.starts_with("SECRET_M2_"))
+                }),
+                "[{label}] Background OutboxWorker leaked Account A message under Bearer TOK_B (B6-02): {entries:?}"
+            );
+            let m2_text = format!("SECRET_M2_{label}");
+            assert!(
+                !entries.iter().any(|(_, txt)| txt == &m2_text),
+                "[{label}] Account A M2 MUST NEVER transmit after account transition (B6-02): {entries:?}"
+            );
+        }
+
+        fabushi_host_destroy(host);
+    }
+
+    // =========================================================================
+    // 2B. Post-shutdown() client_cache.db-wal Silence Proof (Keeping Arc<FabushiAppHost>
+    //     and Tokio Runtime Alive Across shutdown() + Barrier Release!)
+    // =========================================================================
+    let dir2 = tempdir().unwrap();
+    let host_arc = Arc::new(
+        FabushiAppHost::from_config(HostConfig {
+            app_data_dir: Some(dir2.path().to_string_lossy().into_owned()),
+            server_url: Some(format!("http://{addr}")),
+            test_mode: true,
+            ..Default::default()
+        })
+        .expect("from_config for B6-02 shutdown WAL test"),
+    );
+
+    let dispatch_arc = |h: &FabushiAppHost, payload: &Value| -> Value {
+        serde_json::from_str(&h.dispatch(&payload.to_string())).unwrap()
+    };
+
+    m1_entered.store(false, Ordering::SeqCst);
+    m1_release.store(false, Ordering::SeqCst);
+
+    assert_eq!(
+        dispatch_arc(
+            &host_arc,
+            &json!({"method": "auth.login", "params": {"username": "alice_b602", "password": "pw"}})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        dispatch_arc(
+            &host_arc,
+            &json!({"method": "outbox.setNetworkState", "params": {"online": false}})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        dispatch_arc(
+            &host_arc,
+            &json!({
+                "method": "outbox.enqueue",
+                "params": {"chat_id": 9299, "text": "HOLD_M1_SHUTDOWN", "client_nonce": 929_001}
+            })
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        dispatch_arc(
+            &host_arc,
+            &json!({
+                "method": "outbox.enqueue",
+                "params": {"chat_id": 9299, "text": "PENDING_M2_SHUTDOWN", "client_nonce": 929_002}
+            })
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        dispatch_arc(
+            &host_arc,
+            &json!({"method": "outbox.setNetworkState", "params": {"online": true}})
+        )["ok"],
+        true
+    );
+    assert_eq!(dispatch_arc(&host_arc, &json!({"method": "outbox.retryNow"}))["ok"], true);
+
+    let wait_sd = Instant::now();
+    while !m1_entered.load(Ordering::SeqCst) {
+        assert!(
+            wait_sd.elapsed() < Duration::from_secs(4),
+            "Timed out waiting for OutboxWorker HOLD_M1_SHUTDOWN to enter HTTP barrier"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Invoke shutdown() while retaining Arc<FabushiAppHost> (Tokio runtime stays alive!)
+    host_arc.shutdown();
+
+    let cache_db2 = dir2.path().join("client_cache.db");
+    let wal_path2 = dir2.path().join("client_cache.db-wal");
+    let wal_len_before = std::fs::metadata(&wal_path2).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_before, 0,
+        "client_cache.db-wal must be 0 bytes immediately after shutdown() checkpoint_all_wals()"
+    );
+
+    let snapshot_outbox_ro = |db_path: &std::path::Path| -> Vec<(i64, String, Option<i64>, i64)> {
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT client_nonce, status, server_message_id, retry_count
+                 FROM outbox_messages ORDER BY client_nonce ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+
+    let rows_before = snapshot_outbox_ro(&cache_db2);
+    assert_eq!(rows_before.len(), 2, "Precondition: 2 outbox rows persisted on disk");
+    let wal_len_after_snap = std::fs::metadata(&wal_path2).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wal_len_after_snap, 0);
+
+    // Release HTTP barrier so server returns HTTP 200 OK while Arc<FabushiAppHost> is STILL alive!
+    m1_release.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(300));
+
+    let wal_len_after = std::fs::metadata(&wal_path2).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_after, 0,
+        "client_cache.db-wal MUST remain 0 bytes (zero post-shutdown OutboxWorker WAL writes, B6-02)"
+    );
+    let rows_after = snapshot_outbox_ro(&cache_db2);
+    assert_eq!(
+        rows_after, rows_before,
+        "outbox_messages MUST NOT be mutated after shutdown() when HTTP response completes (B6-02)"
+    );
+    assert!(
+        !wire_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, txt)| txt == "PENDING_M2_SHUTDOWN"),
+        "Stopped OutboxWorker MUST NEVER claim/send PENDING_M2_SHUTDOWN after shutdown() (B6-02)"
+    );
+
+    drop(host_arc);
+}
+
 
 

@@ -215,6 +215,11 @@ fn finalize_authenticated_session(
     auth: &AuthResponse,
     generation_advanced: &mut bool,
 ) -> HostResult<u64> {
+    if auth.user_id == 0 {
+        return Err(HostError::invalid_arguments(
+            "Authenticated session requires a non-zero user_id",
+        ));
+    }
     let _sess_guard = host.session_lock.write();
     if host.is_shutdown() {
         return Err(HostError::host_closed());
@@ -224,22 +229,32 @@ fn finalize_authenticated_session(
     if current_gen != start_gen || !std::sync::Arc::ptr_eq(client, &live_client) {
         return Err(HostError::stale_generation(start_gen, current_gen));
     }
-    let prev_uid = live_client.current_user_id();
-    let had_token_only_session = prev_uid.is_none() && live_client.token().is_some();
-    // Step 1: Clear live client session (token == None, user_id == None)
+    let target_owner = format!("{}|{}", host.current_server_url(), auth.user_id);
+    let prev_owner = host
+        .host_db
+        .get_meta("local_store_owner_scope")
+        .ok()
+        .flatten();
+    let needs_local_wipe = prev_owner.as_deref() != Some(target_owner.as_str());
+
+    // Step 1: Clear live client session (stops & drains OutboxWorker/WsTransport/Tailnet; token == None)
     live_client.clear_session();
-    // Step 2: Wipe all account-scoped cryptographic keys and runtime state.
-    // If transitioning out of a token-only session (where LocalStore owner_scope is None so
-    // bind_account_scope would not wipe it), clear LocalStore immediately (B5-02).
+    // Step 2: Drain stale WS frames, wipe runtime account scope, and if local_store_owner_scope
+    // does not match "{server_url}|{user_id}" (covering cross-user switch, token-only cold restart,
+    // iOS Jetsam crash, and unauthenticated staging), wipe all account-scoped local data BEFORE
+    // Step 3 SQLite I/O while preserving same-user re-login caches (B6-01, NB6-01, NB6-02).
+    let _ = live_client.poll_events();
     host.reset_account_scope();
-    if had_token_only_session {
-        live_client.local_store.clear_all();
+    if needs_local_wipe {
+        let _ = host.host_db.delete_meta("local_store_owner_scope");
+        host.clear_account_local_data(&live_client);
     }
     // Step 3: Execute ALL fallible SQLite persistence while live_client.token() is STILL None
     if let Err(err) = persist_account_record(host, auth) {
         let _ = host.host_db.delete_meta("active_account_id");
-        if prev_uid != Some(auth.user_id) {
-            live_client.local_store.clear_all();
+        if needs_local_wipe {
+            let _ = host.host_db.delete_meta("local_store_owner_scope");
+            host.clear_account_local_data(&live_client);
         }
         host.bump_generation();
         *generation_advanced = true;
@@ -250,8 +265,22 @@ fn finalize_authenticated_session(
         .set_meta("active_account_id", &auth.user_id.to_string())
     {
         let _ = host.host_db.delete_meta("active_account_id");
-        if prev_uid != Some(auth.user_id) {
-            live_client.local_store.clear_all();
+        if needs_local_wipe {
+            let _ = host.host_db.delete_meta("local_store_owner_scope");
+            host.clear_account_local_data(&live_client);
+        }
+        host.bump_generation();
+        *generation_advanced = true;
+        return Err(err);
+    }
+    if let Err(err) = host
+        .host_db
+        .set_meta("local_store_owner_scope", &target_owner)
+    {
+        let _ = host.host_db.delete_meta("active_account_id");
+        if needs_local_wipe {
+            let _ = host.host_db.delete_meta("local_store_owner_scope");
+            host.clear_account_local_data(&live_client);
         }
         host.bump_generation();
         *generation_advanced = true;
@@ -261,7 +290,7 @@ fn finalize_authenticated_session(
     let new_gen = host.bump_generation();
     *generation_advanced = true;
     // Step 5: Infallible live credential installation LAST strictly inside session_lock.write()
-    // (calls bind_account_scope, preserving same-user cache and wiping on cross-user switch)
+    // (calls bind_account_scope, preserving same-user cache and starting OutboxWorker)
     live_client.set_auth_session(auth.clone());
     Ok(new_gen)
 }
@@ -282,13 +311,14 @@ fn finalize_token_only_session(
     if current_gen != start_gen || !std::sync::Arc::ptr_eq(client, &live_client) {
         return Err(HostError::stale_generation(start_gen, current_gen));
     }
-    // Step 1: Clear live client session (token == None, user_id == None)
+    // Step 1: Clear live client session (stops & drains OutboxWorker/WsTransport/Tailnet; token == None)
     live_client.clear_session();
-    // Step 2: Wipe all account-scoped cryptographic keys, runtime state, and LocalStore
-    // (outbox_messages, messages, chats, drafts, E2EE keys) because a token-only session has
-    // no user_id to verify cache ownership (B5-02).
+    // Step 2: Wipe all account-scoped cryptographic keys, runtime state, owner scope marker,
+    // and account-scoped local data because a token-only session has no user_id to verify cache
+    // ownership (B5-02, B6-01, NB6-01, NB6-02).
     host.reset_account_scope();
-    live_client.local_store.clear_all();
+    let _ = host.host_db.delete_meta("local_store_owner_scope");
+    host.clear_account_local_data(&live_client);
     // Step 3: Execute fallible SQLite persistence while live_client.token() is STILL None
     if let Err(err) = host.host_db.delete_meta("active_account_id") {
         host.bump_generation();
@@ -458,7 +488,8 @@ pub fn handle_auth(
                     });
                 live_client.clear_session();
                 host.reset_account_scope();
-                live_client.local_store.clear_all();
+                let _ = host.host_db.delete_meta("local_store_owner_scope");
+                host.clear_account_local_data(&live_client);
                 let mut delete_err = None;
                 if let Some(uid) = target_uid {
                     host.account_tokens.lock().remove(&uid);
@@ -916,8 +947,9 @@ pub fn handle_session(
                         }
                         live_client.clear_session();
                         let _ = host.host_db.delete_meta("active_account_id");
+                        let _ = host.host_db.delete_meta("local_store_owner_scope");
                         host.reset_account_scope();
-                        live_client.local_store.clear_all();
+                        host.clear_account_local_data(&live_client);
                         let next_gen = host.bump_generation();
                         *generation_advanced = true;
                         next_gen
@@ -928,6 +960,11 @@ pub fn handle_session(
         }
         "setAuthSession" => {
             let auth: AuthResponse = parse_req(params)?;
+            if auth.user_id == 0 {
+                return Err(HostError::invalid_arguments(
+                    "session.setAuthSession requires a non-zero user_id",
+                ));
+            }
             let new_gen = finalize_authenticated_session(
                 host,
                 &client,
@@ -950,8 +987,9 @@ pub fn handle_session(
                 }
                 live_client.clear_session();
                 let _ = host.host_db.delete_meta("active_account_id");
+                let _ = host.host_db.delete_meta("local_store_owner_scope");
                 host.reset_account_scope();
-                live_client.local_store.clear_all();
+                host.clear_account_local_data(&live_client);
                 let next_gen = host.bump_generation();
                 *generation_advanced = true;
                 next_gen
@@ -976,21 +1014,47 @@ pub fn handle_session(
             // Validate server binding, AEAD integrity, and non-empty recoverable token BEFORE
             // clearing the current live session, wiping account scope, or bumping generation!
             let auth = restore_account_auth(host, account_id, &raw)?;
-            let prev_uid = live_client.current_user_id();
-            let had_token_only_session = prev_uid.is_none() && live_client.token().is_some();
-            // Strict 5-step commit order (B4-02, B5-02):
-            // Step 1: Clear live client session (token == None, user_id == None)
-            live_client.clear_session();
-            // Step 2: Wipe all account-scoped cryptographic keys and runtime state
-            host.reset_account_scope();
-            if had_token_only_session {
-                live_client.local_store.clear_all();
+            if auth.user_id == 0 {
+                return Err(HostError::invalid_arguments(
+                    "Stored account has invalid zero user_id",
+                ));
             }
-            // Step 3: Persist active_account_id while live_client.token() is STILL None
+            let target_owner = format!("{}|{}", host.current_server_url(), auth.user_id);
+            let prev_owner = host
+                .host_db
+                .get_meta("local_store_owner_scope")
+                .ok()
+                .flatten();
+            let needs_local_wipe = prev_owner.as_deref() != Some(target_owner.as_str());
+            // Strict 5-step commit order (B4-02, B5-02, B6-01, NB6-01, NB6-02):
+            // Step 1: Clear live client session (stops & drains OutboxWorker/WsTransport/Tailnet)
+            live_client.clear_session();
+            // Step 2: Drain stale WS frames, wipe runtime account scope & cross-account local data
+            let _ = live_client.poll_events();
+            host.reset_account_scope();
+            if needs_local_wipe {
+                let _ = host.host_db.delete_meta("local_store_owner_scope");
+                host.clear_account_local_data(&live_client);
+            }
+            // Step 3: Persist active_account_id & local_store_owner_scope while token() is STILL None
             if let Err(err) = host.host_db.set_meta("active_account_id", account_id) {
                 let _ = host.host_db.delete_meta("active_account_id");
-                if prev_uid != Some(auth.user_id) {
-                    live_client.local_store.clear_all();
+                if needs_local_wipe {
+                    let _ = host.host_db.delete_meta("local_store_owner_scope");
+                    host.clear_account_local_data(&live_client);
+                }
+                host.bump_generation();
+                *generation_advanced = true;
+                return Err(err);
+            }
+            if let Err(err) = host
+                .host_db
+                .set_meta("local_store_owner_scope", &target_owner)
+            {
+                let _ = host.host_db.delete_meta("active_account_id");
+                if needs_local_wipe {
+                    let _ = host.host_db.delete_meta("local_store_owner_scope");
+                    host.clear_account_local_data(&live_client);
                 }
                 host.bump_generation();
                 *generation_advanced = true;
@@ -1046,7 +1110,8 @@ pub fn handle_session(
             "default_server_url": DEFAULT_SERVER_URL,
         })),
         "checkpointWal" => {
-            let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
+            let (busy, log, checkpointed) =
+                host.with_fenced_session_read(&client, || host.checkpoint_all_wals())?;
             Ok(json!({
                 "checkpointed": true,
                 "busy": busy,
@@ -1134,7 +1199,7 @@ pub fn handle_settings(
                 .ok_or_else(|| HostError::invalid_arguments("Missing 'value'"))?;
             let encoded = serde_json::to_string(val)
                 .map_err(|e| HostError::invalid_json(e.to_string()))?;
-            host.host_db.kv_set("settings", key, &encoded)?;
+            host.with_fenced_session_read(&client, || host.host_db.kv_set("settings", key, &encoded))?;
             Ok(json!({ "key": key, "saved": true }))
         }
         "localAll" => {
@@ -1164,7 +1229,9 @@ pub fn handle_settings(
             to_val(metrics)
         }
         "storagePurge" => {
-            let (freed_bytes, removed_files) = purge_media_cas_dir(&host.storage_dir)?;
+            let (freed_bytes, removed_files) = host.with_fenced_session_read(&client, || {
+                purge_media_cas_dir(&host.storage_dir)
+            })?;
             let metrics = compute_storage_metrics(&host.storage_dir);
             Ok(json!({
                 "freed_bytes": freed_bytes,
@@ -1197,8 +1264,10 @@ pub fn handle_settings(
             let salt_b64 = BASE64_STANDARD.encode(salt);
             let hash_hex = hex::encode(&*digest);
             let encoded_hash = format!("argon2id$m={m_cost},t={t_cost},p={p_cost}${salt_b64}${hash_hex}");
-            host.host_db.set_meta("passcode_salt", &salt_b64)?;
-            host.host_db.set_meta("passcode_hash", &encoded_hash)?;
+            host.with_fenced_session_read(&client, || {
+                host.host_db.set_meta("passcode_salt", &salt_b64)?;
+                host.host_db.set_meta("passcode_hash", &encoded_hash)
+            })?;
             Ok(json!({ "configured": true, "algorithm": "argon2id" }))
         }
         "passcodeVerify" => {
@@ -1251,8 +1320,10 @@ pub fn handle_settings(
             }
         }
         "passcodeClear" => {
-            host.host_db.delete_meta("passcode_salt")?;
-            host.host_db.delete_meta("passcode_hash")?;
+            host.with_fenced_session_read(&client, || {
+                host.host_db.delete_meta("passcode_salt")?;
+                host.host_db.delete_meta("passcode_hash")
+            })?;
             Ok(json!({ "cleared": true }))
         }
         "updateCheck" => Ok(json!({
@@ -1262,7 +1333,8 @@ pub fn handle_settings(
             "note": "iOS updates are delivered strictly through App Store / TestFlight"
         })),
         "checkpointWal" => {
-            let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
+            let (busy, log, checkpointed) =
+                host.with_fenced_session_read(&client, || host.checkpoint_all_wals())?;
             Ok(json!({
                 "checkpointed": true,
                 "busy": busy,
@@ -1317,24 +1389,30 @@ pub fn handle_proxy(
                 .map_err(|e| HostError::invalid_arguments(format!("Invalid proxy config: {e}")))?;
             let encoded = serde_json::to_string(&cfg)
                 .map_err(|e| HostError::internal(e.to_string()))?;
-            host.host_db.kv_set("proxies", &id, &encoded)?;
-            if params
+            let activate = params
                 .get("activate")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                client.apply_proxy(Some(cfg.clone()))?;
-                host.host_db.set_meta("active_proxy_id", &id)?;
-            }
+                .unwrap_or(false);
+            host.with_fenced_session_read(&client, || {
+                host.host_db.kv_set("proxies", &id, &encoded)?;
+                if activate {
+                    client.apply_proxy(Some(cfg.clone()))?;
+                    host.host_db.set_meta("active_proxy_id", &id)?;
+                }
+                Ok(())
+            })?;
             Ok(json!({ "id": id, "proxy": cfg }))
         }
         "delete" => {
             let id = req_str(params, "id")?;
-            let deleted = host.host_db.kv_delete("proxies", id)?;
-            if host.host_db.get_meta("active_proxy_id")?.as_deref() == Some(id) {
-                host.host_db.delete_meta("active_proxy_id")?;
-                client.apply_proxy(None)?;
-            }
+            let deleted = host.with_fenced_session_read(&client, || {
+                let removed = host.host_db.kv_delete("proxies", id)?;
+                if host.host_db.get_meta("active_proxy_id")?.as_deref() == Some(id) {
+                    host.host_db.delete_meta("active_proxy_id")?;
+                    client.apply_proxy(None)?;
+                }
+                Ok(removed)
+            })?;
             Ok(json!({ "deleted": deleted, "id": id }))
         }
         "setActive" => {
@@ -1345,19 +1423,24 @@ pub fn handle_proxy(
                 .filter(|s| !s.is_empty());
             match id_opt {
                 None => {
-                    client.apply_proxy(None)?;
-                    host.host_db.delete_meta("active_proxy_id")?;
+                    host.with_fenced_session_read(&client, || {
+                        client.apply_proxy(None)?;
+                        host.host_db.delete_meta("active_proxy_id")
+                    })?;
                     Ok(json!({ "active_proxy_id": Value::Null }))
                 }
                 Some(id) => {
-                    let raw = host
-                        .host_db
-                        .kv_get("proxies", id)?
-                        .ok_or_else(|| HostError::not_found(format!("Proxy '{id}' not found")))?;
-                    let cfg: ClientProxyConfig = serde_json::from_str(&raw)
-                        .map_err(|e| HostError::storage(format!("Corrupt proxy record: {e}")))?;
-                    client.apply_proxy(Some(cfg.clone()))?;
-                    host.host_db.set_meta("active_proxy_id", id)?;
+                    let cfg = host.with_fenced_session_read(&client, || {
+                        let raw = host
+                            .host_db
+                            .kv_get("proxies", id)?
+                            .ok_or_else(|| HostError::not_found(format!("Proxy '{id}' not found")))?;
+                        let parsed: ClientProxyConfig = serde_json::from_str(&raw)
+                            .map_err(|e| HostError::storage(format!("Corrupt proxy record: {e}")))?;
+                        client.apply_proxy(Some(parsed.clone()))?;
+                        host.host_db.set_meta("active_proxy_id", id)?;
+                        Ok(parsed)
+                    })?;
                     Ok(json!({ "active_proxy_id": id, "proxy": cfg }))
                 }
             }
@@ -1418,16 +1501,16 @@ pub fn handle_push(
                 ));
             }
             let now_ms = Utc::now().timestamp_millis();
-            host.host_db.kv_set(
-                "push",
-                "apns_registration",
-                &json!({
-                    "token": token,
-                    "environment": environment,
-                    "updated_at_ms": now_ms,
-                })
-                .to_string(),
-            )?;
+            let client = host.client();
+            let payload = json!({
+                "token": token,
+                "environment": environment,
+                "updated_at_ms": now_ms,
+            })
+            .to_string();
+            host.with_fenced_session_read(&client, || {
+                host.host_db.kv_set("push", "apns_registration", &payload)
+            })?;
             Ok(json!({
                 "persisted": true,
                 "token_length": token.len(),
@@ -1438,7 +1521,10 @@ pub fn handle_push(
             }))
         }
         "unregisterToken" => {
-            let removed = host.host_db.kv_delete("push", "apns_registration")?;
+            let client = host.client();
+            let removed = host.with_fenced_session_read(&client, || {
+                host.host_db.kv_delete("push", "apns_registration")
+            })?;
             Ok(json!({
                 "unregistered": removed,
                 "server_apns_dispatch": "upstream_stub_blocked",
