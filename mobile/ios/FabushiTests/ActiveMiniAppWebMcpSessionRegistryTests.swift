@@ -3,8 +3,10 @@ import XCTest
 
 @MainActor
 final class ActiveMiniAppWebMcpSessionRegistryTests: XCTestCase {
-    override func tearDown() async throws {
-        ActiveMiniAppWebMcpSessionRegistry.shared.resetForTesting()
+    nonisolated override func tearDown() async throws {
+        await MainActor.run {
+            ActiveMiniAppWebMcpSessionRegistry.shared.resetForTesting()
+        }
         try await super.tearDown()
     }
 
