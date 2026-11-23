@@ -3820,6 +3820,10 @@ class LoopbackHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = HTTP_SOCKET_TIMEOUT_SECS
 
+    def handle_expect_100(self) -> bool:
+        """Defer 100 Continue until _read_request_body() validates Content-Length/TE/offline."""
+        return True
+
     def handle_one_request(self) -> None:
         try:
             super().handle_one_request()
@@ -4867,7 +4871,9 @@ def run_self_test(report_path: str = "") -> int:
                     f"Connection: close\r\n\r\nhello"
                 ).encode("ascii")
                 st_bcl, head_bcl, _ = _raw_tcp_request("127.0.0.1", port, raw_req)
-                assert st_bcl == 400 and "100 Continue" not in head_bcl
+                assert st_bcl == 400 and "100 Continue" not in head_bcl, (
+                    f"bad_cl={bad_cl!r} expected 400 without 100 Continue, got st={st_bcl} head={head_bcl!r}"
+                )
             dup_cl_req = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"
@@ -4875,8 +4881,8 @@ def run_self_test(report_path: str = "") -> int:
                 f"Content-Length: 10\r\n"
                 f"Connection: close\r\n\r\nhello"
             ).encode("ascii")
-            st_dcl, _, _ = _raw_tcp_request("127.0.0.1", port, dup_cl_req)
-            assert st_dcl == 400
+            st_dcl, head_dcl, _ = _raw_tcp_request("127.0.0.1", port, dup_cl_req)
+            assert st_dcl == 400, f"dup CL expected 400, got st={st_dcl} head={head_dcl!r}"
             big_req = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"
@@ -4885,7 +4891,9 @@ def run_self_test(report_path: str = "") -> int:
                 f"Connection: close\r\n\r\n"
             ).encode("ascii")
             st_413, head_413, _ = _raw_tcp_request("127.0.0.1", port, big_req)
-            assert st_413 == 413 and "100 Continue" not in head_413
+            assert st_413 == 413 and "100 Continue" not in head_413, (
+                f"oversized CL expected 413 without 100 Continue, got st={st_413} head={head_413!r}"
+            )
             bad_chunk_plus = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"
@@ -4893,7 +4901,7 @@ def run_self_test(report_path: str = "") -> int:
                 f"Connection: close\r\n\r\n+a\r\n0123456789\r\n0\r\n\r\n"
             ).encode("ascii")
             st_bc1, _, _ = _raw_tcp_request("127.0.0.1", port, bad_chunk_plus)
-            assert st_bc1 == 400
+            assert st_bc1 == 400, f"bad chunk +a expected 400, got {st_bc1}"
             trunc_trailer = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"
@@ -4904,8 +4912,14 @@ def run_self_test(report_path: str = "") -> int:
                 s_tr.settimeout(5.0)
                 s_tr.sendall(trunc_trailer)
                 s_tr.shutdown(socket.SHUT_WR)
-                raw_tr = s_tr.recv(4096)
-            assert raw_tr.startswith(b"HTTP/1.1 400 ")
+                tr_chunks: list[bytes] = []
+                while True:
+                    b_tr = s_tr.recv(4096)
+                    if not b_tr:
+                        break
+                    tr_chunks.append(b_tr)
+                raw_tr = b"".join(tr_chunks)
+            assert raw_tr.startswith(b"HTTP/1.1 400 "), f"truncated trailer expected 400, got {raw_tr!r}"
             many_trailers = (
                 f"POST /api/v1/messages/send HTTP/1.1\r\n"
                 f"Host: 127.0.0.1:{port}\r\n"
@@ -4915,14 +4929,16 @@ def run_self_test(report_path: str = "") -> int:
                 + "\r\n"
             ).encode("ascii")
             st_mt, _, _ = _raw_tcp_request("127.0.0.1", port, many_trailers)
-            assert st_mt == 400
+            assert st_mt == 400, f"too many trailers expected 400, got {st_mt}"
             st_hd, hdr_hd, body_hd = _http_call(base, "HEAD", "/healthz")
-            assert st_hd == 200 and int(hdr_hd.get("content-length", "0")) > 0 and body_hd == b""
+            assert st_hd == 200 and int(hdr_hd.get("content-length", "0")) > 0 and body_hd == b"", (
+                f"HEAD /healthz failed: st={st_hd} hdr={hdr_hd} body={body_hd!r}"
+            )
             conn_req = (
                 f"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n"
             ).encode("ascii")
             st_cn, _, _ = _raw_tcp_request("127.0.0.1", port, conn_req)
-            assert st_cn == 200
+            assert st_cn == 200, f"CONNECT online expected 200, got {st_cn}"
             _json_call(base, "POST", "/__e2e__/fault", {"offline": True})
             with socket.create_connection(("127.0.0.1", port), timeout=5.0) as s_cn:
                 s_cn.settimeout(5.0)
