@@ -11,8 +11,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ios-desktop-main-architecture-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ios-desktop-main-architecture-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

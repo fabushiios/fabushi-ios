@@ -71,6 +71,7 @@
     "gpui",
     "khronos-egl",
     "khronos_egl",
+    "openssl-sys",
     "gpui_telegram_desktop",
     "fabushi_remote_daemon",
     "gpui_telegram_cli",

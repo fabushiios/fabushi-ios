@@ -82,7 +82,7 @@ Build, verify, and ship a standalone, 100% iOS-owned, Apple HIG-native iOS/iPadO
     2. `gpui_telegram_proto`
     3. `gpui_telegram_client`
     4. `gpui_telegram_media`
-    5. `gpui_telegram_webrtc`
+    5. `gpui_telegram_webrtc` (signaling/fingerprint/audio-level/SFU/Opus/VAD; desktop `webrtc-rs`/`peer_transport` gated off `target_os = "ios"` in favor of native `LiveKitWebRTC` + `CallKit`)
     6. `gpui_telegram_agent` (incl. `assets/fixtures/**`)
     7. `gpui_telegram_coding`
     8. `magpie_gateway`
@@ -232,7 +232,7 @@ None of the following may ever be fabricated, mocked as production success, or s
 - **`IOS-MAIN-GATE-03`**: Zero skipped required steps; skipped, cancelled, neutral, warning-only, or environment-blocked outcomes are never treated as `passed`.
 - **`IOS-MAIN-GATE-04`**: Full non-truncated Git tree verification against `bhrumom/gpui-telegram@main` (`--desktop-checkout` or authenticated GitHub Git Trees API with `truncated == false`), asserting exact blob count, `0` gitlinks, `crates/**` + `inherited/**` counts, 18-directory crate closure, and SHA-256 tree digests.
 - **`IOS-MAIN-GATE-05`**: 100% iOS-owned dependency fence: zero external path/git repo dependencies, zero escaping `../` or absolute paths, and zero forbidden `gpui`, `khronos-egl`, or excluded desktop crates in `source/desktop_core/**` or mobile iOS manifests.
-- **`IOS-MAIN-GATE-06`**: `rust-desktop-core-ubuntu` compiles all workspace test targets (`--no-run`) and executes all deterministic offline Rust unit + integration tests across all vendored crates with `GPUI_OFFLINE_TEST=1` (zero deleted tests, zero weakened assertions).
+- **`IOS-MAIN-GATE-06`**: `rust-desktop-core-ubuntu` compiles all workspace test targets (`--no-run`) and executes all deterministic offline Rust unit + integration tests across all vendored crates with `GPUI_OFFLINE_TEST=1` (with `auth_client_tests` unsetting `GPUI_OFFLINE_TEST` specifically for its local `127.0.0.1:0` loopback bridge tests; zero deleted tests, zero weakened assertions).
 - **`IOS-MAIN-GATE-07`**: `rust-desktop-core-ios-check` (`macos-15`) verifies `cargo check` for BOTH `aarch64-apple-ios-sim` AND `aarch64-apple-ios` across the entire `source/desktop_core` workspace and confirms zero `gpui`/`khronos-egl` nodes in the iOS `cargo tree`.
 - **`IOS-MAIN-GATE-08`**: Staged CI expansion across milestones: M1a (authority + `desktop_core` Ubuntu tests + iOS target check) -> M1b (`source/host` C-ABI + `FabushiCore` Swift tests) -> M2–M6 (XcodeGen, Swift unit tests, Simulator XCUITest, E2E Tiers 1–4, unsigned/signed archive).
 - **`IOS-MAIN-GATE-09`**: No test deletion, warning downgrade, or assertion relaxation to turn CI green; genuine defects are fixed at root cause on a new exact HEAD.

@@ -67,12 +67,38 @@ FORBIDDEN_EXTERNAL_REPO_STRINGS = [
     "github.com/bhrunom/gpui-telegram",
 ]
 FORBIDDEN_GIT_ORG_RE = re.compile(r"(?:github\.com[:/])?(bhrumom|bhrum|bhrunom)/", re.IGNORECASE)
+FORBIDDEN_FILE_GIT_RE = re.compile(r"^file://", re.IGNORECASE)
 WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 LOCAL_PATH_PATTERNS = [
     re.compile(r"/Users/"),
-    re.compile(r"/home/[^/\s]+/"),
-    re.compile(r"[A-Za-z]:\\Users\\"),
+    re.compile(r"/home/[^/\s]+(?:/|$|\s)"),
+    re.compile(r"[A-Za-z]:[/\\][Uu]sers[/\\]"),
+    re.compile(r"(?:^|[\s\x22\x27(`:=])~/"),
 ]
+TEST_READY_ACTIONS_URL_RE = re.compile(
+    r"(?:^|[\s(\[<\x22\x27`])https://github\.com/fabushiios/fabushi-ios/actions/runs/[1-9][0-9]*(?:\b|/)"
+)
+TEST_READY_RUN_ID_RE = re.compile(r"\bGITHUB_RUN_ID\s*[:=]\s*[1-9][0-9]*\b")
+HOST_STUB_ACK_RE = re.compile(r'"status"\s*:\s*"acknowledged"')
+EXPECTED_RELEASE_GATES = frozenset({
+    "rust-host-and-coordinator",
+    "swift-unit-and-ui",
+    "native-lifecycle-restart-recovery",
+    "protected-global-dharma-real-account",
+    "signed-device-archive-export",
+    "physical-device-install-launch",
+    "installed-app-upgrade-data-migration",
+    "testflight-install-and-app-store-validation",
+    "accessibility-localization-iPhone-iPad",
+    "security-privacy-credential-isolation",
+    "performance-fault-soak",
+    "licensing-provenance-legal-review",
+    "post-merge-main-exact-head-verification",
+})
+
+
+def _norm_crate_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_")
 
 
 def document(path):
@@ -216,16 +242,22 @@ def verify_tree_entries(real, lock, errors, actual_head=None, actual_tree=None):
     computed_selected = tree_digest(crates_blobs)
     expected_full = inv.get("fullTreeSha256")
     expected_selected = inv.get("selectedTreeSha256")
-    if expected_full is not None:
-        if not HEX64.fullmatch(str(expected_full)) or computed_full != expected_full:
-            errors.append(
-                f"full tracked Desktop root tree inventory SHA256 drift: got={computed_full} expected={expected_full}"
-            )
-    if expected_selected is not None:
-        if not HEX64.fullmatch(str(expected_selected)) or computed_selected != expected_selected:
-            errors.append(
-                f"selected crates/** inventory SHA256 drift: got={computed_selected} expected={expected_selected}"
-            )
+    if not isinstance(expected_full, str) or not HEX64.fullmatch(expected_full):
+        errors.append(
+            f"full tracked Desktop root tree inventory SHA256 missing or invalid 64-hex digest: {expected_full!r}"
+        )
+    elif computed_full != expected_full:
+        errors.append(
+            f"full tracked Desktop root tree inventory SHA256 drift: got={computed_full} expected={expected_full}"
+        )
+    if not isinstance(expected_selected, str) or not HEX64.fullmatch(expected_selected):
+        errors.append(
+            f"selected crates/** inventory SHA256 missing or invalid 64-hex digest: {expected_selected!r}"
+        )
+    elif computed_selected != expected_selected:
+        errors.append(
+            f"selected crates/** inventory SHA256 drift: got={computed_selected} expected={expected_selected}"
+        )
     return computed_full, computed_selected
 
 
@@ -275,7 +307,15 @@ def check_status(row, path, complete, errors, warnings, locked_commit):
                     errors.append(f"{path}: verified lacks current-head evidence field {field}")
             if row.get("desktop_review_commit") != locked_commit:
                 errors.append(f"{path}: verified source review not bound to current Desktop main")
-            if row.get("ios_target_commit") != os.environ.get("IOS_EXPECTED_HEAD"):
+            expected_ios_head = os.environ.get("IOS_EXPECTED_HEAD")
+            row_ios_commit = row.get("ios_target_commit")
+            if (
+                not isinstance(row_ios_commit, str)
+                or not HEX40.fullmatch(row_ios_commit)
+                or not expected_ios_head
+                or not HEX40.fullmatch(expected_ios_head)
+                or row_ios_commit != expected_ios_head
+            ):
                 errors.append(f"{path}: verified evidence not bound to current iOS HEAD")
     elif status in {"verified", "not-applicable"} and row.get("desktop_review_commit") != locked_commit:
         warnings.append(f"{path}: legacy {status} is HISTORICAL, not current-main verified")
@@ -343,6 +383,10 @@ def verify_snapshot(lock, manifest_index, ledger_index, errors):
         errors.append("authority lock inventory counts must be non-negative integers")
     elif sel_cnt + non_cnt != full_cnt:
         errors.append("authority lock selectedFileCount + nonselectedCount != fullTrackedCount")
+    if not isinstance(inventory.get("fullTreeSha256"), str) or not HEX64.fullmatch(inventory["fullTreeSha256"]):
+        errors.append("authority lock must record valid 64-hex inventory.fullTreeSha256")
+    if not isinstance(inventory.get("selectedTreeSha256"), str) or not HEX64.fullmatch(inventory["selectedTreeSha256"]):
+        errors.append("authority lock must record valid 64-hex inventory.selectedTreeSha256")
 
     if ledger_mode != "current-main-complete":
         for flag in ("baselineReady", "dependenciesReviewed", "completenessAccepted", "acceptanceAccepted"):
@@ -450,6 +494,85 @@ def verify_snapshot(lock, manifest_index, ledger_index, errors):
         for token in ["Status: superseded", "docs/specs/gpui-telegram-main-ios-parity.md"]:
             if token not in superseded:
                 errors.append(f"superseded fabushi-desktop Spec missing token {token}")
+
+
+def verify_release_evidence(release, lock, errors, complete):
+    source_sha = lock.get("commit")
+    if release.get("desktopRepository") != lock.get("repository"):
+        errors.append(
+            f"release acceptance matrix desktopRepository mismatch: {release.get('desktopRepository')!r} != {lock.get('repository')!r}"
+        )
+    if release.get("desktopSourceCommit") != source_sha or release.get("desktopRootTree") != lock.get("rootTreeSha"):
+        errors.append("release acceptance matrix is not bound to current Desktop main")
+    expected_ac = {f"IOS-MAIN-AC-{i:02d}" for i in range(1, 22)}
+    entries = release.get("acceptanceCriteria", [])
+    actual_ac = [r.get("id") for r in entries]
+    if len(actual_ac) != 21 or set(actual_ac) != expected_ac:
+        errors.append("release matrix must contain exactly 21 stable acceptance criterion IDs")
+    expected_ios_head = os.environ.get("IOS_EXPECTED_HEAD")
+    for r in entries:
+        if r.get("status") == "passed":
+            if not r.get("evidence") or not r.get("independentReviewer"):
+                errors.append(f"{r.get('id')}: passed claim lacks evidence or independent reviewer")
+            ios_commit = r.get("iosCommit")
+            if (
+                not isinstance(ios_commit, str)
+                or not HEX40.fullmatch(ios_commit)
+                or not expected_ios_head
+                or not HEX40.fullmatch(expected_ios_head)
+                or ios_commit != expected_ios_head
+            ):
+                errors.append(f"{r.get('id')}: passed claim not tied to current iOS exact head")
+    release_gates = release.get("releaseGates")
+    if not isinstance(release_gates, dict) or set(release_gates.keys()) != EXPECTED_RELEASE_GATES:
+        present_keys = set(release_gates.keys()) if isinstance(release_gates, dict) else set()
+        missing_gates = sorted(EXPECTED_RELEASE_GATES - present_keys)
+        extra_gates = sorted(present_keys - EXPECTED_RELEASE_GATES)
+        errors.append(
+            f"release matrix releaseGates must match exact 13 canonical keys "
+            f"(missing={missing_gates} extra={extra_gates})"
+        )
+        release_gates_iter = {}
+    else:
+        release_gates_iter = release_gates
+    for key, gate in release_gates_iter.items():
+        if not isinstance(gate, dict):
+            errors.append(f"{key}: release gate entry must be an object")
+            continue
+        if gate.get("status") == "passed":
+            required = [
+                "iosCommit", "desktopCommit", "workflowRun", "runAttempt", "job",
+                "requiredSteps", "artifactId", "artifactDigest", "independentReviewer",
+            ]
+            for field in required:
+                if not gate.get(field):
+                    errors.append(f"{key}: passed release gate lacks {field}")
+            gate_ios_commit = gate.get("iosCommit")
+            if (
+                gate.get("desktopCommit") != source_sha
+                or not isinstance(gate_ios_commit, str)
+                or not HEX40.fullmatch(gate_ios_commit)
+                or not expected_ios_head
+                or not HEX40.fullmatch(expected_ios_head)
+                or gate_ios_commit != expected_ios_head
+            ):
+                errors.append(f"{key}: passed release gate source identity mismatch")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", gate.get("artifactDigest") or ""):
+                errors.append(f"{key}: passed release artifact digest not sha256")
+            if gate.get("requiredSteps") and any(
+                step.get("conclusion") != "success" or step.get("status") != "completed"
+                for step in gate["requiredSteps"]
+            ):
+                errors.append(f"{key}: passed release gate has missing, skipped or failed required step")
+    if complete:
+        if release.get("finalAcceptance") is not True:
+            errors.append("final independent iOS release acceptance not recorded")
+        for r in entries:
+            if r.get("status") != "passed":
+                errors.append(f"{r.get('id')}: mandatory release criterion not accepted")
+        for name, gate in release_gates_iter.items():
+            if not isinstance(gate, dict) or gate.get("status") != "passed":
+                errors.append(f"release gate pending/blocked: {name}")
 
 
 def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete, checkout, verify_api_tree=False):
@@ -602,53 +725,9 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
     release_path = ROOT / "docs/parity/desktop-main-release-evidence.json"
     if not release_path.is_file():
         errors.append("missing durable current-main release acceptance/evidence matrix")
-        release = {}
     else:
         release = document(release_path)
-        if release.get("desktopRepository") != lock.get("repository"):
-            errors.append(
-                f"release acceptance matrix desktopRepository mismatch: {release.get('desktopRepository')!r} != {lock.get('repository')!r}"
-            )
-        if release.get("desktopSourceCommit") != source_sha or release.get("desktopRootTree") != lock.get("rootTreeSha"):
-            errors.append("release acceptance matrix is not bound to current Desktop main")
-        expected_ac = {f"IOS-MAIN-AC-{i:02d}" for i in range(1, 22)}
-        entries = release.get("acceptanceCriteria", [])
-        actual_ac = [r.get("id") for r in entries]
-        if len(actual_ac) != 21 or set(actual_ac) != expected_ac:
-            errors.append("release matrix must contain exactly 21 stable acceptance criterion IDs")
-        for r in entries:
-            if r.get("status") == "passed":
-                if not r.get("evidence") or not r.get("independentReviewer"):
-                    errors.append(f"{r.get('id')}: passed claim lacks evidence or independent reviewer")
-                if r.get("iosCommit") != os.environ.get("IOS_EXPECTED_HEAD"):
-                    errors.append(f"{r.get('id')}: passed claim not tied to current iOS exact head")
-        for key, gate in release.get("releaseGates", {}).items():
-            if gate.get("status") == "passed":
-                required = [
-                    "iosCommit", "desktopCommit", "workflowRun", "runAttempt", "job",
-                    "requiredSteps", "artifactId", "artifactDigest", "independentReviewer",
-                ]
-                for field in required:
-                    if not gate.get(field):
-                        errors.append(f"{key}: passed release gate lacks {field}")
-                if gate.get("desktopCommit") != source_sha or gate.get("iosCommit") != os.environ.get("IOS_EXPECTED_HEAD"):
-                    errors.append(f"{key}: passed release gate source identity mismatch")
-                if not re.fullmatch(r"sha256:[0-9a-f]{64}", gate.get("artifactDigest") or ""):
-                    errors.append(f"{key}: passed release artifact digest not sha256")
-                if gate.get("requiredSteps") and any(
-                    step.get("conclusion") != "success" or step.get("status") != "completed"
-                    for step in gate["requiredSteps"]
-                ):
-                    errors.append(f"{key}: passed release gate has missing, skipped or failed required step")
-        if complete:
-            if release.get("finalAcceptance") is not True:
-                errors.append("final independent iOS release acceptance not recorded")
-            for r in entries:
-                if r.get("status") != "passed":
-                    errors.append(f"{r.get('id')}: mandatory release criterion not accepted")
-            for name, gate in release.get("releaseGates", {}).items():
-                if gate.get("status") != "passed":
-                    errors.append(f"release gate pending/blocked: {name}")
+        verify_release_evidence(release, lock, errors, complete)
 
     if complete:
         for key in ("baselineReady", "dependenciesReviewed", "completenessAccepted", "acceptanceAccepted"):
@@ -686,6 +765,14 @@ def _iter_dependency_tables(parsed):
                 tbl = body.get(key)
                 if isinstance(tbl, dict):
                     yield f"target.{cfg}.{key}", tbl
+    patches = parsed.get("patch")
+    if isinstance(patches, dict):
+        for source, tbl in patches.items():
+            if isinstance(tbl, dict):
+                yield f"patch.{source}", tbl
+    replace_tbl = parsed.get("replace")
+    if isinstance(replace_tbl, dict):
+        yield "replace", replace_tbl
 
 
 def verify_cargo_toml_hygiene(
@@ -716,14 +803,23 @@ def verify_cargo_toml_hygiene(
         return
 
     core_root_resolved = core_root.resolve()
-    forbidden_set = set(forbidden_deps)
+    forbidden_set = {_norm_crate_name(name) for name in forbidden_deps}
 
     for table_name, deps in _iter_dependency_tables(parsed):
+        if table_name.startswith("patch."):
+            patch_source = table_name[len("patch."):].strip()
+            if FORBIDDEN_GIT_ORG_RE.search(patch_source) or FORBIDDEN_FILE_GIT_RE.match(patch_source):
+                errors.append(
+                    f"{rel_display} [{table_name}]: forbidden patch source URL: {patch_source!r}"
+                )
         for dep_key, spec in deps.items():
-            pkg_name = dep_key
+            raw_dep_name = dep_key
+            if table_name == "replace":
+                raw_dep_name = raw_dep_name.rsplit("#", 1)[-1].split(":", 1)[0]
+            pkg_name = raw_dep_name
             if isinstance(spec, dict) and isinstance(spec.get("package"), str):
                 pkg_name = spec["package"]
-            if dep_key in forbidden_set or pkg_name in forbidden_set:
+            if _norm_crate_name(raw_dep_name) in forbidden_set or _norm_crate_name(pkg_name) in forbidden_set:
                 errors.append(
                     f"{rel_display} [{table_name}]: forbidden mobile dependency {dep_key!r} (package={pkg_name!r})"
                 )
@@ -748,10 +844,15 @@ def verify_cargo_toml_hygiene(
                                     f"{rel_display} [{table_name}.{dep_key}]: path dependency target does not exist: {dep_path!r}"
                                 )
                 git_url = spec.get("git")
-                if isinstance(git_url, str) and FORBIDDEN_GIT_ORG_RE.search(git_url):
-                    errors.append(
-                        f"{rel_display} [{table_name}.{dep_key}]: external Fabushi git dependency forbidden: {git_url!r}"
-                    )
+                if isinstance(git_url, str):
+                    if FORBIDDEN_GIT_ORG_RE.search(git_url):
+                        errors.append(
+                            f"{rel_display} [{table_name}.{dep_key}]: external Fabushi git dependency forbidden: {git_url!r}"
+                        )
+                    if FORBIDDEN_FILE_GIT_RE.match(git_url.strip()):
+                        errors.append(
+                            f"{rel_display} [{table_name}.{dep_key}]: local file:// git dependency forbidden: {git_url!r}"
+                        )
 
 
 def verify_desktop_core_workspace(core_root, lock, errors):
@@ -769,9 +870,14 @@ def verify_desktop_core_workspace(core_root, lock, errors):
     excluded_crates = set(EXCLUDED_DESKTOP_CRATES)
     if lock and isinstance(lock.get("excludedDesktopCrates"), list):
         excluded_crates |= set(lock["excludedDesktopCrates"])
+    forbidden_norm = {_norm_crate_name(name) for name in forbidden_deps}
+    excluded_norm = {_norm_crate_name(name) for name in excluded_crates}
 
     verify_cargo_toml_hygiene(root_toml, core_root, forbidden_deps, errors, require_path_exists=True)
-    parsed = tomllib.loads(root_toml.read_text(encoding="utf-8"))
+    try:
+        parsed = tomllib.loads(root_toml.read_text(encoding="utf-8"))
+    except Exception:
+        return
     ws = parsed.get("workspace", {})
     members = ws.get("members", [])
     excludes = set(ws.get("exclude", []))
@@ -783,11 +889,56 @@ def verify_desktop_core_workspace(core_root, lock, errors):
         if prof.get("debug") != 0 or prof.get("incremental") is not False:
             errors.append(f"source/desktop_core/Cargo.toml: profile.{profile_name} must enforce debug=0 and incremental=false")
 
-    member_set = set(members)
+    core_root_resolved = core_root.resolve()
+    normalized_members = set()
+    if not isinstance(members, list):
+        errors.append("source/desktop_core/Cargo.toml: workspace.members must be a list")
+        members = []
+    for member in members:
+        if not isinstance(member, str) or not member.strip():
+            errors.append(f"source/desktop_core/Cargo.toml: invalid workspace member entry: {member!r}")
+            continue
+        if any(ch in member for ch in "*?[]"):
+            errors.append(f"source/desktop_core/Cargo.toml: wildcard workspace member forbidden: {member!r}")
+            continue
+        if member.startswith("/") or WINDOWS_ABS_RE.match(member) or Path(member).is_absolute():
+            errors.append(f"source/desktop_core/Cargo.toml: workspace member absolute path forbidden: {member!r}")
+            continue
+        resolved_member = (core_root / member).resolve()
+        try:
+            rel_member_path = resolved_member.relative_to(core_root_resolved)
+        except ValueError:
+            errors.append(
+                f"source/desktop_core/Cargo.toml: workspace member escapes {core_root_resolved}: {member!r}"
+            )
+            continue
+        normalized_members.add(rel_member_path.as_posix())
+        if any(
+            _norm_crate_name(part) in excluded_norm or _norm_crate_name(part) in forbidden_norm
+            for part in rel_member_path.parts
+        ):
+            errors.append(
+                f"source/desktop_core/Cargo.toml: workspace member includes excluded desktop crate: {member!r}"
+            )
+        member_toml = resolved_member / "Cargo.toml"
+        if member_toml.is_file():
+            try:
+                member_parsed = tomllib.loads(member_toml.read_text(encoding="utf-8"))
+                pkg_name = (member_parsed.get("package") or {}).get("name")
+                if isinstance(pkg_name, str) and (
+                    _norm_crate_name(pkg_name) in excluded_norm
+                    or _norm_crate_name(pkg_name) in forbidden_norm
+                ):
+                    errors.append(
+                        f"source/desktop_core/Cargo.toml: workspace member {member!r} declares excluded desktop package {pkg_name!r}"
+                    )
+            except Exception as exc:
+                errors.append(f"source/desktop_core/{rel_member_path.as_posix()}/Cargo.toml: failed to parse: {exc}")
+
     if lock:
         for crate in lock.get("vendoredCoreCrates", []):
             rel_member = f"crates/{crate}"
-            if rel_member not in member_set:
+            if rel_member not in normalized_members:
                 errors.append(f"source/desktop_core/Cargo.toml missing required vendored member: {rel_member}")
             if not (core_root / rel_member / "Cargo.toml").is_file():
                 errors.append(f"missing vendored crate manifest: source/desktop_core/{rel_member}/Cargo.toml")
@@ -795,15 +946,16 @@ def verify_desktop_core_workspace(core_root, lock, errors):
             if not (core_root / "crates" / shared_dir).is_dir():
                 errors.append(f"missing vendored shared source directory: source/desktop_core/crates/{shared_dir}")
 
-    for excluded in sorted(excluded_crates):
-        if f"crates/{excluded}" in member_set or excluded in member_set:
-            errors.append(f"source/desktop_core/Cargo.toml includes excluded desktop crate: {excluded}")
-        if (core_root / "crates" / excluded).exists():
-            errors.append(f"excluded desktop crate directory present under source/desktop_core/crates/{excluded}")
+    crates_dir = core_root / "crates"
+    if crates_dir.is_dir():
+        for child in sorted(crates_dir.iterdir()):
+            if _norm_crate_name(child.name) in excluded_norm:
+                errors.append(f"excluded desktop crate directory present under source/desktop_core/crates/{child.name}")
 
     excluded_paths = [(core_root / ex).resolve() for ex in excludes]
     for toml_file in sorted(core_root.rglob("Cargo.toml")):
-        if "target" in toml_file.relative_to(core_root).parts:
+        rel_parts = toml_file.relative_to(core_root).parts
+        if rel_parts and rel_parts[0] == "target":
             continue
         if toml_file == root_toml:
             continue
@@ -820,7 +972,7 @@ def verify_desktop_core_workspace(core_root, lock, errors):
         )
 
 
-def verify_test_ready_integrity(root, errors):
+def verify_test_ready_integrity(root, errors, complete=False):
     test_ready = root / "TEST_READY.md"
     if not test_ready.is_file():
         return
@@ -828,30 +980,55 @@ def verify_test_ready_integrity(root, errors):
     for pat in LOCAL_PATH_PATTERNS:
         if pat.search(text):
             errors.append(f"TEST_READY.md contains forbidden local host path matching {pat.pattern!r}")
-    for marker in ("cd /Users/", "worker_m6_iter3_impl", "bhrumom/fabushi-desktop"):
+    for marker in (
+        "cd /Users/",
+        "worker_m6_iter3_impl",
+        "target/e2e/master_e2e_runner",
+        "bhrumom/fabushi-desktop",
+        "bhrunom/gpui-telegram",
+        "bhrum/gpui-telegram",
+    ):
         if marker in text:
             errors.append(f"TEST_READY.md contains forbidden stale/local-only marker: {marker!r}")
-    has_actions_url = "github.com/fabushiios/fabushi-ios/actions/runs/" in text
-    has_run_id = "GITHUB_RUN_ID" in text
-    has_sha = bool(re.search(r"\b[0-9a-f]{40}\b", text))
+    has_actions_url = bool(TEST_READY_ACTIONS_URL_RE.search(text))
+    has_run_id = bool(TEST_READY_RUN_ID_RE.search(text))
+    all_shas = re.findall(r"\b[0-9a-f]{40}\b", text)
+    if "0" * 40 in all_shas:
+        errors.append("TEST_READY.md contains forbidden all-zero 40-hex commit SHA")
+    valid_shas = [sha for sha in all_shas if sha != "0" * 40]
+    has_sha = bool(valid_shas)
     if not ((has_actions_url or has_run_id) and has_sha):
         errors.append(
-            "TEST_READY.md lacks required GitHub Actions run provenance (actions run URL or GITHUB_RUN_ID) and exact 40-hex commit SHA"
+            "TEST_READY.md lacks required GitHub Actions run provenance "
+            "(anchored actions run URL with numeric run ID or numeric GITHUB_RUN_ID) "
+            "and non-zero 40-hex commit SHA"
         )
+    if complete:
+        expected_head = os.environ.get("IOS_EXPECTED_HEAD")
+        if expected_head and not re.search(rf"\b{re.escape(expected_head)}\b", text):
+            errors.append(
+                f"TEST_READY.md does not reference current IOS_EXPECTED_HEAD ({expected_head})"
+            )
 
 
 def verify_host_anti_stub(root, errors):
-    dispatch = root / "source/host/src/dispatch.rs"
+    host_src = root / "source/host/src"
+    dispatch = host_src / "dispatch.rs"
     if not dispatch.is_file():
         errors.append("missing C-ABI host dispatch owner: source/host/src/dispatch.rs")
         return
-    text = dispatch.read_text(encoding="utf-8")
-    for bad in ('"status": "acknowledged"', "sample_chats"):
-        if bad in text:
-            errors.append(f"source/host/src/dispatch.rs contains forbidden stub/fake fallback: {bad}")
+    for rs_file in sorted(host_src.rglob("*.rs")):
+        text = rs_file.read_text(encoding="utf-8")
+        rel = rs_file.relative_to(root).as_posix()
+        if HOST_STUB_ACK_RE.search(text):
+            errors.append(
+                f'{rel} contains forbidden stub/fake fallback matching "status": "acknowledged"'
+            )
+        if "sample_chats" in text:
+            errors.append(f"{rel} contains forbidden stub/fake fallback: sample_chats")
 
 
-def verify_ios_owners(errors, lock=None):
+def verify_ios_owners(errors, lock=None, complete=False):
     """Keep preexisting shipping-path architecture regression fences and standalone iOS core checks intact."""
     required_roots = [
         "frontend",
@@ -879,7 +1056,6 @@ def verify_ios_owners(errors, lock=None):
     dependency_files = [
         ROOT / "mobile/ios/project.yml",
         ROOT / "source/packages/mahayana-rs/Cargo.toml",
-        ROOT / "source/host/Cargo.toml",
     ]
     for dependency_file in dependency_files:
         if not dependency_file.is_file():
@@ -891,8 +1067,15 @@ def verify_ios_owners(errors, lock=None):
                     f"{dependency_file.relative_to(ROOT)} introduces forbidden cross-repo runtime dependency: {forbidden}"
                 )
 
+    forbidden_deps = set(FORBIDDEN_MOBILE_DEPS)
+    if lock and isinstance(lock.get("forbiddenMobileWorkspaceDeps"), list):
+        forbidden_deps |= set(lock["forbiddenMobileWorkspaceDeps"])
+    host_toml = ROOT / "source/host/Cargo.toml"
+    if host_toml.is_file():
+        verify_cargo_toml_hygiene(host_toml, ROOT, forbidden_deps, errors, require_path_exists=True)
+
     verify_desktop_core_workspace(ROOT / "source/desktop_core", lock, errors)
-    verify_test_ready_integrity(ROOT, errors)
+    verify_test_ready_integrity(ROOT, errors, complete=complete)
 
     # Preserve the shipping ownership chain established by PR #3 while it is re-audited.
     preload = ROOT / "source/ios-preload/preload.swift"
@@ -1001,7 +1184,7 @@ def run():
     parser.add_argument("--authority-only", action="store_true", help="fast start/end live main authority check (not a complete source audit)")
     parser.add_argument("--desktop-checkout", type=Path, help="pinned Desktop-main checkout; required for source tree acceptance")
     parser.add_argument("--verify-api-tree", action="store_true", help="verify non-truncated full Git tree via GitHub REST API")
-    parser.add_argument("--check-host-bridge", action="store_true", help="enforce fail-closed anti-stub checks on source/host/src/dispatch.rs")
+    parser.add_argument("--check-host-bridge", action="store_true", help="enforce fail-closed anti-stub checks across source/host/src/**/*.rs")
     args = parser.parse_args()
     errors = []
     warnings = []
@@ -1039,10 +1222,10 @@ def run():
                 verify_api_tree=use_api_tree,
             )
             if args.strict or args.complete:
-                verify_ios_owners(errors, lock)
+                verify_ios_owners(errors, lock, complete=args.complete)
         else:
             if args.strict:
-                verify_ios_owners(errors, lock)
+                verify_ios_owners(errors, lock, complete=False)
             if args.verify_api_tree:
                 api_tree_sha = github_api_commit_tree(lock["repository"], lock["commit"])
                 real = github_api_tree(lock["repository"], lock["rootTreeSha"])

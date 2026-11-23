@@ -11,8 +11,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ios-gpui-telegram-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ios-gpui-telegram-ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -285,16 +285,24 @@ jobs:
       - name: Verify zero forbidden desktop/EGL crates in iOS dependency trees
         run: |
           set -euo pipefail
+          FORBIDDEN_RE='^(gpui|khronos-egl|khronos_egl|openssl-sys|openssl_sys|xcap|keyring|webrtc|enigo|uiautomation|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) '
           for target in aarch64-apple-ios-sim aarch64-apple-ios; do
-            echo "=== Auditing cargo tree for $target ==="
+            echo "=== Auditing workspace cargo tree for $target ==="
             TREE="$(cargo tree --manifest-path source/desktop_core/Cargo.toml --workspace --target "$target" --prefix none)"
-            if grep -Eq '^(gpui|khronos-egl|khronos_egl|openssl-sys|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) ' <<< "$TREE"; then
-              echo "ERROR: Forbidden crate found in $target dependency tree:"
-              grep -E '^(gpui|khronos-egl|khronos_egl|openssl-sys|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) ' <<< "$TREE"
+            if grep -Eq "$FORBIDDEN_RE" <<< "$TREE"; then
+              echo "ERROR: Forbidden crate found in $target workspace dependency tree:"
+              grep -E "$FORBIDDEN_RE" <<< "$TREE"
+              exit 1
+            fi
+            echo "=== Auditing fabushi_miniapp (--features server) cargo tree for $target ==="
+            MINIAPP_TREE="$(cargo tree --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --target "$target" --prefix none)"
+            if grep -Eq "$FORBIDDEN_RE" <<< "$MINIAPP_TREE"; then
+              echo "ERROR: Forbidden crate found in $target fabushi_miniapp (--features server) dependency tree:"
+              grep -E "$FORBIDDEN_RE" <<< "$MINIAPP_TREE"
               exit 1
             fi
           done
-          echo "PASS: Zero forbidden desktop/EGL crates in iOS target dependency trees."
+          echo "PASS: Zero forbidden desktop/EGL/iOS-gated crates in iOS target dependency trees (workspace + fabushi_miniapp --features server)."
 
       - name: Check all vendored crates for aarch64-apple-ios-sim and aarch64-apple-ios
         env:
