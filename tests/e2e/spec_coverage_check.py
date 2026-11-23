@@ -1223,8 +1223,8 @@ def check_coverage(repo_root: Path, matrix_path: Path, strict: bool) -> dict[str
         for req_tok in (
             "public enum MasterE2ERunner",
             "Tier1FeatureCoverageSuite",
-            "Tier2BoundaryAndCornerCaseSuite",
-            "Tier3PairwiseInteractionsSuite",
+            "Tier2BoundaryCornerCasesSuite",
+            "Tier3CrossFeatureSuite",
             "Tier4RealWorldScenariosSuite",
         ):
             if req_tok not in ms_txt:
