@@ -232,7 +232,7 @@ public struct MessageBubbleRowView: View {
     public let onSelectReaction: (String) -> Void
     public let onMenuAction: (MessageMenuAction) -> Void
     public let onReply: (TelegramStageMessage) -> Void
-    public let onExpireSecretMessage: () -> Void
+    public let onExpireSecretMessage: @MainActor () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
