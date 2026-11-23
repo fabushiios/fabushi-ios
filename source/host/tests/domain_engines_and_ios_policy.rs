@@ -215,10 +215,10 @@ fn test_real_e2ee_double_ratchet_sender_keys_and_safety_numbers() {
         assert_eq!(grp_tamper["ok"], true);
         let mut bad_grp_obj = grp_tamper["result"].clone();
         let mut g_ct = BASE64_STANDARD
-            .decode(bad_grp_obj["ciphertext_b64"].as_str().unwrap())
+            .decode(bad_grp_obj["ciphertext"].as_str().unwrap())
             .unwrap();
         g_ct[0] ^= 0xAA;
-        bad_grp_obj["ciphertext_b64"] = json!(BASE64_STANDARD.encode(&g_ct));
+        bad_grp_obj["ciphertext"] = json!(BASE64_STANDARD.encode(&g_ct));
         let bad_sk = dispatch(
             host,
             &json!({

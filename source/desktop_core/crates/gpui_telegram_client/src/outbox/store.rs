@@ -382,6 +382,19 @@ impl OutboxStore {
         Ok(n)
     }
 
+    /// Removes a terminal `Failed` outbox row so retrying after a permanently rejected HTTP 4xx
+    /// does not remain poisoned by `Duplicate client_nonce ... (Failed)`.
+    pub fn delete_failed(&self, client_nonce: u64) -> Result<bool> {
+        let conn = self.cache.conn.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM outbox_messages WHERE client_nonce = ?1 AND status = 'Failed'",
+                params![client_nonce as i64],
+            )
+            .map_err(db_err)?;
+        Ok(n > 0)
+    }
+
     pub fn get(&self, client_nonce: u64) -> Result<Option<OutboxMessageRecord>> {
         let conn = self.cache.conn.lock();
         conn.query_row(

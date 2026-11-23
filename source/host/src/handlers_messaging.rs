@@ -831,6 +831,7 @@ pub fn handle_messages(
                         if e.retryable && outbox_pending {
                             delivery_status = "queued_outbox";
                         } else {
+                            let _ = client.outbox.store().delete_failed(effective_nonce);
                             return Err(e);
                         }
                     }
