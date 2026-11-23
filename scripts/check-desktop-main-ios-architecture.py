@@ -67,7 +67,7 @@ FORBIDDEN_EXTERNAL_REPO_STRINGS = [
     "github.com/bhrunom/gpui-telegram",
 ]
 FORBIDDEN_GIT_ORG_RE = re.compile(r"(?:github\.com[:/])?(bhrumom|bhrum|bhrunom)/", re.IGNORECASE)
-FORBIDDEN_FILE_GIT_RE = re.compile(r"^file://", re.IGNORECASE)
+FORBIDDEN_FILE_GIT_RE = re.compile(r"^(?:(?:git|registry|sparse)\+)?file://", re.IGNORECASE)
 WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 LOCAL_PATH_PATTERNS = [
     re.compile(r"/Users/"),
@@ -79,7 +79,15 @@ TEST_READY_ACTIONS_URL_RE = re.compile(
     r"(?:^|[\s(\[<\x22\x27`])https://github\.com/fabushiios/fabushi-ios/actions/runs/[1-9][0-9]*(?:\b|/)"
 )
 TEST_READY_RUN_ID_RE = re.compile(r"\bGITHUB_RUN_ID\s*[:=]\s*[1-9][0-9]*\b")
-HOST_STUB_ACK_RE = re.compile(r'"status"\s*:\s*"acknowledged"')
+HOST_STUB_ACK_RE = re.compile(r'\\?"status\\?"\s*:\s*\\?"acknowledged\\?"')
+HOST_HARDCODED_LOCALHOST_RE = re.compile(r'https?://127\.0\.0\.1:8443')
+DEP_TABLE_KEYS = (
+    "dependencies",
+    "dev-dependencies",
+    "build-dependencies",
+    "dev_dependencies",
+    "build_dependencies",
+)
 EXPECTED_RELEASE_GATES = frozenset({
     "rust-host-and-coordinator",
     "swift-unit-and-ui",
@@ -564,6 +572,33 @@ def verify_release_evidence(release, lock, errors, complete):
                 for step in gate["requiredSteps"]
             ):
                 errors.append(f"{key}: passed release gate has missing, skipped or failed required step")
+    if release.get("finalAcceptance") is True:
+        if lock.get("inventory", {}).get("fileLedgerMode") != "current-main-complete":
+            errors.append(
+                "release acceptance matrix sets premature finalAcceptance=true while "
+                f"fileLedgerMode={lock.get('inventory', {}).get('fileLedgerMode')!r}"
+            )
+        final_ios_commit = release.get("finalIosCommit")
+        if (
+            not isinstance(final_ios_commit, str)
+            or not HEX40.fullmatch(final_ios_commit)
+            or not expected_ios_head
+            or not HEX40.fullmatch(expected_ios_head)
+            or final_ios_commit != expected_ios_head
+        ):
+            errors.append(
+                "release acceptance matrix sets finalAcceptance=true without matching 40-hex finalIosCommit == IOS_EXPECTED_HEAD"
+            )
+        for r in entries:
+            if r.get("status") != "passed":
+                errors.append(
+                    f"release acceptance matrix sets finalAcceptance=true while {r.get('id')} status={r.get('status')!r}"
+                )
+        for name, gate in release_gates_iter.items():
+            if not isinstance(gate, dict) or gate.get("status") != "passed":
+                errors.append(
+                    f"release acceptance matrix sets finalAcceptance=true while release gate {name!r} is not passed"
+                )
     if complete:
         if release.get("finalAcceptance") is not True:
             errors.append("final independent iOS release acceptance not recorded")
@@ -749,7 +784,7 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
 
 
 def _iter_dependency_tables(parsed):
-    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+    for key in DEP_TABLE_KEYS:
         tbl = parsed.get(key)
         if isinstance(tbl, dict):
             yield key, tbl
@@ -761,7 +796,7 @@ def _iter_dependency_tables(parsed):
         for cfg, body in targets.items():
             if not isinstance(body, dict):
                 continue
-            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for key in DEP_TABLE_KEYS:
                 tbl = body.get(key)
                 if isinstance(tbl, dict):
                     yield f"target.{cfg}.{key}", tbl
@@ -815,7 +850,15 @@ def verify_cargo_toml_hygiene(
         for dep_key, spec in deps.items():
             raw_dep_name = dep_key
             if table_name == "replace":
-                raw_dep_name = raw_dep_name.rsplit("#", 1)[-1].split(":", 1)[0]
+                pkg_spec = dep_key
+                if "#" in dep_key:
+                    replace_source, pkg_spec = dep_key.rsplit("#", 1)
+                    replace_source_s = replace_source.strip()
+                    if FORBIDDEN_GIT_ORG_RE.search(replace_source_s) or FORBIDDEN_FILE_GIT_RE.match(replace_source_s):
+                        errors.append(
+                            f"{rel_display} [replace]: forbidden replace source URL: {replace_source!r}"
+                        )
+                raw_dep_name = re.split(r"[:@]", pkg_spec, maxsplit=1)[0]
             pkg_name = raw_dep_name
             if isinstance(spec, dict) and isinstance(spec.get("package"), str):
                 pkg_name = spec["package"]
@@ -1005,7 +1048,11 @@ def verify_test_ready_integrity(root, errors, complete=False):
         )
     if complete:
         expected_head = os.environ.get("IOS_EXPECTED_HEAD")
-        if expected_head and not re.search(rf"\b{re.escape(expected_head)}\b", text):
+        if not expected_head or not HEX40.fullmatch(expected_head):
+            errors.append(
+                "complete mode requires valid 40-hex IOS_EXPECTED_HEAD to verify TEST_READY.md binding"
+            )
+        elif not re.search(rf"\b{re.escape(expected_head)}\b", text):
             errors.append(
                 f"TEST_READY.md does not reference current IOS_EXPECTED_HEAD ({expected_head})"
             )
@@ -1026,6 +1073,26 @@ def verify_host_anti_stub(root, errors):
             )
         if "sample_chats" in text:
             errors.append(f"{rel} contains forbidden stub/fake fallback: sample_chats")
+        if HOST_HARDCODED_LOCALHOST_RE.search(text):
+            errors.append(f"{rel} contains forbidden hardcoded localhost stub URL (127.0.0.1:8443)")
+    cleaner = root / "scripts/clean_build_garbage.py"
+    if cleaner.is_file():
+        cleaner_text = cleaner.read_text(encoding="utf-8")
+        if "/Users/" in cleaner_text:
+            errors.append("scripts/clean_build_garbage.py contains forbidden hardcoded /Users/ personal path")
+
+
+def verify_host_cargo_manifests(root, forbidden_deps, errors):
+    host_dir = root / "source/host"
+    host_toml = host_dir / "Cargo.toml"
+    if not host_toml.is_file():
+        errors.append("missing C-ABI host manifest: source/host/Cargo.toml")
+        return
+    for toml_file in sorted(host_dir.rglob("Cargo.toml")):
+        rel_parts = toml_file.relative_to(host_dir).parts
+        if rel_parts and rel_parts[0] == "target":
+            continue
+        verify_cargo_toml_hygiene(toml_file, root, forbidden_deps, errors, require_path_exists=True)
 
 
 def verify_ios_owners(errors, lock=None, complete=False):
@@ -1070,9 +1137,8 @@ def verify_ios_owners(errors, lock=None, complete=False):
     forbidden_deps = set(FORBIDDEN_MOBILE_DEPS)
     if lock and isinstance(lock.get("forbiddenMobileWorkspaceDeps"), list):
         forbidden_deps |= set(lock["forbiddenMobileWorkspaceDeps"])
-    host_toml = ROOT / "source/host/Cargo.toml"
-    if host_toml.is_file():
-        verify_cargo_toml_hygiene(host_toml, ROOT, forbidden_deps, errors, require_path_exists=True)
+    verify_host_cargo_manifests(ROOT, forbidden_deps, errors)
+    verify_host_anti_stub(ROOT, errors)
 
     verify_desktop_core_workspace(ROOT / "source/desktop_core", lock, errors)
     verify_test_ready_integrity(ROOT, errors, complete=complete)
@@ -1232,7 +1298,7 @@ def run():
                 computed_digests = verify_tree_entries(
                     real, lock, errors, actual_head=lock["commit"], actual_tree=api_tree_sha
                 )
-        if args.check_host_bridge:
+        if args.check_host_bridge and not (args.strict or args.complete):
             verify_host_anti_stub(ROOT, errors)
         if errors:
             for message in errors[:250]:

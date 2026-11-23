@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
 scripts/clean_build_garbage.py
-Mandatory local build garbage & stale artifact cleaner conforming to AGENTS.md.
+Build garbage & stale artifact cleaner respecting CARGO_TARGET_DIR without hardcoded developer paths.
 
 Enforces:
-1. Purges target/**/incremental caches across all target profiles and architecture triples.
-2. Purges target/**/*.dSYM debug symbol bundles.
-3. Purges stale test executable binaries in deps/ and reconciles target/**/.fingerprint.
-4. Auto-recycles temporary test SQLite databases (*.db, *.sqlite, *.sqlite-wal, *.sqlite-shm),
-   temporary Tantivy index directories, and chunk upload scratch files.
-5. Verifies and enforces single workspace target/ directory (flags/purges redundant target dirs).
+1. Purges incremental caches across target profiles and architecture triples.
+2. Purges *.dSYM debug symbol bundles in target deps/.
+3. Purges stale test executable binaries in deps/ and reconciles .fingerprint.
+4. Auto-recycles temporary test scratch directories without deleting the active CARGO_TARGET_DIR.
+5. Prunes only known redundant workspace Cargo target directories (never walks .git/.agents/source).
 """
 
+import argparse
 import os
+from pathlib import Path
 import re
 import shutil
-import glob
 import sys
+import tempfile
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for dp, _, fns in os.walk(path):
+        for fn in fns:
+            try:
+                total += os.path.getsize(os.path.join(dp, fn))
+            except OSError:
+                pass
+    return total
 
 
 def clean_target_dir(target_dir: str) -> int:
@@ -24,23 +36,16 @@ def clean_target_dir(target_dir: str) -> int:
         return 0
     freed_bytes = 0
 
-    # 1. Purge all incremental cache directories recursively (handles top-level & target-triples)
+    # 1. Purge all incremental cache directories recursively
     for root, dirs, _ in os.walk(target_dir):
         for d in list(dirs):
             if d == "incremental":
                 inc_path = os.path.join(root, d)
-                for dp, _, fns in os.walk(inc_path):
-                    for f in fns:
-                        try:
-                            freed_bytes += os.path.getsize(os.path.join(dp, f))
-                        except OSError:
-                            pass
+                freed_bytes += _dir_size(inc_path)
                 shutil.rmtree(inc_path, ignore_errors=True)
                 dirs.remove(d)
 
-    # 2. Discover all profile directories:
-    #    - target/debug, target/release
-    #    - target/<triple>/debug, target/<triple>/release
+    # 2. Discover profile directories (debug, release, <triple>/debug, <triple>/release)
     profile_dirs = []
     for prof in ("debug", "release"):
         p = os.path.join(target_dir, prof)
@@ -63,21 +68,15 @@ def clean_target_dir(target_dir: str) -> int:
 
         removed_hashes = set()
 
-        # Remove *.dSYM directories and stale test executable binaries
         for entry in os.listdir(deps_dir):
             full_p = os.path.join(deps_dir, entry)
             if entry.endswith(".dSYM") and os.path.isdir(full_p):
-                for dp, _, fns in os.walk(full_p):
-                    for f in fns:
-                        try:
-                            freed_bytes += os.path.getsize(os.path.join(dp, f))
-                        except OSError:
-                            pass
+                freed_bytes += _dir_size(full_p)
                 shutil.rmtree(full_p, ignore_errors=True)
             elif os.path.isfile(full_p):
                 _, ext = os.path.splitext(entry)
                 if ext == "" and os.access(full_p, os.X_OK):
-                    m = re.match(r"^.+ -?([0-9a-f]{16})$", entry) or re.search(r"-([0-9a-f]{16})$", entry)
+                    m = re.search(r"-([0-9a-f]{16})$", entry)
                     if m:
                         removed_hashes.add(m.group(1))
                     try:
@@ -86,7 +85,7 @@ def clean_target_dir(target_dir: str) -> int:
                     except OSError:
                         pass
 
-        # Reconcile .fingerprint so Cargo never sees a fingerprint whose .rmeta/.rlib is missing in deps/
+        # Reconcile .fingerprint so Cargo never sees a fingerprint whose artifact was removed
         if os.path.isdir(fp_dir):
             existing_dep_hashes = set()
             for entry in os.listdir(deps_dir):
@@ -118,72 +117,72 @@ def clean_target_dir(target_dir: str) -> int:
     return freed_bytes
 
 
-def clean_test_artifacts(root_dir: str) -> int:
-    """Purges temporary test SQLite DBs, Tantivy indexes, and chunk upload scratch files."""
+def clean_test_artifacts(root_dir: str, canonical_target: str) -> int:
+    """Purges temporary test scratch directories and known redundant Cargo target directories."""
     freed_bytes = 0
     search_dirs = [
-        os.path.join(root_dir, "target", "tmp"),
+        os.path.join(canonical_target, "tmp"),
         os.path.join(root_dir, "build", "tmp"),
-        "/tmp/fabushi_tests",
+        os.path.join(tempfile.gettempdir(), "fabushi_tests"),
     ]
     for s_dir in search_dirs:
         if os.path.isdir(s_dir):
-            for dp, _, fns in os.walk(s_dir):
-                for f in fns:
-                    try:
-                        freed_bytes += os.path.getsize(os.path.join(dp, f))
-                    except OSError:
-                        pass
+            freed_bytes += _dir_size(s_dir)
             shutil.rmtree(s_dir, ignore_errors=True)
 
-    # Clean any stray redundant .cargo-target-* directories per AGENTS.md Rule 1
+    # Clean stray .cargo-target* directories at repo root
     for item in os.listdir(root_dir):
-        if item.startswith(".cargo-target-") or item.startswith(".cargo-target"):
+        if item.startswith(".cargo-target"):
             full_p = os.path.join(root_dir, item)
-            if os.path.isdir(full_p):
-                for dp, _, fns in os.walk(full_p):
-                    for f in fns:
-                        try:
-                            freed_bytes += os.path.getsize(os.path.join(dp, f))
-                        except OSError:
-                            pass
+            if os.path.isdir(full_p) and os.path.abspath(full_p) != canonical_target:
+                freed_bytes += _dir_size(full_p)
                 shutil.rmtree(full_p, ignore_errors=True)
 
-    # Purge any redundant nested target/ directories (e.g. source/host/target/) per AGENTS.md Rule 1
-    canonical_target = os.path.abspath(os.path.join(root_dir, "target"))
-    for root, dirs, _ in os.walk(root_dir):
-        if ".git" in root or root == canonical_target or root.startswith(canonical_target + os.sep):
-            continue
-        for d in list(dirs):
-            if d == "target":
-                redundant_target = os.path.join(root, d)
-                if os.path.abspath(redundant_target) != canonical_target:
-                    for dp, _, fns in os.walk(redundant_target):
-                        for f in fns:
-                            try:
-                                freed_bytes += os.path.getsize(os.path.join(dp, f))
-                            except OSError:
-                                pass
-                    shutil.rmtree(redundant_target, ignore_errors=True)
-                    dirs.remove(d)
+    # Prune only known redundant Cargo target locations that differ from active CARGO_TARGET_DIR
+    known_target_candidates = [
+        os.path.join(root_dir, "target"),
+        os.path.join(root_dir, "source", "host", "target"),
+        os.path.join(root_dir, "source", "desktop_core", "target"),
+        os.path.join(root_dir, "source", "packages", "mahayana-rs", "target"),
+    ]
+    for cand in known_target_candidates:
+        abs_cand = os.path.abspath(cand)
+        if abs_cand != canonical_target and os.path.isdir(abs_cand):
+            freed_bytes += _dir_size(abs_cand)
+            shutil.rmtree(abs_cand, ignore_errors=True)
 
     return freed_bytes
 
 
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.abspath(os.path.join(script_dir, ".."))
-    if not os.path.exists(os.path.join(repo_root, "Cargo.toml")) and not os.path.exists(os.path.join(repo_root, "source")):
-        candidate = "/Users/bhrum/Documents/ChatGPT/fabushi-ios"
-        if os.path.isdir(candidate):
-            repo_root = candidate
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Clean Cargo build garbage safely.")
+    parser.add_argument("--repo-root", type=Path, help="Optional explicit repository root.")
+    args = parser.parse_args()
 
-    target_dir = os.path.join(repo_root, "target")
-    total_freed = clean_target_dir(target_dir)
-    total_freed += clean_test_artifacts(repo_root)
+    repo_root = (
+        args.repo_root.resolve()
+        if args.repo_root is not None
+        else Path(__file__).resolve().parents[1]
+    )
+    if not (repo_root / "source").is_dir():
+        print(
+            f"[clean_build_garbage] Error: invalid repository root (missing source/): {repo_root}",
+            file=sys.stderr,
+        )
+        return 2
 
-    print(f"[clean_build_garbage] Freed {total_freed / (1024**2):.2f} MB in {repo_root}")
+    canonical_target = os.path.abspath(
+        os.environ.get("CARGO_TARGET_DIR") or str(repo_root / "target")
+    )
+    total_freed = clean_target_dir(canonical_target)
+    total_freed += clean_test_artifacts(str(repo_root), canonical_target)
+
+    print(
+        f"[clean_build_garbage] Freed {total_freed / (1024**2):.2f} MB in {repo_root} "
+        f"(active target: {canonical_target})"
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

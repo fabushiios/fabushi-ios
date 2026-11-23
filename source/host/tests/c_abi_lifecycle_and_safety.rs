@@ -1,0 +1,482 @@
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use axum::routing::get;
+use axum::Router;
+use mahayana_app_host::{
+    compat::{mahayana_cloud_agent_trace_rows, mahayana_spreadsheet_parse_file},
+    fabushi_host_cancel, fabushi_host_create, fabushi_host_destroy, fabushi_host_dispatch,
+    fabushi_host_free_string, fabushi_host_last_error, fabushi_host_poll_events,
+    mahayana_app_host_create, mahayana_app_host_create_test,
+    mahayana_app_host_create_with_storage_passphrase, mahayana_app_host_destroy,
+    mahayana_app_host_dispatch, mahayana_app_host_dispatch_with_handle,
+    mahayana_app_host_free_string, telegram_app_host_create, telegram_app_host_create_test,
+    telegram_app_host_destroy, telegram_app_host_dispatch,
+    telegram_app_host_dispatch_with_handle, telegram_app_host_free_string,
+    telegram_bridge_register_event_callback, telegram_proto_max_packet_size,
+    telegram_replay_window_check_and_add, telegram_replay_window_create,
+    telegram_replay_window_destroy,
+};
+use serde_json::{json, Value};
+use tempfile::tempdir;
+
+unsafe fn call_dispatch(handle: *mut c_void, payload: &Value) -> Value {
+    let req_c = CString::new(payload.to_string()).expect("valid JSON CString");
+    let ptr = unsafe { fabushi_host_dispatch(handle, req_c.as_ptr()) };
+    assert!(!ptr.is_null(), "dispatch must never return null");
+    let text = unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .expect("valid UTF-8 response")
+        .to_string();
+    unsafe { fabushi_host_free_string(ptr) };
+    serde_json::from_str(&text).expect("response must be valid JSON")
+}
+
+#[test]
+fn test_c_abi_lifecycle_aliases_replay_window_and_null_callback_unregister() {
+    let dir = tempdir().expect("tempdir");
+    let cfg = json!({
+        "app_data_dir": dir.path().to_string_lossy(),
+        "test_mode": false
+    });
+    let cfg_c = CString::new(cfg.to_string()).unwrap();
+
+    struct CallbackCounter {
+        count: AtomicUsize,
+    }
+    let counter = Arc::new(CallbackCounter {
+        count: AtomicUsize::new(0),
+    });
+
+    unsafe extern "C" fn on_event(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        ctx: *mut c_void,
+    ) {
+        if !event_type.is_null() && !ctx.is_null() {
+            let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+            if ev == "newMessage" {
+                let c = unsafe { &*(ctx as *const CallbackCounter) };
+                c.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe {
+        // 1. Canonical fabushi_host_* lifecycle
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null(), "fabushi_host_create failed");
+
+        // Register callback -> emit -> unregister via None (NULL) without UB -> emit again
+        let raw_ctx = Arc::into_raw(Arc::clone(&counter)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_event), raw_ctx);
+
+        let send1 = call_dispatch(
+            host,
+            &json!({
+                "id": "req-1",
+                "method": "messages.send",
+                "params": {"chat_id": 101, "text": "hello callback", "local_only": true}
+            }),
+        );
+        assert_eq!(send1["ok"], true);
+        assert_eq!(send1["id"], "req-1");
+        assert_eq!(counter.count.load(Ordering::SeqCst), 1);
+
+        // Unregister by passing None (C NULL) — must NOT cause UB or crash
+        telegram_bridge_register_event_callback(host, None, std::ptr::null_mut());
+        let send2 = call_dispatch(
+            host,
+            &json!({
+                "id": "req-2",
+                "method": "messages.send",
+                "params": {"chat_id": 101, "text": "after unregister", "local_only": true}
+            }),
+        );
+        assert_eq!(send2["ok"], true);
+        assert_eq!(
+            counter.count.load(Ordering::SeqCst),
+            1,
+            "Callback must not fire after NULL unregister"
+        );
+
+        // Canonical fabushi_host_poll_events should still have both events
+        let poll_ptr = fabushi_host_poll_events(host, 16, 100);
+        let poll_val: Value =
+            serde_json::from_str(CStr::from_ptr(poll_ptr).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(poll_ptr);
+        assert_eq!(poll_val["ok"], true);
+        let events = poll_val["result"]["events"].as_array().unwrap();
+        assert!(events.len() >= 2, "Expected >=2 polled events, got {:?}", events);
+
+        fabushi_host_destroy(host);
+        drop(Arc::from_raw(raw_ctx as *const CallbackCounter));
+
+        // 2. Legacy telegram_* and mahayana_* aliases route into exact same real engine
+        let dir_c = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let pass_c = CString::new("keychain-secret-passphrase").unwrap();
+
+        let tg_host = telegram_app_host_create(dir_c.as_ptr(), pass_c.as_ptr());
+        assert!(!tg_host.is_null());
+        let ping_c = CString::new(r#"{"command":"telegram.ping","params":{"nonce":99}}"#).unwrap();
+        let r1 = telegram_app_host_dispatch(tg_host, ping_c.as_ptr());
+        let v1: Value = serde_json::from_str(CStr::from_ptr(r1).to_str().unwrap()).unwrap();
+        telegram_app_host_free_string(r1);
+        assert_eq!(v1["ok"], true);
+        assert_eq!(v1["result"]["nonce"], 99);
+
+        let r2 = telegram_app_host_dispatch_with_handle(tg_host, ping_c.as_ptr());
+        let v2: Value = serde_json::from_str(CStr::from_ptr(r2).to_str().unwrap()).unwrap();
+        telegram_app_host_free_string(r2);
+        assert_eq!(v2["ok"], true);
+        telegram_app_host_destroy(tg_host);
+
+        let mh_dir = tempdir().unwrap();
+        let mh_dir_c = CString::new(mh_dir.path().to_str().unwrap()).unwrap();
+        let mh1 = mahayana_app_host_create(mh_dir_c.as_ptr());
+        assert!(!mh1.is_null());
+        let mr = mahayana_app_host_dispatch_with_handle(mh1, ping_c.as_ptr());
+        let mv: Value = serde_json::from_str(CStr::from_ptr(mr).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(mr);
+        assert_eq!(mv["ok"], true);
+        mahayana_app_host_destroy(mh1);
+
+        let mh2 = mahayana_app_host_create_with_storage_passphrase(mh_dir_c.as_ptr(), pass_c.as_ptr());
+        assert!(!mh2.is_null());
+        mahayana_app_host_destroy(mh2);
+
+        let mh3 = mahayana_app_host_create_test(mh_dir_c.as_ptr());
+        assert!(!mh3.is_null());
+        mahayana_app_host_destroy(mh3);
+
+        // 3. Sliding 128-bit replay window & protocol packet size
+        assert_eq!(telegram_proto_max_packet_size(), 16_777_216);
+        let win = telegram_replay_window_create();
+        assert!(!win.is_null());
+        assert!(!telegram_replay_window_check_and_add(win, 0));
+        assert!(telegram_replay_window_check_and_add(win, 10));
+        assert!(!telegram_replay_window_check_and_add(win, 10));
+        assert!(telegram_replay_window_check_and_add(win, 5));
+        assert!(!telegram_replay_window_check_and_add(win, 5));
+        assert!(telegram_replay_window_check_and_add(win, 200));
+        assert!(!telegram_replay_window_check_and_add(win, 50)); // >128 behind
+        assert!(!telegram_replay_window_check_and_add(std::ptr::null_mut(), 1));
+        telegram_replay_window_destroy(win);
+        telegram_replay_window_destroy(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn test_null_utf8_malformed_json_and_panic_isolation() {
+    let dir = tempdir().unwrap();
+
+    unsafe {
+        // Invalid config JSON -> returns NULL and records fabushi_host_last_error
+        let bad_cfg = CString::new("{not-json").unwrap();
+        let bad_host = fabushi_host_create(bad_cfg.as_ptr());
+        assert!(bad_host.is_null());
+        let err_ptr = fabushi_host_last_error();
+        assert!(!err_ptr.is_null());
+        let err_msg = CStr::from_ptr(err_ptr).to_str().unwrap();
+        assert!(err_msg.contains("invalid_json"), "unexpected err: {err_msg}");
+
+        // Null pointers to dispatch / poll / cancel / destroy / free must never crash
+        let null_res = fabushi_host_dispatch(std::ptr::null_mut(), std::ptr::null());
+        let null_val: Value =
+            serde_json::from_str(CStr::from_ptr(null_res).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(null_res);
+        assert_eq!(null_val["ok"], false);
+        assert_eq!(null_val["error"]["code"], "invalid_arguments");
+
+        let poll_null = fabushi_host_poll_events(std::ptr::null_mut(), 10, 0);
+        let poll_null_val: Value =
+            serde_json::from_str(CStr::from_ptr(poll_null).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(poll_null);
+        assert_eq!(poll_null_val["ok"], false);
+        assert_eq!(poll_null_val["error"]["code"], "invalid_arguments");
+
+        assert!(!fabushi_host_cancel(std::ptr::null_mut(), std::ptr::null()));
+        fabushi_host_destroy(std::ptr::null_mut());
+        fabushi_host_free_string(std::ptr::null_mut());
+
+        // Test-mode host: panic trigger caught cleanly by catch_unwind & handle remains usable
+        let dir_c = CString::new(dir.path().to_str().unwrap()).unwrap();
+        let test_host = telegram_app_host_create_test(dir_c.as_ptr());
+        assert!(!test_host.is_null());
+
+        // Invalid UTF-8 bytes
+        let bad_utf8: [u8; 3] = [0xFF, 0xFE, 0x00];
+        let utf8_ptr = fabushi_host_dispatch(test_host, bad_utf8.as_ptr() as *const c_char);
+        let utf8_val: Value =
+            serde_json::from_str(CStr::from_ptr(utf8_ptr).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(utf8_ptr);
+        assert_eq!(utf8_val["ok"], false);
+        assert_eq!(utf8_val["error"]["code"], "invalid_utf8");
+
+        // Malformed JSON
+        let bad_json = CString::new("{broken").unwrap();
+        let bj_ptr = fabushi_host_dispatch(test_host, bad_json.as_ptr());
+        let bj_val: Value =
+            serde_json::from_str(CStr::from_ptr(bj_ptr).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(bj_ptr);
+        assert_eq!(bj_val["ok"], false);
+        assert_eq!(bj_val["error"]["code"], "invalid_json");
+
+        // Trigger panic in test_mode -> returns host_panic, does NOT crash process
+        let panic_res = call_dispatch(
+            test_host,
+            &json!({"id": "p-1", "method": "debug.trigger_panic"}),
+        );
+        assert_eq!(panic_res["ok"], false);
+        assert_eq!(panic_res["error"]["code"], "host_panic");
+
+        // Handle remains healthy after caught panic
+        let after_panic = call_dispatch(
+            test_host,
+            &json!({"id": "p-2", "method": "session.ping", "params": {"nonce": 7}}),
+        );
+        assert_eq!(after_panic["ok"], true);
+        assert_eq!(after_panic["result"]["nonce"], 7);
+        fabushi_host_destroy(test_host);
+
+        // Production handle (test_mode: false) MUST reject debug.trigger_panic with unknown_command
+        let prod_dir = tempdir().unwrap();
+        let prod_cfg = CString::new(
+            json!({
+                "app_data_dir": prod_dir.path().to_string_lossy(),
+                "test_mode": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let prod_host = fabushi_host_create(prod_cfg.as_ptr());
+        assert!(!prod_host.is_null());
+        let prod_panic = call_dispatch(
+            prod_host,
+            &json!({"id": "prod-1", "method": "debug.trigger_panic"}),
+        );
+        assert_eq!(prod_panic["ok"], false);
+        assert_eq!(prod_panic["error"]["code"], "unknown_command");
+        fabushi_host_destroy(prod_host);
+    }
+}
+
+#[test]
+fn test_anti_stub_fail_closed_contracts_and_compat_exports() {
+    let dir = tempdir().unwrap();
+    let cfg_c = CString::new(
+        json!({ "app_data_dir": dir.path().to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Arbitrary unknown commands MUST fail closed with unknown_command (zero fake ack!)
+        for bogus in ["nonexistent.method", "totally_fake", "chats.doesNotExist", "remote.unknownOp"] {
+            let resp = call_dispatch(host, &json!({"id": "u-1", "method": bogus, "params": {}}));
+            let raw = resp.to_string();
+            assert_eq!(resp["ok"], false, "Bogus method {bogus} must fail closed: {raw}");
+            assert_eq!(resp["error"]["code"], "unknown_command");
+            assert!(!raw.contains(r#""status":"acknowledged""#));
+            assert!(!raw.contains("acknowledged"));
+            assert!(!raw.contains("sample_chats"));
+        }
+
+        // 2. Default server URL MUST be http://34.46.77.133:8080 (never localhost:8443)
+        let url_resp = call_dispatch(host, &json!({"id": "u-2", "method": "session.getServerUrl"}));
+        assert_eq!(url_resp["ok"], true);
+        assert_eq!(url_resp["result"]["server_url"], "http://34.46.77.133:8080");
+        assert!(!url_resp.to_string().contains("127.0.0.1:8443"));
+
+        // 3. Fresh chats.list returns real empty array (ZERO fake sample chats!)
+        let chats = call_dispatch(host, &json!({"id": "u-3", "method": "chats.list"}));
+        assert_eq!(chats["ok"], true);
+        assert_eq!(chats["result"].as_array().unwrap().len(), 0);
+        assert!(!chats.to_string().contains("Saved Messages"));
+        assert!(!chats.to_string().contains("Fabushi Community"));
+
+        // 4. Legacy singleton mahayana_app_host_dispatch fails closed
+        let mh_null = mahayana_app_host_dispatch(std::ptr::null());
+        let mh_null_v: Value =
+            serde_json::from_str(CStr::from_ptr(mh_null).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(mh_null);
+        assert_eq!(mh_null_v["ok"], false);
+        assert_eq!(mh_null_v["error"]["code"], "invalid_arguments");
+
+        let req_c = CString::new(r#"{"method":"session.ping"}"#).unwrap();
+        let mh_nohandle = mahayana_app_host_dispatch(req_c.as_ptr());
+        let mh_nh_v: Value =
+            serde_json::from_str(CStr::from_ptr(mh_nohandle).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(mh_nohandle);
+        assert_eq!(mh_nh_v["ok"], false);
+        assert_eq!(mh_nh_v["error"]["code"], "handle_required");
+
+        // 5. Compat exports fail closed instead of faking empty ok:true
+        let bin_bytes: [u8; 4] = [0x0A, 0xFF, 0xFE, 0x01];
+        let tr_ptr = mahayana_cloud_agent_trace_rows(bin_bytes.as_ptr(), bin_bytes.len());
+        let tr_v: Value = serde_json::from_str(CStr::from_ptr(tr_ptr).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(tr_ptr);
+        assert_eq!(tr_v["ok"], false);
+        assert!(tr_v["error"].as_str().unwrap().contains("capability_unavailable"));
+
+        // Real JSONL trace parses cleanly
+        let jsonl = b"{\"step\":1,\"tool\":\"read\"}\n{\"step\":2,\"tool\":\"edit\"}\n";
+        let tr_ok = mahayana_cloud_agent_trace_rows(jsonl.as_ptr(), jsonl.len());
+        let tr_ok_v: Value = serde_json::from_str(CStr::from_ptr(tr_ok).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(tr_ok);
+        assert_eq!(tr_ok_v["ok"], true);
+        assert_eq!(tr_ok_v["rows"].as_array().unwrap().len(), 2);
+
+        // Unsupported .xlsx fails closed
+        let fake_xlsx = CString::new("/nonexistent/book.xlsx").unwrap();
+        let sp_fail = mahayana_spreadsheet_parse_file(fake_xlsx.as_ptr(), 1024 * 1024, 100);
+        let sp_fail_v: Value =
+            serde_json::from_str(CStr::from_ptr(sp_fail).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(sp_fail);
+        assert_eq!(sp_fail_v["ok"], false);
+        assert!(sp_fail_v["error"].as_str().unwrap().contains("capability_unavailable"));
+
+        // Real bounded CSV parses cleanly
+        let csv_path = dir.path().join("ledger.csv");
+        std::fs::write(&csv_path, "name,stars\nalice,100\nbob,250\n").unwrap();
+        let csv_c = CString::new(csv_path.to_str().unwrap()).unwrap();
+        let sp_ok = mahayana_spreadsheet_parse_file(csv_c.as_ptr(), 1024 * 1024, 100);
+        let sp_ok_v: Value = serde_json::from_str(CStr::from_ptr(sp_ok).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(sp_ok);
+        assert_eq!(sp_ok_v["ok"], true);
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["rowCount"], 3);
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["rows"][2][0], "bob");
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_generation_fencing_persistence_and_real_async_cancellation() {
+    let dir = tempdir().unwrap();
+
+    // Start a real slow local TCP loopback HTTP server (sleeps 5s on /health)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let addr = rt.block_on(async {
+        let app = Router::new().route(
+            "/health",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_str = json!({
+        "app_data_dir": dir.path().to_string_lossy(),
+        "server_url": format!("http://{addr}"),
+        "http_timeout_secs": 15
+    })
+    .to_string();
+    let cfg_c = CString::new(cfg_str.clone()).unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Generation fencing
+        let g1 = call_dispatch(host, &json!({"id": "g1", "method": "generation.current"}));
+        assert_eq!(g1["result"]["generation"], 1);
+
+        let g2 = call_dispatch(host, &json!({"id": "g2", "method": "generation.bump"}));
+        assert_eq!(g2["result"]["generation"], 2);
+
+        // Stale generation=1 MUST fail closed with stale_generation
+        let stale = call_dispatch(
+            host,
+            &json!({
+                "id": "g3",
+                "method": "chats.list",
+                "generation": 1
+            }),
+        );
+        assert_eq!(stale["ok"], false);
+        assert_eq!(stale["error"]["code"], "stale_generation");
+        assert_eq!(stale["error"]["retryable"], false);
+        assert_eq!(stale["generation"], 2);
+
+        // Matching generation=2 succeeds
+        let fresh = call_dispatch(
+            host,
+            &json!({
+                "id": "g4",
+                "method": "chats.list",
+                "generation": 2
+            }),
+        );
+        assert_eq!(fresh["ok"], true);
+
+        // 2. Real in-flight async cancellation via fabushi_host_cancel
+        let host_addr = host as usize;
+        let cancel_req_id = "cancel-me-42";
+        let start = Instant::now();
+
+        let dispatch_thread = thread::spawn(move || {
+            let req = CString::new(
+                json!({
+                    "id": cancel_req_id,
+                    "method": "auth.health",
+                    "generation": 2
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ptr = fabushi_host_dispatch(host_addr as *mut c_void, req.as_ptr());
+            let s = CStr::from_ptr(ptr).to_str().unwrap().to_string();
+            fabushi_host_free_string(ptr);
+            serde_json::from_str::<Value>(&s).unwrap()
+        });
+
+        // Wait briefly for request to enter in-flight map, then cancel
+        let req_id_c = CString::new(cancel_req_id).unwrap();
+        let mut cancelled_hit = false;
+        for _ in 0..100 {
+            thread::sleep(Duration::from_millis(20));
+            if fabushi_host_cancel(host, req_id_c.as_ptr()) {
+                cancelled_hit = true;
+                break;
+            }
+        }
+        assert!(cancelled_hit, "fabushi_host_cancel must find and cancel in-flight request");
+
+        let resp = dispatch_thread.join().unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp["ok"], false);
+        assert_eq!(resp["id"], cancel_req_id);
+        assert_eq!(resp["error"]["code"], "cancelled");
+        assert_eq!(resp["error"]["retryable"], false);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Cancellation should abort well before 5s server delay (took {elapsed:?})"
+        );
+
+        fabushi_host_destroy(host);
+
+        // 3. Reopen on same storage_dir -> generation=2 persisted in SQLite WAL!
+        let host2 = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host2.is_null());
+        let g_reopen = call_dispatch(host2, &json!({"id": "g5", "method": "generation.current"}));
+        assert_eq!(g_reopen["result"]["generation"], 2);
+        fabushi_host_destroy(host2);
+    }
+}

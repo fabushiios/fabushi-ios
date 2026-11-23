@@ -566,24 +566,212 @@ class DesktopMainAuthorityTests(unittest.TestCase):
     def test_strict_authority_only_invokes_verify_ios_owners_and_host_cargo_hygiene(self):
         real_lock = validator.document(validator.LOCK)
 
-        # verify_ios_owners inspects source/host/Cargo.toml via verify_cargo_toml_hygiene cleanly
+        # verify_ios_owners inspects source/host/Cargo.toml and invokes verify_host_anti_stub cleanly
         real_hygiene = validator.verify_cargo_toml_hygiene
+        real_anti_stub = validator.verify_host_anti_stub
         owner_errors = []
-        with mock.patch.object(validator, "verify_cargo_toml_hygiene", wraps=real_hygiene) as spy_hygiene:
+        with mock.patch.object(validator, "verify_cargo_toml_hygiene", wraps=real_hygiene) as spy_hygiene, \
+             mock.patch.object(validator, "verify_host_anti_stub", wraps=real_anti_stub) as spy_anti_stub:
             validator.verify_ios_owners(owner_errors, real_lock)
         self.assertEqual(owner_errors, [])
         checked_paths = [call.args[0] for call in spy_hygiene.call_args_list]
         self.assertIn(validator.ROOT / "source/host/Cargo.toml", checked_paths)
+        spy_anti_stub.assert_called_once()
 
-        # --strict --authority-only genuinely dispatches verify_ios_owners
+        # --strict --authority-only genuinely dispatches verify_ios_owners + verify_host_anti_stub
         real_verify_owners = validator.verify_ios_owners
         with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--strict", "--authority-only"]), \
              mock.patch.object(validator, "live_head", return_value=real_lock["commit"]), \
              mock.patch.object(validator, "verify_ios_owners", wraps=real_verify_owners) as spy_owners, \
+             mock.patch.object(validator, "verify_host_anti_stub", wraps=real_anti_stub) as spy_stub_cli, \
              contextlib.redirect_stdout(io.StringIO()):
             rc = validator.run()
         self.assertEqual(rc, 0)
         spy_owners.assert_called_once()
+        spy_stub_cli.assert_called_once()
+
+        # Negative sub-assertion: stub error in verify_host_anti_stub causes --strict to fail closed
+        def inject_stub_error(_root, errs):
+            errs.append("injected stub error")
+
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--strict", "--authority-only"]), \
+             mock.patch.object(validator, "live_head", return_value=real_lock["commit"]), \
+             mock.patch.object(validator, "verify_host_anti_stub", side_effect=inject_stub_error), \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc_fail = validator.run()
+        self.assertEqual(rc_fail, 1)
+
+    def test_host_cargo_manifests_missing_and_recursive_subcrate_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "source/host").mkdir(parents=True)
+
+            # Case 1: missing source/host/Cargo.toml fails closed
+            errs_missing = []
+            validator.verify_host_cargo_manifests(root, validator.FORBIDDEN_MOBILE_DEPS, errs_missing)
+            self.assertTrue(
+                any("missing C-ABI host manifest: source/host/Cargo.toml" in e for e in errs_missing),
+                errs_missing,
+            )
+
+            # Case 2: valid root manifest + top-level source/host/target/ skipped, nested subcrate rejected
+            (root / "source/host/Cargo.toml").write_text(
+                '[package]\nname = "ok"\nversion = "1.0.0"\n[dependencies]\nserde = "1"\n',
+                encoding="utf-8",
+            )
+            (root / "source/host/target/debug").mkdir(parents=True)
+            (root / "source/host/target/debug/Cargo.toml").write_text(
+                '[package]\nname = "build-scratch"\nversion = "0.1.0"\n[dependencies]\ngpui = "0.2"\n',
+                encoding="utf-8",
+            )
+            errs_ok = []
+            validator.verify_host_cargo_manifests(root, validator.FORBIDDEN_MOBILE_DEPS, errs_ok)
+            self.assertEqual(errs_ok, [])
+
+            # Nested subcrate under source/host/subcrate/Cargo.toml with forbidden dep fails closed
+            (root / "source/host/subcrate").mkdir(parents=True)
+            (root / "source/host/subcrate/Cargo.toml").write_text(
+                '[package]\nname = "nested"\nversion = "0.1.0"\n[dependencies]\ngpui = "0.2"\n',
+                encoding="utf-8",
+            )
+            errs_nested = []
+            validator.verify_host_cargo_manifests(root, validator.FORBIDDEN_MOBILE_DEPS, errs_nested)
+            self.assertTrue(any("forbidden mobile dependency" in e for e in errs_nested), errs_nested)
+
+            # Nested target dir inside a subcrate is NOT skipped
+            (root / "source/host/subcrate/Cargo.toml").unlink()
+            (root / "source/host/sub/target").mkdir(parents=True)
+            (root / "source/host/sub/target/Cargo.toml").write_text(
+                '[package]\nname = "tricky"\nversion = "0.1.0"\n[dependencies]\nkhronos-egl = "6"\n',
+                encoding="utf-8",
+            )
+            errs_tricky = []
+            validator.verify_host_cargo_manifests(root, validator.FORBIDDEN_MOBILE_DEPS, errs_tricky)
+            self.assertTrue(any("forbidden mobile dependency" in e for e in errs_tricky), errs_tricky)
+
+    def test_cargo_toml_hygiene_rejects_underscore_dep_aliases_and_replace_at_separator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            toml_path = root / "Cargo.toml"
+
+            # Underscore dev_dependencies / build_dependencies at top-level and under target.*
+            toml_path.write_text(
+                '[package]\nname = "alias-test"\nversion = "0.1.0"\n'
+                '[dev_dependencies]\ngpui = "0.2"\n'
+                '[build_dependencies]\nopenssl_sys = "0.9"\n'
+                '[target.\'cfg(target_os = "ios")\'.dev_dependencies]\n'
+                'evil = { path = "../../outside" }\n'
+                '[target.\'cfg(target_os = "ios")\'.build_dependencies]\n'
+                'local_git = { git = "git+file:///tmp/evil" }\n',
+                encoding="utf-8",
+            )
+            errs_alias = []
+            validator.verify_cargo_toml_hygiene(
+                toml_path, root, validator.FORBIDDEN_MOBILE_DEPS, errs_alias, require_path_exists=False
+            )
+            self.assertTrue(any("[dev_dependencies]" in e for e in errs_alias), errs_alias)
+            self.assertTrue(any("[build_dependencies]" in e for e in errs_alias), errs_alias)
+            self.assertTrue(any("escapes" in e for e in errs_alias), errs_alias)
+            self.assertTrue(any("file://" in e for e in errs_alias), errs_alias)
+
+            # Cargo 1.77+ [replace] '@' PkgId separator & forbidden replace source URLs
+            toml_path.write_text(
+                '[package]\nname = "replace-test"\nversion = "0.1.0"\n'
+                '[replace]\n'
+                '"gpui@0.2.2" = { version = "0.2.2" }\n'
+                '"openssl_sys@0.9.100" = { version = "0.9.100" }\n'
+                '"https://github.com/bhrumom/gpui-telegram#0.1.0" = { version = "0.1.0" }\n'
+                '"git+file:///tmp/evil#serde@1.0" = { version = "1.0" }\n',
+                encoding="utf-8",
+            )
+            errs_rep = []
+            validator.verify_cargo_toml_hygiene(
+                toml_path, root, validator.FORBIDDEN_MOBILE_DEPS, errs_rep, require_path_exists=False
+            )
+            self.assertTrue(any("gpui@0.2.2" in e for e in errs_rep), errs_rep)
+            self.assertTrue(any("openssl_sys@0.9.100" in e for e in errs_rep), errs_rep)
+            self.assertTrue(any("forbidden replace source URL" in e and "bhrumom" in e for e in errs_rep), errs_rep)
+            self.assertTrue(any("forbidden replace source URL" in e and "file://" in e for e in errs_rep), errs_rep)
+
+    def test_release_evidence_rejects_premature_final_acceptance_in_non_complete_mode(self):
+        real_lock = validator.document(validator.LOCK)
+        real_release = validator.document(validator.ROOT / "docs/parity/desktop-main-release-evidence.json")
+
+        # Positive control: finalAcceptance=false passes in complete=False
+        errs_ok = []
+        validator.verify_release_evidence(real_release, real_lock, errs_ok, complete=False)
+        self.assertEqual(errs_ok, [])
+
+        # Negative: finalAcceptance=true while archived / pending ACs / mismatched finalIosCommit MUST fail closed
+        mutated = copy.deepcopy(real_release)
+        mutated["finalAcceptance"] = True
+        mutated["finalIosCommit"] = None
+        errs_bad = []
+        with mock.patch.dict(os.environ, {"IOS_EXPECTED_HEAD": "a" * 40}):
+            validator.verify_release_evidence(mutated, real_lock, errs_bad, complete=False)
+        self.assertTrue(any("premature finalAcceptance=true" in e for e in errs_bad), errs_bad)
+        self.assertTrue(any("finalIosCommit" in e for e in errs_bad), errs_bad)
+        self.assertTrue(any("IOS-MAIN-AC-01" in e for e in errs_bad), errs_bad)
+
+    def test_host_anti_stub_rejects_escaped_quotes_and_localhost_without_scanning_tests_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            host_src = root / "source/host/src"
+            host_tests = root / "source/host/tests"
+            host_src.mkdir(parents=True)
+            host_tests.mkdir(parents=True)
+
+            (host_src / "dispatch.rs").write_text('pub fn dispatch() -> &str { "{}" }\n', encoding="utf-8")
+            # Integration tests under source/host/tests/ may safely contain negative anti-stub assertions
+            (host_tests / "anti_stub.rs").write_text(
+                'assert!(!resp.contains(r#"{"status": "acknowledged"}"#));\n'
+                'assert!(!resp.contains("sample_chats"));\n'
+                'assert!(!resp.contains("https://127.0.0.1:8443"));\n',
+                encoding="utf-8",
+            )
+            errs_clean = []
+            validator.verify_host_anti_stub(root, errs_clean)
+            self.assertEqual(errs_clean, [])
+
+            # Escaped JSON quotes inside source/host/src/ MUST fail closed
+            (host_src / "dispatch.rs").write_text(
+                r'let s = "{\"status\":\"acknowledged\"}";' + "\n", encoding="utf-8"
+            )
+            errs_esc = []
+            validator.verify_host_anti_stub(root, errs_esc)
+            self.assertTrue(any("acknowledged" in e for e in errs_esc), errs_esc)
+
+            # Hardcoded localhost:8443 inside source/host/src/ MUST fail closed
+            (host_src / "dispatch.rs").write_text(
+                'let url = "https://127.0.0.1:8443";\n', encoding="utf-8"
+            )
+            errs_local = []
+            validator.verify_host_anti_stub(root, errs_local)
+            self.assertTrue(any("127.0.0.1:8443" in e for e in errs_local), errs_local)
+
+    def test_test_ready_complete_mode_rejects_unset_or_malformed_ios_expected_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            sha = "a" * 40
+            (root / "TEST_READY.md").write_text(
+                f"Verified on https://github.com/fabushiios/fabushi-ios/actions/runs/987654321 for {sha}\n",
+                encoding="utf-8",
+            )
+            env_without_head = {k: v for k, v in os.environ.items() if k != "IOS_EXPECTED_HEAD"}
+            with mock.patch.dict(os.environ, env_without_head, clear=True):
+                errs_unset = []
+                validator.verify_test_ready_integrity(root, errs_unset, complete=True)
+                self.assertTrue(any("valid 40-hex IOS_EXPECTED_HEAD" in e for e in errs_unset), errs_unset)
+
+            with mock.patch.dict(os.environ, {"IOS_EXPECTED_HEAD": "not-a-sha"}):
+                errs_malformed = []
+                validator.verify_test_ready_integrity(root, errs_malformed, complete=True)
+                self.assertTrue(any("valid 40-hex IOS_EXPECTED_HEAD" in e for e in errs_malformed), errs_malformed)
+
+            with mock.patch.dict(os.environ, {"IOS_EXPECTED_HEAD": sha}):
+                errs_ok = []
+                validator.verify_test_ready_integrity(root, errs_ok, complete=True)
+                self.assertEqual(errs_ok, [])
 
     def test_complete_mode_rejects_archived_legacy_file_ledger_mode(self):
         # Non-complete with closure flags=False passes snapshot validation

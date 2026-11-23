@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ios-gpui-telegram-ci-${{ github.head_ref || github.ref_name }}
+  group: ios-gpui-telegram-ci-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -162,10 +162,13 @@ jobs:
             -p magpie_gateway \
             -p bot-browser \
             -p fabushi_remote_engine \
-            -p fabushi_miniapp
+            -p fabushi_miniapp \
+            -p mahayana-computer \
+            -p mahayana-host-protocol \
+            -p fabushi-messaging-core
           cargo test --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --no-run
 
-      - name: Run full offline tests across all vendored mobile crates
+      - name: Run full offline tests across all vendored mobile & inherited crates
         env:
           GPUI_OFFLINE_TEST: "1"
         run: |
@@ -174,7 +177,7 @@ jobs:
           cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast -j 1 \
             -p gpui_telegram_core
 
-          echo "=== Testing 9 offline mobile crates (process-isolated nextest) ==="
+          echo "=== Testing 9 offline mobile crates + 3 inherited crates (process-isolated nextest) ==="
           cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
             -p gpui_telegram_proto \
             -p gpui_telegram_media \
@@ -184,7 +187,10 @@ jobs:
             -p magpie_gateway \
             -p bot-browser \
             -p fabushi_remote_engine \
-            -p fabushi_miniapp
+            -p fabushi_miniapp \
+            -p mahayana-computer \
+            -p mahayana-host-protocol \
+            -p fabushi-messaging-core
 
           echo "=== Testing crate: fabushi_miniapp (--features server) ==="
           cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
@@ -213,6 +219,15 @@ jobs:
             --test storage_subsystem_tests \
             --test wallet_part2_subsystem_tests \
             --test wallet_part4_subsystem_tests
+
+          echo "=== Testing crate: gpui_telegram_client (deterministic offline subset of 4 mixed suites) ==="
+          cargo nextest run --manifest-path source/desktop_core/Cargo.toml --no-fail-fast \
+            -p gpui_telegram_client \
+            --test challenger_m3_adversarial_stress_tests \
+            --test challenger_m3_f11_f12_adversarial_tests \
+            --test challenger_m4_precedence_and_fault_tests \
+            --test live_cloud_connectivity_tests \
+            -E 'not test(/live_cloud|non_tokio_executor_login|ws_transport_401_terminates_loop/)'
 
       - name: Show sccache statistics
         if: always()
@@ -285,17 +300,17 @@ jobs:
       - name: Verify zero forbidden desktop/EGL crates in iOS dependency trees
         run: |
           set -euo pipefail
-          FORBIDDEN_RE='^(gpui|khronos-egl|khronos_egl|openssl-sys|openssl_sys|xcap|keyring|webrtc|enigo|uiautomation|gpui_telegram_desktop|gpui_telegram_server|gpui_telegram_cli|fabushi_remote_daemon|fabushi_miniapp_wasm|gpui_telegram_test_harness) '
+          FORBIDDEN_RE='^(gpui|khronos[-_]egl|openssl[-_]sys|xcap|keyring|webrtc|enigo|uiautomation|gpui[-_]telegram[-_]desktop|gpui[-_]telegram[-_]server|gpui[-_]telegram[-_]cli|fabushi[-_]remote[-_]daemon|fabushi[-_]miniapp[-_]wasm|gpui[-_]telegram[-_]test[-_]harness) '
           for target in aarch64-apple-ios-sim aarch64-apple-ios; do
             echo "=== Auditing workspace cargo tree for $target ==="
-            TREE="$(cargo tree --manifest-path source/desktop_core/Cargo.toml --workspace --target "$target" --prefix none)"
+            TREE="$(cargo tree --color never --manifest-path source/desktop_core/Cargo.toml --workspace --target "$target" --prefix none)"
             if grep -Eq "$FORBIDDEN_RE" <<< "$TREE"; then
               echo "ERROR: Forbidden crate found in $target workspace dependency tree:"
               grep -E "$FORBIDDEN_RE" <<< "$TREE"
               exit 1
             fi
             echo "=== Auditing fabushi_miniapp (--features server) cargo tree for $target ==="
-            MINIAPP_TREE="$(cargo tree --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --target "$target" --prefix none)"
+            MINIAPP_TREE="$(cargo tree --color never --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --target "$target" --prefix none)"
             if grep -Eq "$FORBIDDEN_RE" <<< "$MINIAPP_TREE"; then
               echo "ERROR: Forbidden crate found in $target fabushi_miniapp (--features server) dependency tree:"
               grep -E "$FORBIDDEN_RE" <<< "$MINIAPP_TREE"
@@ -318,6 +333,262 @@ jobs:
           cargo check --manifest-path source/desktop_core/Cargo.toml --workspace --lib --target aarch64-apple-ios
           cargo check --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --lib --target aarch64-apple-ios-sim
           cargo check --manifest-path source/desktop_core/Cargo.toml -p fabushi_miniapp --features server --lib --target aarch64-apple-ios
+
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  rust-host-ffi-ubuntu:
+    name: Rust Host C-ABI & Integration Tests (Ubuntu + sccache)
+    needs: [authority-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update -o Acquire::Languages=none
+          sudo apt-get install -y --no-install-recommends \
+            mold clang pkg-config cmake protobuf-compiler libclang-dev \
+            libssl-dev libsqlite3-dev libzstd-dev \
+            libegl-dev libpipewire-0.3-dev libspa-0.2-dev libgbm-dev libdrm-dev \
+            libdbus-1-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Rust toolchain >= 1.85 (edition 2024)
+        run: rustc --version && cargo --version
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source/host -> target
+          cache-on-failure: true
+          shared-key: "ubuntu-m1b-host-ffi-v1"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Start sccache server
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sccache --start-server; then
+              exit 0
+            fi
+            echo "sccache --start-server attempt $attempt failed; waiting before retry..."
+            sccache --stop-server >/dev/null 2>&1 || true
+            sleep $((attempt * 5))
+          done
+          echo "sccache server did not start cleanly; falling back to Swatinem/rust-cache without sccache wrapper"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+      - name: Compile source/host library & all test targets (--no-run)
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path source/host/Cargo.toml --lib
+          cargo test --manifest-path source/host/Cargo.toml --no-run
+
+      - name: Execute all source/host unit and integration tests
+        run: |
+          set -euo pipefail
+          cargo nextest run --manifest-path source/host/Cargo.toml --no-fail-fast
+
+      - name: Verify zero leaked test artifacts in git working tree
+        run: |
+          set -euo pipefail
+          STATUS="$(git status --porcelain --untracked-files=all -- . ':!source/host/Cargo.lock')"
+          if [[ -n "$STATUS" ]]; then
+            echo "ERROR: Unexpected dirty/untracked files after tests:"
+            echo "$STATUS"
+            exit 1
+          fi
+          echo "PASS: Working tree clean after source/host tests."
+
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Verify live Desktop main unchanged at job end
+        if: always()
+        run: python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+  rust-host-ios-staticlib:
+    name: Rust Host iOS Staticlib, C11 Header & Symbol Proof (macOS-15 + sccache)
+    needs: [authority-check]
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact iOS source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.IOS_EXPECTED_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout & live Desktop main at start
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$IOS_EXPECTED_HEAD"
+          python3 scripts/check-desktop-main-ios-architecture.py --authority-only
+
+      - name: Verify Xcode SDKs and build tools (protoc + cmake)
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+          command -v protoc >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install protobuf
+          command -v cmake >/dev/null 2>&1 || HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source/host -> target
+          cache-on-failure: true
+          shared-key: "macos15-m1b-host-staticlib-v1"
+
+      - name: Start sccache server
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sccache --start-server; then
+              exit 0
+            fi
+            echo "sccache --start-server attempt $attempt failed; waiting before retry..."
+            sccache --stop-server >/dev/null 2>&1 || true
+            sleep $((attempt * 5))
+          done
+          echo "sccache server did not start cleanly; falling back to Swatinem/rust-cache without sccache wrapper"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+      - name: Audit source/host iOS dependency trees (zero forbidden crates)
+        run: |
+          set -euo pipefail
+          FORBIDDEN_RE='^(gpui|khronos[-_]egl|openssl[-_]sys|xcap|keyring|webrtc|enigo|uiautomation|gpui[-_]telegram[-_]desktop|gpui[-_]telegram[-_]server|gpui[-_]telegram[-_]cli|fabushi[-_]remote[-_]daemon|fabushi[-_]miniapp[-_]wasm|gpui[-_]telegram[-_]test[-_]harness) '
+          for target in aarch64-apple-ios-sim aarch64-apple-ios; do
+            echo "=== Auditing source/host cargo tree for $target ==="
+            TREE="$(cargo tree --color never --manifest-path source/host/Cargo.toml --target "$target" --prefix none)"
+            if grep -Eq "$FORBIDDEN_RE" <<< "$TREE"; then
+              echo "ERROR: Forbidden crate found in source/host $target dependency tree:"
+              grep -E "$FORBIDDEN_RE" <<< "$TREE"
+              exit 1
+            fi
+          done
+          echo "PASS: Zero forbidden crates in source/host iOS dependency trees."
+
+      - name: Build libmahayana_app_host.a for iphonesimulator and iphoneos
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/source/host/target
+          CONFIGURATION: Release
+          FORCE_RELEASE: "1"
+          IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        run: |
+          set -euo pipefail
+          bash scripts/build-mahayana-ios.sh iphonesimulator arm64
+          bash scripts/build-mahayana-ios.sh iphoneos arm64
+
+      - name: Verify C11 header syntax against both iOS SDKs
+        run: |
+          set -euo pipefail
+          xcrun --sdk iphonesimulator clang -fsyntax-only -std=c11 -Wall -Wextra -Werror source/host/include/mahayana_app_host.h
+          xcrun --sdk iphoneos clang -fsyntax-only -std=c11 -Wall -Wextra -Werror source/host/include/mahayana_app_host.h
+          echo "PASS: source/host/include/mahayana_app_host.h passed strict C11 -Wall -Wextra -Werror on iphonesimulator & iphoneos."
+
+      - name: Verify all 29 exported Mach-O C-ABI symbols and arm64 architecture on both staticlibs
+        run: |
+          set -euo pipefail
+          REQUIRED_SYMBOLS=(
+            _fabushi_host_create
+            _fabushi_host_dispatch
+            _fabushi_host_poll_events
+            _fabushi_host_cancel
+            _fabushi_host_destroy
+            _fabushi_host_free_string
+            _fabushi_host_last_error
+            _telegram_app_host_create
+            _telegram_app_host_create_test
+            _telegram_app_host_last_error
+            _telegram_app_host_dispatch
+            _telegram_app_host_dispatch_with_handle
+            _telegram_bridge_register_event_callback
+            _telegram_app_host_free_string
+            _telegram_app_host_destroy
+            _telegram_replay_window_create
+            _telegram_replay_window_check_and_add
+            _telegram_replay_window_destroy
+            _telegram_proto_max_packet_size
+            _mahayana_app_host_create
+            _mahayana_app_host_create_with_storage_passphrase
+            _mahayana_app_host_create_test
+            _mahayana_app_host_last_error
+            _mahayana_app_host_dispatch_with_handle
+            _mahayana_app_host_dispatch
+            _mahayana_app_host_free_string
+            _mahayana_app_host_destroy
+            _mahayana_cloud_agent_trace_rows
+            _mahayana_spreadsheet_parse_file
+          )
+          for lib in build/rust/iphonesimulator/libmahayana_app_host.a build/rust/iphoneos/libmahayana_app_host.a; do
+            echo "=== Inspecting $lib ==="
+            test -s "$lib"
+            lipo -info "$lib" | grep -q "arm64"
+            SYMBOLS="$(nm -gU "$lib")"
+            for sym in "${REQUIRED_SYMBOLS[@]}"; do
+              if ! grep -Eq "[[:space:]]T[[:space:]]+${sym}$" <<< "$SYMBOLS"; then
+                echo "ERROR: Missing global text symbol ${sym} in ${lib}"
+                exit 1
+              fi
+            done
+            echo "PASS: All ${#REQUIRED_SYMBOLS[@]} required Mach-O C-ABI symbols verified in ${lib}."
+          done
+
+      - name: Compute SHA-256 checksums for iOS staticlib artifacts
+        run: |
+          set -euo pipefail
+          shasum -a 256 \
+            build/rust/iphonesimulator/libmahayana_app_host.a \
+            build/rust/iphoneos/libmahayana_app_host.a \
+            source/host/include/mahayana_app_host.h | tee build/rust/SHA256SUMS.txt
+
+      - name: Upload iOS Rust staticlib artifacts & checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabushi-rust-host-ios-staticlibs-${{ env.IOS_EXPECTED_HEAD }}
+          path: |
+            build/rust/iphonesimulator/libmahayana_app_host.a
+            build/rust/iphoneos/libmahayana_app_host.a
+            build/rust/SHA256SUMS.txt
+            source/host/include/mahayana_app_host.h
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Show sccache statistics
         if: always()
