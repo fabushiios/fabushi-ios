@@ -1,14 +1,14 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use gpui_telegram_core::types::{ChatId, MessageId, PeerId, UserId};
@@ -1001,8 +1001,8 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             .as_u64()
             .unwrap();
 
-        // 1. Invalid URL (including malformed bracketed IPv6 ports, NB2-02) MUST fail atomically
-        //    without breaking live host or wiping session/vault!
+        // 1. Invalid URL (including malformed bracketed IPv6 & RFC 3986 ports, NB2-02/NB3-03/NB4-02)
+        //    MUST fail atomically without breaking live host or wiping session/vault!
         for bad_url in [
             "",
             "   ",
@@ -1016,6 +1016,10 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             "http://[::1]]:8080",
             "http://[]",
             "http://foo[::1]:8080",
+            "http://[::1]:+8080",
+            "http://[::1]:0",
+            "http://example.com:+80",
+            "http://example.com:0",
         ] {
             let bad = dispatch(
                 host,
@@ -2330,6 +2334,496 @@ fn test_b3_02_session_set_token_wipes_scope_clears_identity_and_null_revokes_bea
         assert_eq!(
             dispatch(host, &json!({"method": "auth.me"}))["error"]["code"],
             "unauthorized"
+        );
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_b4_02_zero_cross_account_bearer_token_leakage_under_concurrent_switch_login_set_token() {
+    let dir = tempdir().unwrap();
+    let wire_log: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let round_a_hits = Arc::new(AtomicUsize::new(0));
+
+    let wire_log_del = Arc::clone(&wire_log);
+    let round_a_hits_del = Arc::clone(&round_a_hits);
+    let wire_log_me = Arc::clone(&wire_log);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|Json(body): Json<Value>| async move {
+                    let user = body["username"].as_str().unwrap_or("");
+                    if user == "bob_b402" {
+                        Json(json!({
+                            "user_id": 202,
+                            "username": "bob_b402",
+                            "session_id": "sess-bob-b402",
+                            "token": "TOK_B",
+                            "first_name": "Bob"
+                        }))
+                    } else {
+                        Json(json!({
+                            "user_id": 101,
+                            "username": "alice_b402",
+                            "session_id": "sess-alice-b402",
+                            "token": "TOK_A",
+                            "first_name": "Alice"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/sessions/{session_id}",
+                delete(move |Path(session_id): Path<String>, headers: HeaderMap| {
+                    let log = Arc::clone(&wire_log_del);
+                    let hits = Arc::clone(&round_a_hits_del);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        if session_id.starts_with("acctA-") {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        log.lock().unwrap().push((session_id, auth_val));
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/me",
+                get(move |headers: HeaderMap| {
+                    let log = Arc::clone(&wire_log_me);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        log.lock().unwrap().push(("auth.me".to_string(), auth_val));
+                        Json(json!({
+                            "user_id": 101,
+                            "username": "caller_b402",
+                            "first_name": "Caller",
+                            "session_id": "sess-me-b402"
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    // Enable storage_passphrase so persist_account_record runs full HKDF + ChaCha20-Poly1305 AEAD
+    // + synchronous SQLite WAL disk I/O inside finalize_authenticated_session!
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "storage_passphrase": "b402-aead-passphrase",
+            "server_url": format!("http://{addr}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        // Prime Account B ("202") in host_state.db so session.switchAccount("202") can restore it
+        let prime_b = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "bob_b402", "password": "pw"}}),
+        );
+        assert_eq!(prime_b["ok"], true, "Prime login Bob failed: {prime_b}");
+
+        let mut total_a_wire_hits = 0usize;
+        let mut total_stale_rejections = 0usize;
+
+        // Exercise ALL 3 session-installing paths under continuous concurrent Account A RPCs:
+        // Rounds 0, 1: auth.login (Account B TOK_B)
+        // Rounds 2, 3: session.switchAccount("202") (Account B TOK_B)
+        // Rounds 4, 5: session.setToken({"token": "TOK_C"}) (Token-only TOK_C)
+        for round in 0..6usize {
+            let login_a = dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_b402", "password": "pw"}}),
+            );
+            assert_eq!(login_a["ok"], true, "Round {round} login Alice failed: {login_a}");
+            let gen_a = login_a["generation"].as_u64().unwrap();
+
+            // Baseline verification at gen_a
+            let base_me = dispatch(
+                host,
+                &json!({"method": "auth.me", "generation": gen_a}),
+            );
+            assert_eq!(base_me["ok"], true);
+            assert_eq!(
+                wire_log.lock().unwrap().last().map(|(_, auth)| auth.as_str()),
+                Some("Bearer TOK_A")
+            );
+
+            round_a_hits.store(0, Ordering::SeqCst);
+            let round_log_start = wire_log.lock().unwrap().len();
+            let round_stop = Arc::new(AtomicBool::new(false));
+            let stale_counter = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(5));
+
+            let mut workers = Vec::new();
+            for w in 0..4usize {
+                let stop_w = Arc::clone(&round_stop);
+                let stale_w = Arc::clone(&stale_counter);
+                let bar_w = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    bar_w.wait();
+                    let mut seq = 0usize;
+                    while !stop_w.load(Ordering::Acquire) {
+                        let resp = if seq % 2 == 0 {
+                            dispatch(
+                                host_addr as *mut c_void,
+                                &json!({
+                                    "id": format!("b402-r{round}-w{w}-s{seq}"),
+                                    "method": "session.revoke",
+                                    "generation": gen_a,
+                                    "params": { "session_id": format!("acctA-r{round}-g{gen_a}-w{w}-{seq}") }
+                                }),
+                            )
+                        } else {
+                            dispatch(
+                                host_addr as *mut c_void,
+                                &json!({
+                                    "id": format!("b402-r{round}-w{w}-m{seq}"),
+                                    "method": "auth.me",
+                                    "generation": gen_a
+                                }),
+                            )
+                        };
+                        if resp["ok"] == false && resp["error"]["code"] == "stale_generation" {
+                            stale_w.fetch_add(1, Ordering::Relaxed);
+                        }
+                        seq += 1;
+                    }
+                }));
+            }
+
+            // Release all 4 workers and wait until genuine Account A traffic is actively hitting the server
+            barrier.wait();
+            let active_deadline = Instant::now() + Duration::from_secs(2);
+            while round_a_hits.load(Ordering::SeqCst) < 4 && Instant::now() < active_deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                round_a_hits.load(Ordering::SeqCst) >= 4,
+                "Round {round} workers must actively execute Account A RPCs before transition"
+            );
+
+            // Execute the racing session transition while all 4 workers hammer generation == gen_a
+            let (transition_resp, expected_after_auth) = match round {
+                0 | 1 => (
+                    dispatch(
+                        host,
+                        &json!({"method": "auth.login", "params": {"username": "bob_b402", "password": "pw"}}),
+                    ),
+                    "Bearer TOK_B",
+                ),
+                2 | 3 => (
+                    dispatch(
+                        host,
+                        &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+                    ),
+                    "Bearer TOK_B",
+                ),
+                _ => (
+                    dispatch(
+                        host,
+                        &json!({"method": "session.setToken", "params": {"token": "TOK_C"}}),
+                    ),
+                    "Bearer TOK_C",
+                ),
+            };
+            assert_eq!(
+                transition_resp["ok"], true,
+                "Round {round} transition failed: {transition_resp}"
+            );
+            let new_gen = transition_resp["generation"].as_u64().unwrap();
+            assert!(new_gen > gen_a, "Round {round} must advance generation");
+
+            // Keep hammering with stale gen_a for 25ms AFTER transition completes
+            thread::sleep(Duration::from_millis(25));
+            round_stop.store(true, Ordering::Release);
+            for w in workers {
+                w.join().expect("B4-02 worker thread must not panic");
+            }
+
+            // Inspect EVERY wire request observed during the round: ZERO gen_a RPCs may EVER
+            // carry Bearer TOK_B or Bearer TOK_C!
+            {
+                let entries = wire_log.lock().unwrap();
+                for (tag, auth_header) in &entries[round_log_start..] {
+                    assert_eq!(
+                        auth_header, "Bearer TOK_A",
+                        "CROSS-ACCOUNT BEARER TOKEN LEAKAGE in round {round} on tag='{tag}': got '{auth_header}' instead of 'Bearer TOK_A' (B4-02)"
+                    );
+                }
+            }
+
+            total_a_wire_hits += round_a_hits.load(Ordering::SeqCst);
+            total_stale_rejections += stale_counter.load(Ordering::Relaxed);
+
+            // Verify the new session genuinely transmits TOK_B / TOK_C at new_gen
+            let verify_new = dispatch(
+                host,
+                &json!({"method": "auth.me", "generation": new_gen}),
+            );
+            assert_eq!(verify_new["ok"], true, "Round {round} post-transition auth.me failed: {verify_new}");
+            assert_eq!(
+                wire_log.lock().unwrap().last().map(|(_, auth)| auth.as_str()),
+                Some(expected_after_auth),
+                "Round {round} post-transition auth.me must authenticate with {expected_after_auth}"
+            );
+        }
+
+        assert!(
+            total_a_wire_hits >= 24,
+            "Expected >= 24 real Account A wire hits across 6 rounds, got {total_a_wire_hits}"
+        );
+        assert!(
+            total_stale_rejections > 0,
+            "Expected concurrent stale_generation rejections across 6 rounds, got 0"
+        );
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_nb4_01_persistence_rollback_preserves_storage_error_while_raced_network_error_returns_stale_generation() {
+    let dir = tempdir().unwrap();
+    let slow_entered = Arc::new(AtomicBool::new(false));
+    let slow_release = Arc::new(AtomicBool::new(false));
+    let slow_entered_srv = Arc::clone(&slow_entered);
+    let slow_release_srv = Arc::clone(&slow_release);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(move |Json(body): Json<Value>| {
+                    let entered = Arc::clone(&slow_entered_srv);
+                    let release = Arc::clone(&slow_release_srv);
+                    async move {
+                        match body["username"].as_str().unwrap_or("") {
+                            "charlie_kv_fail" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "user_id": 303,
+                                    "username": "charlie_kv_fail",
+                                    "session_id": "sess-charlie-303",
+                                    "token": "TOK_CHARLIE_303",
+                                    "first_name": "Charlie"
+                                })),
+                            ),
+                            "dave_meta_fail" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "user_id": 404,
+                                    "username": "dave_meta_fail",
+                                    "session_id": "sess-dave-404",
+                                    "token": "TOK_DAVE_404",
+                                    "first_name": "Dave"
+                                })),
+                            ),
+                            "slow_net_fail" => {
+                                entered.store(true, Ordering::SeqCst);
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                while !release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({ "error": "injected_upstream_500" })),
+                                )
+                            }
+                            _ => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "user_id": 101,
+                                    "username": "alice_nb401",
+                                    "session_id": "sess-alice-101",
+                                    "token": "TOK_ALICE_101",
+                                    "first_name": "Alice"
+                                })),
+                            ),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/me",
+                get(|| async {
+                    Json(json!({
+                        "user_id": 101,
+                        "username": "alice_nb401",
+                        "first_name": "Alice",
+                        "session_id": "sess-alice-101"
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        let login_alice = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_nb401", "password": "pw"}}),
+        );
+        assert_eq!(login_alice["ok"], true);
+        let gen_alice = login_alice["generation"].as_u64().unwrap();
+
+        // Inject deterministic SQLite failures on host_kv ('303') and host_meta ('active_account_id' = '404')
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_charlie_kv
+                 BEFORE INSERT ON host_kv
+                 WHEN NEW.namespace = 'accounts' AND NEW.key = '303'
+                 BEGIN SELECT RAISE(ABORT, 'injected_kv_failure'); END;
+
+                 CREATE TRIGGER fail_dave_meta_ins
+                 BEFORE INSERT ON host_meta
+                 WHEN NEW.key = 'active_account_id' AND NEW.value = '404'
+                 BEGIN SELECT RAISE(ABORT, 'injected_meta_failure'); END;
+
+                 CREATE TRIGGER fail_dave_meta_upd
+                 BEFORE UPDATE ON host_meta
+                 WHEN NEW.key = 'active_account_id' AND NEW.value = '404'
+                 BEGIN SELECT RAISE(ABORT, 'injected_meta_failure'); END;",
+            )
+            .unwrap();
+        }
+
+        // 1. persist_account_record kv_set failure MUST preserve storage_error (NOT stale_generation),
+        //    bump generation on rollback, keep live_client cleared, and NOT persist account 303.
+        let charlie_res = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "charlie_kv_fail", "password": "pw"}}),
+        );
+        assert_eq!(charlie_res["ok"], false);
+        assert_eq!(
+            charlie_res["error"]["code"], "storage_error",
+            "Rollback storage error on kv_set MUST NOT be masked as stale_generation (NB4-01): {charlie_res}"
+        );
+        let gen_after_charlie = charlie_res["generation"].as_u64().unwrap();
+        assert!(gen_after_charlie > gen_alice);
+        assert_eq!(
+            dispatch(host, &json!({"method": "auth.me"}))["error"]["code"],
+            "unauthorized",
+            "Rolled-back auth.login MUST leave live_client token cleared (B4-02)"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            Value::Null
+        );
+
+        // 2. set_meta("active_account_id") failure MUST preserve storage_error (NOT stale_generation),
+        //    bump generation on rollback, and leave live_client cleared.
+        let dave_res = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "dave_meta_fail", "password": "pw"}}),
+        );
+        assert_eq!(dave_res["ok"], false);
+        assert_eq!(
+            dave_res["error"]["code"], "storage_error",
+            "Rollback storage error on set_meta MUST NOT be masked as stale_generation (NB4-01): {dave_res}"
+        );
+        let gen_after_dave = dave_res["generation"].as_u64().unwrap();
+        assert!(gen_after_dave > gen_after_charlie);
+        assert_eq!(
+            dispatch(host, &json!({"method": "auth.me"}))["error"]["code"],
+            "unauthorized"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            Value::Null
+        );
+
+        // Clean up injected SQLite triggers
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER fail_charlie_kv;
+                 DROP TRIGGER fail_dave_meta_ins;
+                 DROP TRIGGER fail_dave_meta_upd;",
+            )
+            .unwrap();
+        }
+
+        // 3. Contrast case: a slow failing network auth.login where THIS handler did NOT bump
+        //    generation, raced by another thread bumping generation, MUST STILL return stale_generation!
+        let slow_thread = thread::spawn(move || {
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({"method": "auth.login", "params": {"username": "slow_net_fail", "password": "pw"}}),
+            )
+        });
+        let enter_deadline = Instant::now() + Duration::from_secs(3);
+        while !slow_entered.load(Ordering::SeqCst) && Instant::now() < enter_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slow_entered.load(Ordering::SeqCst));
+        let bumped = dispatch(host, &json!({"method": "generation.bump"}));
+        assert_eq!(bumped["ok"], true);
+        slow_release.store(true, Ordering::SeqCst);
+
+        let slow_res = slow_thread.join().expect("slow_net_fail thread must not panic");
+        assert_eq!(slow_res["ok"], false);
+        assert_eq!(
+            slow_res["error"]["code"], "stale_generation",
+            "Network failure raced by another thread's generation bump MUST still fail closed with stale_generation (NB4-01): {slow_res}"
         );
 
         fabushi_host_destroy(host);

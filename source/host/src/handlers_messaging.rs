@@ -432,8 +432,8 @@ pub fn handle_chats(
         }
         "sendAsPeers" => {
             let chat_id = req_i64(params, "chat_id")?;
-            let token = client
-                .token()
+            let token = host
+                .fenced_client_token(&client)?
                 .ok_or_else(|| HostError::unauthorized("No active session token"))?;
             let res = host.run_cancellable(req_id, async move {
                 client
@@ -775,7 +775,7 @@ pub fn handle_messages(
                 .get("local_only")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let remote_delivery = !local_only && client.token().is_some();
+            let remote_delivery = !local_only && host.fenced_client_token(&client)?.is_some();
 
             let timestamp = now.timestamp_millis();
             let mut assigned_id = host.next_message_id();

@@ -995,23 +995,21 @@ pub fn handle_magpie(
             to_val(resolved)
         }
         "state" => {
-            if client.token().is_some()
-                && params
-                    .get("remote")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+            if params
+                .get("remote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
             {
-                let token = client
-                    .token()
-                    .ok_or_else(|| HostError::unauthorized("No active token"))?;
-                let res = host.run_cancellable(req_id, async move {
-                    client
-                        .hermes
-                        .magpie_state(&token)
-                        .await
-                        .map_err(HostError::from)
-                })?;
-                return to_val(res);
+                if let Some(token) = host.fenced_client_token(&client)? {
+                    let res = host.run_cancellable(req_id, async move {
+                        client
+                            .hermes
+                            .magpie_state(&token)
+                            .await
+                            .map_err(HostError::from)
+                    })?;
+                    return to_val(res);
+                }
             }
             let groups: Vec<_> = host.magpie_groups.lock().values().cloned().collect();
             let usage = host.magpie_usage.lock().summary(None);

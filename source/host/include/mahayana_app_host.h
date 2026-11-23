@@ -126,6 +126,17 @@ char *telegram_app_host_dispatch_with_handle(
 /**
  * Registers or unregisters a push event callback.
  * Pass NULL for `callback` to unregister safely without undefined behavior.
+ *
+ * Concurrency & lifecycle contract:
+ *   - Push callbacks execute serially under a single-owner re-entrant gate
+ *     (the active callback thread may re-enter or call this function safely
+ *     without deadlocking).
+ *   - Unregistering (NULL) or replacing a callback drains any in-flight
+ *     callback executing on other threads before returning, so callers may
+ *     safely release the previous `user_context` immediately upon return.
+ *   - Callers MUST NOT race `telegram_bridge_register_event_callback` against
+ *     `fabushi_host_destroy` (or legacy destroy aliases) on the same handle;
+ *     `fabushi_host_destroy` itself drains all active callbacks before returning.
  */
 void telegram_bridge_register_event_callback(
     void *host,

@@ -1,6 +1,6 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -895,7 +895,14 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
         release: AtomicBool,
         exited: AtomicBool,
         unregister_returned: AtomicBool,
-        post_unregister_callbacks: AtomicUsize,
+        post_unregister_callbacks: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for UnregDrainCtx {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     unsafe extern "C" fn on_blocking_cb(
@@ -974,13 +981,16 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
         let host_addr = host as usize;
 
         // 1. Unregister (NULL callback) while host remains ALIVE MUST block until in-flight
-        //    C callback on Thread 1 completes before caller frees ctx_1 (B3-03).
+        //    C callback on Thread 1 completes before caller frees ctx_1 (B3-03 + NB4-01).
+        let post_unreg_1 = Arc::new(AtomicUsize::new(0));
+        let dropped_1 = Arc::new(AtomicBool::new(false));
         let ctx_1 = Arc::new(UnregDrainCtx {
             entered: AtomicBool::new(false),
             release: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             unregister_returned: AtomicBool::new(false),
-            post_unregister_callbacks: AtomicUsize::new(0),
+            post_unregister_callbacks: Arc::clone(&post_unreg_1),
+            dropped: Arc::clone(&dropped_1),
         });
         let raw_ctx_1 = Arc::into_raw(Arc::clone(&ctx_1)) as *mut c_void;
         telegram_bridge_register_event_callback(host, Some(on_blocking_cb), raw_ctx_1);
@@ -1021,10 +1031,15 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
 
         assert!(ctx_1.exited.load(Ordering::SeqCst));
         assert!(ctx_1.unregister_returned.load(Ordering::SeqCst));
-        assert_eq!(ctx_1.post_unregister_callbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(post_unreg_1.load(Ordering::SeqCst), 0);
 
-        // Immediately free ctx_1 while host stays ALIVE and dispatch again -> ZERO UAF!
+        // Truly drop ctx_1 to refcount 0 BEFORE b303-t2 while host stays ALIVE -> ZERO UAF!
+        drop(ctx_1);
         drop(Arc::from_raw(raw_ctx_1 as *const UnregDrainCtx));
+        assert!(
+            dropped_1.load(Ordering::SeqCst),
+            "ctx_1 MUST truly drop to refcount 0 before b303-t2"
+        );
         let alive_after_unreg = call_dispatch(
             host,
             &json!({"id": "b303-alive-1", "method": "fabushi.createTask", "params": {"task_id": "b303-t2"}}),
@@ -1034,15 +1049,23 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
             call_dispatch(host, &json!({"id": "b303-ping", "method": "session.ping"}))["ok"],
             true
         );
+        assert_eq!(
+            post_unreg_1.load(Ordering::SeqCst),
+            0,
+            "post_unregister_callbacks MUST remain 0 AFTER b303-t2"
+        );
 
         // 2. Replacing callback (cb_1b -> cb_2) ALSO drains cb_1b before returning and routes
         //    subsequent events strictly to cb_2!
+        let post_unreg_1b = Arc::new(AtomicUsize::new(0));
+        let dropped_1b = Arc::new(AtomicBool::new(false));
         let ctx_1b = Arc::new(UnregDrainCtx {
             entered: AtomicBool::new(false),
             release: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             unregister_returned: AtomicBool::new(false),
-            post_unregister_callbacks: AtomicUsize::new(0),
+            post_unregister_callbacks: Arc::clone(&post_unreg_1b),
+            dropped: Arc::clone(&dropped_1b),
         });
         let raw_ctx_1b = Arc::into_raw(Arc::clone(&ctx_1b)) as *mut c_void;
         let ctx_2 = Arc::new(CounterCtx {
@@ -1085,10 +1108,15 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
         assert_eq!(emitter2.join().expect("emitter2 must not panic")["ok"], true);
         replacer.join().expect("replacer must not panic");
         assert!(ctx_1b.exited.load(Ordering::SeqCst));
-        assert_eq!(ctx_1b.post_unregister_callbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(post_unreg_1b.load(Ordering::SeqCst), 0);
 
-        // Free ctx_1b immediately and verify replacement cb_2 receives new events cleanly
+        // Truly free ctx_1b to refcount 0 BEFORE b303-t4 and verify cb_2 receives new events cleanly
+        drop(ctx_1b);
         drop(Arc::from_raw(raw_ctx_1b as *const UnregDrainCtx));
+        assert!(
+            dropped_1b.load(Ordering::SeqCst),
+            "ctx_1b MUST truly drop to refcount 0 before b303-t4"
+        );
         assert_eq!(
             call_dispatch(
                 host,
@@ -1096,6 +1124,7 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
             )["ok"],
             true
         );
+        assert_eq!(post_unreg_1b.load(Ordering::SeqCst), 0);
         assert_eq!(ctx_2.count.load(Ordering::SeqCst), 1);
 
         telegram_bridge_register_event_callback(host, None, std::ptr::null_mut());
@@ -1134,6 +1163,279 @@ fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf
 
         fabushi_host_destroy(host);
         drop(Arc::from_raw(raw_ctx_reent as *const ReentrantUnregCtx));
+    }
+}
+
+#[test]
+fn test_b4_01_multithread_reentrant_unregister_and_non_pump_set_server_url_no_deadlock() {
+    let dir = tempdir().unwrap();
+    let cfg_c = CString::new(
+        json!({ "app_data_dir": dir.path().to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+
+    struct OneShotCtx {
+        host_addr: usize,
+        invocations: AtomicUsize,
+        in_callback: AtomicUsize,
+        max_concurrent: AtomicUsize,
+        unregister_done: AtomicBool,
+    }
+
+    unsafe extern "C" fn on_oneshot_self_unregister_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        if ev == "taskStateUpdated" {
+            let st = unsafe { &*(user_ctx as *const OneShotCtx) };
+            let cur = st.in_callback.fetch_add(1, Ordering::SeqCst) + 1;
+            st.max_concurrent.fetch_max(cur, Ordering::SeqCst);
+            st.invocations.fetch_add(1, Ordering::SeqCst);
+            // Hold briefly to guarantee the second concurrent emitter thread overlaps on callback_gate!
+            thread::sleep(Duration::from_millis(30));
+            unsafe {
+                telegram_bridge_register_event_callback(
+                    st.host_addr as *mut c_void,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+            st.unregister_done.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
+            st.in_callback.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct NonPumpReconfigCtx {
+        host_addr: usize,
+        entered: AtomicBool,
+        response_ok: AtomicBool,
+        error_code: Mutex<String>,
+    }
+
+    unsafe extern "C" fn on_non_pump_set_server_url_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        if ev == "taskStateUpdated" {
+            let st = unsafe { &*(user_ctx as *const NonPumpReconfigCtx) };
+            if !st.entered.swap(true, Ordering::SeqCst) {
+                let resp = unsafe {
+                    call_dispatch(
+                        st.host_addr as *mut c_void,
+                        &json!({
+                            "id": "b401-reconfig-from-cb",
+                            "method": "session.setServerUrl",
+                            "params": { "server_url": "http://127.0.0.1:19999" }
+                        }),
+                    )
+                };
+                st.response_ok
+                    .store(resp["ok"].as_bool().unwrap_or(true), Ordering::SeqCst);
+                *st.error_code.lock().unwrap() = resp["error"]["code"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+    }
+
+    struct NestedEmitCtx {
+        host_addr: usize,
+        count: AtomicUsize,
+    }
+
+    unsafe extern "C" fn on_nested_emit_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        if ev == "taskStateUpdated" {
+            let st = unsafe { &*(user_ctx as *const NestedEmitCtx) };
+            let prev = st.count.fetch_add(1, Ordering::SeqCst);
+            if prev == 0 {
+                // Re-entrant nested emit on the SAME callback owner thread exercises active_depth: 1 -> 2 -> 1 -> 0
+                let nested = unsafe {
+                    call_dispatch(
+                        st.host_addr as *mut c_void,
+                        &json!({
+                            "id": "b401-nested-inner",
+                            "method": "fabushi.createTask",
+                            "params": { "task_id": "b401-nested-inner-task" }
+                        }),
+                    )
+                };
+                assert_eq!(nested["ok"], true);
+            }
+        }
+    }
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        // 1. Two concurrent emitter threads invoking a self-unregistering one-shot callback MUST
+        //    complete with ZERO deadlock, invoke the callback EXACTLY ONCE (count == 1), never
+        //    enter concurrently (max_concurrent == 1), and leave the host alive and responsive.
+        let ctx_oneshot = Arc::new(OneShotCtx {
+            host_addr,
+            invocations: AtomicUsize::new(0),
+            in_callback: AtomicUsize::new(0),
+            max_concurrent: AtomicUsize::new(0),
+            unregister_done: AtomicBool::new(false),
+        });
+        let raw_oneshot = Arc::into_raw(Arc::clone(&ctx_oneshot)) as *mut c_void;
+        telegram_bridge_register_event_callback(
+            host,
+            Some(on_oneshot_self_unregister_cb),
+            raw_oneshot,
+        );
+
+        let start_barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&start_barrier);
+        let t1 = thread::spawn(move || {
+            b1.wait();
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "b401-mt-1", "method": "fabushi.createTask", "params": {"task_id": "b401-t1"}}),
+            )
+        });
+        let b2 = Arc::clone(&start_barrier);
+        let t2 = thread::spawn(move || {
+            b2.wait();
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "b401-mt-2", "method": "fabushi.createTask", "params": {"task_id": "b401-t2"}}),
+            )
+        });
+
+        let r1 = t1.join().expect("emitter t1 must not panic or deadlock");
+        let r2 = t2.join().expect("emitter t2 must not panic or deadlock");
+        assert_eq!(r1["ok"], true);
+        assert_eq!(r2["ok"], true);
+        assert_eq!(
+            ctx_oneshot.invocations.load(Ordering::SeqCst),
+            1,
+            "One-shot self-unregistering callback MUST fire EXACTLY ONCE under 2-thread contention (B4-01)"
+        );
+        assert_eq!(
+            ctx_oneshot.max_concurrent.load(Ordering::SeqCst),
+            1,
+            "Single-owner CallbackGate MUST serialize callbacks across threads (B4-01)"
+        );
+        assert!(ctx_oneshot.unregister_done.load(Ordering::SeqCst));
+
+        // Subsequent task emit must not invoke unregistered callback, and host remains responsive
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b401-mt-3", "method": "fabushi.createTask", "params": {"task_id": "b401-t3"}}),
+            )["ok"],
+            true
+        );
+        assert_eq!(ctx_oneshot.invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            call_dispatch(host, &json!({"id": "b401-ping", "method": "session.ping"}))["ok"],
+            true
+        );
+        drop(Arc::from_raw(raw_oneshot as *const OneShotCtx));
+
+        // 2. Non-pump callback thread synchronously invoking session.setServerUrl MUST fail
+        //    closed immediately with error.code == "conflict" and ZERO deadlock (B4-01)!
+        let original_url = call_dispatch(
+            host,
+            &json!({"id": "b401-get-url", "method": "session.getServerUrl"}),
+        )["result"]["server_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let ctx_reconfig = Arc::new(NonPumpReconfigCtx {
+            host_addr,
+            entered: AtomicBool::new(false),
+            response_ok: AtomicBool::new(true),
+            error_code: Mutex::new(String::new()),
+        });
+        let raw_reconfig = Arc::into_raw(Arc::clone(&ctx_reconfig)) as *mut c_void;
+        telegram_bridge_register_event_callback(
+            host,
+            Some(on_non_pump_set_server_url_cb),
+            raw_reconfig,
+        );
+
+        let trigger = call_dispatch(
+            host,
+            &json!({"id": "b401-reconfig-trigger", "method": "fabushi.createTask", "params": {"task_id": "b401-reconfig-t"}}),
+        );
+        assert_eq!(trigger["ok"], true);
+        assert!(ctx_reconfig.entered.load(Ordering::SeqCst));
+        assert!(
+            !ctx_reconfig.response_ok.load(Ordering::SeqCst),
+            "Non-pump callback thread calling session.setServerUrl MUST fail closed (B4-01)"
+        );
+        assert_eq!(
+            ctx_reconfig.error_code.lock().unwrap().as_str(),
+            "conflict",
+            "Non-pump callback thread calling session.setServerUrl MUST return conflict (B4-01)"
+        );
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b401-url-unchanged", "method": "session.getServerUrl"}),
+            )["result"]["server_url"],
+            original_url
+        );
+
+        telegram_bridge_register_event_callback(host, None, std::ptr::null_mut());
+        drop(Arc::from_raw(raw_reconfig as *const NonPumpReconfigCtx));
+
+        // 3. Same-thread re-entrant nested emit executes cleanly (active_depth 1 -> 2 -> 1 -> 0)
+        //    and allows subsequent top-level session.setServerUrl & host destroy without hanging!
+        let ctx_nested = Arc::new(NestedEmitCtx {
+            host_addr,
+            count: AtomicUsize::new(0),
+        });
+        let raw_nested = Arc::into_raw(Arc::clone(&ctx_nested)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_nested_emit_cb), raw_nested);
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b401-nested-outer", "method": "fabushi.createTask", "params": {"task_id": "b401-nested-outer-task"}}),
+            )["ok"],
+            true
+        );
+        assert_eq!(ctx_nested.count.load(Ordering::SeqCst), 2);
+        telegram_bridge_register_event_callback(host, None, std::ptr::null_mut());
+        drop(Arc::from_raw(raw_nested as *const NestedEmitCtx));
+
+        // Top-level session.setServerUrl succeeds cleanly after callback unwinds
+        let ok_reconfig = call_dispatch(
+            host,
+            &json!({
+                "id": "b401-reconfig-toplevel",
+                "method": "session.setServerUrl",
+                "params": { "server_url": "http://127.0.0.1:19999" }
+            }),
+        );
+        assert_eq!(ok_reconfig["ok"], true);
+        assert_eq!(ok_reconfig["result"]["server_url"], "http://127.0.0.1:19999");
+
+        fabushi_host_destroy(host);
     }
 }
 
