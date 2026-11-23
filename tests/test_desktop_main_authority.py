@@ -810,6 +810,54 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             complete_errors,
         )
 
+    def test_cargo_replace_rejects_path_file_url_without_hash_and_url_version_shorthand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            toml_path = root / "Cargo.toml"
+            toml_path.write_text(
+                '[package]\nname = "replace-edge"\nversion = "0.1.0"\n'
+                '[replace]\n'
+                '"path+file:///tmp/evil#serde@1.0.0" = { version = "1.0.0" }\n'
+                '"git+file:///tmp/evil@1.0.0" = { version = "1.0.0" }\n'
+                '"https://github.com/bhrumom/other@1.0.0" = { version = "1.0.0" }\n'
+                '"https://github.com/someone/gpui#0.2.2" = { version = "0.2.2" }\n'
+                '"https://github.com/someone/openssl-sys.git@0.9.100" = { version = "0.9.100" }\n',
+                encoding="utf-8",
+            )
+            errs = []
+            validator.verify_cargo_toml_hygiene(
+                toml_path, root, validator.FORBIDDEN_MOBILE_DEPS, errs, require_path_exists=False
+            )
+            self.assertTrue(any("path+file://" in e for e in errs), errs)
+            self.assertTrue(any("git+file:///tmp/evil@1.0.0" in e for e in errs), errs)
+            self.assertTrue(any("bhrumom/other@1.0.0" in e for e in errs), errs)
+            self.assertTrue(any("someone/gpui#0.2.2" in e and "forbidden mobile dependency" in e for e in errs), errs)
+            self.assertTrue(
+                any("openssl-sys.git@0.9.100" in e and "forbidden mobile dependency" in e for e in errs),
+                errs,
+            )
+
+    def test_host_anti_stub_rejects_local_paths_in_clean_build_garbage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "source/host/src").mkdir(parents=True)
+            (root / "source/host/src/dispatch.rs").write_text('pub fn dispatch() {}\n', encoding="utf-8")
+            (root / "scripts").mkdir(parents=True)
+
+            for idx, bad_line in enumerate([
+                'TARGET = "/Users/dev/project/target"\n',
+                'TARGET = "/home/alice/project/target"\n',
+                'TARGET = "C:\\Users\\dev\\target"\n',
+                'TARGET = "~/project/target"\n',
+            ]):
+                (root / "scripts/clean_build_garbage.py").write_text(bad_line, encoding="utf-8")
+                errs = []
+                validator.verify_host_anti_stub(root, errs)
+                self.assertTrue(
+                    any("clean_build_garbage.py" in e for e in errs),
+                    f"case {idx} unexpectedly passed: {bad_line!r} -> {errs}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

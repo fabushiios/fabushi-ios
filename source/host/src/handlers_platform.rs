@@ -33,6 +33,7 @@ use gpui_telegram_webrtc::signaling::SignalingFrame;
 use gpui_telegram_webrtc::media::AiMediaTap;
 use gpui_telegram_agent::talk::TalkSessionState;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::error::{HostError, HostResult};
 use crate::host::FabushiAppHost;
@@ -47,6 +48,14 @@ fn req_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
+}
+
+fn req_raw_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
 }
@@ -69,20 +78,30 @@ fn to_val<T: serde::Serialize>(v: T) -> HostResult<Value> {
     serde_json::to_value(v).map_err(|e| HostError::internal(format!("Serialization error: {e}")))
 }
 
-fn parse_kdf_params(params: &Value) -> Argon2KdfParams {
-    if let Some(p) = params.get("kdf_params") {
-        if let Ok(parsed) = serde_json::from_value::<Argon2KdfParams>(p.clone()) {
-            return parsed;
-        }
-    }
-    if params
+fn parse_kdf_params(host: &FabushiAppHost, params: &Value) -> HostResult<Argon2KdfParams> {
+    let requested_fast = params
         .get("fast_kdf")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        Argon2KdfParams::fast_for_tests()
+        .unwrap_or(false);
+    if requested_fast && !host.test_mode {
+        return Err(HostError::invalid_arguments(
+            "fast_kdf is prohibited on production handles",
+        ));
+    }
+    if let Some(p) = params.get("kdf_params") {
+        let parsed: Argon2KdfParams = serde_json::from_value(p.clone())
+            .map_err(|e| HostError::invalid_arguments(format!("Invalid kdf_params: {e}")))?;
+        if !host.test_mode && (parsed.m_cost_kib < 16_384 || parsed.t_cost < 2 || parsed.p_cost == 0) {
+            return Err(HostError::invalid_arguments(
+                "kdf_params below minimum production Argon2id strength (require m_cost_kib >= 16384 and t_cost >= 2)",
+            ));
+        }
+        return Ok(parsed);
+    }
+    if requested_fast {
+        Ok(Argon2KdfParams::fast_for_tests())
     } else {
-        Argon2KdfParams::default()
+        Ok(Argon2KdfParams::default())
     }
 }
 
@@ -105,14 +124,14 @@ pub fn handle_vault(
     let client = host.client();
     match action {
         "deriveSplitKey" => {
-            let password = req_str(params, "password")?;
+            let password = req_raw_str(params, "password")?;
             let salt_b64 = params
                 .get("salt_b64")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(generate_split_key_salt_b64);
-            let kdf = parse_kdf_params(params);
+            let kdf = parse_kdf_params(host, params)?;
             let bundle = derive_split_key(password, &salt_b64, &kdf)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             Ok(json!({
@@ -124,8 +143,8 @@ pub fn handle_vault(
         }
         "initNew" => {
             let user_id = req_u64(params, "user_id")?;
-            let passphrase = req_str(params, "passphrase")?;
-            let kdf = parse_kdf_params(params);
+            let passphrase = req_raw_str(params, "passphrase")?;
+            let kdf = parse_kdf_params(host, params)?;
             let (unlocked, envelope, recovery_key) =
                 UserVaultCrypto::initialize_new(user_id, passphrase, kdf)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
@@ -141,14 +160,14 @@ pub fn handle_vault(
         }
         "initSplitKey" => {
             let user_id = req_u64(params, "user_id")?;
-            let password = req_str(params, "password")?;
+            let password = req_raw_str(params, "password")?;
             let salt_b64 = params
                 .get("salt_b64")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(generate_split_key_salt_b64);
-            let kdf = parse_kdf_params(params);
+            let kdf = parse_kdf_params(host, params)?;
             let bundle = derive_split_key(password, &salt_b64, &kdf)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             let (envelope, unlocked, emergency_kit) = UserVaultCrypto::initialize_with_split_key(
@@ -172,7 +191,7 @@ pub fn handle_vault(
         }
         "unlockWithPassphrase" => {
             let user_id = req_u64(params, "user_id")?;
-            let passphrase = req_str(params, "passphrase")?;
+            let passphrase = req_raw_str(params, "passphrase")?;
             let envelope: UserVaultKeyEnvelope = if let Some(env_val) = params.get("envelope") {
                 parse_req(env_val)?
             } else {
@@ -198,15 +217,18 @@ pub fn handle_vault(
                     .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))?
             };
             let kek = if let Some(kek_b64) = params.get("vault_kek_b64").and_then(|v| v.as_str()) {
-                let raw = BASE64_STANDARD
-                    .decode(kek_b64.trim())
-                    .map_err(|e| HostError::invalid_arguments(format!("Invalid vault_kek_b64: {e}")))?;
-                let arr: [u8; 32] = raw
-                    .try_into()
-                    .map_err(|_| HostError::invalid_arguments("vault_kek_b64 must decode to 32 bytes"))?;
-                SplitKeyVaultKek::from_bytes(arr)
+                let raw = Zeroizing::new(
+                    BASE64_STANDARD
+                        .decode(kek_b64.trim())
+                        .map_err(|e| HostError::invalid_arguments(format!("Invalid vault_kek_b64: {e}")))?,
+                );
+                let arr = Zeroizing::new(
+                    <[u8; 32]>::try_from(raw.as_slice())
+                        .map_err(|_| HostError::invalid_arguments("vault_kek_b64 must decode to 32 bytes"))?,
+                );
+                SplitKeyVaultKek::from_bytes(*arr)
             } else {
-                let password = req_str(params, "password")?;
+                let password = req_raw_str(params, "password")?;
                 let bundle = derive_split_key(password, &envelope.kdf_salt_b64, &envelope.kdf_params)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
                 bundle.vault_kek.clone()
@@ -220,7 +242,7 @@ pub fn handle_vault(
         }
         "unlockWithRecoveryKey" => {
             let user_id = req_u64(params, "user_id")?;
-            let recovery_key = req_str(params, "recovery_key")?;
+            let recovery_key = req_raw_str(params, "recovery_key")?;
             let envelope: UserVaultKeyEnvelope = if let Some(env_val) = params.get("envelope") {
                 parse_req(env_val)?
             } else {
@@ -237,13 +259,16 @@ pub fn handle_vault(
             Ok(json!({ "unlocked": true }))
         }
         "unlockWithKeyBytes" => {
-            let raw = BASE64_STANDARD
-                .decode(req_str(params, "root_key_b64")?)
-                .map_err(|e| HostError::invalid_arguments(format!("Invalid root_key_b64: {e}")))?;
-            let arr: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| HostError::invalid_arguments("root_key_b64 must be exactly 32 bytes"))?;
-            *host.vault_unlocked_key.lock() = Some(UnlockedUserVaultKey::from_bytes(arr));
+            let raw = Zeroizing::new(
+                BASE64_STANDARD
+                    .decode(req_str(params, "root_key_b64")?)
+                    .map_err(|e| HostError::invalid_arguments(format!("Invalid root_key_b64: {e}")))?,
+            );
+            let arr = Zeroizing::new(
+                <[u8; 32]>::try_from(raw.as_slice())
+                    .map_err(|_| HostError::invalid_arguments("root_key_b64 must be exactly 32 bytes"))?,
+            );
+            *host.vault_unlocked_key.lock() = Some(UnlockedUserVaultKey::from_bytes(*arr));
             Ok(json!({ "unlocked": true }))
         }
         "lock" => {
@@ -258,7 +283,7 @@ pub fn handle_vault(
             let vault = open_unlocked_vault(host)?;
             let origin = req_str(params, "origin")?;
             let username = req_str(params, "username")?;
-            let password = req_str(params, "password")?;
+            let password = req_raw_str(params, "password")?;
             let totp_secret = params.get("totp_secret").and_then(|v| v.as_str());
             let account_hint = params.get("account_hint").and_then(|v| v.as_str());
             let reuse_policy: Option<ReusePolicy> = params
@@ -334,7 +359,7 @@ pub fn handle_vault(
                 .map_err(|e| HostError::invalid_arguments(e.to_string()))?;
             let item_key = req_str(params, "item_key")?;
             let revision = params.get("revision").and_then(|v| v.as_i64()).unwrap_or(1);
-            let plaintext = req_str(params, "plaintext")?.as_bytes();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes();
             let blob = key
                 .seal_item(user_id, cat, item_key, revision, plaintext)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
@@ -916,6 +941,11 @@ pub fn handle_tailnet(
                 .get("approved")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            if approved && host.is_ios_sandbox() {
+                return Err(HostError::capability_unavailable(
+                    "iOS devices cannot approve inbound host execution onto themselves",
+                ));
+            }
             let outcome = host.run_cancellable(req_id, async move {
                 Ok(client
                     .decide_tailnet_approval_async(&command_id, approved)

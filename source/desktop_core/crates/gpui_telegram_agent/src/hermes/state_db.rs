@@ -641,6 +641,14 @@ impl HermesStateStore {
             .map_err(db_err)
     }
 
+    pub fn wal_checkpoint_truncate(&self) -> Result<(i32, i32, i32)> {
+        let conn = self.conn.lock();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(db_err)
+    }
+
     // =========================================================================
     // Sessions CRUD & Continuity
     // =========================================================================

@@ -4,6 +4,10 @@ use chrono::{DateTime, Utc};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
+fn default_delivery_status() -> String {
+    "sent".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedMessage {
     pub message_id: i64,
@@ -13,6 +17,8 @@ pub struct CachedMessage {
     pub timestamp: i64,
     pub reply_to: Option<i64>,
     pub client_nonce: u64,
+    #[serde(default = "default_delivery_status")]
+    pub delivery_status: String,
     #[serde(skip)]
     pub created_at: DateTime<Utc>,
 }
@@ -121,6 +127,21 @@ impl MessageDedupStore {
         }
     }
 
+    fn evict_oldest_completed_if_needed(&mut self, incoming_key: &(u64, u64)) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(incoming_key) {
+            // NEVER evict InFlight entries — evicting an InFlight slot would orphan waiting followers!
+            if let Some(oldest_completed_key) = self
+                .entries
+                .iter()
+                .filter(|(_, v)| matches!(v, DedupEntry::Completed(_)))
+                .min_by_key(|(_, v)| v.created_at())
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&oldest_completed_key);
+            }
+        }
+    }
+
     pub fn reserve(&mut self, sender_id: u64, nonce: u64, now: DateTime<Utc>) -> ReservationOutcome {
         self.cleanup_expired(now);
 
@@ -139,14 +160,7 @@ impl MessageDedupStore {
             }
         }
 
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
-            if let Some(oldest_key) = self.entries.iter()
-                .min_by_key(|(_, v)| v.created_at())
-                .map(|(k, _)| *k)
-            {
-                self.entries.remove(&oldest_key);
-            }
-        }
+        self.evict_oldest_completed_if_needed(&key);
 
         let slot = Arc::new(InFlightSlot::new(now));
         self.entries.insert(key, DedupEntry::InFlight(Arc::clone(&slot)));
@@ -161,15 +175,43 @@ impl MessageDedupStore {
         self.entries.insert(key, DedupEntry::Completed(msg));
     }
 
+    /// Completes a specific leader `slot` directly (guaranteeing waiting followers always wake
+    /// even if the entry was replaced/expired in the map) and stores the completed record.
+    pub fn complete_slot(
+        &mut self,
+        sender_id: u64,
+        nonce: u64,
+        slot: &Arc<InFlightSlot>,
+        msg: CachedMessage,
+    ) {
+        slot.complete(msg.clone());
+        let key = (sender_id, nonce);
+        if let Some(DedupEntry::InFlight(existing)) = self.entries.get(&key) {
+            if !Arc::ptr_eq(existing, slot) {
+                existing.complete(msg.clone());
+            }
+        }
+        self.entries.insert(key, DedupEntry::Completed(msg));
+    }
+
     pub fn abort(&mut self, sender_id: u64, nonce: u64) {
         let key = (sender_id, nonce);
-        match self.entries.get(&key) {
-            Some(DedupEntry::InFlight(_)) => {
-                if let Some(DedupEntry::InFlight(slot)) = self.entries.remove(&key) {
-                    slot.abort();
-                }
+        if matches!(self.entries.get(&key), Some(DedupEntry::InFlight(_))) {
+            if let Some(DedupEntry::InFlight(slot)) = self.entries.remove(&key) {
+                slot.abort();
             }
-            _ => {}
+        }
+    }
+
+    /// Aborts a specific leader `slot` directly (guaranteeing waiting followers always wake)
+    /// and removes the map entry only if it still points to this exact `slot`.
+    pub fn abort_slot(&mut self, sender_id: u64, nonce: u64, slot: &Arc<InFlightSlot>) {
+        slot.abort();
+        let key = (sender_id, nonce);
+        if let Some(DedupEntry::InFlight(existing)) = self.entries.get(&key) {
+            if Arc::ptr_eq(existing, slot) {
+                self.entries.remove(&key);
+            }
         }
     }
 
@@ -190,21 +232,20 @@ impl MessageDedupStore {
         if let Some(DedupEntry::InFlight(slot)) = self.entries.get(&key) {
             slot.complete(msg.clone());
         }
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
-            if let Some(oldest_key) = self.entries.iter()
-                .min_by_key(|(_, v)| v.created_at())
-                .map(|(k, _)| *k)
-            {
-                self.entries.remove(&oldest_key);
-            }
-        }
+        self.evict_oldest_completed_if_needed(&key);
         self.entries.insert(key, DedupEntry::Completed(msg));
     }
 
     pub fn cleanup_expired(&mut self, now: DateTime<Utc>) {
         let ttl_ms = self.ttl_ms;
         self.entries.retain(|_, v| {
-            now.signed_duration_since(v.created_at()).num_milliseconds() < ttl_ms
+            let keep = now.signed_duration_since(v.created_at()).num_milliseconds() < ttl_ms;
+            if !keep {
+                if let DedupEntry::InFlight(slot) = v {
+                    slot.abort();
+                }
+            }
+            keep
         });
     }
 
@@ -222,21 +263,33 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    fn sample_cached(
+        message_id: i64,
+        chat_id: i64,
+        sender_id: u64,
+        text: &str,
+        nonce: u64,
+        created_at: DateTime<Utc>,
+    ) -> CachedMessage {
+        CachedMessage {
+            message_id,
+            chat_id,
+            sender_id,
+            text: text.to_string(),
+            timestamp: created_at.timestamp_millis(),
+            reply_to: None,
+            client_nonce: nonce,
+            delivery_status: "sent".to_string(),
+            created_at,
+        }
+    }
+
     #[test]
     fn test_dedup_unique_and_duplicate() {
         let mut store = MessageDedupStore::new();
         let now = Utc::now();
 
-        let cached = CachedMessage {
-            message_id: 1,
-            chat_id: 10,
-            sender_id: 42,
-            text: "Hello".to_string(),
-            timestamp: now.timestamp_millis(),
-            reply_to: None,
-            client_nonce: 9999,
-            created_at: now,
-        };
+        let cached = sample_cached(1, 10, 42, "Hello", 9999, now);
 
         assert!(store.get(42, 9999, now).is_none());
         store.insert(42, 9999, cached.clone(), now);
@@ -254,16 +307,7 @@ mod tests {
         let mut store = MessageDedupStore::new();
         let start = Utc::now();
 
-        let cached = CachedMessage {
-            message_id: 2,
-            chat_id: 10,
-            sender_id: 42,
-            text: "Test TTL".to_string(),
-            timestamp: start.timestamp_millis(),
-            reply_to: None,
-            client_nonce: 12345,
-            created_at: start,
-        };
+        let cached = sample_cached(2, 10, 42, "Test TTL", 12345, start);
 
         store.insert(42, 12345, cached, start);
 
@@ -277,45 +321,52 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_capacity_eviction() {
-        let mut store = MessageDedupStore::with_config(MessageDedupStore::DEFAULT_TTL_MS, 3);
+    fn test_dedup_capacity_eviction_never_evicts_in_flight() {
+        let mut store = MessageDedupStore::with_config(MessageDedupStore::DEFAULT_TTL_MS, 2);
         let t0 = Utc::now();
 
-        for i in 1..=3 {
-            let msg = CachedMessage {
-                message_id: i,
-                chat_id: 10,
-                sender_id: 1,
-                text: format!("Msg {i}"),
-                timestamp: (t0 + Duration::seconds(i)).timestamp_millis(),
-                reply_to: None,
-                client_nonce: i as u64,
-                created_at: t0 + Duration::seconds(i),
-            };
-            store.insert(1, i as u64, msg, t0 + Duration::seconds(i));
-        }
-
-        assert_eq!(store.len(), 3);
-
-        // Insert 4th item at t0 + 4s, oldest (nonce 1) should be evicted
-        let t4 = t0 + Duration::seconds(4);
-        let msg4 = CachedMessage {
-            message_id: 4,
-            chat_id: 10,
-            sender_id: 1,
-            text: "Msg 4".to_string(),
-            timestamp: t4.timestamp_millis(),
-            reply_to: None,
-            client_nonce: 4,
-            created_at: t4,
+        // Reserve an oldest InFlight slot at t0
+        let leader_slot = match store.reserve(1, 1, t0) {
+            ReservationOutcome::Leader(s) => s,
+            _ => panic!("Expected Leader"),
         };
-        store.insert(1, 4, msg4, t4);
+        let follower_slot = match store.reserve(1, 1, t0) {
+            ReservationOutcome::Follower(s) => s,
+            _ => panic!("Expected Follower"),
+        };
 
-        assert_eq!(store.len(), 3);
-        assert!(store.get(1, 1, t4).is_none());
-        assert!(store.get(1, 2, t4).is_some());
-        assert!(store.get(1, 3, t4).is_some());
-        assert!(store.get(1, 4, t4).is_some());
+        // Insert a newer Completed entry at t0 + 1s (fills capacity = 2)
+        store.insert(1, 2, sample_cached(2, 10, 1, "Msg 2", 2, t0 + Duration::seconds(1)), t0 + Duration::seconds(1));
+
+        // Insert a 3rd Completed entry at t0 + 2s: MUST evict Completed nonce 2, NOT InFlight nonce 1!
+        let t2 = t0 + Duration::seconds(2);
+        store.insert(1, 3, sample_cached(3, 10, 1, "Msg 3", 3, t2), t2);
+        assert!(store.get(1, 2, t2).is_none());
+        assert!(store.get(1, 3, t2).is_some());
+
+        let waiter = std::thread::spawn(move || follower_slot.wait());
+        store.complete_slot(1, 1, &leader_slot, sample_cached(1, 10, 1, "Msg 1", 1, t0));
+        let done = waiter.join().unwrap().expect("Follower must wake with completed msg");
+        assert_eq!(done.message_id, 1);
+    }
+
+    #[test]
+    fn test_cleanup_expired_aborts_in_flight_followers() {
+        let mut store = MessageDedupStore::new();
+        let t0 = Utc::now();
+
+        let _leader = match store.reserve(7, 700, t0) {
+            ReservationOutcome::Leader(s) => s,
+            _ => panic!("Expected Leader"),
+        };
+        let follower = match store.reserve(7, 700, t0) {
+            ReservationOutcome::Follower(s) => s,
+            _ => panic!("Expected Follower"),
+        };
+
+        let waiter = std::thread::spawn(move || follower.wait());
+        store.cleanup_expired(t0 + Duration::hours(25));
+        assert_eq!(waiter.join().unwrap(), Err(DedupWaitError::Aborted));
     }
 
     #[test]
@@ -323,32 +374,10 @@ mod tests {
         let mut store = MessageDedupStore::new();
         let now = Utc::now();
 
-        // Nonce 0
-        let msg0 = CachedMessage {
-            message_id: 100,
-            chat_id: 1,
-            sender_id: 1,
-            text: "Zero".to_string(),
-            timestamp: now.timestamp_millis(),
-            reply_to: None,
-            client_nonce: 0,
-            created_at: now,
-        };
-        store.insert(1, 0, msg0, now);
+        store.insert(1, 0, sample_cached(100, 1, 1, "Zero", 0, now), now);
         assert_eq!(store.get(1, 0, now).unwrap().message_id, 100);
 
-        // Nonce u64::MAX
-        let msg_max = CachedMessage {
-            message_id: 101,
-            chat_id: 1,
-            sender_id: 1,
-            text: "Max".to_string(),
-            timestamp: now.timestamp_millis(),
-            reply_to: None,
-            client_nonce: u64::MAX,
-            created_at: now,
-        };
-        store.insert(1, u64::MAX, msg_max, now);
+        store.insert(1, u64::MAX, sample_cached(101, 1, 1, "Max", u64::MAX, now), now);
         assert_eq!(store.get(1, u64::MAX, now).unwrap().message_id, 101);
     }
 
@@ -357,14 +386,12 @@ mod tests {
         let mut store = MessageDedupStore::new();
         let now = Utc::now();
 
-        let outcome1 = store.reserve(1, 1001, now);
-        let leader_slot = match outcome1 {
+        let leader_slot = match store.reserve(1, 1001, now) {
             ReservationOutcome::Leader(slot) => slot,
             _ => panic!("Expected Leader"),
         };
 
-        let outcome2 = store.reserve(1, 1001, now);
-        let follower_slot = match outcome2 {
+        let follower_slot = match store.reserve(1, 1001, now) {
             ReservationOutcome::Follower(slot) => slot,
             _ => panic!("Expected Follower"),
         };
@@ -373,24 +400,12 @@ mod tests {
             follower_slot.wait().expect("Follower should succeed")
         });
 
-        let cached = CachedMessage {
-            message_id: 555,
-            chat_id: 10,
-            sender_id: 1,
-            text: "Hello".to_string(),
-            timestamp: now.timestamp_millis(),
-            reply_to: None,
-            client_nonce: 1001,
-            created_at: now,
-        };
-
-        leader_slot.complete(cached.clone());
-        store.complete(1, 1001, cached);
+        let cached = sample_cached(555, 10, 1, "Hello", 1001, now);
+        store.complete_slot(1, 1001, &leader_slot, cached);
 
         let result = handle.join().unwrap();
         assert_eq!(result.message_id, 555);
 
-        // Third reservation should see AlreadyExists
         let outcome3 = store.reserve(1, 1001, now);
         match outcome3 {
             ReservationOutcome::AlreadyExists(msg) => assert_eq!(msg.message_id, 555),
@@ -403,29 +418,23 @@ mod tests {
         let mut store = MessageDedupStore::new();
         let now = Utc::now();
 
-        let outcome1 = store.reserve(2, 2002, now);
-        let _leader_slot = match outcome1 {
+        let leader_slot = match store.reserve(2, 2002, now) {
             ReservationOutcome::Leader(slot) => slot,
             _ => panic!("Expected Leader"),
         };
 
-        let outcome2 = store.reserve(2, 2002, now);
-        let follower_slot = match outcome2 {
+        let follower_slot = match store.reserve(2, 2002, now) {
             ReservationOutcome::Follower(slot) => slot,
             _ => panic!("Expected Follower"),
         };
 
-        let handle = std::thread::spawn(move || {
-            follower_slot.wait()
-        });
+        let handle = std::thread::spawn(move || follower_slot.wait());
 
-        // Abort the leader
-        store.abort(2, 2002);
+        store.abort_slot(2, 2002, &leader_slot);
 
         let err = handle.join().unwrap();
         assert_eq!(err, Err(DedupWaitError::Aborted));
 
-        // After abort, next reserve becomes Leader again
         let outcome3 = store.reserve(2, 2002, now);
         match outcome3 {
             ReservationOutcome::Leader(_) => {}

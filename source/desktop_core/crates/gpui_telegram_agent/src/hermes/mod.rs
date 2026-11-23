@@ -93,6 +93,10 @@ pub struct HermesEngineConfig {
     pub default_max_tokens: Option<u32>,
     pub default_temperature: Option<f32>,
     pub terminal_backend: TerminalBackendConfig,
+    /// When true (default on iOS), disables local CLI dotfile scanning (`~/.claude`, `~/.codex`,
+    /// `~/.gemini`, `.env`) and loopback `127.0.0.1:3425` probes during `HermesEngine::new`.
+    #[serde(default)]
+    pub skip_local_discovery: bool,
 }
 
 impl Default for HermesEngineConfig {
@@ -110,6 +114,7 @@ impl Default for HermesEngineConfig {
             default_max_tokens: None,
             default_temperature: None,
             terminal_backend: TerminalBackendConfig::default(),
+            skip_local_discovery: cfg!(target_os = "ios"),
         }
     }
 }
@@ -3246,7 +3251,10 @@ impl HermesEngine {
 
         let force_live_providers =
             std::env::var("HERMES_FORCE_LIVE_PROVIDERS").ok().as_deref() == Some("1");
-        let providers = if config.data_dir.is_some() || force_live_providers {
+        let providers = if !config.skip_local_discovery
+            && !cfg!(target_os = "ios")
+            && (config.data_dir.is_some() || force_live_providers)
+        {
             ProviderRouter::from_env()
         } else {
             ProviderRouter::new()

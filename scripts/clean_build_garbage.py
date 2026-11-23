@@ -134,7 +134,7 @@ def clean_test_artifacts(root_dir: str, canonical_target: str) -> int:
     for item in os.listdir(root_dir):
         if item.startswith(".cargo-target"):
             full_p = os.path.join(root_dir, item)
-            if os.path.isdir(full_p) and os.path.abspath(full_p) != canonical_target:
+            if os.path.isdir(full_p) and os.path.realpath(full_p) != canonical_target:
                 freed_bytes += _dir_size(full_p)
                 shutil.rmtree(full_p, ignore_errors=True)
 
@@ -146,7 +146,7 @@ def clean_test_artifacts(root_dir: str, canonical_target: str) -> int:
         os.path.join(root_dir, "source", "packages", "mahayana-rs", "target"),
     ]
     for cand in known_target_candidates:
-        abs_cand = os.path.abspath(cand)
+        abs_cand = os.path.realpath(cand)
         if abs_cand != canonical_target and os.path.isdir(abs_cand):
             freed_bytes += _dir_size(abs_cand)
             shutil.rmtree(abs_cand, ignore_errors=True)
@@ -171,7 +171,7 @@ def main() -> int:
         )
         return 2
 
-    canonical_target = os.path.abspath(
+    canonical_target = os.path.realpath(
         os.environ.get("CARGO_TARGET_DIR") or str(repo_root / "target")
     )
     total_freed = clean_target_dir(canonical_target)

@@ -1,9 +1,12 @@
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use mahayana_app_host::{
     fabushi_host_create, fabushi_host_destroy, fabushi_host_dispatch, fabushi_host_free_string,
+    telegram_bridge_register_event_callback,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,6 +27,22 @@ fn create_temp_host() -> (tempfile::TempDir, *mut c_void) {
         json!({
             "app_data_dir": dir.path().to_string_lossy(),
             "ios_sandbox_strict": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let host = unsafe { fabushi_host_create(cfg.as_ptr()) };
+    assert!(!host.is_null());
+    (dir, host)
+}
+
+fn create_temp_test_host() -> (tempfile::TempDir, *mut c_void) {
+    let dir = tempdir().unwrap();
+    let cfg = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "ios_sandbox_strict": true,
+            "test_mode": true
         })
         .to_string(),
     )
@@ -159,13 +178,94 @@ fn test_real_e2ee_double_ratchet_sender_keys_and_safety_numbers() {
         );
         assert_eq!(grp_pt["result"]["plaintext_utf8"], "Group broadcast payload");
 
+        // 4. Negative crypto integrity: tampered Double Ratchet & Sender Key ciphertexts MUST fail closed
+        let enc_tamper = dispatch(
+            host,
+            &json!({
+                "method": "e2ee.ratchetEncrypt",
+                "params": {"session_id": "alice", "plaintext": "Authentic payload"}
+            }),
+        );
+        assert_eq!(enc_tamper["ok"], true);
+        let mut ct_bytes = BASE64_STANDARD
+            .decode(enc_tamper["result"]["ciphertext_b64"].as_str().unwrap())
+            .unwrap();
+        ct_bytes[0] ^= 0xFF;
+        let bad_dr = dispatch(
+            host,
+            &json!({
+                "method": "e2ee.ratchetDecrypt",
+                "params": {
+                    "session_id": "bob",
+                    "header": enc_tamper["result"]["header"],
+                    "ciphertext_b64": BASE64_STANDARD.encode(&ct_bytes)
+                }
+            }),
+        );
+        assert_eq!(bad_dr["ok"], false, "Tampered DR ciphertext must be rejected: {bad_dr}");
+        assert_eq!(bad_dr["error"]["code"], "crypto_error");
+
+        let grp_tamper = dispatch(
+            host,
+            &json!({
+                "method": "e2ee.senderKeyEncrypt",
+                "params": {"key_id": "grp-sender", "plaintext": "Group secret"}
+            }),
+        );
+        assert_eq!(grp_tamper["ok"], true);
+        let mut bad_grp_obj = grp_tamper["result"].clone();
+        let mut g_ct = BASE64_STANDARD
+            .decode(bad_grp_obj["ciphertext_b64"].as_str().unwrap())
+            .unwrap();
+        g_ct[0] ^= 0xAA;
+        bad_grp_obj["ciphertext_b64"] = json!(BASE64_STANDARD.encode(&g_ct));
+        let bad_sk = dispatch(
+            host,
+            &json!({
+                "method": "e2ee.senderKeyDecrypt",
+                "params": {"key_id": "grp-receiver", "ciphertext": bad_grp_obj}
+            }),
+        );
+        assert_eq!(bad_sk["ok"], false, "Tampered Sender Key ciphertext must be rejected: {bad_sk}");
+        assert_eq!(bad_sk["error"]["code"], "crypto_error");
+
         fabushi_host_destroy(host);
     }
 }
 
 #[test]
 fn test_real_split_key_v2_argon2id_x25519_vault_and_rfc6238_totp() {
-    let (_dir, host) = create_temp_host();
+    // Production handle (test_mode: false) MUST reject fast_kdf: true and weak kdf_params!
+    let (_prod_dir, prod_host) = create_temp_host();
+    unsafe {
+        let rej_fast = dispatch(
+            prod_host,
+            &json!({
+                "method": "vault.deriveSplitKey",
+                "params": {"password": "CorrectHorseBatteryStaple!", "fast_kdf": true}
+            }),
+        );
+        assert_eq!(rej_fast["ok"], false, "Production handle must reject fast_kdf: {rej_fast}");
+        assert_eq!(rej_fast["error"]["code"], "invalid_arguments");
+
+        let rej_weak = dispatch(
+            prod_host,
+            &json!({
+                "method": "vault.initSplitKey",
+                "params": {
+                    "user_id": 42,
+                    "password": "CorrectHorseBatteryStaple!",
+                    "kdf_params": {"m_cost_kib": 1024, "t_cost": 1, "p_cost": 1}
+                }
+            }),
+        );
+        assert_eq!(rej_weak["ok"], false, "Production handle must reject weak kdf_params: {rej_weak}");
+        assert_eq!(rej_weak["error"]["code"], "invalid_arguments");
+        fabushi_host_destroy(prod_host);
+    }
+
+    // Test-mode handle exercises full Split-Key V2, Vault, X25519 Device Trust Ring, and RFC 6238 TOTP
+    let (_dir, host) = create_temp_test_host();
     unsafe {
         // 1. Split-Key V2 Argon2id derivation & vault initialization
         let derived = dispatch(
@@ -411,6 +511,47 @@ fn test_real_waveform_5bit_63byte_and_sha256_chunked_cas() {
         assert_eq!(purge["ok"], true);
         assert!(purge["result"]["freed_bytes"].as_u64().unwrap() >= payload.len() as u64);
 
+        // Negative integrity: SHA-256 mismatch MUST fail closed on media.chunkedSessionFinalize
+        let bad_payload = b"corrupted chunk bytes";
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({
+                    "method": "media.chunkedSessionCreate",
+                    "params": {
+                        "file_id": "bad-sha-001",
+                        "total_size": bad_payload.len(),
+                        "part_size": 1024,
+                        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({
+                    "method": "media.chunkedSessionReceivePart",
+                    "params": {
+                        "file_id": "bad-sha-001",
+                        "part_index": 0,
+                        "data_b64": BASE64_STANDARD.encode(bad_payload)
+                    }
+                })
+            )["ok"],
+            true
+        );
+        let bad_fin = dispatch(
+            host,
+            &json!({
+                "method": "media.chunkedSessionFinalize",
+                "params": {"file_id": "bad-sha-001"}
+            }),
+        );
+        assert_eq!(bad_fin["ok"], false, "SHA-256 mismatch must fail closed: {bad_fin}");
+        assert_eq!(bad_fin["error"]["code"], "crypto_error");
+
         fabushi_host_destroy(host);
     }
 }
@@ -452,6 +593,37 @@ fn test_real_magpie_masking_routing_and_presets() {
             &json!({"method": "magpie.unmaskText", "params": {"text": masked_str}}),
         );
         assert_eq!(unmasked["result"]["text"], raw);
+
+        // magpie.maskingPreview uses preview_text: works even when enabled=false and does NOT retain secrets in RAM vault!
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({
+                    "method": "magpie.maskingUpdate",
+                    "params": {"enabled": false, "mask_secrets": true, "mask_personal": true}
+                })
+            )["ok"],
+            true
+        );
+        let preview_raw = "PreviewKey=sk-ant-api03-previewOnly991122";
+        let preview = dispatch(
+            host,
+            &json!({"method": "magpie.maskingPreview", "params": {"text": preview_raw}}),
+        );
+        assert_eq!(preview["ok"], true);
+        let preview_masked = preview["result"]["masked_text"].as_str().unwrap();
+        assert!(!preview_masked.contains("sk-ant-api03-previewOnly991122"));
+        let preview_unmask = dispatch(
+            host,
+            &json!({"method": "magpie.unmaskText", "params": {"text": preview_masked}}),
+        );
+        assert!(
+            !preview_unmask["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("sk-ant-api03-previewOnly991122"),
+            "maskingPreview must not persist preview secrets into unmask vault"
+        );
 
         // Routing group + circuit breaker cooldown
         let grp = dispatch(
@@ -601,7 +773,7 @@ fn test_real_multi_agent_governance_and_hermes_studio() {
             host,
             &json!({
                 "method": "fabushi.kanbanCreateCard",
-                "params": {"board_id": board_id, "title": "Ship v1.6.7"}
+                "params": {"board_id": board_id, "title": "Ship v1.6.8"}
             }),
         );
         assert_eq!(card["ok"], true);
@@ -771,14 +943,41 @@ fn test_real_webrtc_talk_remote_hub_miniapp_and_action_bus() {
             true
         );
 
-        // 5. Action Bus (>=37 actions + all 4 exporters)
+        // 5. Action Bus (>=37 actions + all 4 exporters with non-empty verified payloads)
         let actions = dispatch(host, &json!({"method": "actions.list"}));
         assert_eq!(actions["ok"], true);
         assert!(actions["result"]["count"].as_u64().unwrap() >= 37);
-        assert_eq!(dispatch(host, &json!({"method": "actions.exportMcp"}))["ok"], true);
-        assert_eq!(dispatch(host, &json!({"method": "actions.exportOpenApi"}))["ok"], true);
-        assert_eq!(dispatch(host, &json!({"method": "actions.exportHermes"}))["ok"], true);
-        assert_eq!(dispatch(host, &json!({"method": "actions.exportCli"}))["ok"], true);
+
+        let mcp_exp = dispatch(host, &json!({"method": "actions.exportMcp"}));
+        assert_eq!(mcp_exp["ok"], true);
+        assert!(
+            mcp_exp["result"]
+                .get("tools")
+                .and_then(|v| v.as_array())
+                .map_or(false, |a| a.len() >= 37)
+                || mcp_exp["result"].as_array().map_or(false, |a| a.len() >= 37),
+            "Unexpected exportMcp payload: {mcp_exp}"
+        );
+
+        let openapi_exp = dispatch(host, &json!({"method": "actions.exportOpenApi"}));
+        assert_eq!(openapi_exp["ok"], true);
+        assert!(openapi_exp["result"]["openapi"].as_str().is_some());
+        assert!(
+            openapi_exp["result"]["paths"]
+                .as_object()
+                .map_or(false, |m| m.len() >= 37),
+            "Expected >=37 OpenAPI paths: {openapi_exp}"
+        );
+
+        let hermes_exp = dispatch(host, &json!({"method": "actions.exportHermes"}));
+        assert_eq!(hermes_exp["ok"], true);
+        assert!(hermes_exp["result"]["count"].as_u64().unwrap() >= 37);
+        assert!(hermes_exp["result"]["openai_tools"].as_array().unwrap().len() >= 37);
+        assert!(hermes_exp["result"]["anthropic_tools"].as_array().unwrap().len() >= 37);
+
+        let cli_exp = dispatch(host, &json!({"method": "actions.exportCli"}));
+        assert_eq!(cli_exp["ok"], true);
+        assert!(cli_exp["result"].to_string().len() > 500);
 
         fabushi_host_destroy(host);
     }
@@ -788,7 +987,63 @@ fn test_real_webrtc_talk_remote_hub_miniapp_and_action_bus() {
 fn test_fail_closed_ios_capability_policy_and_honest_blockers() {
     let (_dir, host) = create_temp_host();
     unsafe {
-        // Every desktop host-control / subprocess / dotfile scan RPC MUST fail closed on iOS!
+        // 1. Default iOS Hermes toolsets MUST use Safe preset and disable desktop-only toolsets (B-06)
+        let ts_list = dispatch(host, &json!({"method": "fabushi.listToolsets"}));
+        assert_eq!(ts_list["ok"], true);
+        assert_eq!(ts_list["result"]["summary"]["active_preset"], "safe");
+        let toolsets_arr = ts_list["result"]["summary"]["toolsets"]
+            .as_array()
+            .expect("summary.toolsets must be an array");
+        assert_eq!(toolsets_arr.len(), 29);
+        let core_entry = toolsets_arr
+            .iter()
+            .find(|t| t["id"] == "core")
+            .expect("core toolset must exist");
+        assert_eq!(core_entry["enabled"], true);
+        for forbidden_ts in ["terminal", "code_execution", "desktop_ui", "browser"] {
+            let entry = toolsets_arr
+                .iter()
+                .find(|t| t["id"] == forbidden_ts)
+                .unwrap_or_else(|| panic!("missing toolset entry '{forbidden_ts}'"));
+            assert_eq!(
+                entry["enabled"], false,
+                "Default iOS Hermes toolsets must NOT enable '{forbidden_ts}': {entry}"
+            );
+        }
+
+        // 2. fabushi.updateToolsets MUST reject presets & alias/whitespace bypasses on iOS (B-06)
+        for bypass in [
+            "full",
+            "all",
+            "hermes-cli",
+            "cli",
+            "hermes-acp",
+            "acp",
+            "code-execution",
+            "codeexecution",
+            " terminal ",
+            "shell",
+            "desktop_ui",
+            "browser",
+        ] {
+            let res = dispatch(
+                host,
+                &json!({
+                    "method": "fabushi.updateToolsets",
+                    "params": {"enable": [bypass]}
+                }),
+            );
+            assert_eq!(
+                res["ok"], false,
+                "fabushi.updateToolsets({bypass:?}) must fail closed on iOS: {res}"
+            );
+            assert_eq!(
+                res["error"]["code"], "capability_unavailable",
+                "fabushi.updateToolsets({bypass:?}) must return capability_unavailable: {res}"
+            );
+        }
+
+        // 3. Every desktop host-control / subprocess / dotfile scan RPC MUST fail closed on iOS!
         let forbidden_on_ios = [
             "remote.localPower",
             "remote.localAccessibility",
@@ -803,6 +1058,7 @@ fn test_fail_closed_ios_capability_policy_and_honest_blockers() {
             "coding.localControl",
             "computers.registerLocalHost",
             "computers.pollLocalCommands",
+            "computers.executeLocalOp",
             "magpie.scanLocalSubscriptions",
             "fabushi.executeLocalTerminalTool",
         ];
@@ -818,7 +1074,45 @@ fn test_fail_closed_ios_capability_policy_and_honest_blockers() {
             );
         }
 
-        // Honest blocker BLK-01: APNs push token persists locally and reports upstream_stub_blocked
+        // 4. mcp.registerServer(transport="stdio") fails closed on iOS
+        let mcp_stdio = dispatch(
+            host,
+            &json!({
+                "method": "mcp.registerServer",
+                "params": {"name": "local-stdio", "transport": "stdio", "command": "/bin/sh"}
+            }),
+        );
+        assert_eq!(mcp_stdio["ok"], false);
+        assert_eq!(mcp_stdio["error"]["code"], "capability_unavailable");
+
+        // 5. tailnet.decideApproval(approved=true) fails closed on iOS (B-01)
+        let tailnet_approve = dispatch(
+            host,
+            &json!({
+                "method": "tailnet.decideApproval",
+                "params": {"command_id": "cmd-inbound-1", "approved": true}
+            }),
+        );
+        assert_eq!(tailnet_approve["ok"], false);
+        assert_eq!(tailnet_approve["error"]["code"], "capability_unavailable");
+
+        // 6. Desktop host-control actions via actions.execute fail closed on iOS (NB-08)
+        for act_name in ["device_power_action", "terminal_exec", "remote_capture_screen"] {
+            let act_res = dispatch(
+                host,
+                &json!({
+                    "method": "actions.execute",
+                    "params": {"name": act_name, "input": {"node_id": "local", "action": "shutdown", "session_name": "s", "command": "id"}, "approved": true}
+                }),
+            );
+            assert_eq!(
+                act_res["ok"], false,
+                "actions.execute({act_name}) must fail closed on iOS: {act_res}"
+            );
+            assert_eq!(act_res["error"]["code"], "capability_unavailable");
+        }
+
+        // 7. Honest blocker BLK-01: APNs push token persists locally and reports upstream_stub_blocked
         let push = dispatch(
             host,
             &json!({
@@ -830,11 +1124,68 @@ fn test_fail_closed_ios_capability_policy_and_honest_blockers() {
         assert_eq!(push["result"]["persisted"], true);
         assert_eq!(push["result"]["server_apns_dispatch"], "upstream_stub_blocked");
 
-        // Honest blocker BLK-03: TON signing fails closed with upstream_not_implemented
+        // 8. Honest blocker BLK-03: TON signing fails closed with upstream_not_implemented
         let ton = dispatch(host, &json!({"method": "wallet.tonSignBroadcast"}));
         assert_eq!(ton["ok"], false);
         assert_eq!(ton["error"]["code"], "upstream_not_implemented");
 
         fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_transition_task_reentrant_callback_no_deadlock() {
+    let (_dir, host) = create_temp_host();
+
+    struct ReentrantTaskCtx {
+        host: usize,
+        list_calls: AtomicUsize,
+    }
+    let ctx = Arc::new(ReentrantTaskCtx {
+        host: host as usize,
+        list_calls: AtomicUsize::new(0),
+    });
+
+    unsafe extern "C" fn on_task_event(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if !event_type.is_null() && !user_ctx.is_null() {
+            let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+            if ev == "taskStateUpdated" {
+                let st = unsafe { &*(user_ctx as *const ReentrantTaskCtx) };
+                // Re-entrantly locks host.task_registry via fabushi.listTasks — MUST NOT DEADLOCK (B-03)!
+                let list = unsafe {
+                    dispatch(st.host as *mut c_void, &json!({"method": "fabushi.listTasks"}))
+                };
+                assert_eq!(list["ok"], true);
+                st.list_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe {
+        let raw_ctx = Arc::into_raw(Arc::clone(&ctx)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_task_event), raw_ctx);
+
+        let created = dispatch(
+            host,
+            &json!({"method": "fabushi.createTask", "params": {"task_id": "t-reent-1"}}),
+        );
+        assert_eq!(created["ok"], true);
+
+        let transitioned = dispatch(
+            host,
+            &json!({
+                "method": "fabushi.transitionTask",
+                "params": {"task_id": "t-reent-1", "state": "running"}
+            }),
+        );
+        assert_eq!(transitioned["ok"], true);
+        assert!(ctx.list_calls.load(Ordering::SeqCst) >= 2);
+
+        fabushi_host_destroy(host);
+        drop(Arc::from_raw(raw_ctx as *const ReentrantTaskCtx));
     }
 }

@@ -734,4 +734,12 @@ impl LocalStore {
         }
         self.state.read().mem_media_bytes.get(file_id).cloned()
     }
+
+    pub fn wal_checkpoint_truncate(&self) -> Result<(i32, i32, i32)> {
+        if let Some(db) = &self.sqlite {
+            db.wal_checkpoint_truncate()
+        } else {
+            Ok((0, 0, 0))
+        }
+    }
 }

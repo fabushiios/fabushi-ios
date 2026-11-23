@@ -162,24 +162,45 @@ pub fn route_command(host: &FabushiAppHost, request_json: &str) -> String {
         return make_error_json(&req_id, current_gen, &HostError::unknown_command(method));
     }
 
-    // Generation fencing: reject any stale generation on generation-sensitive RPCs.
+    // Generation fencing: reject any stale generation both BEFORE and AFTER dispatch_inner
+    // so an in-flight Account 1 RPC can never return stamped with Account 2's newer generation.
+    let start_gen = host.current_generation();
     let (ns, act) = normalize_legacy_method(method);
     let exempt_from_fence = ns == "generation" || (ns == "session" && act == "ping");
+    let bumps_generation = matches!(
+        (ns, act),
+        ("auth", "login" | "register" | "logout")
+            | ("session", "setAuthSession" | "clearSession" | "switchAccount" | "setServerUrl")
+            | ("settings", "serverUrlSet")
+            | ("generation", "bump" | "set")
+    );
     if !exempt_from_fence {
         if let Some(requested_gen) = req.generation {
-            if requested_gen < current_gen {
+            if requested_gen < start_gen {
                 return make_error_json(
                     &req_id,
-                    current_gen,
-                    &HostError::stale_generation(requested_gen, current_gen),
+                    start_gen,
+                    &HostError::stale_generation(requested_gen, start_gen),
                 );
             }
         }
     }
 
     let params = req.params.unwrap_or(Value::Null);
-    match dispatch_inner(host, &req_id, method, &params) {
-        Ok(result) => make_success_json(&req_id, host.current_generation(), &result),
-        Err(err) => make_error_json(&req_id, host.current_generation(), &err),
+    let outcome = dispatch_inner(host, &req_id, method, &params);
+    let end_gen = host.current_generation();
+    if !exempt_from_fence && !bumps_generation {
+        let effective_req_gen = req.generation.unwrap_or(start_gen);
+        if end_gen != start_gen || effective_req_gen < end_gen {
+            return make_error_json(
+                &req_id,
+                end_gen,
+                &HostError::stale_generation(effective_req_gen, end_gen),
+            );
+        }
+    }
+    match outcome {
+        Ok(result) => make_success_json(&req_id, end_gen, &result),
+        Err(err) => make_error_json(&req_id, end_gen, &err),
     }
 }

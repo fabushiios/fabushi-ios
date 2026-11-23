@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use parking_lot::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -13,10 +14,11 @@ use crate::error::{HostError, HostResult};
 use crate::storage::LocalSearchHit;
 
 /// Genuine local full-text search engine backed by persistent Tantivy 0.22 (BM25 + mmap).
+/// `reader` is lock-free (`Sync`) outside the writer mutex so concurrent searches never block behind commits.
 pub struct HostSearchEngine {
     index_dir: PathBuf,
     index: Index,
-    writer: IndexWriter,
+    writer: Mutex<IndexWriter>,
     reader: IndexReader,
     f_message_id: Field,
     f_chat_id: Field,
@@ -69,7 +71,7 @@ impl HostSearchEngine {
         Ok(Self {
             index_dir: index_dir.to_path_buf(),
             index,
-            writer,
+            writer: Mutex::new(writer),
             reader,
             f_message_id,
             f_chat_id,
@@ -84,51 +86,62 @@ impl HostSearchEngine {
     }
 
     pub fn index_message(
-        &mut self,
+        &self,
         message_id: i64,
         chat_id: i64,
         sender_id: u64,
         timestamp_ms: i64,
         body: &str,
     ) -> HostResult<()> {
+        let mut writer = self.writer.lock();
         let term = Term::from_field_i64(self.f_message_id, message_id);
-        self.writer.delete_term(term);
-        self.writer
-            .add_document(doc!(
-                self.f_message_id => message_id,
-                self.f_chat_id => chat_id,
-                self.f_sender_id => sender_id,
-                self.f_timestamp_ms => timestamp_ms,
-                self.f_body => body,
-            ))
-            .map_err(|e| HostError::storage(format!("Tantivy add_document failed: {e}")))?;
-        self.writer
-            .commit()
-            .map_err(|e| HostError::storage(format!("Tantivy commit failed: {e}")))?;
+        writer.delete_term(term);
+        if let Err(e) = writer.add_document(doc!(
+            self.f_message_id => message_id,
+            self.f_chat_id => chat_id,
+            self.f_sender_id => sender_id,
+            self.f_timestamp_ms => timestamp_ms,
+            self.f_body => body,
+        )) {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!("Tantivy add_document failed: {e}")));
+        }
+        if let Err(e) = writer.commit() {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!("Tantivy commit failed: {e}")));
+        }
+        drop(writer);
         self.reader
             .reload()
             .map_err(|e| HostError::storage(format!("Tantivy reader reload failed: {e}")))?;
         Ok(())
     }
 
-    pub fn rebuild(&mut self, messages: &[(i64, i64, u64, i64, String)]) -> HostResult<usize> {
-        self.writer
-            .delete_all_documents()
-            .map_err(|e| HostError::storage(format!("Tantivy delete_all_documents failed: {e}")))?;
-        for (message_id, chat_id, sender_id, timestamp_ms, body) in messages {
-            self.writer
-                .add_document(doc!(
-                    self.f_message_id => *message_id,
-                    self.f_chat_id => *chat_id,
-                    self.f_sender_id => *sender_id,
-                    self.f_timestamp_ms => *timestamp_ms,
-                    self.f_body => body.as_str(),
-                ))
-                .map_err(|e| HostError::storage(format!("Tantivy add_document failed: {e}")))?;
+    pub fn rebuild(&self, messages: &[(i64, i64, u64, i64, String)]) -> HostResult<usize> {
+        let mut writer = self.writer.lock();
+        if let Err(e) = writer.delete_all_documents() {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!(
+                "Tantivy delete_all_documents failed: {e}"
+            )));
         }
-        self.writer
-            .commit()
-            .map_err(|e| HostError::storage(format!("Tantivy rebuild commit failed: {e}")))?;
+        for (message_id, chat_id, sender_id, timestamp_ms, body) in messages {
+            if let Err(e) = writer.add_document(doc!(
+                self.f_message_id => *message_id,
+                self.f_chat_id => *chat_id,
+                self.f_sender_id => *sender_id,
+                self.f_timestamp_ms => *timestamp_ms,
+                self.f_body => body.as_str(),
+            )) {
+                let _ = writer.rollback();
+                return Err(HostError::storage(format!("Tantivy add_document failed: {e}")));
+            }
+        }
+        if let Err(e) = writer.commit() {
+            let _ = writer.rollback();
+            return Err(HostError::storage(format!("Tantivy rebuild commit failed: {e}")));
+        }
+        drop(writer);
         self.reader
             .reload()
             .map_err(|e| HostError::storage(format!("Tantivy rebuild reload failed: {e}")))?;

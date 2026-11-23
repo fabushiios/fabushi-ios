@@ -414,7 +414,9 @@ struct UnsupportedScreenCaptureBackend;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 impl ScreenCaptureBackend for UnsupportedScreenCaptureBackend {
     fn list_displays(&self) -> EngineResult<Vec<DisplayInfoDto>> {
-        Ok(Vec::new())
+        Err(RemoteEngineError::Unavailable(
+            "screen capture is unavailable on iOS".to_string(),
+        ))
     }
 
     fn capture_display(

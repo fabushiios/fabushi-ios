@@ -574,9 +574,30 @@ pub async fn execute_local_computer_op(
     command_id: &str,
     op: &RemoteComputerOp,
 ) -> RemoteComputerCommandResult {
-    execute_local_computer_op_inner(node_id, command_id, op, false).await
+    #[cfg(target_os = "ios")]
+    {
+        let _ = op;
+        return RemoteComputerCommandResult {
+            command_id: command_id.to_string(),
+            node_id: node_id.to_string(),
+            ok: false,
+            exit_code: 501,
+            stdout: String::new(),
+            stderr: "capability_unavailable: local computer host execution is disabled on iOS"
+                .to_string(),
+            entries: Vec::new(),
+            frame_data_url: None,
+            executed_by: "ios-sandbox-denied".to_string(),
+            duration_ms: 0,
+        };
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        execute_local_computer_op_inner(node_id, command_id, op, false).await
+    }
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 async fn execute_local_computer_op_inner(
     node_id: &str,
     command_id: &str,

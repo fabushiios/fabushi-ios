@@ -1,5 +1,8 @@
+use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use chrono::Utc;
 use gpui_telegram_client::config::{ClientConfig, DEFAULT_SERVER_URL};
 use gpui_telegram_client::net::proxy::ClientProxyConfig;
@@ -12,12 +15,159 @@ use gpui_telegram_client::net::{
 use gpui_telegram_core::action_bus::{
     ActionCategory, ActionContext, CliExporter, HermesToolExporter, McpExporter, OpenApiExporter,
 };
+use hkdf::Hkdf;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+use subtle::ConstantTimeEq as _;
+use zeroize::Zeroizing;
 
 use crate::error::{HostError, HostResult};
 use crate::host::FabushiAppHost;
 use crate::storage::{compute_storage_metrics, purge_media_cas_dir};
+
+const ACCOUNT_TOKEN_HKDF_SALT: &[u8] = b"fabushi-ios:host-kv:account-token-salt:v1";
+const ACCOUNT_TOKEN_HKDF_INFO: &[u8] = b"fabushi-ios:host-kv:account-token-aead:v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAccountRecord {
+    user_id: u64,
+    username: String,
+    session_id: String,
+    first_name: Option<String>,
+    created_at: Option<String>,
+    expires_at: Option<String>,
+    server_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypted_token_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce_b64: Option<String>,
+}
+
+fn derive_account_aead_key(passphrase: &str) -> HostResult<Zeroizing<[u8; 32]>> {
+    let hk = Hkdf::<Sha256>::new(Some(ACCOUNT_TOKEN_HKDF_SALT), passphrase.as_bytes());
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(ACCOUNT_TOKEN_HKDF_INFO, &mut *key)
+        .map_err(|e| HostError::crypto(format!("HKDF derivation failed: {e}")))?;
+    Ok(key)
+}
+
+fn persist_account_record(host: &FabushiAppHost, auth: &AuthResponse) -> HostResult<()> {
+    let account_id = auth.user_id.to_string();
+    if !auth.token.is_empty() {
+        host.account_tokens
+            .lock()
+            .insert(account_id.clone(), Zeroizing::new(auth.token.clone()));
+    }
+
+    let (encrypted_token_b64, nonce_b64) = if let Some(ref pass) = host.storage_passphrase {
+        if !auth.token.is_empty() {
+            let key = derive_account_aead_key(pass.as_str())?;
+            let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+                .map_err(|e| HostError::crypto(format!("AEAD init failed: {e}")))?;
+            let mut nonce_bytes = [0u8; 12];
+            getrandom::getrandom(&mut nonce_bytes)
+                .map_err(|e| HostError::crypto(format!("CSPRNG failed: {e}")))?;
+            let aad = format!("fabushi-account-token:v1|{}", auth.user_id);
+            let ct = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce_bytes),
+                    Payload {
+                        msg: auth.token.as_bytes(),
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|e| HostError::crypto(format!("Token encryption failed: {e}")))?;
+            (
+                Some(BASE64_STANDARD.encode(ct)),
+                Some(BASE64_STANDARD.encode(nonce_bytes)),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        // Without a Keychain storage_passphrase, NEVER persist raw bearer tokens in SQLite:
+        // store strictly non-secret account metadata on disk while token stays RAM-only.
+        (None, None)
+    };
+
+    let record = StoredAccountRecord {
+        user_id: auth.user_id,
+        username: auth.username.clone(),
+        session_id: auth.session_id.clone(),
+        first_name: auth.first_name.clone(),
+        created_at: auth.created_at.clone(),
+        expires_at: auth.expires_at.clone(),
+        server_url: host.current_server_url(),
+        encrypted_token_b64,
+        nonce_b64,
+    };
+    let encoded = serde_json::to_string(&record)
+        .map_err(|e| HostError::internal(format!("Account record serialization failed: {e}")))?;
+    host.host_db.kv_set("accounts", &account_id, &encoded)?;
+    Ok(())
+}
+
+fn restore_account_auth(
+    host: &FabushiAppHost,
+    account_id: &str,
+    raw: &str,
+) -> HostResult<AuthResponse> {
+    let rec: StoredAccountRecord = serde_json::from_str(raw)
+        .map_err(|e| HostError::storage(format!("Corrupt stored account record: {e}")))?;
+    let token = if let (Some(ct_b64), Some(nonce_b64)) =
+        (rec.encrypted_token_b64.as_deref(), rec.nonce_b64.as_deref())
+    {
+        if let Some(ref pass) = host.storage_passphrase {
+            let key = derive_account_aead_key(pass.as_str())?;
+            let cipher = ChaCha20Poly1305::new_from_slice(&*key)
+                .map_err(|e| HostError::crypto(format!("AEAD init failed: {e}")))?;
+            let ct = BASE64_STANDARD
+                .decode(ct_b64.trim())
+                .map_err(|e| HostError::crypto(format!("Invalid encrypted_token_b64: {e}")))?;
+            let nonce_vec = BASE64_STANDARD
+                .decode(nonce_b64.trim())
+                .map_err(|e| HostError::crypto(format!("Invalid nonce_b64: {e}")))?;
+            if nonce_vec.len() != 12 {
+                return Err(HostError::crypto("Corrupt account token nonce length"));
+            }
+            let aad = format!("fabushi-account-token:v1|{}", rec.user_id);
+            let plain = Zeroizing::new(
+                cipher
+                    .decrypt(
+                        Nonce::from_slice(&nonce_vec),
+                        Payload {
+                            msg: &ct,
+                            aad: aad.as_bytes(),
+                        },
+                    )
+                    .map_err(|_| HostError::crypto("Failed to decrypt stored account token"))?,
+            );
+            String::from_utf8(plain.to_vec())
+                .map_err(|e| HostError::crypto(format!("Decrypted token is invalid UTF-8: {e}")))?
+        } else if let Some(mem_tok) = host.account_tokens.lock().get(account_id) {
+            mem_tok.as_str().to_string()
+        } else {
+            return Err(HostError::unauthorized(
+                "Account token is encrypted and storage_passphrase is unavailable",
+            ));
+        }
+    } else if let Some(mem_tok) = host.account_tokens.lock().get(account_id) {
+        mem_tok.as_str().to_string()
+    } else {
+        String::new()
+    };
+
+    Ok(AuthResponse {
+        user_id: rec.user_id,
+        username: rec.username,
+        session_id: rec.session_id,
+        token,
+        first_name: rec.first_name,
+        created_at: rec.created_at,
+        expires_at: rec.expires_at,
+    })
+}
 
 fn parse_req<T: serde::de::DeserializeOwned>(params: &Value) -> HostResult<T> {
     serde_json::from_value(params.clone())
@@ -29,6 +179,15 @@ fn req_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
+}
+
+/// Non-trimming string extractor for secrets, passwords, and passcodes so leading/trailing spaces are preserved.
+fn req_raw_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
 }
@@ -63,7 +222,7 @@ pub fn handle_auth(
             } else {
                 LoginRequest {
                     username: req_str(params, "username")?.to_string(),
-                    password: req_str(params, "password")?.to_string(),
+                    password: req_raw_str(params, "password")?.to_string(),
                     device_name: params
                         .get("device_name")
                         .and_then(|v| v.as_str())
@@ -74,11 +233,7 @@ pub fn handle_auth(
             let auth = host.run_cancellable(req_id, async move {
                 client.login(&req).await.map_err(HostError::from)
             })?;
-            let _ = host.host_db.kv_set(
-                "accounts",
-                &auth.user_id.to_string(),
-                &serde_json::to_string(&auth).unwrap_or_default(),
-            );
+            persist_account_record(host, &auth)?;
             let _ = host
                 .host_db
                 .set_meta("active_account_id", &auth.user_id.to_string());
@@ -89,17 +244,24 @@ pub fn handle_auth(
             let auth = host.run_cancellable(req_id, async move {
                 client.register(&req).await.map_err(HostError::from)
             })?;
-            let _ = host.host_db.kv_set(
-                "accounts",
-                &auth.user_id.to_string(),
-                &serde_json::to_string(&auth).unwrap_or_default(),
-            );
+            persist_account_record(host, &auth)?;
+            let _ = host
+                .host_db
+                .set_meta("active_account_id", &auth.user_id.to_string());
             to_val(auth)
         }
         "logout" => {
+            let active_uid = client.current_user_id().map(|id| id.to_string());
+            let c_logout = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client.logout().await.map_err(HostError::from)
+                c_logout.logout().await.map_err(HostError::from)
             });
+            client.clear_session();
+            if let Some(uid) = active_uid {
+                host.account_tokens.lock().remove(&uid);
+            }
+            let _ = host.host_db.delete_meta("active_account_id");
+            host.reset_account_scope();
             host.bump_generation();
             match res {
                 Ok(()) => Ok(json!({ "logged_out": true, "generation": host.current_generation() })),
@@ -439,11 +601,7 @@ pub fn handle_session(
         "setAuthSession" => {
             let auth: AuthResponse = parse_req(params)?;
             client.set_auth_session(auth.clone());
-            let _ = host.host_db.kv_set(
-                "accounts",
-                &auth.user_id.to_string(),
-                &serde_json::to_string(&auth).unwrap_or_default(),
-            );
+            persist_account_record(host, &auth)?;
             let _ = host
                 .host_db
                 .set_meta("active_account_id", &auth.user_id.to_string());
@@ -451,30 +609,27 @@ pub fn handle_session(
         }
         "clearSession" => {
             client.clear_session();
+            let _ = host.host_db.delete_meta("active_account_id");
+            host.reset_account_scope();
             let generation = host.bump_generation();
             Ok(json!({ "cleared": true, "generation": generation }))
         }
         "switchAccount" => {
             let account_id = req_str(params, "account_id")?;
-            let saved = host.host_db.kv_get("accounts", account_id)?;
+            let raw = host
+                .host_db
+                .kv_get("accounts", account_id)?
+                .ok_or_else(|| HostError::not_found(format!("account not found: {account_id}")))?;
+            let auth = restore_account_auth(host, account_id, &raw)?;
             client.clear_session();
+            host.reset_account_scope();
             let new_gen = host.bump_generation();
-            if let Some(raw) = saved {
-                if let Ok(auth) = serde_json::from_str::<AuthResponse>(&raw) {
-                    client.set_auth_session(auth.clone());
-                    host.host_db.set_meta("active_account_id", account_id)?;
-                    return Ok(json!({
-                        "switched": true,
-                        "account_id": account_id,
-                        "user_id": auth.user_id,
-                        "generation": new_gen,
-                    }));
-                }
-            }
+            client.set_auth_session(auth.clone());
             host.host_db.set_meta("active_account_id", account_id)?;
             Ok(json!({
                 "switched": true,
                 "account_id": account_id,
+                "user_id": auth.user_id,
                 "generation": new_gen,
             }))
         }
@@ -484,12 +639,12 @@ pub fn handle_session(
             let accounts: Vec<Value> = map
                 .into_iter()
                 .map(|(k, v)| {
-                    if let Ok(auth) = serde_json::from_str::<AuthResponse>(&v) {
+                    if let Ok(rec) = serde_json::from_str::<StoredAccountRecord>(&v) {
                         json!({
                             "account_id": k,
-                            "user_id": auth.user_id,
-                            "username": auth.username,
-                            "first_name": auth.first_name,
+                            "user_id": rec.user_id,
+                            "username": rec.username,
+                            "first_name": rec.first_name,
                             "active": active.as_deref() == Some(k.as_str()),
                         })
                     } else {
@@ -516,7 +671,7 @@ pub fn handle_session(
             "default_server_url": DEFAULT_SERVER_URL,
         })),
         "checkpointWal" => {
-            let (busy, log, checkpointed) = host.host_db.wal_checkpoint_truncate()?;
+            let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
             Ok(json!({
                 "checkpointed": true,
                 "busy": busy,
@@ -545,7 +700,7 @@ pub fn handle_generation(
                 .get("generation")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| HostError::invalid_arguments("Missing u64 'generation'"))?;
-            let applied = host.set_generation(val);
+            let applied = host.set_generation(val)?;
             Ok(json!({ "generation": applied }))
         }
         "validate" => {
@@ -641,7 +796,7 @@ pub fn handle_settings(
             }))
         }
         "passcodeSet" => {
-            let passcode = req_str(params, "passcode")?;
+            let passcode = req_raw_str(params, "passcode")?;
             if passcode.len() < 4 {
                 return Err(HostError::invalid_arguments(
                     "Passcode must be at least 4 characters",
@@ -650,31 +805,71 @@ pub fn handle_settings(
             let mut salt = [0u8; 16];
             getrandom::getrandom(&mut salt)
                 .map_err(|e| HostError::crypto(format!("CSPRNG failed: {e}")))?;
+            let (m_cost, t_cost, p_cost) = if host.test_mode {
+                (1_024u32, 1u32, 1u32)
+            } else {
+                (65_536u32, 3u32, 1u32)
+            };
+            let argon_params = Argon2Params::new(m_cost, t_cost, p_cost, Some(32))
+                .map_err(|e| HostError::crypto(format!("Invalid Argon2id params: {e}")))?;
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
+            let mut digest = Zeroizing::new([0u8; 32]);
+            argon2
+                .hash_password_into(passcode.as_bytes(), &salt, &mut *digest)
+                .map_err(|e| HostError::crypto(format!("Argon2id passcode hashing failed: {e}")))?;
             let salt_b64 = BASE64_STANDARD.encode(salt);
-            let mut hasher = Sha256::new();
-            hasher.update(salt);
-            hasher.update(passcode.as_bytes());
-            let hash_hex = hex::encode(hasher.finalize());
+            let hash_hex = hex::encode(&*digest);
+            let encoded_hash = format!("argon2id$m={m_cost},t={t_cost},p={p_cost}${salt_b64}${hash_hex}");
             host.host_db.set_meta("passcode_salt", &salt_b64)?;
-            host.host_db.set_meta("passcode_hash", &hash_hex)?;
-            Ok(json!({ "configured": true }))
+            host.host_db.set_meta("passcode_hash", &encoded_hash)?;
+            Ok(json!({ "configured": true, "algorithm": "argon2id" }))
         }
         "passcodeVerify" => {
-            let passcode = req_str(params, "passcode")?;
-            let salt_opt = host.host_db.get_meta("passcode_salt")?;
+            let passcode = req_raw_str(params, "passcode")?;
             let hash_opt = host.host_db.get_meta("passcode_hash")?;
-            match (salt_opt, hash_opt) {
-                (Some(salt_b64), Some(expected_hash)) => {
+            match hash_opt {
+                Some(stored) => {
+                    let parts: Vec<&str> = stored.split('$').collect();
+                    if parts.len() != 4 || parts[0] != "argon2id" {
+                        return Err(HostError::crypto(
+                            "Unsupported or corrupt passcode hash format",
+                        ));
+                    }
+                    let mut m_cost: Option<u32> = None;
+                    let mut t_cost: Option<u32> = None;
+                    let mut p_cost: Option<u32> = None;
+                    for kv in parts[1].split(',') {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            match k {
+                                "m" => m_cost = v.parse().ok(),
+                                "t" => t_cost = v.parse().ok(),
+                                "p" => p_cost = v.parse().ok(),
+                                _ => {}
+                            }
+                        }
+                    }
+                    let (Some(m), Some(t), Some(p)) = (m_cost, t_cost, p_cost) else {
+                        return Err(HostError::crypto("Corrupt Argon2id passcode parameters"));
+                    };
                     let salt = BASE64_STANDARD
-                        .decode(salt_b64.trim())
+                        .decode(parts[2].trim())
                         .map_err(|e| HostError::crypto(format!("Corrupt passcode salt: {e}")))?;
-                    let mut hasher = Sha256::new();
-                    hasher.update(salt);
-                    hasher.update(passcode.as_bytes());
-                    let actual_hash = hex::encode(hasher.finalize());
-                    Ok(json!({ "valid": actual_hash == expected_hash, "configured": true }))
+                    let expected = hex::decode(parts[3].trim())
+                        .map_err(|e| HostError::crypto(format!("Corrupt passcode digest: {e}")))?;
+                    if expected.len() != 32 {
+                        return Err(HostError::crypto("Corrupt passcode digest length"));
+                    }
+                    let argon_params = Argon2Params::new(m, t, p, Some(32))
+                        .map_err(|e| HostError::crypto(format!("Invalid Argon2id params: {e}")))?;
+                    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
+                    let mut actual = Zeroizing::new([0u8; 32]);
+                    argon2
+                        .hash_password_into(passcode.as_bytes(), &salt, &mut *actual)
+                        .map_err(|e| HostError::crypto(format!("Argon2id verify failed: {e}")))?;
+                    let valid = bool::from(actual.as_slice().ct_eq(expected.as_slice()));
+                    Ok(json!({ "valid": valid, "configured": true }))
                 }
-                _ => Ok(json!({ "valid": false, "configured": false })),
+                None => Ok(json!({ "valid": false, "configured": false })),
             }
         }
         "passcodeClear" => {
@@ -689,7 +884,7 @@ pub fn handle_settings(
             "note": "iOS updates are delivered strictly through App Store / TestFlight"
         })),
         "checkpointWal" => {
-            let (busy, log, checkpointed) = host.host_db.wal_checkpoint_truncate()?;
+            let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
             Ok(json!({
                 "checkpointed": true,
                 "busy": busy,
@@ -972,6 +1167,26 @@ pub fn handle_actions(
         }
         "execute" => {
             let name = req_str(params, "name")?.to_string();
+            if host.is_ios_sandbox() {
+                let norm = name.trim().to_ascii_lowercase();
+                if matches!(
+                    norm.as_str(),
+                    "device_power_action"
+                        | "device_connect"
+                        | "remote_capture_screen"
+                        | "remote_mouse"
+                        | "remote_mouse_action"
+                        | "remote_keyboard"
+                        | "remote_keyboard_action"
+                        | "remote_disconnect_all"
+                        | "terminal_exec"
+                        | "terminal_list"
+                ) {
+                    return Err(HostError::capability_unavailable(format!(
+                        "Action '{name}' requires desktop host-control capabilities unavailable in the iOS sandbox"
+                    )));
+                }
+            }
             let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
             let approved = params
                 .get("approved")

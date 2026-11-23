@@ -6,7 +6,7 @@ use gpui_telegram_agent::hermes::state_db::{
     ApprovalStatus, CreateApprovalRequest, CreateCronJobRequest, CreateKanbanCardRequest,
     CreateSessionRequest, SessionListFilter,
 };
-use gpui_telegram_agent::hermes::toolsets::ToolsetId;
+use gpui_telegram_agent::hermes::toolsets::{ToolsetId, ToolsetPreset};
 use gpui_telegram_agent::multi_agent::{
     evaluate_group_wake_gate, evaluate_outbound_turn_review, is_explicit_pass_sentinel,
     FloorControlQueue, FloorPriority, GroupWakeGateInput, LoopBudget, OutboundTurnReviewInput,
@@ -29,9 +29,21 @@ use magpie_gateway::{
     UsageRecord,
 };
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::error::{HostError, HostResult};
 use crate::host::FabushiAppHost;
+
+const IOS_FORBIDDEN_TOOLSETS: [ToolsetId; 4] = [
+    ToolsetId::Terminal,
+    ToolsetId::CodeExecution,
+    ToolsetId::DesktopUi,
+    ToolsetId::Browser,
+];
+
+fn is_forbidden_ios_toolset(id: ToolsetId) -> bool {
+    IOS_FORBIDDEN_TOOLSETS.contains(&id)
+}
 
 fn parse_req<T: serde::de::DeserializeOwned>(params: &Value) -> HostResult<T> {
     serde_json::from_value(params.clone())
@@ -43,6 +55,14 @@ fn req_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
+}
+
+fn req_raw_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
 }
@@ -132,17 +152,35 @@ pub fn handle_fabushi(
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(enables) = params.get("enable").and_then(|v| v.as_array()) {
-                for item in enables.iter().filter_map(|v| v.as_str()) {
-                    if host.is_ios_sandbox()
-                        && matches!(
-                            item.to_ascii_lowercase().as_str(),
-                            "terminal" | "shell" | "code_execution"
-                        )
-                    {
-                        return Err(HostError::capability_unavailable(
-                            "Local terminal/shell toolset execution is unavailable in the iOS sandbox",
-                        ));
+                let items: Vec<&str> = enables.iter().filter_map(|v| v.as_str()).collect();
+                if host.is_ios_sandbox() {
+                    for raw in &items {
+                        let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
+                        if let Some(preset) = ToolsetPreset::from_str(raw.trim()) {
+                            if preset.toolsets().iter().any(|t| is_forbidden_ios_toolset(*t)) {
+                                return Err(HostError::capability_unavailable(format!(
+                                    "Toolset preset '{}' includes desktop-only toolsets unavailable in the iOS sandbox",
+                                    preset.as_str()
+                                )));
+                            }
+                        } else if let Some(custom) = reg.custom_toolsets.get(raw.trim()) {
+                            if custom.toolsets.iter().any(|t| is_forbidden_ios_toolset(*t)) {
+                                return Err(HostError::capability_unavailable(format!(
+                                    "Custom toolset '{}' includes desktop-only toolsets unavailable in the iOS sandbox",
+                                    custom.name
+                                )));
+                            }
+                        } else if let Some(id) = ToolsetId::from_str(&norm) {
+                            if is_forbidden_ios_toolset(id) {
+                                return Err(HostError::capability_unavailable(format!(
+                                    "Toolset '{}' is unavailable in the iOS sandbox",
+                                    id.as_str()
+                                )));
+                            }
+                        }
                     }
+                }
+                for item in items {
                     reg.enable_by_name(item)
                         .map_err(HostError::invalid_arguments)?;
                 }
@@ -207,12 +245,15 @@ pub fn handle_fabushi(
             let target = TaskState::from_str(state_str).ok_or_else(|| {
                 HostError::invalid_arguments(format!("Invalid TaskState '{state_str}'"))
             })?;
-            let mut reg = host.task_registry.lock();
-            let task = reg
-                .get_mut(task_id)
-                .ok_or_else(|| HostError::not_found(format!("Task '{task_id}' not found")))?;
-            task.transition_to(target)?;
-            let out = to_val(task.clone())?;
+            let out = {
+                let mut reg = host.task_registry.lock();
+                let task = reg
+                    .get_mut(task_id)
+                    .ok_or_else(|| HostError::not_found(format!("Task '{task_id}' not found")))?;
+                task.transition_to(target)?;
+                to_val(task.clone())?
+            };
+            // Lock on task_registry is explicitly dropped BEFORE invoking emit_event / foreign C callbacks (B-03).
             host.emit_event(
                 "taskStateUpdated",
                 json!({ "taskId": task_id, "state": target.as_str() }),
@@ -858,10 +899,10 @@ pub fn handle_multi_agent(
                 .get("ttl_secs")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(300);
-            let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed)
+            let mut seed = Zeroizing::new([0u8; 32]);
+            getrandom::getrandom(&mut *seed)
                 .map_err(|e| HostError::crypto(format!("CSPRNG error: {e}")))?;
-            let signing_key = SigningKey::from_bytes(&seed);
+            let signing_key = SigningKey::from_bytes(&*seed);
             let verifying_key: VerifyingKey = signing_key.verifying_key();
             let token = ScopedCapabilityToken::issue(
                 &signing_key,
@@ -1073,8 +1114,8 @@ pub fn handle_magpie(
             *host.magpie_masking.lock() = MaskingEngine::new(cfg.clone());
             to_val(cfg)
         }
-        "maskText" | "maskingPreview" => {
-            let text = req_str(params, "text")?;
+        "maskText" => {
+            let text = req_raw_str(params, "text")?;
             if let Some(cfg_val) = params.get("config") {
                 let cfg: MaskingConfig = parse_req(cfg_val)?;
                 let temp_engine = MaskingEngine::new(cfg);
@@ -1085,8 +1126,20 @@ pub fn handle_magpie(
             let res = engine.mask_text(text);
             to_val(res)
         }
+        "maskingPreview" => {
+            let text = req_raw_str(params, "text")?;
+            if let Some(cfg_val) = params.get("config") {
+                let cfg: MaskingConfig = parse_req(cfg_val)?;
+                let temp_engine = MaskingEngine::new(cfg);
+                let res = temp_engine.preview_text(text);
+                return to_val(res);
+            }
+            let engine = host.magpie_masking.lock();
+            let res = engine.preview_text(text);
+            to_val(res)
+        }
         "unmaskText" => {
-            let masked_text = req_str(params, "text")?;
+            let masked_text = req_raw_str(params, "text")?;
             let engine = host.magpie_masking.lock();
             let restored = engine.unmask_text(masked_text);
             Ok(json!({ "text": restored }))

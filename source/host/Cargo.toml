@@ -12,7 +12,7 @@ name = "mahayana_app_host"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# All 11 vendored v1.6.7 pure-Rust mobile domain crates in source/desktop_core
+# All 11 vendored v1.6.8 pure-Rust mobile domain crates in source/desktop_core
 gpui_telegram_core = { path = "../desktop_core/crates/gpui_telegram_core" }
 gpui_telegram_proto = { path = "../desktop_core/crates/gpui_telegram_proto" }
 gpui_telegram_client = { path = "../desktop_core/crates/gpui_telegram_client" }
@@ -52,6 +52,10 @@ parking_lot = "0.12"
 libc = "0.2"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 getrandom = "0.2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+subtle = "2.6"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -72,6 +76,12 @@ debug = 0
 strip = "debuginfo"
 incremental = false
 codegen-units = 16
+
+[profile.test.package.argon2]
+opt-level = 3
+
+[profile.test.package.blake2]
+opt-level = 3
 
 [profile.release]
 # Keep default panic = "unwind" so catch_unwind works across every C-ABI boundary!

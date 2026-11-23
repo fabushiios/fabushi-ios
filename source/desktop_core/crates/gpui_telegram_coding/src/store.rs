@@ -537,6 +537,14 @@ impl CodingStore {
         .map_err(|e| format!("failed to finalize turn receipt: {e}"))?;
         Ok(())
     }
+
+    pub fn wal_checkpoint_truncate(&self) -> Result<(i32, i32, i32), String> {
+        let conn = self.conn.lock();
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| format!("failed to checkpoint coding_store WAL: {e}"))
+    }
 }
 
 pub fn now_ms() -> i64 {

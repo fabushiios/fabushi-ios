@@ -222,19 +222,26 @@ fn test_sqlite_wal_outbox_settings_passcode_proxy_and_persistence() {
             )["ok"],
             true
         );
+        let set_pw = dispatch(
+            host,
+            &json!({"method": "settings.passcodeSet", "params": {"passcode": " 246810 "}}),
+        );
+        assert_eq!(set_pw["ok"], true);
+        assert_eq!(set_pw["result"]["algorithm"], "argon2id");
         assert_eq!(
             dispatch(
                 host,
-                &json!({"method": "settings.passcodeSet", "params": {"passcode": "246810"}})
-            )["ok"],
+                &json!({"method": "settings.passcodeVerify", "params": {"passcode": " 246810 "}})
+            )["result"]["valid"],
             true
         );
+        // Trimmed version MUST NOT match (verifies req_raw_str preserves leading/trailing whitespace!)
         assert_eq!(
             dispatch(
                 host,
                 &json!({"method": "settings.passcodeVerify", "params": {"passcode": "246810"}})
             )["result"]["valid"],
-            true
+            false
         );
         assert_eq!(
             dispatch(
@@ -243,6 +250,21 @@ fn test_sqlite_wal_outbox_settings_passcode_proxy_and_persistence() {
             )["result"]["valid"],
             false
         );
+
+        // Verify stored passcode_hash in host_state.db is genuinely Argon2id (never raw SHA-256!)
+        let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+        let stored_hash: String = conn
+            .query_row(
+                "SELECT value FROM host_meta WHERE key = 'passcode_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored_hash.starts_with("argon2id$m=65536,t=3,p=1$"),
+            "Expected production Argon2id passcode hash, got: {stored_hash}"
+        );
+        drop(conn);
 
         let proxy_up = dispatch(
             host,
@@ -282,7 +304,7 @@ fn test_sqlite_wal_outbox_settings_passcode_proxy_and_persistence() {
 
         let verify_reopen = dispatch(
             host2,
-            &json!({"method": "settings.passcodeVerify", "params": {"passcode": "246810"}}),
+            &json!({"method": "settings.passcodeVerify", "params": {"passcode": " 246810 "}}),
         );
         assert_eq!(verify_reopen["result"]["valid"], true);
 
@@ -384,6 +406,16 @@ fn test_real_tantivy_full_text_search_ranking_persistence_and_cjk_fallback() {
         let rebuild = dispatch(host2, &json!({"method": "search.rebuildLocalIndex"}));
         assert_eq!(rebuild["ok"], true);
         assert_eq!(rebuild["result"]["indexed_docs"], 4);
+
+        // Trailing backslash in search query must not trigger SQLite LIKE ESCAPE error (NB-06)
+        let bs = dispatch(
+            host2,
+            &json!({
+                "method": "search.localMessages",
+                "params": {"query": "path\\"}
+            }),
+        );
+        assert_eq!(bs["ok"], true, "Backslash query must not error: {bs}");
 
         fabushi_host_destroy(host2);
     }

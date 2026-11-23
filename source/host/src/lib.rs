@@ -12,10 +12,14 @@ pub mod host;
 pub mod search;
 pub mod storage;
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 
 pub use events::{HostEvent, TelegramBridgeEventCallback};
@@ -27,7 +31,44 @@ use crate::ffi::{
 };
 
 // ============================================================================
-// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.7 API)
+// 0. Refcounted Opaque Handle Registry (Eliminates FFI UAF & Aliasing UB)
+// ============================================================================
+
+static NEXT_HOST_HANDLE_ID: AtomicUsize = AtomicUsize::new(1);
+static HOST_REGISTRY: OnceLock<RwLock<HashMap<usize, Arc<FabushiAppHost>>>> = OnceLock::new();
+
+fn host_registry() -> &'static RwLock<HashMap<usize, Arc<FabushiAppHost>>> {
+    HOST_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn register_host(host: FabushiAppHost) -> *mut c_void {
+    let mut guard = host_registry().write();
+    let mut id = NEXT_HOST_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+    while id == 0 || guard.contains_key(&id) {
+        id = NEXT_HOST_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+    }
+    guard.insert(id, Arc::new(host));
+    id as *mut c_void
+}
+
+fn lookup_host(handle: *mut c_void) -> Option<Arc<FabushiAppHost>> {
+    if handle.is_null() {
+        return None;
+    }
+    let id = handle as usize;
+    host_registry().read().get(&id).cloned()
+}
+
+fn unregister_host(handle: *mut c_void) -> Option<Arc<FabushiAppHost>> {
+    if handle.is_null() {
+        return None;
+    }
+    let id = handle as usize;
+    host_registry().write().remove(&id)
+}
+
+// ============================================================================
+// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.8 API)
 // ============================================================================
 
 /// Creates a canonical `FabushiAppHost` instance from optional JSON configuration.
@@ -62,7 +103,7 @@ pub unsafe extern "C" fn fabushi_host_create(config_json: *const c_char) -> *mut
         };
 
         match FabushiAppHost::from_config(config) {
-            Ok(host) => Box::into_raw(Box::new(host)) as *mut c_void,
+            Ok(host) => register_host(host),
             Err(err) => {
                 set_last_error(Some(err));
                 std::ptr::null_mut()
@@ -83,7 +124,7 @@ pub unsafe extern "C" fn fabushi_host_create(config_json: *const c_char) -> *mut
 /// Synchronously dispatches a fail-closed JSON-RPC request to the canonical host engine.
 ///
 /// # Safety
-/// `handle` must be a live pointer returned by `fabushi_host_create` (or legacy aliases).
+/// `handle` must be a handle returned by `fabushi_host_create` (or legacy aliases).
 /// `request_json` must point to a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fabushi_host_dispatch(
@@ -114,8 +155,16 @@ pub unsafe extern "C" fn fabushi_host_dispatch(
             }
         };
 
-        let host_ref = unsafe { &*(handle as *const FabushiAppHost) };
-        let response_str = host_ref.dispatch(input_str);
+        let Some(host) = lookup_host(handle) else {
+            return make_error_json_ptr(
+                "",
+                0,
+                "host_closed",
+                "Host handle is invalid or already destroyed",
+                false,
+            );
+        };
+        let response_str = host.dispatch(input_str);
         string_to_c_ptr(response_str)
     }));
 
@@ -137,7 +186,7 @@ pub unsafe extern "C" fn fabushi_host_dispatch(
 /// Polls up to `max_count` events, blocking up to `timeout_ms` ms until an event is ready.
 ///
 /// # Safety
-/// `handle` must be a live pointer returned by `fabushi_host_create` (or legacy aliases).
+/// `handle` must be a handle returned by `fabushi_host_create` (or legacy aliases).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fabushi_host_poll_events(
     handle: *mut c_void,
@@ -154,9 +203,17 @@ pub unsafe extern "C" fn fabushi_host_poll_events(
                 false,
             );
         }
-        let host_ref = unsafe { &*(handle as *const FabushiAppHost) };
-        let events = host_ref.poll_events(max_count, timeout_ms);
-        let generation = host_ref.current_generation();
+        let Some(host) = lookup_host(handle) else {
+            return make_error_json_ptr(
+                "",
+                0,
+                "host_closed",
+                "Host handle is invalid or already destroyed",
+                false,
+            );
+        };
+        let events = host.poll_events(max_count, timeout_ms);
+        let generation = host.current_generation();
         let response = make_success_json("", generation, &json!({ "events": events }));
         string_to_c_ptr(response)
     }));
@@ -179,7 +236,7 @@ pub unsafe extern "C" fn fabushi_host_poll_events(
 /// Cooperatively cancels an in-flight RPC matching `request_id`.
 ///
 /// # Safety
-/// `handle` must be a live host pointer and `request_id` a valid NUL-terminated C string.
+/// `handle` must be a host handle and `request_id` a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fabushi_host_cancel(
     handle: *mut c_void,
@@ -193,22 +250,25 @@ pub unsafe extern "C" fn fabushi_host_cancel(
             Ok(s) => s,
             Err(_) => return false,
         };
-        let host_ref = unsafe { &*(handle as *const FabushiAppHost) };
-        host_ref.cancel_request(id)
+        let Some(host) = lookup_host(handle) else {
+            return false;
+        };
+        host.cancel_request(id)
     }));
     result.unwrap_or(false)
 }
 
-/// Destroys a canonical host handle and reclaims all resources cleanly.
+/// Destroys a canonical host handle and reclaims all resources cleanly without UAF/double-free.
 ///
 /// # Safety
-/// `handle` must be NULL or a live pointer created by `fabushi_host_create` / legacy create aliases.
+/// `handle` must be NULL or a handle created by `fabushi_host_create` / legacy create aliases.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fabushi_host_destroy(handle: *mut c_void) {
     if !handle.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            unsafe {
-                drop(Box::from_raw(handle as *mut FabushiAppHost));
+            if let Some(host) = unregister_host(handle) {
+                host.shutdown();
+                drop(host);
             }
         }));
     }
@@ -245,20 +305,30 @@ pub unsafe extern "C" fn telegram_app_host_create(
         let path = if app_data_dir.is_null() {
             compat::default_app_data_dir()
         } else {
-            let cstr = unsafe { CStr::from_ptr(app_data_dir) };
-            PathBuf::from(cstr.to_string_lossy().into_owned())
+            match unsafe { CStr::from_ptr(app_data_dir) }.to_str() {
+                Ok(s) => PathBuf::from(s),
+                Err(e) => {
+                    set_last_error(Some(format!("invalid_utf8: app_data_dir: {e}")));
+                    return std::ptr::null_mut();
+                }
+            }
         };
 
         let passphrase = if storage_passphrase.is_null() {
             None
         } else {
-            let cstr = unsafe { CStr::from_ptr(storage_passphrase) };
-            let s = cstr.to_string_lossy().into_owned();
-            if s.is_empty() { None } else { Some(s) }
+            match unsafe { CStr::from_ptr(storage_passphrase) }.to_str() {
+                Ok(s) if !s.is_empty() => Some(s.to_string()),
+                Ok(_) => None,
+                Err(e) => {
+                    set_last_error(Some(format!("invalid_utf8: storage_passphrase: {e}")));
+                    return std::ptr::null_mut();
+                }
+            }
         };
 
         match FabushiAppHost::new(path, passphrase) {
-            Ok(host) => Box::into_raw(Box::new(host)) as *mut c_void,
+            Ok(host) => register_host(host),
             Err(err) => {
                 set_last_error(Some(err));
                 std::ptr::null_mut()
@@ -287,12 +357,17 @@ pub unsafe extern "C" fn telegram_app_host_create_test(
         let path = if app_data_dir.is_null() {
             compat::default_app_data_dir().join("test_host")
         } else {
-            let cstr = unsafe { CStr::from_ptr(app_data_dir) };
-            PathBuf::from(cstr.to_string_lossy().into_owned())
+            match unsafe { CStr::from_ptr(app_data_dir) }.to_str() {
+                Ok(s) => PathBuf::from(s),
+                Err(e) => {
+                    set_last_error(Some(format!("invalid_utf8: app_data_dir: {e}")));
+                    return std::ptr::null_mut();
+                }
+            }
         };
 
         match FabushiAppHost::new_test(path) {
-            Ok(host) => Box::into_raw(Box::new(host)) as *mut c_void,
+            Ok(host) => register_host(host),
             Err(err) => {
                 set_last_error(Some(err));
                 std::ptr::null_mut()
@@ -318,7 +393,7 @@ pub unsafe extern "C" fn telegram_app_host_last_error() -> *const c_char {
 /// Registers or unregisters a push event callback. Passing NULL for `callback` safely unregisters.
 ///
 /// # Safety
-/// `host` must be NULL or a live handle returned by host creation.
+/// `host` must be NULL or a handle returned by host creation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn telegram_bridge_register_event_callback(
     host: *mut c_void,
@@ -326,11 +401,10 @@ pub unsafe extern "C" fn telegram_bridge_register_event_callback(
     user_context: *mut c_void,
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if host.is_null() {
+        let Some(host_arc) = lookup_host(host) else {
             return;
-        }
-        let host_ref = unsafe { &*(host as *const FabushiAppHost) };
-        host_ref.register_event_callback(callback, user_context);
+        };
+        host_arc.register_event_callback(callback, user_context);
     }));
 }
 
@@ -487,7 +561,7 @@ impl SlidingReplayWindow128 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn telegram_replay_window_create() -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(SlidingReplayWindow128::new())) as *mut c_void
+        Box::into_raw(Box::new(Mutex::new(SlidingReplayWindow128::new()))) as *mut c_void
     }))
     .unwrap_or(std::ptr::null_mut())
 }
@@ -501,8 +575,8 @@ pub unsafe extern "C" fn telegram_replay_window_check_and_add(
         if window.is_null() {
             return false;
         }
-        let win = unsafe { &mut *(window as *mut SlidingReplayWindow128) };
-        win.check_and_add(seq)
+        let win = unsafe { &*(window as *const Mutex<SlidingReplayWindow128>) };
+        win.lock().check_and_add(seq)
     }))
     .unwrap_or(false)
 }
@@ -511,7 +585,7 @@ pub unsafe extern "C" fn telegram_replay_window_check_and_add(
 pub unsafe extern "C" fn telegram_replay_window_destroy(window: *mut c_void) {
     if !window.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            unsafe { drop(Box::from_raw(window as *mut SlidingReplayWindow128)) };
+            unsafe { drop(Box::from_raw(window as *mut Mutex<SlidingReplayWindow128>)) };
         }));
     }
 }

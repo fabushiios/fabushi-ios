@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bot_browser::e2ee_sync::{DeviceSyncKeypair, UnlockedUserVaultKey, UserVaultKeyEnvelope};
@@ -13,6 +13,8 @@ use fabushi_remote_engine::control_lease::RemoteControlHub;
 use fabushi_remote_engine::terminal::Osc52StreamScanner;
 use gpui_telegram_agent::computer::ComputerLeaseBroker;
 use gpui_telegram_agent::hermes::security::ValueBoundApprovalLedger;
+use gpui_telegram_agent::hermes::toolsets::{ToolsetId, ToolsetPreset};
+use gpui_telegram_agent::hermes::HermesEngineConfig;
 use gpui_telegram_agent::mcp::ToolPermissionDock;
 use gpui_telegram_agent::multi_agent::{FloorControlQueue, LoopBudget, SharedGroupWorkspace};
 use gpui_telegram_agent::talk::{TalkCoordinator, VadBargeInDetector};
@@ -21,6 +23,7 @@ use gpui_telegram_agent::HermesEngine;
 use gpui_telegram_client::client::TelegramClient;
 use gpui_telegram_client::config::{ClientConfig, DEFAULT_HTTP_TIMEOUT_SECS, DEFAULT_SERVER_URL};
 use gpui_telegram_client::e2ee::{DoubleRatchetSession, SenderKeyState};
+use gpui_telegram_client::outbox::OutboxStatusEvent;
 use gpui_telegram_core::action_bus::{register_full_app_actions, ActionRegistry};
 use gpui_telegram_core::auth::GenerationFence;
 use gpui_telegram_core::types::ChatId;
@@ -31,11 +34,12 @@ use gpui_telegram_webrtc::calls::WebRtcCallEngine;
 use gpui_telegram_webrtc::media::DefaultAiMediaTap;
 use gpui_telegram_webrtc::sfu::SfuBridge;
 use magpie_gateway::{MaskingConfig, MaskingEngine, RouteRuntimeMetrics, RoutingGroup, UsageLedger};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::compat::default_app_data_dir;
 use crate::dedup::MessageDedupStore;
@@ -63,26 +67,86 @@ pub struct HostConfig {
 struct InFlightGuard<'a> {
     host: &'a FabushiAppHost,
     request_id: Option<String>,
+    call_seq: u64,
 }
 
 impl<'a> Drop for InFlightGuard<'a> {
     fn drop(&mut self) {
         if let Some(ref id) = self.request_id {
-            self.host.in_flight_cancels.lock().remove(id);
+            let mut map = self.host.in_flight_cancels.lock();
+            if let Some(entries) = map.get_mut(id) {
+                entries.retain(|(seq, _)| *seq != self.call_seq);
+                if entries.is_empty() {
+                    map.remove(id);
+                }
+            }
         }
     }
 }
 
+struct PumpControl {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn validate_server_url_input(raw_url: &str) -> HostResult<String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return Err(HostError::invalid_arguments("server_url cannot be empty"));
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(HostError::invalid_arguments(
+            "server_url must not contain whitespace or control characters",
+        ));
+    }
+    if let Some(scheme_pos) = trimmed.find("://") {
+        let scheme = &trimmed[..scheme_pos];
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(HostError::invalid_arguments(format!(
+                "Unsupported server_url scheme '{scheme}': only http and https are allowed"
+            )));
+        }
+    } else if trimmed.starts_with("javascript:") || trimmed.starts_with("file:") || trimmed.starts_with(':') {
+        return Err(HostError::invalid_arguments(
+            "Invalid server_url format; expected http:// or https:// host",
+        ));
+    }
+    let normalized = ClientConfig::normalize_url(trimmed);
+    let after_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or("");
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') || authority.contains("://") {
+        return Err(HostError::invalid_arguments(format!(
+            "Invalid server_url authority in '{raw_url}'"
+        )));
+    }
+    if let Some((host_part, port_part)) = authority.rsplit_once(':') {
+        if !host_part.ends_with(']') {
+            if host_part.is_empty() || port_part.is_empty() || port_part.parse::<u16>().is_err() {
+                return Err(HostError::invalid_arguments(format!(
+                    "Invalid server_url host/port in '{raw_url}'"
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 pub struct FabushiAppHost {
     pub storage_dir: PathBuf,
-    pub storage_passphrase: Option<String>,
+    pub storage_passphrase: Option<Zeroizing<String>>,
     pub test_mode: bool,
     pub ios_sandbox_strict: bool,
     pub http_timeout_secs: u64,
     pub server_url: RwLock<String>,
     pub client: RwLock<Arc<TelegramClient>>,
     pub host_db: Arc<HostSqliteStore>,
-    pub search_engine: Arc<Mutex<HostSearchEngine>>,
+    pub search_engine: Arc<HostSearchEngine>,
     pub hermes: Arc<HermesEngine>,
     pub coding_store: Arc<Mutex<CodingStore>>,
     pub miniapp_db: Arc<Mutex<Connection>>,
@@ -92,10 +156,17 @@ pub struct FabushiAppHost {
     pub event_queue: Arc<EventQueue>,
     pub event_sink: Arc<Mutex<Option<BridgeEventSink>>>,
     pub generation_fence: Arc<GenerationFence>,
+    gen_lock: Mutex<()>,
+    reconfig_lock: Mutex<()>,
+    is_shutdown: AtomicBool,
     pub dedup_store: Arc<Mutex<MessageDedupStore>>,
     pub next_message_id: AtomicI64,
-    pub in_flight_cancels: Mutex<HashMap<String, CancellationToken>>,
-    pump_shutdown: Mutex<CancellationToken>,
+    next_call_seq: AtomicU64,
+    pub in_flight_cancels: Mutex<HashMap<String, Vec<(u64, CancellationToken)>>>,
+    pump_control: Mutex<Option<PumpControl>>,
+    /// In-memory bearer token cache keyed by account_id (used when storage_passphrase is absent;
+    /// bearer tokens are NEVER written in plaintext to host_state.db).
+    pub account_tokens: Mutex<HashMap<String, Zeroizing<String>>>,
     // Domain engine state
     pub vault_unlocked_key: Mutex<Option<UnlockedUserVaultKey>>,
     pub vault_envelope: Mutex<Option<UserVaultKeyEnvelope>>,
@@ -129,6 +200,28 @@ pub type TelegramAppHost = FabushiAppHost;
 
 impl FabushiAppHost {
     pub fn from_config(config: HostConfig) -> Result<Self, String> {
+        let test_mode = {
+            #[cfg(all(target_os = "ios", not(debug_assertions)))]
+            {
+                false
+            }
+            #[cfg(not(all(target_os = "ios", not(debug_assertions))))]
+            {
+                config.test_mode
+            }
+        };
+
+        let ios_sandbox_strict = {
+            #[cfg(target_os = "ios")]
+            {
+                true
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                config.ios_sandbox_strict.unwrap_or(true)
+            }
+        };
+
         let storage_dir = config
             .app_data_dir
             .or(config.storage_dir)
@@ -136,7 +229,7 @@ impl FabushiAppHost {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                if config.test_mode {
+                if test_mode {
                     default_app_data_dir().join("test_host")
                 } else {
                     default_app_data_dir()
@@ -157,7 +250,7 @@ impl FabushiAppHost {
             if trimmed.is_empty() {
                 DEFAULT_SERVER_URL.to_string()
             } else {
-                ClientConfig::normalize_url(trimmed)
+                validate_server_url_input(trimmed).map_err(|e| e.to_string())?
             }
         } else if let Ok(Some(saved)) = host_db.get_meta("server_url") {
             let trimmed = saved.trim();
@@ -194,17 +287,38 @@ impl FabushiAppHost {
             }
         }
 
-        // Open persistent Tantivy 0.22 local search index
+        // Open persistent Tantivy 0.22 local search index (lock-free IndexReader, inner writer lock)
         let tantivy_dir = storage_dir.join("tantivy_index");
         let search_engine =
-            Arc::new(Mutex::new(HostSearchEngine::open(&tantivy_dir).map_err(|e| e.to_string())?));
+            Arc::new(HostSearchEngine::open(&tantivy_dir).map_err(|e| e.to_string())?);
 
-        // Open embedded Hermes/Fabushi agent runtime (SQLite WAL)
+        // Open embedded Hermes/Fabushi agent runtime (SQLite WAL).
+        // Under iOS sandbox policy, skip local CLI dotfile / loopback discovery and default to Safe preset.
         let hermes_dir = storage_dir.join("hermes");
+        let mut hermes_cfg = HermesEngineConfig {
+            workspace_root: storage_dir.clone(),
+            data_dir: Some(hermes_dir),
+            ..Default::default()
+        };
+        if ios_sandbox_strict {
+            hermes_cfg.skip_local_discovery = true;
+            hermes_cfg.default_preset = ToolsetPreset::Safe;
+        }
         let hermes = Arc::new(
-            HermesEngine::open(&hermes_dir, &storage_dir)
+            HermesEngine::new(hermes_cfg)
                 .map_err(|e| format!("Failed to open HermesEngine: {e}"))?,
         );
+        if ios_sandbox_strict {
+            let mut ts = hermes.toolsets().write().unwrap_or_else(|e| e.into_inner());
+            for forbidden in [
+                ToolsetId::Terminal,
+                ToolsetId::CodeExecution,
+                ToolsetId::DesktopUi,
+                ToolsetId::Browser,
+            ] {
+                ts.disable(forbidden);
+            }
+        }
 
         // Open SQLite CodingStore
         let coding_store = Arc::new(Mutex::new(
@@ -228,7 +342,7 @@ impl FabushiAppHost {
         register_full_app_actions(&action_registry)
             .map_err(|e| format!("Failed to register full app actions: {e}"))?;
 
-        // Hydrate generation fence, next_message_id, and 24h client_nonce dedup from SQLite WAL
+        // Hydrate generation fence, next_message_id, 24h client_nonce dedup, and Magpie groups from SQLite WAL
         let initial_gen = host_db.load_generation().unwrap_or(1);
         let generation_fence = Arc::new(GenerationFence::new(initial_gen));
         let next_msg_id = host_db.load_next_message_id().unwrap_or(1001);
@@ -241,34 +355,36 @@ impl FabushiAppHost {
             }
         }
 
+        let mut magpie_groups = HashMap::new();
+        if let Ok(persisted_groups) = host_db.kv_list("magpie_groups") {
+            for (gid, raw) in persisted_groups {
+                if let Ok(group) = serde_json::from_str::<RoutingGroup>(&raw) {
+                    magpie_groups.insert(gid, group);
+                }
+            }
+        }
+
         let event_queue = Arc::new(EventQueue::default());
         let event_sink: Arc<Mutex<Option<BridgeEventSink>>> = Arc::new(Mutex::new(None));
 
-        let pump_shutdown = CancellationToken::new();
-        Self::spawn_event_pump(
-            Arc::clone(&client),
+        let pump = Self::spawn_event_pump(
+            Arc::downgrade(&client),
+            client.outbox.subscribe_events(),
             Arc::clone(&event_queue),
             Arc::clone(&event_sink),
             Arc::clone(&generation_fence),
             Arc::clone(&host_db),
-            pump_shutdown.clone(),
         );
 
-        let ios_sandbox_strict = {
-            #[cfg(target_os = "ios")]
-            {
-                true
-            }
-            #[cfg(not(target_os = "ios"))]
-            {
-                config.ios_sandbox_strict.unwrap_or(true)
-            }
-        };
+        let storage_passphrase = config
+            .storage_passphrase
+            .filter(|s| !s.is_empty())
+            .map(Zeroizing::new);
 
         Ok(Self {
             storage_dir,
-            storage_passphrase: config.storage_passphrase,
-            test_mode: config.test_mode,
+            storage_passphrase,
+            test_mode,
             ios_sandbox_strict,
             http_timeout_secs,
             server_url: RwLock::new(initial_url),
@@ -284,10 +400,15 @@ impl FabushiAppHost {
             event_queue,
             event_sink,
             generation_fence,
+            gen_lock: Mutex::new(()),
+            reconfig_lock: Mutex::new(()),
+            is_shutdown: AtomicBool::new(false),
             dedup_store: Arc::new(Mutex::new(dedup_store)),
             next_message_id: AtomicI64::new(next_msg_id),
+            next_call_seq: AtomicU64::new(1),
             in_flight_cancels: Mutex::new(HashMap::new()),
-            pump_shutdown: Mutex::new(pump_shutdown),
+            pump_control: Mutex::new(pump),
+            account_tokens: Mutex::new(HashMap::new()),
             vault_unlocked_key: Mutex::new(None),
             vault_envelope: Mutex::new(None),
             vault_device_keypairs: Mutex::new(HashMap::new()),
@@ -300,7 +421,7 @@ impl FabushiAppHost {
             floor_queues: Mutex::new(HashMap::new()),
             loop_budgets: Mutex::new(HashMap::new()),
             group_workspaces: Mutex::new(HashMap::new()),
-            magpie_groups: Mutex::new(HashMap::new()),
+            magpie_groups: Mutex::new(magpie_groups),
             magpie_metrics: Mutex::new(RouteRuntimeMetrics::default()),
             magpie_masking: Mutex::new(MaskingEngine::new(MaskingConfig {
                 enabled: true,
@@ -338,60 +459,132 @@ impl FabushiAppHost {
         })
     }
 
+    /// Spawns a lightweight dedicated non-Tokio OS thread holding `Weak<TelegramClient>` so:
+    /// 1. It NEVER creates a strong `Runtime -> Task -> Arc<TelegramClient> -> Arc<Runtime>` cycle
+    ///    and NEVER triggers a Tokio `Runtime::drop` panic inside a worker thread.
+    /// 2. Sync SQLite PTS writes & foreign C callbacks NEVER block the 2-thread Tokio worker pool.
+    /// 3. `event_sink.lock()` is ALWAYS cloned and released before invoking `sink.emit(...)`.
+    /// 4. `stop_event_pump()` signals the Condvar and synchronously `.join()`s the thread so ZERO
+    ///    callbacks can ever fire after `fabushi_host_destroy` returns.
     fn spawn_event_pump(
-        client: Arc<TelegramClient>,
+        client_weak: Weak<TelegramClient>,
+        mut outbox_rx: tokio::sync::broadcast::Receiver<OutboxStatusEvent>,
         event_queue: Arc<EventQueue>,
         event_sink: Arc<Mutex<Option<BridgeEventSink>>>,
         generation_fence: Arc<GenerationFence>,
         host_db: Arc<HostSqliteStore>,
-        shutdown: CancellationToken,
-    ) {
-        let rt_handle = client.runtime().handle().clone();
-        let mut outbox_rx = client.outbox.subscribe_events();
-        rt_handle.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(15));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
+    ) -> Option<PumpControl> {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_bg = Arc::clone(&stop);
+        let builder = std::thread::Builder::new().name("fabushi-event-pump".to_string());
+        let handle = builder
+            .spawn(move || {
+                loop {
+                    if *stop_bg.0.lock() {
                         break;
                     }
-                    Ok(ob_ev) = outbox_rx.recv() => {
-                        let (ev_type, payload) = outbox_event_to_host_event(&ob_ev);
-                        let generation = generation_fence.current();
-                        event_queue.push(generation, &ev_type, payload.clone());
-                        if let Some(sink) = event_sink.lock().as_ref() {
-                            sink.emit(&ev_type, &payload.to_string());
-                        }
-                    }
-                    _ = interval.tick() => {
-                        let events = client.poll_events();
-                        if !events.is_empty() {
-                            let generation = generation_fence.current();
-                            for ev in events {
-                                if let gpui_telegram_client::client_dispatch::ClientDomainEvent::MessageAck { pts, .. } = &ev {
-                                    let _ = pts;
-                                }
-                                let (ev_type, payload) = domain_event_to_host_event(ev);
-                                if ev_type == "newMessage" {
-                                    if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
-                                        let pts = client.sync_coordinator.last_pts(ChatId(cid));
-                                        if pts > 0 {
-                                            let _ = host_db.save_pts(cid, pts);
-                                        }
-                                    }
-                                }
+
+                    // 1. Drain outbox events synchronously via broadcast::Receiver::try_recv()
+                    loop {
+                        match outbox_rx.try_recv() {
+                            Ok(ob_ev) => {
+                                let (ev_type, payload) = outbox_event_to_host_event(&ob_ev);
+                                let generation = generation_fence.current();
                                 event_queue.push(generation, &ev_type, payload.clone());
-                                if let Some(sink) = event_sink.lock().as_ref() {
+                                if *stop_bg.0.lock() {
+                                    break;
+                                }
+                                let sink_opt = event_sink.lock().clone();
+                                if let Some(sink) = sink_opt {
                                     sink.emit(&ev_type, &payload.to_string());
                                 }
                             }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                         }
                     }
+
+                    if *stop_bg.0.lock() {
+                        break;
+                    }
+
+                    // 2. Upgrade Weak<TelegramClient> inside a minimal inner scope and drop the
+                    //    strong Arc BEFORE SQLite persistence, C callbacks, or Condvar wait.
+                    let drained_events = {
+                        let Some(client) = client_weak.upgrade() else {
+                            break;
+                        };
+                        let events = client.poll_events();
+                        let mut mapped = Vec::with_capacity(events.len());
+                        for ev in events {
+                            let (ev_type, payload) = domain_event_to_host_event(ev);
+                            let pts_to_save = if ev_type == "newMessage" {
+                                payload
+                                    .get("chat_id")
+                                    .and_then(|v| v.as_i64())
+                                    .and_then(|cid| {
+                                        let pts = client.sync_coordinator.last_pts(ChatId(cid));
+                                        (pts > 0).then_some((cid, pts))
+                                    })
+                            } else {
+                                None
+                            };
+                            mapped.push((ev_type, payload, pts_to_save));
+                        }
+                        mapped
+                    };
+
+                    if !drained_events.is_empty() {
+                        let generation = generation_fence.current();
+                        for (ev_type, payload, pts_to_save) in drained_events {
+                            if let Some((cid, pts)) = pts_to_save {
+                                let _ = host_db.save_pts(cid, pts);
+                            }
+                            event_queue.push(generation, &ev_type, payload.clone());
+                            if *stop_bg.0.lock() {
+                                break;
+                            }
+                            let sink_opt = event_sink.lock().clone();
+                            if let Some(sink) = sink_opt {
+                                sink.emit(&ev_type, &payload.to_string());
+                            }
+                        }
+                    }
+
+                    // 3. Sleep up to 20ms, waking immediately when shutdown signals Condvar
+                    let mut stopped = stop_bg.0.lock();
+                    if *stopped {
+                        break;
+                    }
+                    let _ = stop_bg.1.wait_for(&mut stopped, Duration::from_millis(20));
+                    if *stopped {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(PumpControl {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn stop_event_pump(&self) {
+        let control_opt = self.pump_control.lock().take();
+        if let Some(mut control) = control_opt {
+            {
+                let mut stopped = control.stop.0.lock();
+                *stopped = true;
+                control.stop.1.notify_all();
+            }
+            if let Some(handle) = control.handle.take() {
+                if handle.thread().id() != std::thread::current().id() {
+                    let _ = handle.join();
                 }
             }
-        });
+        }
     }
 
     pub fn client(&self) -> Arc<TelegramClient> {
@@ -427,16 +620,25 @@ impl FabushiAppHost {
     }
 
     pub fn bump_generation(&self) -> u64 {
+        let _guard = self.gen_lock.lock();
         let next = self.generation_fence.bump();
         let _ = self.host_db.save_generation(next);
         next
     }
 
-    pub fn set_generation(&self, val: u64) -> u64 {
-        let clamped = val.max(1);
-        self.generation_fence.set(clamped);
-        let _ = self.host_db.save_generation(clamped);
-        clamped
+    /// Monotonically advances the generation counter; rejects any downward regression.
+    pub fn set_generation(&self, val: u64) -> HostResult<u64> {
+        let _guard = self.gen_lock.lock();
+        let current = self.generation_fence.current();
+        if val < current {
+            return Err(HostError::invalid_arguments(format!(
+                "generation cannot be decreased below current generation ({val} < {current})"
+            )));
+        }
+        let target = val.max(1);
+        self.generation_fence.set(target);
+        let _ = self.host_db.save_generation(target);
+        Ok(target)
     }
 
     pub fn next_message_id(&self) -> i64 {
@@ -445,26 +647,56 @@ impl FabushiAppHost {
         id
     }
 
-    /// Reconfigures the backend server URL, stops the prior client/pump cleanly,
-    /// opens a fresh `TelegramClient` against the same `storage_dir`, and bumps generation.
-    pub fn set_server_url(&self, raw_url: &str) -> HostResult<String> {
-        let trimmed = raw_url.trim();
-        if trimmed.is_empty() {
-            return Err(HostError::invalid_arguments("server_url cannot be empty"));
+    /// Cancels all in-flight RPCs and wipes/zeroizes all account-scoped cryptographic keys
+    /// and runtime state to prevent cross-account secret leakage across logout/clear/switch/reconfig.
+    pub fn reset_account_scope(&self) {
+        {
+            let mut map = self.in_flight_cancels.lock();
+            for (_, entries) in map.drain() {
+                for (_, tok) in entries {
+                    tok.cancel();
+                }
+            }
         }
-        let normalized = ClientConfig::normalize_url(trimmed);
+        *self.vault_unlocked_key.lock() = None;
+        *self.vault_envelope.lock() = None;
+        self.vault_device_keypairs.lock().clear();
+        self.local_dr_sessions.lock().clear();
+        self.local_sender_keys.lock().clear();
+        self.task_registry.lock().clear();
+        *self.approval_ledger.lock() = ValueBoundApprovalLedger::new();
+        *self.tool_dock.lock() = ToolPermissionDock::new();
+        self.floor_queues.lock().clear();
+        self.loop_budgets.lock().clear();
+        self.group_workspaces.lock().clear();
+        self.chunked_sessions.lock().clear();
+        self.webmcp_control_modes.lock().clear();
+    }
+
+    /// Checkpoints all 5 SQLite WAL databases cleanly for iOS `0xdead10cc` background & shutdown safety.
+    pub fn checkpoint_all_wals(&self) -> HostResult<(i32, i32, i32)> {
+        let host_ckpt = self.host_db.wal_checkpoint_truncate()?;
+        let _ = self.client().local_store.wal_checkpoint_truncate();
+        let _ = self.hermes.store().wal_checkpoint_truncate();
+        let _ = self.coding_store.lock().wal_checkpoint_truncate();
+        let _ = self
+            .miniapp_db
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        Ok(host_ckpt)
+    }
+
+    /// Atomically and serially reconfigures the backend server URL:
+    /// validates the URL and opens `new_client` FIRST before touching any live state,
+    /// then stops & joins the old pump thread, wipes prior account scope, swaps cleanly, and bumps generation.
+    pub fn set_server_url(&self, raw_url: &str) -> HostResult<String> {
+        let normalized = validate_server_url_input(raw_url)?;
+        let _reconfig = self.reconfig_lock.lock();
         if *self.server_url.read() == normalized {
             return Ok(normalized);
         }
 
-        // Stop old pump & client cleanly
-        {
-            let old_shutdown = self.pump_shutdown.lock();
-            old_shutdown.cancel();
-        }
-        let old_client = self.client();
-        old_client.clear_session();
-
+        // 1. Construct and validate the new TelegramClient BEFORE mutating live host state
         let new_cfg = ClientConfig {
             server_url: normalized.clone(),
             http_timeout_secs: self.http_timeout_secs,
@@ -479,22 +711,33 @@ impl FabushiAppHost {
                 new_client.sync_coordinator.set_pts(ChatId(cid), pts);
             }
         }
-
-        let new_shutdown = CancellationToken::new();
-        Self::spawn_event_pump(
-            Arc::clone(&new_client),
-            Arc::clone(&self.event_queue),
-            Arc::clone(&self.event_sink),
-            Arc::clone(&self.generation_fence),
-            Arc::clone(&self.host_db),
-            new_shutdown.clone(),
-        );
-
-        *self.pump_shutdown.lock() = new_shutdown;
-        *self.client.write() = new_client;
-        *self.server_url.write() = normalized.clone();
         self.host_db.set_meta("server_url", &normalized)?;
+
+        // 2. Stop & join old pump synchronously so no old callbacks/client handles remain
+        self.stop_event_pump();
+
+        // 3. Clear old client session & wipe cross-account secrets + cancel in-flight ops
+        let old_client = self.client();
+        old_client.clear_session();
+        self.reset_account_scope();
+
+        // 4. Swap live client & server_url, launch dedicated pump for new_client, bump generation
+        *self.client.write() = Arc::clone(&new_client);
+        *self.server_url.write() = normalized.clone();
+
+        if !self.is_shutdown.load(Ordering::Acquire) {
+            let new_pump = Self::spawn_event_pump(
+                Arc::downgrade(&new_client),
+                new_client.outbox.subscribe_events(),
+                Arc::clone(&self.event_queue),
+                Arc::clone(&self.event_sink),
+                Arc::clone(&self.generation_fence),
+                Arc::clone(&self.host_db),
+            );
+            *self.pump_control.lock() = new_pump;
+        }
         self.bump_generation();
+        drop(old_client);
 
         Ok(normalized)
     }
@@ -504,6 +747,9 @@ impl FabushiAppHost {
         callback: Option<TelegramBridgeEventCallback>,
         user_context: *mut std::ffi::c_void,
     ) {
+        if self.is_shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let mut guard = self.event_sink.lock();
         *guard = callback.map(|cb| BridgeEventSink::new(cb, user_context));
     }
@@ -516,6 +762,9 @@ impl FabushiAppHost {
     pub fn emit_event(&self, event_type: &str, payload: Value) {
         let generation = self.current_generation();
         self.event_queue.push(generation, event_type, payload.clone());
+        if self.is_shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let sink_opt = self.event_sink.lock().clone();
         if let Some(sink) = sink_opt {
             sink.emit(event_type, &payload.to_string());
@@ -523,12 +772,21 @@ impl FabushiAppHost {
     }
 
     pub fn poll_events(&self, max_count: u32, timeout_ms: u32) -> Vec<HostEvent> {
-        // Opportunistically drain any pending WS events immediately before polling
+        // Opportunistically drain any pending WS events immediately before polling,
+        // persisting PTS cursors consistently with the background event pump.
         let client = self.client();
         let drained = client.poll_events();
         if !drained.is_empty() {
             for ev in drained {
                 let (ev_type, payload) = domain_event_to_host_event(ev);
+                if ev_type == "newMessage" {
+                    if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
+                        let pts = client.sync_coordinator.last_pts(ChatId(cid));
+                        if pts > 0 {
+                            let _ = self.host_db.save_pts(cid, pts);
+                        }
+                    }
+                }
                 self.emit_event(&ev_type, payload);
             }
         }
@@ -540,12 +798,19 @@ impl FabushiAppHost {
         if trimmed.is_empty() {
             return false;
         }
-        let token_opt = self.in_flight_cancels.lock().get(trimmed).cloned();
-        if let Some(token) = token_opt {
-            token.cancel();
-            true
-        } else {
+        let tokens: Vec<CancellationToken> = self
+            .in_flight_cancels
+            .lock()
+            .get(trimmed)
+            .map(|list| list.iter().map(|(_, tok)| tok.clone()).collect())
+            .unwrap_or_default();
+        if tokens.is_empty() {
             false
+        } else {
+            for token in tokens {
+                token.cancel();
+            }
+            true
         }
     }
 
@@ -556,19 +821,30 @@ impl FabushiAppHost {
         F: Future<Output = HostResult<T>> + Send,
         T: Send,
     {
+        if self.is_shutdown.load(Ordering::Acquire) {
+            return Err(HostError::cancelled(request_id));
+        }
+
         let token = CancellationToken::new();
+        let call_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
         let tracked_id = if request_id.trim().is_empty() {
             None
         } else {
             let id = request_id.trim().to_string();
             self.in_flight_cancels
                 .lock()
-                .insert(id.clone(), token.clone());
+                .entry(id.clone())
+                .or_default()
+                .push((call_seq, token.clone()));
             Some(id)
         };
+        if self.is_shutdown.load(Ordering::Acquire) {
+            token.cancel();
+        }
         let _guard = InFlightGuard {
             host: self,
             request_id: tracked_id,
+            call_seq,
         };
 
         let req_id_owned = request_id.to_string();
@@ -594,17 +870,31 @@ impl FabushiAppHost {
     pub fn dispatch(&self, request_json: &str) -> String {
         crate::dispatch::route_command(self, request_json)
     }
+
+    /// Idempotent synchronous host shutdown invoked by `fabushi_host_destroy` and `Drop`.
+    /// Clears the C callback sink FIRST and joins the event pump synchronously so ZERO callbacks
+    /// or background references can survive after `fabushi_host_destroy` returns.
+    pub fn shutdown(&self) {
+        self.is_shutdown.store(true, Ordering::SeqCst);
+        // 1. Clear C callback sink FIRST so zero callbacks can fire after shutdown begins
+        *self.event_sink.lock() = None;
+        // 2. Stop and synchronously join the dedicated event pump thread
+        self.stop_event_pump();
+        // 3. Cancel all in-flight RPCs and wipe in-memory account secrets
+        self.reset_account_scope();
+        self.account_tokens.lock().clear();
+        // 4. Wake any blocked poll_events callers cleanly
+        self.event_queue.close();
+        // 5. Disconnect WS, outbox worker, and tailnet mesh
+        let client = self.client();
+        client.clear_session();
+        // 6. Checkpoint all SQLite WAL databases cleanly for iOS 0xdead10cc safety
+        let _ = self.checkpoint_all_wals();
+    }
 }
 
 impl Drop for FabushiAppHost {
     fn drop(&mut self) {
-        self.pump_shutdown.lock().cancel();
-        self.event_queue.close();
-        for (_, tok) in self.in_flight_cancels.lock().drain() {
-            tok.cancel();
-        }
-        let client = self.client();
-        client.clear_session();
-        let _ = self.host_db.wal_checkpoint_truncate();
+        self.shutdown();
     }
 }

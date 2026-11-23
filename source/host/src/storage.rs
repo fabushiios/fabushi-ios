@@ -69,6 +69,7 @@ impl HostSqliteStore {
                  text TEXT NOT NULL,
                  timestamp_ms INTEGER NOT NULL,
                  reply_to INTEGER,
+                 delivery_status TEXT NOT NULL DEFAULT 'sent',
                  created_at_ms INTEGER NOT NULL,
                  PRIMARY KEY (sender_id, client_nonce)
              );
@@ -89,6 +90,12 @@ impl HostSqliteStore {
                  ON host_messages_index(chat_id, timestamp_ms);",
         )
         .map_err(|e| HostError::storage(format!("Failed to initialize host_state.db schema: {e}")))?;
+
+        // Idempotent migration for pre-existing host_state.db files lacking delivery_status
+        let _ = conn.execute(
+            "ALTER TABLE nonce_dedup ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent'",
+            [],
+        );
 
         let fts5_enabled = conn
             .execute_batch(
@@ -286,7 +293,7 @@ impl HostSqliteStore {
         );
         let mut stmt = conn
             .prepare(
-                "SELECT sender_id, client_nonce, message_id, chat_id, text, timestamp_ms, reply_to, created_at_ms
+                "SELECT sender_id, client_nonce, message_id, chat_id, text, timestamp_ms, reply_to, delivery_status, created_at_ms
                  FROM nonce_dedup
                  WHERE created_at_ms > ?1",
             )
@@ -295,7 +302,7 @@ impl HostSqliteStore {
             .query_map(params![cutoff_ms], |row| {
                 let sender_raw: i64 = row.get(0)?;
                 let nonce_raw: i64 = row.get(1)?;
-                let created_ms: i64 = row.get(7)?;
+                let created_ms: i64 = row.get(8)?;
                 let created_at = Utc
                     .timestamp_millis_opt(created_ms)
                     .single()
@@ -308,6 +315,10 @@ impl HostSqliteStore {
                     timestamp: row.get(5)?,
                     reply_to: row.get(6)?,
                     client_nonce: nonce_raw as u64,
+                    delivery_status: row
+                        .get::<_, Option<String>>(7)?
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "sent".to_string()),
                     created_at,
                 })
             })
@@ -323,14 +334,15 @@ impl HostSqliteStore {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO nonce_dedup (
-                sender_id, client_nonce, message_id, chat_id, text, timestamp_ms, reply_to, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                sender_id, client_nonce, message_id, chat_id, text, timestamp_ms, reply_to, delivery_status, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(sender_id, client_nonce) DO UPDATE SET
                 message_id = excluded.message_id,
                 chat_id = excluded.chat_id,
                 text = excluded.text,
                 timestamp_ms = excluded.timestamp_ms,
                 reply_to = excluded.reply_to,
+                delivery_status = excluded.delivery_status,
                 created_at_ms = excluded.created_at_ms",
             params![
                 cached.sender_id as i64,
@@ -340,6 +352,7 @@ impl HostSqliteStore {
                 cached.text,
                 cached.timestamp,
                 cached.reply_to,
+                cached.delivery_status,
                 cached.created_at.timestamp_millis(),
             ],
         )
@@ -471,7 +484,11 @@ impl HostSqliteStore {
         }
 
         // 2. Substring fallback for unsegmented CJK / partial terms
-        let like_pattern = format!("%{}%", trimmed.replace('%', "\\%").replace('_', "\\_"));
+        let escaped_like = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_pattern = format!("%{escaped_like}%");
         let mut hits = Vec::new();
         if let Some(cid) = chat_id {
             let mut stmt = conn
@@ -531,12 +548,18 @@ impl HostSqliteStore {
 }
 
 fn dir_size_and_count(path: &Path) -> (u64, u64) {
-    if !path.exists() {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, 0);
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
         return (0, 0);
     }
-    if path.is_file() {
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        return (len, 1);
+    if ft.is_file() {
+        return (meta.len(), 1);
+    }
+    if !ft.is_dir() {
+        return (0, 0);
     }
     let mut bytes = 0u64;
     let mut files = 0u64;

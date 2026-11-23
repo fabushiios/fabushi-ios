@@ -1,6 +1,8 @@
 use crate::net::api_computers::{
-    detect_local_host_info, detect_local_hostname, detect_real_lan_ips, execute_local_computer_op,
+    detect_local_host_info, detect_local_hostname, detect_real_lan_ips,
 };
+#[cfg(not(target_os = "ios"))]
+use crate::net::api_computers::execute_local_computer_op;
 use crate::net::http_client::{HttpClient, HttpClientError};
 use crate::net::http_helpers::percent_encode_rfc3986;
 use chacha20poly1305::{
@@ -1383,8 +1385,15 @@ impl TailnetEngine {
             Err(HttpClientError::Api {
                 status: 404 | 405, ..
             }) => {
-                debug!("Tailnet register endpoint unavailable (404/405); using HTTP fallback");
-                let _ = http_client.register_current_host_computer(token).await;
+                #[cfg(not(target_os = "ios"))]
+                {
+                    debug!("Tailnet register endpoint unavailable (404/405); using HTTP fallback");
+                    let _ = http_client.register_current_host_computer(token).await;
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    debug!("Tailnet register endpoint unavailable (404/405); skipping unattended host-computer registration on iOS controller");
+                }
             }
             Err(err) => {
                 debug!("Tailnet registration attempt failed: {}", err);
@@ -1599,40 +1608,84 @@ impl TailnetEngine {
                 }
             }
             DerpServerFrame::ServerCommandDispatch { command } => {
-                if command.requires_user_approval && !command.approved {
-                    // Server-queued commands needing approval are surfaced via ComputerListResponse.pending_approvals.
+                #[cfg(target_os = "ios")]
+                {
+                    let res = RemoteComputerCommandResult {
+                        command_id: command.command_id.clone(),
+                        node_id: command.node_id.clone(),
+                        ok: false,
+                        exit_code: 501,
+                        stdout: String::new(),
+                        stderr: "capability_unavailable: local computer host execution is disabled on iOS"
+                            .to_string(),
+                        entries: Vec::new(),
+                        frame_data_url: None,
+                        executed_by: "ios-sandbox-denied".to_string(),
+                        duration_ms: 0,
+                    };
+                    let frame = DerpClientFrame::CommandResult {
+                        command_id: command.command_id.clone(),
+                        result: res.clone(),
+                    };
+                    if out_tx.send(frame).is_err() {
+                        let engine = Arc::clone(self);
+                        let handle = self
+                            .runtime_cfg
+                            .read()
+                            .as_ref()
+                            .map(|c| c.runtime_handle.clone())
+                            .or_else(|| Handle::try_current().ok());
+                        if let Some(rt) = handle {
+                            rt.spawn(async move {
+                                let cfg = engine.runtime_cfg.read().clone();
+                                if let Some(c) = cfg {
+                                    let _ = c
+                                        .http_client
+                                        .complete_computer_command(&c.token, &command.command_id, &res)
+                                        .await;
+                                }
+                            });
+                        }
+                    }
                     return;
                 }
-                let engine = Arc::clone(self);
-                let derp_sender = out_tx.clone();
-                let handle = self
-                    .runtime_cfg
-                    .read()
-                    .as_ref()
-                    .map(|c| c.runtime_handle.clone())
-                    .or_else(|| Handle::try_current().ok());
-                if let Some(rt) = handle {
-                    rt.spawn(async move {
-                        let res = execute_local_computer_op(
-                            &command.node_id,
-                            &command.command_id,
-                            &command.operation,
-                        )
-                        .await;
-                        let frame = DerpClientFrame::CommandResult {
-                            command_id: command.command_id.clone(),
-                            result: res.clone(),
-                        };
-                        if derp_sender.send(frame).is_err() {
-                            let cfg = engine.runtime_cfg.read().clone();
-                            if let Some(c) = cfg {
-                                let _ = c
-                                    .http_client
-                                    .complete_computer_command(&c.token, &command.command_id, &res)
-                                    .await;
+                #[cfg(not(target_os = "ios"))]
+                {
+                    if command.requires_user_approval && !command.approved {
+                        // Server-queued commands needing approval are surfaced via ComputerListResponse.pending_approvals.
+                        return;
+                    }
+                    let engine = Arc::clone(self);
+                    let derp_sender = out_tx.clone();
+                    let handle = self
+                        .runtime_cfg
+                        .read()
+                        .as_ref()
+                        .map(|c| c.runtime_handle.clone())
+                        .or_else(|| Handle::try_current().ok());
+                    if let Some(rt) = handle {
+                        rt.spawn(async move {
+                            let res = execute_local_computer_op(
+                                &command.node_id,
+                                &command.command_id,
+                                &command.operation,
+                            )
+                            .await;
+                            let frame = DerpClientFrame::CommandResult {
+                                command_id: command.command_id.clone(),
+                                result: res.clone(),
+                            };
+                            if derp_sender.send(frame).is_err() {
+                                let cfg = engine.runtime_cfg.read().clone();
+                                if let Some(c) = cfg {
+                                    let _ = c
+                                        .http_client
+                                        .complete_computer_command(&c.token, &command.command_id, &res)
+                                        .await;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
             DerpServerFrame::Error { code, message } => {
@@ -2118,6 +2171,38 @@ impl TailnetEngine {
             return;
         }
 
+        #[cfg(target_os = "ios")]
+        {
+            let _ = (&caller_device_id, &caller_label, &operation);
+            let target_node_id = self
+                .netmap
+                .read()
+                .as_ref()
+                .and_then(|nm| nm.self_peer.as_ref().map(|sp| sp.node_id.clone()))
+                .unwrap_or_default();
+            let reply = PeerApiFrame::ExecResponse {
+                request_id,
+                result: RemoteComputerCommandResult {
+                    command_id: format!("p2p:{}", Uuid::new_v4()),
+                    node_id: target_node_id,
+                    ok: false,
+                    exit_code: 501,
+                    stdout: String::new(),
+                    stderr: "capability_unavailable: local computer host execution is disabled on iOS"
+                        .to_string(),
+                    entries: Vec::new(),
+                    frame_data_url: None,
+                    executed_by: "ios-sandbox-denied".to_string(),
+                    duration_ms: 0,
+                },
+            };
+            self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+            return;
+        }
+
+        #[cfg(not(target_os = "ios"))]
+        {
+
         // Refresh netmap once if caller is missing/offline or self_peer missing.
         let mut caller_opt = self.find_peer_by_node_key(&caller_node_key);
         let mut self_peer_opt = self
@@ -2318,6 +2403,7 @@ impl TailnetEngine {
             result: exec_res,
         };
         self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+        }
     }
 
     async fn send_peer_reply(

@@ -23,9 +23,12 @@ use gpui_telegram_proto::e2ee::{
 use gpui_telegram_proto::message::{MessageContent, MessageEntity, MessageItem, ReplyHeader};
 use gpui_telegram_proto::sync::{PtsUpdate, TypingAction};
 use gpui_telegram_proto::ws::WsServerFrame;
-use serde_json::{json, Value};
+use std::sync::Arc;
 
-use crate::dedup::{CachedMessage, DedupWaitError, ReservationOutcome};
+use serde_json::{json, Value};
+use zeroize::Zeroizing;
+
+use crate::dedup::{CachedMessage, DedupWaitError, InFlightSlot, ReservationOutcome};
 use crate::error::{HostError, HostResult};
 use crate::events::domain_event_to_host_event;
 use crate::host::FabushiAppHost;
@@ -41,6 +44,14 @@ fn req_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
+}
+
+fn req_raw_str<'a>(params: &'a Value, key: &str) -> HostResult<&'a str> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| HostError::invalid_arguments(format!("Missing required string '{key}'")))
 }
@@ -67,13 +78,17 @@ struct LeaderGuard<'a> {
     host: &'a FabushiAppHost,
     sender_id: u64,
     nonce: u64,
+    slot: Arc<InFlightSlot>,
     completed: bool,
 }
 
 impl<'a> Drop for LeaderGuard<'a> {
     fn drop(&mut self) {
         if !self.completed {
-            self.host.dedup_store.lock().abort(self.sender_id, self.nonce);
+            self.host
+                .dedup_store
+                .lock()
+                .abort_slot(self.sender_id, self.nonce, &self.slot);
         }
     }
 }
@@ -720,7 +735,7 @@ pub fn handle_messages(
                                 "timestamp": cached.timestamp,
                                 "reply_to": cached.reply_to,
                                 "client_nonce": cached.client_nonce,
-                                "status": "sent",
+                                "status": cached.delivery_status,
                                 "duplicate": true
                             }));
                         }
@@ -734,17 +749,18 @@ pub fn handle_messages(
                                     "timestamp": cached.timestamp,
                                     "reply_to": cached.reply_to,
                                     "client_nonce": cached.client_nonce,
-                                    "status": "sent",
+                                    "status": cached.delivery_status,
                                     "duplicate": true
                                 }));
                             }
                             Err(DedupWaitError::Aborted) => continue,
                         },
-                        ReservationOutcome::Leader(_slot) => {
+                        ReservationOutcome::Leader(slot) => {
                             leader_guard = Some(LeaderGuard {
                                 host,
                                 sender_id,
                                 nonce,
+                                slot,
                                 completed: false,
                             });
                             break;
@@ -766,6 +782,7 @@ pub fn handle_messages(
             let mut delivery_status = "sent";
 
             if remote_delivery {
+                let effective_nonce = client_nonce.unwrap_or_else(|| client.next_client_nonce());
                 let req = RichSendMessageRequest {
                     chat_id,
                     text: Some(text.clone()),
@@ -774,7 +791,7 @@ pub fn handle_messages(
                     reply_to,
                     quote_text: None,
                     topic_id: params.get("topic_id").and_then(|v| v.as_i64()),
-                    client_nonce: Some(client_nonce.unwrap_or_else(|| client.next_client_nonce())),
+                    client_nonce: Some(effective_nonce),
                     forward_from_chat_id: None,
                     forward_from_msg_id: None,
                     silent: params.get("silent").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -797,9 +814,25 @@ pub fn handle_messages(
                     Err(e) if e.code == "cancelled" => {
                         return Err(e);
                     }
-                    Err(_) => {
-                        // Message is already durably enqueued in SQLite OutboxWorker by send_message_durable
-                        delivery_status = "queued_outbox";
+                    Err(e) => {
+                        // Only treat genuinely retryable / queued-offline errors where the outbox
+                        // holds a Pending/InFlight entry as "queued_outbox". Permanent HTTP 4xx
+                        // (400/401/403/404/409/422) or OutboxStatus::Failed MUST fail closed so
+                        // LeaderGuard::drop aborts the dedup slot without poisoning nonce_dedup or search!
+                        let outbox_pending = client
+                            .outbox
+                            .store()
+                            .get(effective_nonce)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|rec| {
+                                matches!(rec.status, OutboxStatus::Pending | OutboxStatus::InFlight)
+                            });
+                        if e.retryable && outbox_pending {
+                            delivery_status = "queued_outbox";
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
             } else {
@@ -826,7 +859,6 @@ pub fn handle_messages(
                     .index_message_fts(assigned_id, chat_id, sender_id, timestamp, &text);
                 let _ = host
                     .search_engine
-                    .lock()
                     .index_message(assigned_id, chat_id, sender_id, timestamp, &text);
             }
 
@@ -839,10 +871,13 @@ pub fn handle_messages(
                     timestamp,
                     reply_to,
                     client_nonce: guard.nonce,
+                    delivery_status: delivery_status.to_string(),
                     created_at: now,
                 };
                 let _ = host.host_db.persist_nonce(&cached);
-                host.dedup_store.lock().complete(sender_id, guard.nonce, cached);
+                host.dedup_store
+                    .lock()
+                    .complete_slot(sender_id, guard.nonce, &guard.slot, cached);
                 guard.completed = true;
             }
 
@@ -891,7 +926,7 @@ pub fn handle_messages(
         "edit" => {
             let chat_id = req_i64(params, "chat_id")?;
             let message_id = req_i64(params, "message_id")?;
-            let text = req_str(params, "text")?.to_string();
+            let text = req_raw_str(params, "text")?.to_string();
             let entities: Vec<MessageEntity> = params
                 .get("entities")
                 .cloned()
@@ -1242,7 +1277,7 @@ pub fn handle_e2ee(
         }
         "encryptDm" => {
             let recipient_user_id = req_u64(params, "recipient_user_id")?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes().to_vec();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes().to_vec();
             let env = host.run_cancellable(req_id, async move {
                 client
                     .e2ee_encrypt_dm(recipient_user_id, &plaintext)
@@ -1258,7 +1293,7 @@ pub fn handle_e2ee(
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
                 .ok_or_else(|| HostError::invalid_arguments("Missing array 'member_user_ids'"))?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes().to_vec();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes().to_vec();
             let (dist, group) = host.run_cancellable(req_id, async move {
                 client
                     .e2ee_encrypt_group(chat_id, &member_user_ids, &plaintext)
@@ -1270,7 +1305,7 @@ pub fn handle_e2ee(
         "sendEncryptedDm" => {
             let chat_id = req_i64(params, "chat_id")?;
             let recipient_user_id = req_u64(params, "recipient_user_id")?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes().to_vec();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes().to_vec();
             let resp = host.run_cancellable(req_id, async move {
                 client
                     .send_encrypted_dm(chat_id, recipient_user_id, &plaintext)
@@ -1286,7 +1321,7 @@ pub fn handle_e2ee(
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
                 .ok_or_else(|| HostError::invalid_arguments("Missing array 'member_user_ids'"))?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes().to_vec();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes().to_vec();
             let resp = host.run_cancellable(req_id, async move {
                 client
                     .send_encrypted_group(chat_id, &member_user_ids, &plaintext)
@@ -1331,12 +1366,14 @@ pub fn handle_e2ee(
                 .unwrap_or("fabushi-dr-v1")
                 .as_bytes()
                 .to_vec();
-            let shared_secret = random_32().map_err(|e| HostError::crypto(e.to_string()))?;
-            let bob_dh_sec = random_32().map_err(|e| HostError::crypto(e.to_string()))?;
+            let shared_secret =
+                Zeroizing::new(random_32().map_err(|e| HostError::crypto(e.to_string()))?);
+            let bob_dh_sec =
+                Zeroizing::new(random_32().map_err(|e| HostError::crypto(e.to_string()))?);
             let bob_dh_pub = x25519_pub_from_secret(&bob_dh_sec);
-            let alice = DoubleRatchetSession::init_alice(shared_secret, bob_dh_pub, ad.clone())
+            let alice = DoubleRatchetSession::init_alice(*shared_secret, bob_dh_pub, ad.clone())
                 .map_err(|e| HostError::crypto(e.to_string()))?;
-            let bob = DoubleRatchetSession::init_bob(shared_secret, bob_dh_sec, ad);
+            let bob = DoubleRatchetSession::init_bob(*shared_secret, *bob_dh_sec, ad);
             let mut guard = host.local_dr_sessions.lock();
             guard.insert(alice_id.clone(), alice);
             guard.insert(bob_id.clone(), bob);
@@ -1344,7 +1381,7 @@ pub fn handle_e2ee(
         }
         "ratchetEncrypt" => {
             let session_id = req_str(params, "session_id")?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes();
             let mut guard = host.local_dr_sessions.lock();
             let sess = guard
                 .get_mut(session_id)
@@ -1395,7 +1432,7 @@ pub fn handle_e2ee(
         }
         "senderKeyEncrypt" => {
             let key_id = req_str(params, "key_id")?;
-            let plaintext = req_str(params, "plaintext")?.as_bytes();
+            let plaintext = req_raw_str(params, "plaintext")?.as_bytes();
             let mut guard = host.local_sender_keys.lock();
             let state = guard
                 .get_mut(key_id)
@@ -1474,15 +1511,15 @@ pub fn handle_search(
                 .get("timestamp_ms")
                 .and_then(|v| v.as_i64())
                 .unwrap_or_else(|| Utc::now().timestamp_millis());
-            let body = req_str(params, "body")?;
+            let body = req_raw_str(params, "body")?;
             host.host_db
                 .index_message_fts(message_id, chat_id, sender_id, timestamp_ms, body)?;
-            let mut engine = host.search_engine.lock();
-            engine.index_message(message_id, chat_id, sender_id, timestamp_ms, body)?;
+            host.search_engine
+                .index_message(message_id, chat_id, sender_id, timestamp_ms, body)?;
             Ok(json!({
                 "indexed": true,
                 "message_id": message_id,
-                "tantivy_docs": engine.doc_count(),
+                "tantivy_docs": host.search_engine.doc_count(),
                 "fts5_enabled": host.host_db.fts5_enabled(),
             }))
         }
@@ -1490,7 +1527,7 @@ pub fn handle_search(
             let query = req_str(params, "query")?;
             let chat_id = params.get("chat_id").and_then(|v| v.as_i64());
             let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let tantivy_hits = host.search_engine.lock().search(query, chat_id, limit)?;
+            let tantivy_hits = host.search_engine.search(query, chat_id, limit)?;
             if !tantivy_hits.is_empty() {
                 return Ok(json!({
                     "engine": "tantivy",
@@ -1513,7 +1550,7 @@ pub fn handle_search(
         }
         "rebuildLocalIndex" => {
             let all = host.host_db.list_all_indexed_messages()?;
-            let count = host.search_engine.lock().rebuild(&all)?;
+            let count = host.search_engine.rebuild(&all)?;
             Ok(json!({ "rebuilt": true, "indexed_docs": count }))
         }
         "sessions" => {

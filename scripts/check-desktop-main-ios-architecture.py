@@ -67,7 +67,7 @@ FORBIDDEN_EXTERNAL_REPO_STRINGS = [
     "github.com/bhrunom/gpui-telegram",
 ]
 FORBIDDEN_GIT_ORG_RE = re.compile(r"(?:github\.com[:/])?(bhrumom|bhrum|bhrunom)/", re.IGNORECASE)
-FORBIDDEN_FILE_GIT_RE = re.compile(r"^(?:(?:git|registry|sparse)\+)?file://", re.IGNORECASE)
+FORBIDDEN_FILE_GIT_RE = re.compile(r"^(?:(?:git|registry|sparse|path)\+)?file://", re.IGNORECASE)
 WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 LOCAL_PATH_PATTERNS = [
     re.compile(r"/Users/"),
@@ -779,7 +779,6 @@ def verify_files(lock, manifest_index, ledger_index, errors, warnings, complete,
                 errors.append(f"nonselected tracked item unreviewed: {row.get('path')}")
         if checkout is None:
             errors.append("--complete requires a pinned actual Desktop Git checkout")
-        verify_host_anti_stub(ROOT, errors)
     return statuses, dispositions, computed_digests
 
 
@@ -850,15 +849,38 @@ def verify_cargo_toml_hygiene(
         for dep_key, spec in deps.items():
             raw_dep_name = dep_key
             if table_name == "replace":
-                pkg_spec = dep_key
-                if "#" in dep_key:
-                    replace_source, pkg_spec = dep_key.rsplit("#", 1)
+                dep_key_s = dep_key.strip()
+                if "#" in dep_key_s:
+                    replace_source, pkg_spec = dep_key_s.rsplit("#", 1)
                     replace_source_s = replace_source.strip()
                     if FORBIDDEN_GIT_ORG_RE.search(replace_source_s) or FORBIDDEN_FILE_GIT_RE.match(replace_source_s):
                         errors.append(
                             f"{rel_display} [replace]: forbidden replace source URL: {replace_source!r}"
                         )
-                raw_dep_name = re.split(r"[:@]", pkg_spec, maxsplit=1)[0]
+                    pkg_spec_s = pkg_spec.strip()
+                    if pkg_spec_s and pkg_spec_s[0].isdigit():
+                        # Cargo URL-only '#version' shorthand: crate name is final URL path segment
+                        url_base = replace_source_s.split("?", 1)[0].rstrip("/")
+                        seg = url_base.rsplit("/", 1)[-1]
+                        if seg.endswith(".git"):
+                            seg = seg[:-4]
+                        raw_dep_name = seg
+                    else:
+                        raw_dep_name = re.split(r"[:@]", pkg_spec_s, maxsplit=1)[0]
+                else:
+                    if FORBIDDEN_GIT_ORG_RE.search(dep_key_s) or FORBIDDEN_FILE_GIT_RE.match(dep_key_s):
+                        errors.append(
+                            f"{rel_display} [replace]: forbidden replace source URL: {dep_key!r}"
+                        )
+                    if "://" in dep_key_s:
+                        # Cargo 1.77+ URL with '@version' and no '#'
+                        url_part = re.split(r"@", dep_key_s, maxsplit=1)[0].split("?", 1)[0].rstrip("/")
+                        seg = url_part.rsplit("/", 1)[-1]
+                        if seg.endswith(".git"):
+                            seg = seg[:-4]
+                        raw_dep_name = seg
+                    else:
+                        raw_dep_name = re.split(r"[:@]", dep_key_s, maxsplit=1)[0]
             pkg_name = raw_dep_name
             if isinstance(spec, dict) and isinstance(spec.get("package"), str):
                 pkg_name = spec["package"]
@@ -1078,8 +1100,11 @@ def verify_host_anti_stub(root, errors):
     cleaner = root / "scripts/clean_build_garbage.py"
     if cleaner.is_file():
         cleaner_text = cleaner.read_text(encoding="utf-8")
-        if "/Users/" in cleaner_text:
-            errors.append("scripts/clean_build_garbage.py contains forbidden hardcoded /Users/ personal path")
+        for pat in LOCAL_PATH_PATTERNS:
+            if pat.search(cleaner_text):
+                errors.append(
+                    f"scripts/clean_build_garbage.py contains forbidden local host path matching {pat.pattern}"
+                )
 
 
 def verify_host_cargo_manifests(root, forbidden_deps, errors):

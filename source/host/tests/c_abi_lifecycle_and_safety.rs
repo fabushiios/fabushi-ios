@@ -13,12 +13,12 @@ use mahayana_app_host::{
     mahayana_app_host_create, mahayana_app_host_create_test,
     mahayana_app_host_create_with_storage_passphrase, mahayana_app_host_destroy,
     mahayana_app_host_dispatch, mahayana_app_host_dispatch_with_handle,
-    mahayana_app_host_free_string, telegram_app_host_create, telegram_app_host_create_test,
-    telegram_app_host_destroy, telegram_app_host_dispatch,
+    mahayana_app_host_free_string, mahayana_app_host_last_error, telegram_app_host_create,
+    telegram_app_host_create_test, telegram_app_host_destroy, telegram_app_host_dispatch,
     telegram_app_host_dispatch_with_handle, telegram_app_host_free_string,
-    telegram_bridge_register_event_callback, telegram_proto_max_packet_size,
-    telegram_replay_window_check_and_add, telegram_replay_window_create,
-    telegram_replay_window_destroy,
+    telegram_app_host_last_error, telegram_bridge_register_event_callback,
+    telegram_proto_max_packet_size, telegram_replay_window_check_and_add,
+    telegram_replay_window_create, telegram_replay_window_destroy,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -146,10 +146,19 @@ fn test_c_abi_lifecycle_aliases_replay_window_and_null_callback_unregister() {
 
         let mh2 = mahayana_app_host_create_with_storage_passphrase(mh_dir_c.as_ptr(), pass_c.as_ptr());
         assert!(!mh2.is_null());
+        let mr2 = mahayana_app_host_dispatch_with_handle(mh2, ping_c.as_ptr());
+        let mv2: Value = serde_json::from_str(CStr::from_ptr(mr2).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(mr2);
+        assert_eq!(mv2["ok"], true);
+        assert_eq!(mv2["result"]["nonce"], 99);
         mahayana_app_host_destroy(mh2);
 
         let mh3 = mahayana_app_host_create_test(mh_dir_c.as_ptr());
         assert!(!mh3.is_null());
+        let mr3 = mahayana_app_host_dispatch_with_handle(mh3, ping_c.as_ptr());
+        let mv3: Value = serde_json::from_str(CStr::from_ptr(mr3).to_str().unwrap()).unwrap();
+        mahayana_app_host_free_string(mr3);
+        assert_eq!(mv3["ok"], true);
         mahayana_app_host_destroy(mh3);
 
         // 3. Sliding 128-bit replay window & protocol packet size
@@ -182,6 +191,19 @@ fn test_null_utf8_malformed_json_and_panic_isolation() {
         assert!(!err_ptr.is_null());
         let err_msg = CStr::from_ptr(err_ptr).to_str().unwrap();
         assert!(err_msg.contains("invalid_json"), "unexpected err: {err_msg}");
+        let tg_err_ptr = telegram_app_host_last_error();
+        assert!(!tg_err_ptr.is_null());
+        assert!(CStr::from_ptr(tg_err_ptr).to_str().unwrap().contains("invalid_json"));
+        let mh_err_ptr = mahayana_app_host_last_error();
+        assert!(!mh_err_ptr.is_null());
+        assert!(CStr::from_ptr(mh_err_ptr).to_str().unwrap().contains("invalid_json"));
+
+        // Invalid UTF-8 in telegram_app_host_create fails closed (never lossy U+FFFD!)
+        let bad_utf8_dir: [u8; 3] = [0xFF, 0xFE, 0x00];
+        let bad_tg_host = telegram_app_host_create(bad_utf8_dir.as_ptr() as *const c_char, std::ptr::null());
+        assert!(bad_tg_host.is_null());
+        let tg_utf8_err = CStr::from_ptr(telegram_app_host_last_error()).to_str().unwrap();
+        assert!(tg_utf8_err.contains("invalid_utf8"), "unexpected err: {tg_utf8_err}");
 
         // Null pointers to dispatch / poll / cancel / destroy / free must never crash
         let null_res = fabushi_host_dispatch(std::ptr::null_mut(), std::ptr::null());
@@ -341,16 +363,18 @@ fn test_anti_stub_fail_closed_contracts_and_compat_exports() {
         assert_eq!(sp_fail_v["ok"], false);
         assert!(sp_fail_v["error"].as_str().unwrap().contains("capability_unavailable"));
 
-        // Real bounded CSV parses cleanly
+        // Real bounded CSV parses cleanly with BOTH rowCount and totalRows (including truncation!)
         let csv_path = dir.path().join("ledger.csv");
-        std::fs::write(&csv_path, "name,stars\nalice,100\nbob,250\n").unwrap();
+        std::fs::write(&csv_path, "name,stars\nalice,100\nbob,250\ncarol,500\n").unwrap();
         let csv_c = CString::new(csv_path.to_str().unwrap()).unwrap();
-        let sp_ok = mahayana_spreadsheet_parse_file(csv_c.as_ptr(), 1024 * 1024, 100);
+        let sp_ok = mahayana_spreadsheet_parse_file(csv_c.as_ptr(), 1024 * 1024, 2);
         let sp_ok_v: Value = serde_json::from_str(CStr::from_ptr(sp_ok).to_str().unwrap()).unwrap();
         mahayana_app_host_free_string(sp_ok);
         assert_eq!(sp_ok_v["ok"], true);
-        assert_eq!(sp_ok_v["result"]["sheets"][0]["rowCount"], 3);
-        assert_eq!(sp_ok_v["result"]["sheets"][0]["rows"][2][0], "bob");
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["rowCount"], 2);
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["totalRows"], 4);
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["truncated"], true);
+        assert_eq!(sp_ok_v["result"]["sheets"][0]["rows"][1][0], "alice");
 
         fabushi_host_destroy(host);
     }
@@ -478,5 +502,143 @@ fn test_generation_fencing_persistence_and_real_async_cancellation() {
         let g_reopen = call_dispatch(host2, &json!({"id": "g5", "method": "generation.current"}));
         assert_eq!(g_reopen["result"]["generation"], 2);
         fabushi_host_destroy(host2);
+    }
+}
+
+#[test]
+fn test_concurrent_poll_events_and_destroy_no_uaf_and_destroyed_handle_fails_closed() {
+    let dir = tempdir().unwrap();
+    let cfg_c = CString::new(
+        json!({ "app_data_dir": dir.path().to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        let host_addr = host as usize;
+        let started = Instant::now();
+        let poller = thread::spawn(move || {
+            let ptr = fabushi_host_poll_events(host_addr as *mut c_void, 16, 5_000);
+            assert!(!ptr.is_null());
+            let text = CStr::from_ptr(ptr).to_str().unwrap().to_string();
+            fabushi_host_free_string(ptr);
+            serde_json::from_str::<Value>(&text).unwrap()
+        });
+
+        // Let poller block inside EventQueue::poll Condvar::wait_timeout, then destroy concurrently!
+        thread::sleep(Duration::from_millis(80));
+        fabushi_host_destroy(host);
+        // Double-destroy must also be a safe no-op
+        fabushi_host_destroy(host);
+
+        let poll_resp = poller.join().expect("poller thread must not panic/crash");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "fabushi_host_destroy must wake blocked poll_events immediately (took {elapsed:?})"
+        );
+        assert_eq!(poll_resp["ok"], true);
+
+        // Subsequent calls using destroyed handle MUST fail closed (zero UAF!)
+        let after_dispatch = call_dispatch(host, &json!({"id": "dead-1", "method": "session.ping"}));
+        assert_eq!(after_dispatch["ok"], false);
+        assert_eq!(after_dispatch["error"]["code"], "host_closed");
+
+        let after_poll_ptr = fabushi_host_poll_events(host, 4, 10);
+        let after_poll: Value =
+            serde_json::from_str(CStr::from_ptr(after_poll_ptr).to_str().unwrap()).unwrap();
+        fabushi_host_free_string(after_poll_ptr);
+        assert_eq!(after_poll["ok"], false);
+        assert_eq!(after_poll["error"]["code"], "host_closed");
+
+        let req_id_c = CString::new("any-req").unwrap();
+        assert!(!fabushi_host_cancel(host, req_id_c.as_ptr()));
+    }
+}
+
+#[test]
+fn test_in_flight_generation_bump_toctou_and_monotonic_generation_set() {
+    let dir = tempdir().unwrap();
+
+    // Slow loopback server: /health takes 350ms so we deterministically bump generation while in-flight
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let addr = rt.block_on(async {
+        let app = Router::new().route(
+            "/health",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}")
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Advance generation monotonically to 5, then verify downward generation.set fails closed
+        let up = call_dispatch(
+            host,
+            &json!({"id": "m1", "method": "generation.set", "params": {"generation": 5}}),
+        );
+        assert_eq!(up["ok"], true);
+        assert_eq!(up["result"]["generation"], 5);
+
+        let down = call_dispatch(
+            host,
+            &json!({"id": "m2", "method": "generation.set", "params": {"generation": 3}}),
+        );
+        assert_eq!(down["ok"], false, "Downward generation.set must fail closed: {down}");
+        assert_eq!(down["error"]["code"], "invalid_arguments");
+        assert_eq!(
+            call_dispatch(host, &json!({"id": "m3", "method": "generation.current"}))["result"]["generation"],
+            5
+        );
+
+        // 2. Start slow HTTP request at generation 5, bump generation to 6 while in-flight ->
+        //    in-flight RPC MUST fail closed with stale_generation stamped with 6 (NEVER ok:true!)
+        let host_addr = host as usize;
+        let inflight = thread::spawn(move || {
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "toctou-1", "method": "auth.health", "generation": 5}),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        let bumped = call_dispatch(host, &json!({"id": "bump-6", "method": "generation.bump"}));
+        assert_eq!(bumped["ok"], true);
+        assert_eq!(bumped["result"]["generation"], 6);
+
+        let stale_resp = inflight.join().unwrap();
+        assert_eq!(
+            stale_resp["ok"], false,
+            "In-flight RPC after concurrent generation bump must fail closed: {stale_resp}"
+        );
+        assert_eq!(stale_resp["error"]["code"], "stale_generation");
+        assert_eq!(stale_resp["generation"], 6);
+
+        fabushi_host_destroy(host);
     }
 }

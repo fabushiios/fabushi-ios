@@ -581,9 +581,11 @@ jobs:
           TMPDIR_LINK="$(mktemp -d)"
           trap 'rm -rf "$TMPDIR_LINK"' EXIT
           cat <<'EOF' > "$TMPDIR_LINK/link_check.c"
+          #include <stddef.h>
+          #include <stdint.h>
           #include "mahayana_app_host.h"
           int main(void) {
-            volatile void *syms[] = {
+            void * volatile syms[] = {
               (void *)fabushi_host_create,
               (void *)fabushi_host_dispatch,
               (void *)fabushi_host_poll_events,
@@ -614,20 +616,29 @@ jobs:
               (void *)mahayana_cloud_agent_trace_rows,
               (void *)mahayana_spreadsheet_parse_file
             };
-            return syms[0] == 0 ? 1 : 0;
+            volatile uintptr_t acc = 0;
+            for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); ++i) {
+              if (syms[i] == NULL) {
+                return 1;
+              }
+              acc ^= (uintptr_t)syms[i];
+            }
+            return acc == 0 ? 2 : 0;
           }
           EOF
           xcrun --sdk iphonesimulator clang -arch arm64 -mios-simulator-version-min=17.0 -std=c11 \
+            -Wl,-dead_strip \
             -I source/host/include "$TMPDIR_LINK/link_check.c" \
             build/rust/iphonesimulator/libmahayana_app_host.a \
             -framework Foundation -framework Security -framework CoreFoundation -framework SystemConfiguration \
             -liconv -lresolv -lz -o "$TMPDIR_LINK/link_sim"
           xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -std=c11 \
+            -Wl,-dead_strip \
             -I source/host/include "$TMPDIR_LINK/link_check.c" \
             build/rust/iphoneos/libmahayana_app_host.a \
             -framework Foundation -framework Security -framework CoreFoundation -framework SystemConfiguration \
             -liconv -lresolv -lz -o "$TMPDIR_LINK/link_ios"
-          echo "PASS: Apple Xcode ld linked all 29 C-ABI symbols cleanly for iphonesimulator & iphoneos."
+          echo "PASS: Apple Xcode ld (-Wl,-dead_strip) linked all 29 C-ABI symbols cleanly for iphonesimulator & iphoneos."
 
       - name: Compute SHA-256 checksums for iOS staticlib artifacts
         run: |

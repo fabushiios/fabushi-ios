@@ -1,6 +1,9 @@
 use std::ffi::{c_char, CStr};
+use std::io::Read as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+
+const MAX_TRACE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 use serde_json::{json, Value};
 
@@ -40,6 +43,14 @@ pub unsafe extern "C" fn mahayana_cloud_agent_trace_rows(
                 "ok": false,
                 "rows": Value::Null,
                 "error": "invalid_arguments: cloud agent trace input is empty or null"
+            })
+            .to_string();
+        }
+        if len > MAX_TRACE_PAYLOAD_BYTES {
+            return json!({
+                "ok": false,
+                "rows": Value::Null,
+                "error": format!("invalid_arguments: trace payload size {len} exceeds maximum limit {MAX_TRACE_PAYLOAD_BYTES}")
             })
             .to_string();
         }
@@ -193,7 +204,7 @@ pub unsafe extern "C" fn mahayana_spreadsheet_parse_file(
         };
 
         let byte_limit = if max_bytes == 0 { 10 * 1024 * 1024 } else { max_bytes };
-        if meta.len() as usize > byte_limit {
+        if meta.len() > byte_limit as u64 {
             return json!({
                 "ok": false,
                 "result": Value::Null,
@@ -202,7 +213,38 @@ pub unsafe extern "C" fn mahayana_spreadsheet_parse_file(
             .to_string();
         }
 
-        let content = match std::fs::read_to_string(file_path) {
+        let file = match std::fs::File::open(file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return json!({
+                    "ok": false,
+                    "result": Value::Null,
+                    "error": format!("not_found: unable to open spreadsheet file: {e}")
+                })
+                .to_string();
+            }
+        };
+        let mut raw_bytes = Vec::new();
+        if let Err(e) = file
+            .take((byte_limit as u64).saturating_add(1))
+            .read_to_end(&mut raw_bytes)
+        {
+            return json!({
+                "ok": false,
+                "result": Value::Null,
+                "error": format!("storage_error: failed to read spreadsheet file: {e}")
+            })
+            .to_string();
+        }
+        if raw_bytes.len() > byte_limit {
+            return json!({
+                "ok": false,
+                "result": Value::Null,
+                "error": format!("invalid_arguments: file size exceeds limit {byte_limit}")
+            })
+            .to_string();
+        }
+        let content = match String::from_utf8(raw_bytes) {
             Ok(s) => s,
             Err(e) => {
                 return json!({
@@ -217,13 +259,15 @@ pub unsafe extern "C" fn mahayana_spreadsheet_parse_file(
         let delim = if ext == "tsv" { '\t' } else { ',' };
         let row_limit = if max_rows == 0 { 1000 } else { max_rows };
         let mut parsed_rows: Vec<Vec<String>> = Vec::new();
+        let mut total_rows: usize = 0;
         let mut truncated = false;
         for line in content.lines() {
+            total_rows += 1;
             if parsed_rows.len() >= row_limit {
                 truncated = true;
-                break;
+            } else {
+                parsed_rows.push(parse_delimited_line(line, delim));
             }
-            parsed_rows.push(parse_delimited_line(line, delim));
         }
 
         let sheet_name = file_path
@@ -239,6 +283,7 @@ pub unsafe extern "C" fn mahayana_spreadsheet_parse_file(
                     "name": sheet_name,
                     "rows": parsed_rows,
                     "rowCount": parsed_rows.len(),
+                    "totalRows": total_rows,
                     "columnCount": column_count,
                     "truncated": truncated
                 }]
