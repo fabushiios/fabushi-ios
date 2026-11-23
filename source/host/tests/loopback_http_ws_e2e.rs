@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1011,6 +1011,11 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             "http://[::1]:bad",
             "http://[::1]:",
             "http://[::1",
+            "http://[::1]junk:8080",
+            "http://[::1]junk",
+            "http://[::1]]:8080",
+            "http://[]",
+            "http://foo[::1]:8080",
         ] {
             let bad = dispatch(
                 host,
@@ -1574,6 +1579,42 @@ fn test_b2_03_cross_server_token_replay_blocked_and_no_passphrase_restart_fails_
             gen_bob
         );
 
+        // CI Challenger NB3-02: Even if rec.server_url in host_state.db is directly tampered
+        // from Server A to Server B, ChaCha20-Poly1305 AEAD AAD binding MUST fail closed!
+        {
+            let conn = rusqlite::Connection::open(dir_enc.path().join("host_state.db")).unwrap();
+            let raw_alice: String = conn
+                .query_row(
+                    "SELECT value FROM host_kv WHERE namespace = 'accounts' AND key = '101'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut alice_json: Value = serde_json::from_str(&raw_alice).unwrap();
+            alice_json["server_url"] = json!(format!("http://{addr_b}"));
+            let tampered_json = serde_json::to_string(&alice_json).unwrap();
+            conn.execute(
+                "UPDATE host_kv SET value = ?1 WHERE namespace = 'accounts' AND key = '101'",
+                [tampered_json],
+            )
+            .unwrap();
+        }
+        let tampered_switch = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "101"}}),
+        );
+        assert_eq!(
+            tampered_switch["ok"], false,
+            "Tampered rec.server_url in host_state.db MUST fail closed via AEAD AAD mismatch: {tampered_switch}"
+        );
+        assert_eq!(tampered_switch["error"]["code"], "crypto_error");
+        assert_eq!(dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 202);
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"],
+            gen_bob
+        );
+
         fabushi_host_destroy(host);
     }
 
@@ -1756,3 +1797,542 @@ fn test_nb2_05_messages_send_http_401_and_413_clean_outbox_and_allow_same_nonce_
         fabushi_host_destroy(host);
     }
 }
+
+#[test]
+fn test_b3_01_stale_inflight_logout_fenced_against_account_switch_and_host_destroy() {
+    let dir1 = tempdir().unwrap();
+    let dir2 = tempdir().unwrap();
+
+    let logout_entered = Arc::new(AtomicBool::new(false));
+    let logout_release = Arc::new(AtomicBool::new(false));
+    let entered_srv = Arc::clone(&logout_entered);
+    let release_srv = Arc::clone(&logout_release);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|Json(body): Json<Value>| async move {
+                    let user = body.get("username").and_then(|v| v.as_str()).unwrap_or("alice");
+                    if user == "bob" {
+                        Json(json!({
+                            "user_id": 202,
+                            "username": "bob",
+                            "session_id": "sess-bob-b301",
+                            "token": "TOKEN_BOB_B301",
+                            "first_name": "Bob"
+                        }))
+                    } else {
+                        Json(json!({
+                            "user_id": 101,
+                            "username": "alice",
+                            "session_id": "sess-alice-b301",
+                            "token": "TOKEN_ALICE_B301",
+                            "first_name": "Alice"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/logout",
+                post(move || {
+                    let entered = Arc::clone(&entered_srv);
+                    let release = Arc::clone(&release_srv);
+                    async move {
+                        entered.store(true, Ordering::SeqCst);
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                        while !release.load(Ordering::SeqCst)
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Json(json!({"ok": true}))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    // Part A: Slow in-flight auth.logout (Account A = 101) raced by session.switchAccount (Account B = 202)
+    // AND slow in-flight auth.logout returning HTTP 200 after a concurrent generation.bump.
+    let cfg1 = CString::new(
+        json!({
+            "app_data_dir": dir1.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "storage_passphrase": "keychain-b3-01-passphrase",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg1.as_ptr());
+        assert!(!host.is_null());
+
+        // Seed Bob (202) then switch active session to Alice (101)
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "bob", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice", "password": "pw"}})
+            )["ok"],
+            true
+        );
+
+        // Sub-case A1: Slow auth.logout (Account A = 101) raced by session.switchAccount("202")
+        logout_entered.store(false, Ordering::SeqCst);
+        logout_release.store(false, Ordering::SeqCst);
+        let host_addr = host as usize;
+        let slow_logout_a1 = thread::spawn(move || {
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "slow-logout-a1", "method": "auth.logout"}),
+            )
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(3);
+        while !logout_entered.load(Ordering::SeqCst) && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            logout_entered.load(Ordering::SeqCst),
+            "Slow auth.logout must reach loopback /api/v1/auth/logout"
+        );
+
+        let switched = dispatch(
+            host,
+            &json!({"id": "switch-to-bob", "method": "session.switchAccount", "params": {"account_id": "202"}}),
+        );
+        assert_eq!(switched["ok"], true, "switchAccount(202) failed: {switched}");
+        assert_eq!(switched["result"]["user_id"], 202);
+        let gen_after_switch = switched["result"]["generation"].as_u64().unwrap();
+
+        logout_release.store(true, Ordering::SeqCst);
+        let logout_a1_res = slow_logout_a1.join().expect("logout thread must not panic");
+        assert_eq!(
+            logout_a1_res["ok"], false,
+            "Stale auth.logout raced by switchAccount MUST fail closed (B3-01): {logout_a1_res}"
+        );
+        assert_eq!(logout_a1_res["error"]["code"], "stale_generation");
+
+        // Account B (202) MUST stay active, persisted in host_state.db, with generation unchanged
+        assert_eq!(dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 202);
+        let accts = dispatch(host, &json!({"method": "session.listAccounts"}));
+        assert_eq!(accts["result"]["active_account_id"], "202");
+        assert_eq!(
+            dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"],
+            gen_after_switch,
+            "Stale auth.logout MUST NOT bump generation a second time"
+        );
+        {
+            let conn = rusqlite::Connection::open(dir1.path().join("host_state.db")).unwrap();
+            let bob_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM host_kv WHERE namespace = 'accounts' AND key = '202'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                bob_rows, 1,
+                "Stale auth.logout MUST NOT delete newly switched Account B from host_state.db"
+            );
+        }
+
+        // Sub-case A2: Slow auth.logout returning HTTP 200 after concurrent generation.bump
+        // (exercises the Ok(()) HTTP path fenced inside session_lock)
+        logout_entered.store(false, Ordering::SeqCst);
+        logout_release.store(false, Ordering::SeqCst);
+        let slow_logout_a2 = thread::spawn(move || {
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "slow-logout-a2", "method": "auth.logout"}),
+            )
+        });
+
+        let wait_deadline2 = Instant::now() + Duration::from_secs(3);
+        while !logout_entered.load(Ordering::SeqCst) && Instant::now() < wait_deadline2 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(logout_entered.load(Ordering::SeqCst));
+
+        let bumped = dispatch(host, &json!({"method": "generation.bump"}));
+        assert_eq!(bumped["ok"], true);
+        let gen_bumped = bumped["result"]["generation"].as_u64().unwrap();
+        logout_release.store(true, Ordering::SeqCst);
+
+        let logout_a2_res = slow_logout_a2.join().expect("logout A2 thread must not panic");
+        assert_eq!(logout_a2_res["ok"], false);
+        assert_eq!(logout_a2_res["error"]["code"], "stale_generation");
+        assert_eq!(dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 202);
+        assert_eq!(
+            dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"],
+            gen_bumped
+        );
+
+        fabushi_host_destroy(host);
+    }
+
+    // Part B: Slow in-flight auth.logout raced by fabushi_host_destroy MUST fail closed
+    // with host_closed and perform ZERO SQLite mutations or WAL writes post-destroy!
+    let cfg2 = CString::new(
+        json!({
+            "app_data_dir": dir2.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "storage_passphrase": "keychain-b3-01-destroy-passphrase",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host2 = fabushi_host_create(cfg2.as_ptr());
+        assert!(!host2.is_null());
+
+        let login_res = dispatch(
+            host2,
+            &json!({"method": "auth.login", "params": {"username": "alice", "password": "pw"}}),
+        );
+        assert_eq!(login_res["ok"], true);
+        let gen_before_destroy = login_res["generation"].as_u64().unwrap();
+
+        logout_entered.store(false, Ordering::SeqCst);
+        logout_release.store(false, Ordering::SeqCst);
+        let host2_addr = host2 as usize;
+        let logout_during_destroy = thread::spawn(move || {
+            dispatch(
+                host2_addr as *mut c_void,
+                &json!({"id": "logout-destroy", "method": "auth.logout"}),
+            )
+        });
+
+        let wait_deadline3 = Instant::now() + Duration::from_secs(3);
+        while !logout_entered.load(Ordering::SeqCst) && Instant::now() < wait_deadline3 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(logout_entered.load(Ordering::SeqCst));
+
+        fabushi_host_destroy(host2);
+        logout_release.store(true, Ordering::SeqCst);
+
+        let destroy_logout_res = logout_during_destroy
+            .join()
+            .expect("logout thread during destroy must not panic");
+        assert_eq!(
+            destroy_logout_res["ok"], false,
+            "In-flight auth.logout raced by fabushi_host_destroy MUST fail closed (B3-01): {destroy_logout_res}"
+        );
+        assert_eq!(destroy_logout_res["error"]["code"], "host_closed");
+
+        // Verify host_state.db-wal is truncated (0 bytes) before opening a new inspection connection
+        let wal_len = std::fs::metadata(dir2.path().join("host_state.db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            wal_len, 0,
+            "host_state.db-wal must remain cleanly truncated (0 bytes) after destroy"
+        );
+
+        // Verify auth.logout performed ZERO post-destroy mutations to host_state.db
+        let conn = rusqlite::Connection::open(dir2.path().join("host_state.db")).unwrap();
+        let alice_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM host_kv WHERE namespace = 'accounts' AND key = '101'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            alice_rows, 1,
+            "Post-destroy auth.logout MUST NOT delete ('accounts', '101') from host_state.db"
+        );
+        let active_meta: Option<String> = conn
+            .query_row(
+                "SELECT value FROM host_meta WHERE key = 'active_account_id'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(
+            active_meta.as_deref(),
+            Some("101"),
+            "Post-destroy auth.logout MUST NOT delete active_account_id in host_state.db"
+        );
+        let persisted_gen: String = conn
+            .query_row(
+                "SELECT value FROM host_meta WHERE key = 'account_generation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_gen,
+            gen_before_destroy.to_string(),
+            "Post-destroy auth.logout MUST NOT bump persisted account_generation in host_state.db"
+        );
+    }
+}
+
+#[test]
+fn test_b3_02_session_set_token_wipes_scope_clears_identity_and_null_revokes_bearer() {
+    let dir = tempdir().unwrap();
+    let recorded_auth_headers: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let headers_srv = Arc::clone(&recorded_auth_headers);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|| async {
+                    Json(json!({
+                        "user_id": 101,
+                        "username": "alice_settok",
+                        "session_id": "sess-alice-settok",
+                        "token": "TOK_ALICE_101",
+                        "first_name": "Alice"
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/auth/me",
+                get(move |headers: HeaderMap| {
+                    let log = Arc::clone(&headers_srv);
+                    async move {
+                        let auth_val = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        log.lock().unwrap().push(auth_val);
+                        Json(json!({
+                            "user_id": 202,
+                            "username": "token_caller",
+                            "first_name": "Caller",
+                            "session_id": "sess-me-b302"
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Account A logs in, unlocks Vault, masks a secret in Magpie, and calls auth.me
+        let login_a = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_settok", "password": "pw"}}),
+        );
+        assert_eq!(login_a["ok"], true);
+        let gen_a = login_a["generation"].as_u64().unwrap();
+        assert_eq!(dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 101);
+
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 101, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], true);
+
+        let secret_a = "Key=sk-ant-api03-settoksecret1122 email=alice_tok@secret.io";
+        let masked_a = dispatch(
+            host,
+            &json!({"method": "magpie.maskText", "params": {"text": secret_a}}),
+        )["result"]["masked_text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!masked_a.contains("settoksecret1122"));
+        assert_eq!(
+            dispatch(host, &json!({"method": "magpie.unmaskText", "params": {"text": masked_a}}))["result"]["text"],
+            secret_a
+        );
+        assert_eq!(dispatch(host, &json!({"method": "auth.me"}))["ok"], true);
+        assert_eq!(
+            recorded_auth_headers.lock().unwrap().last().map(String::as_str),
+            Some("Bearer TOK_ALICE_101")
+        );
+
+        // 2. session.setToken({"token": "TOK_B"}) MUST wipe Vault & Magpie, clear stale user_id,
+        //    delete active_account_id, bump generation, and authenticate HTTP with TOK_B!
+        let set_b = dispatch(
+            host,
+            &json!({"method": "session.setToken", "params": {"token": "TOK_B"}}),
+        );
+        assert_eq!(set_b["ok"], true, "session.setToken(TOK_B) failed: {set_b}");
+        assert_eq!(set_b["result"]["has_token"], true);
+        let gen_b = set_b["result"]["generation"].as_u64().unwrap();
+        assert!(gen_b > gen_a, "session.setToken(TOK_B) must bump generation ({gen_b} > {gen_a})");
+        assert_eq!(set_b["generation"], gen_b);
+
+        assert_eq!(
+            dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"],
+            false,
+            "session.setToken(TOK_B) MUST wipe Account A's unlocked Vault key (B3-02)"
+        );
+        let unmasked_after_b = dispatch(
+            host,
+            &json!({"method": "magpie.unmaskText", "params": {"text": masked_a}}),
+        )["result"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !unmasked_after_b.contains("settoksecret1122")
+                && !unmasked_after_b.contains("alice_tok@secret.io"),
+            "session.setToken(TOK_B) MUST wipe Magpie MemoryVault: {unmasked_after_b}"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"],
+            Value::Null,
+            "session.setToken(TOK_B) MUST clear stale user_id to prevent split-brain identity (B3-02)"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            Value::Null
+        );
+        assert_eq!(dispatch(host, &json!({"method": "auth.me"}))["ok"], true);
+        assert_eq!(
+            recorded_auth_headers.lock().unwrap().last().map(String::as_str),
+            Some("Bearer TOK_B")
+        );
+
+        // 3. Re-login Account A (populating BOTH auth_session AND auth_token), unlock Vault, mask secret,
+        //    then call session.setToken({"token": null}) -> MUST truly revoke client.token()!
+        let login_a2 = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_settok", "password": "pw"}}),
+        );
+        assert_eq!(login_a2["ok"], true);
+        let gen_a2 = login_a2["generation"].as_u64().unwrap();
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 101, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        let secret_a2 = "Key=sk-ant-api03-nullclearsecret7788 email=clear@secret.io";
+        let masked_a2 = dispatch(
+            host,
+            &json!({"method": "magpie.maskText", "params": {"text": secret_a2}}),
+        )["result"]["masked_text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let me_calls_before_clear = recorded_auth_headers.lock().unwrap().len();
+        let clear_null = dispatch(
+            host,
+            &json!({"method": "session.setToken", "params": {"token": null}}),
+        );
+        assert_eq!(clear_null["ok"], true, "session.setToken(null) failed: {clear_null}");
+        assert_eq!(clear_null["result"]["has_token"], false);
+        let gen_cleared = clear_null["result"]["generation"].as_u64().unwrap();
+        assert!(gen_cleared > gen_a2);
+        assert_eq!(clear_null["generation"], gen_cleared);
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], false);
+        let unmasked_after_null = dispatch(
+            host,
+            &json!({"method": "magpie.unmaskText", "params": {"text": masked_a2}}),
+        )["result"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !unmasked_after_null.contains("nullclearsecret7788")
+                && !unmasked_after_null.contains("clear@secret.io"),
+            "session.setToken(null) MUST wipe Magpie MemoryVault: {unmasked_after_null}"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"],
+            Value::Null
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            Value::Null
+        );
+
+        // Subsequent authenticated HTTP MUST fail closed with unauthorized (zero Authorization header sent!)
+        let me_after_clear = dispatch(host, &json!({"method": "auth.me"}));
+        assert_eq!(
+            me_after_clear["ok"], false,
+            "auth.me after session.setToken(null) MUST fail closed (B3-02): {me_after_clear}"
+        );
+        assert_eq!(me_after_clear["error"]["code"], "unauthorized");
+        assert_eq!(
+            recorded_auth_headers.lock().unwrap().len(),
+            me_calls_before_clear,
+            "Zero authenticated HTTP requests may leak stale auth_session bearer token after setToken(null)"
+        );
+
+        // 4. Empty/whitespace token string behaves identically to null
+        let login_a3 = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice_settok", "password": "pw"}}),
+        );
+        assert_eq!(login_a3["ok"], true);
+        let gen_a3 = login_a3["generation"].as_u64().unwrap();
+        let clear_ws = dispatch(
+            host,
+            &json!({"method": "session.setToken", "params": {"token": "   "}}),
+        );
+        assert_eq!(clear_ws["ok"], true);
+        assert_eq!(clear_ws["result"]["has_token"], false);
+        assert!(clear_ws["result"]["generation"].as_u64().unwrap() > gen_a3);
+        assert_eq!(
+            dispatch(host, &json!({"method": "auth.me"}))["error"]["code"],
+            "unauthorized"
+        );
+
+        fabushi_host_destroy(host);
+    }
+}
+

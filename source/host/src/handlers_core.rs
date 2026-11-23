@@ -396,10 +396,21 @@ pub fn handle_auth(
             };
             let new_gen = {
                 let _sess_guard = host.session_lock.lock();
-                let target_uid = client
-                    .current_user_id()
-                    .map(|id| id.to_string())
-                    .or(pre_uid)
+                if host.is_shutdown() {
+                    return Err(HostError::host_closed());
+                }
+                let current_gen = host.current_generation();
+                let live_client = host.client();
+                if current_gen != start_gen || !std::sync::Arc::ptr_eq(&client, &live_client) {
+                    return Err(HostError::stale_generation(start_gen, current_gen));
+                }
+                if let Err(ref err) = res {
+                    if err.code == "cancelled" {
+                        return Err(err.clone());
+                    }
+                }
+                let target_uid = pre_uid
+                    .or_else(|| live_client.current_user_id().map(|id| id.to_string()))
                     .or_else(|| {
                         host.host_db
                             .get_meta("active_account_id")
@@ -408,14 +419,21 @@ pub fn handle_auth(
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                     });
-                client.clear_session();
+                live_client.clear_session();
+                let mut delete_err = None;
                 if let Some(uid) = target_uid {
                     host.account_tokens.lock().remove(&uid);
-                    let _ = host.host_db.kv_delete("accounts", &uid);
+                    if let Err(err) = host.host_db.kv_delete("accounts", &uid) {
+                        delete_err = Some(err);
+                    }
                 }
                 let _ = host.host_db.delete_meta("active_account_id");
                 host.reset_account_scope();
-                host.bump_generation()
+                let next_gen = host.bump_generation();
+                if let Some(err) = delete_err {
+                    return Err(err);
+                }
+                next_gen
             };
             match res {
                 Ok(()) => Ok((
@@ -834,8 +852,32 @@ pub fn handle_session(
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            client.set_token(token.clone());
-            Ok((json!({ "has_token": token.is_some() }), false))
+            match token {
+                Some(tok) => {
+                    let new_gen = finalize_token_only_session(host, &client, start_gen, &tok)?;
+                    Ok((json!({ "has_token": true, "generation": new_gen }), true))
+                }
+                None => {
+                    let new_gen = {
+                        let _sess_guard = host.session_lock.lock();
+                        if host.is_shutdown() {
+                            return Err(HostError::host_closed());
+                        }
+                        let current_gen = host.current_generation();
+                        let live_client = host.client();
+                        if current_gen != start_gen
+                            || !std::sync::Arc::ptr_eq(&client, &live_client)
+                        {
+                            return Err(HostError::stale_generation(start_gen, current_gen));
+                        }
+                        live_client.clear_session();
+                        let _ = host.host_db.delete_meta("active_account_id");
+                        host.reset_account_scope();
+                        host.bump_generation()
+                    };
+                    Ok((json!({ "has_token": false, "generation": new_gen }), true))
+                }
+            }
         }
         "setAuthSession" => {
             let auth: AuthResponse = parse_req(params)?;
@@ -848,7 +890,15 @@ pub fn handle_session(
         "clearSession" => {
             let generation = {
                 let _sess_guard = host.session_lock.lock();
-                client.clear_session();
+                if host.is_shutdown() {
+                    return Err(HostError::host_closed());
+                }
+                let current_gen = host.current_generation();
+                let live_client = host.client();
+                if current_gen != start_gen || !std::sync::Arc::ptr_eq(&client, &live_client) {
+                    return Err(HostError::stale_generation(start_gen, current_gen));
+                }
+                live_client.clear_session();
                 let _ = host.host_db.delete_meta("active_account_id");
                 host.reset_account_scope();
                 host.bump_generation()
@@ -862,7 +912,8 @@ pub fn handle_session(
                 return Err(HostError::host_closed());
             }
             let current_gen = host.current_generation();
-            if current_gen != start_gen {
+            let live_client = host.client();
+            if current_gen != start_gen || !std::sync::Arc::ptr_eq(&client, &live_client) {
                 return Err(HostError::stale_generation(start_gen, current_gen));
             }
             let raw = host
@@ -872,12 +923,16 @@ pub fn handle_session(
             // Validate server binding, AEAD integrity, and non-empty recoverable token BEFORE
             // clearing the current live session, wiping account scope, or bumping generation!
             let auth = restore_account_auth(host, account_id, &raw)?;
-            let live_client = host.client();
             live_client.clear_session();
             host.reset_account_scope();
-            let new_gen = host.bump_generation();
             live_client.set_auth_session(auth.clone());
-            host.host_db.set_meta("active_account_id", account_id)?;
+            if let Err(err) = host.host_db.set_meta("active_account_id", account_id) {
+                live_client.clear_session();
+                let _ = host.host_db.delete_meta("active_account_id");
+                host.bump_generation();
+                return Err(err);
+            }
+            let new_gen = host.bump_generation();
             Ok((
                 json!({
                     "switched": true,

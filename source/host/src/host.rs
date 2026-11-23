@@ -218,14 +218,42 @@ fn validate_server_url_input(raw_url: &str) -> HostResult<String> {
             "Invalid server_url authority in '{raw_url}'"
         )));
     }
-    if (authority.starts_with('[') && !authority.contains(']'))
-        || (authority.ends_with(']') && !authority.starts_with('['))
-    {
-        return Err(HostError::invalid_arguments(format!(
-            "Invalid bracketed IPv6 authority in '{raw_url}'"
-        )));
-    }
-    if !authority.ends_with(']') {
+    if authority.starts_with('[') {
+        let Some(close_idx) = authority.find(']') else {
+            return Err(HostError::invalid_arguments(format!(
+                "Invalid bracketed IPv6 authority in '{raw_url}'"
+            )));
+        };
+        let ipv6_inner = &authority[1..close_idx];
+        let rest = &authority[close_idx + 1..];
+        if ipv6_inner.is_empty()
+            || ipv6_inner.contains('[')
+            || ipv6_inner.contains(']')
+            || rest.contains('[')
+            || rest.contains(']')
+        {
+            return Err(HostError::invalid_arguments(format!(
+                "Invalid bracketed IPv6 authority in '{raw_url}'"
+            )));
+        }
+        if !rest.is_empty() {
+            let Some(port_part) = rest.strip_prefix(':') else {
+                return Err(HostError::invalid_arguments(format!(
+                    "Invalid bracketed IPv6 host/port in '{raw_url}'"
+                )));
+            };
+            if port_part.is_empty() || port_part.parse::<u16>().is_err() {
+                return Err(HostError::invalid_arguments(format!(
+                    "Invalid server_url host/port in '{raw_url}'"
+                )));
+            }
+        }
+    } else {
+        if authority.contains('[') || authority.contains(']') {
+            return Err(HostError::invalid_arguments(format!(
+                "Invalid bracketed IPv6 authority in '{raw_url}'"
+            )));
+        }
         if let Some((host_part, port_part)) = authority.rsplit_once(':') {
             if host_part.is_empty() || port_part.is_empty() || port_part.parse::<u16>().is_err() {
                 return Err(HostError::invalid_arguments(format!(
@@ -619,6 +647,9 @@ impl FabushiAppHost {
 
                     // 1. Drain outbox events synchronously via broadcast::Receiver::try_recv()
                     loop {
+                        if *stop_bg.0.lock() {
+                            break;
+                        }
                         match outbox_rx.try_recv() {
                             Ok(ob_ev) => {
                                 let (ev_type, payload) = outbox_event_to_host_event(&ob_ev);
@@ -668,6 +699,9 @@ impl FabushiAppHost {
                     if !drained_events.is_empty() {
                         let generation = generation_fence.current();
                         for (ev_type, payload, pts_to_save) in drained_events {
+                            if *stop_bg.0.lock() {
+                                break;
+                            }
                             if let Some((cid, pts)) = pts_to_save {
                                 let _ = host_db.save_pts(cid, pts);
                             }
@@ -944,6 +978,9 @@ impl FabushiAppHost {
         let old_client = self.client();
         let swap_res: HostResult<()> = (|| {
             let _sess = self.session_lock.lock();
+            if self.is_shutdown.load(Ordering::Acquire) {
+                return Err(HostError::host_closed());
+            }
             self.host_db.set_meta("server_url", &normalized)?;
             old_client.clear_session();
             let _ = self.host_db.delete_meta("active_account_id");
@@ -1004,16 +1041,27 @@ impl FabushiAppHost {
         callback: Option<TelegramBridgeEventCallback>,
         user_context: *mut std::ffi::c_void,
     ) {
+        let my_tid = std::thread::current().id();
         let mut gate = self.callback_gate.0.lock();
-        if gate.shutdown || self.is_shutdown.load(Ordering::Acquire) {
-            return;
+        loop {
+            // Clear sink before draining so no other thread can capture a stale user_context.
+            gate.sink = None;
+            let other_active = gate
+                .active_threads
+                .iter()
+                .any(|(&tid, &count)| count > 0 && tid != my_tid);
+            if !other_active {
+                break;
+            }
+            self.callback_gate.1.wait(&mut gate);
         }
-        gate.sink = callback.map(|cb| BridgeEventSink::new(cb, user_context));
+        if !gate.shutdown && !self.is_shutdown.load(Ordering::Acquire) {
+            gate.sink = callback.map(|cb| BridgeEventSink::new(cb, user_context));
+        }
     }
 
     pub fn unregister_event_callback(&self) {
-        let mut gate = self.callback_gate.0.lock();
-        gate.sink = None;
+        self.register_event_callback(None, std::ptr::null_mut());
     }
 
     pub fn emit_event(&self, event_type: &str, payload: Value) {
@@ -1023,20 +1071,29 @@ impl FabushiAppHost {
     }
 
     pub fn poll_events(&self, max_count: u32, timeout_ms: u32) -> Vec<HostEvent> {
+        if self.is_shutdown() {
+            return self.event_queue.poll(max_count as usize, 0);
+        }
         // Opportunistically drain any pending WS events immediately before polling,
         // persisting PTS cursors consistently with the background event pump.
         let client = self.client();
         let drained = client.poll_events();
         if !drained.is_empty() {
             for ev in drained {
+                if self.is_shutdown() {
+                    break;
+                }
                 let (ev_type, payload) = domain_event_to_host_event(ev);
-                if ev_type == "newMessage" {
+                if ev_type == "newMessage" && !self.is_shutdown() {
                     if let Some(cid) = payload.get("chat_id").and_then(|v| v.as_i64()) {
                         let pts = client.sync_coordinator.last_pts(ChatId(cid));
-                        if pts > 0 {
+                        if pts > 0 && !self.is_shutdown() {
                             let _ = self.host_db.save_pts(cid, pts);
                         }
                     }
+                }
+                if self.is_shutdown() {
+                    break;
                 }
                 self.emit_event(&ev_type, payload);
             }
@@ -1166,16 +1223,20 @@ impl FabushiAppHost {
                 self.pump_lifecycle.1.wait(&mut state);
             }
         }
-        // 5. Cancel all in-flight RPCs (including anonymous ones) and wipe in-memory account secrets
-        self.reset_account_scope();
-        self.account_tokens.lock().clear();
-        // 6. Wake any blocked poll_events callers cleanly
+        // 5. Wake any blocked poll_events callers cleanly
         self.event_queue.close();
-        // 7. Disconnect WS, outbox worker, and tailnet mesh
-        let client = self.client();
-        client.clear_session();
-        // 8. Checkpoint all SQLite WAL databases cleanly for iOS 0xdead10cc safety
-        let _ = self.checkpoint_all_wals();
+        // 6. Hold session_lock across scope reset, token wipe, client teardown, and WAL checkpoint
+        //    so no concurrent session mutator (auth.logout, clearSession, setToken, switchAccount,
+        //    finalize_*) can write SQLite WAL after checkpoint_all_wals() returns.
+        //    Lock DAG: reconfig_lock -> swapping == false -> session_lock -> leaf locks (acyclic).
+        {
+            let _sess_guard = self.session_lock.lock();
+            self.reset_account_scope();
+            self.account_tokens.lock().clear();
+            let client = self.client();
+            client.clear_session();
+            let _ = self.checkpoint_all_wals();
+        }
     }
 }
 

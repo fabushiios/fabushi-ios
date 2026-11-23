@@ -881,3 +881,259 @@ fn test_nb2_01_anonymous_rpc_cancelled_on_destroy_and_nb2_06_replay_window_regis
         assert!(!telegram_replay_window_check_and_add(win, 11)); // post-destroy fails closed safely
     }
 }
+
+#[test]
+fn test_b3_03_unregister_and_replace_callback_drains_inflight_callbacks_zero_uaf_and_reentrant_safe() {
+    let dir = tempdir().unwrap();
+    let cfg_c = CString::new(
+        json!({ "app_data_dir": dir.path().to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+
+    struct UnregDrainCtx {
+        entered: AtomicBool,
+        release: AtomicBool,
+        exited: AtomicBool,
+        unregister_returned: AtomicBool,
+        post_unregister_callbacks: AtomicUsize,
+    }
+
+    unsafe extern "C" fn on_blocking_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        let st = unsafe { &*(user_ctx as *const UnregDrainCtx) };
+        if st.unregister_returned.load(Ordering::SeqCst) {
+            st.post_unregister_callbacks.fetch_add(1, Ordering::SeqCst);
+        }
+        if ev == "taskStateUpdated" {
+            st.entered.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !st.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            st.exited.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct CounterCtx {
+        count: AtomicUsize,
+    }
+
+    unsafe extern "C" fn on_replacement_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        if ev == "taskStateUpdated" {
+            let st = unsafe { &*(user_ctx as *const CounterCtx) };
+            st.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantUnregCtx {
+        host_addr: usize,
+        count: AtomicUsize,
+    }
+
+    unsafe extern "C" fn on_reentrant_unregister_cb(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        if ev == "taskStateUpdated" {
+            let st = unsafe { &*(user_ctx as *const ReentrantUnregCtx) };
+            st.count.fetch_add(1, Ordering::SeqCst);
+            // Re-entrant unregister from inside the callback on its own thread MUST NOT deadlock!
+            unsafe {
+                telegram_bridge_register_event_callback(
+                    st.host_addr as *mut c_void,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        // 1. Unregister (NULL callback) while host remains ALIVE MUST block until in-flight
+        //    C callback on Thread 1 completes before caller frees ctx_1 (B3-03).
+        let ctx_1 = Arc::new(UnregDrainCtx {
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+            unregister_returned: AtomicBool::new(false),
+            post_unregister_callbacks: AtomicUsize::new(0),
+        });
+        let raw_ctx_1 = Arc::into_raw(Arc::clone(&ctx_1)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_blocking_cb), raw_ctx_1);
+
+        let emitter1 = thread::spawn(move || {
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "b303-emit-1", "method": "fabushi.createTask", "params": {"task_id": "b303-t1"}}),
+            )
+        });
+
+        let enter_deadline = Instant::now() + Duration::from_secs(3);
+        while !ctx_1.entered.load(Ordering::SeqCst) && Instant::now() < enter_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ctx_1.entered.load(Ordering::SeqCst), "Callback 1 must enter");
+
+        let ctx_unreg = Arc::clone(&ctx_1);
+        let unregistrator = thread::spawn(move || {
+            telegram_bridge_register_event_callback(
+                host_addr as *mut c_void,
+                None,
+                std::ptr::null_mut(),
+            );
+            ctx_unreg.unregister_returned.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            !ctx_1.unregister_returned.load(Ordering::SeqCst),
+            "telegram_bridge_register_event_callback(NULL) MUST block until in-flight C callback exits (B3-03)"
+        );
+
+        ctx_1.release.store(true, Ordering::SeqCst);
+        let emit1_resp = emitter1.join().expect("emitter1 must not panic");
+        assert_eq!(emit1_resp["ok"], true);
+        unregistrator.join().expect("unregistrator must not panic");
+
+        assert!(ctx_1.exited.load(Ordering::SeqCst));
+        assert!(ctx_1.unregister_returned.load(Ordering::SeqCst));
+        assert_eq!(ctx_1.post_unregister_callbacks.load(Ordering::SeqCst), 0);
+
+        // Immediately free ctx_1 while host stays ALIVE and dispatch again -> ZERO UAF!
+        drop(Arc::from_raw(raw_ctx_1 as *const UnregDrainCtx));
+        let alive_after_unreg = call_dispatch(
+            host,
+            &json!({"id": "b303-alive-1", "method": "fabushi.createTask", "params": {"task_id": "b303-t2"}}),
+        );
+        assert_eq!(alive_after_unreg["ok"], true);
+        assert_eq!(
+            call_dispatch(host, &json!({"id": "b303-ping", "method": "session.ping"}))["ok"],
+            true
+        );
+
+        // 2. Replacing callback (cb_1b -> cb_2) ALSO drains cb_1b before returning and routes
+        //    subsequent events strictly to cb_2!
+        let ctx_1b = Arc::new(UnregDrainCtx {
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+            unregister_returned: AtomicBool::new(false),
+            post_unregister_callbacks: AtomicUsize::new(0),
+        });
+        let raw_ctx_1b = Arc::into_raw(Arc::clone(&ctx_1b)) as *mut c_void;
+        let ctx_2 = Arc::new(CounterCtx {
+            count: AtomicUsize::new(0),
+        });
+        let raw_ctx_2 = Arc::into_raw(Arc::clone(&ctx_2)) as *mut c_void;
+        let raw_ctx_2_addr = raw_ctx_2 as usize;
+
+        telegram_bridge_register_event_callback(host, Some(on_blocking_cb), raw_ctx_1b);
+        let emitter2 = thread::spawn(move || {
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "b303-emit-2", "method": "fabushi.createTask", "params": {"task_id": "b303-t3"}}),
+            )
+        });
+
+        let enter_deadline2 = Instant::now() + Duration::from_secs(3);
+        while !ctx_1b.entered.load(Ordering::SeqCst) && Instant::now() < enter_deadline2 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ctx_1b.entered.load(Ordering::SeqCst));
+
+        let ctx_replace = Arc::clone(&ctx_1b);
+        let replacer = thread::spawn(move || {
+            telegram_bridge_register_event_callback(
+                host_addr as *mut c_void,
+                Some(on_replacement_cb),
+                raw_ctx_2_addr as *mut c_void,
+            );
+            ctx_replace.unregister_returned.store(true, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            !ctx_1b.unregister_returned.load(Ordering::SeqCst),
+            "Callback replacement MUST drain prior callback on other threads before returning (B3-03)"
+        );
+
+        ctx_1b.release.store(true, Ordering::SeqCst);
+        assert_eq!(emitter2.join().expect("emitter2 must not panic")["ok"], true);
+        replacer.join().expect("replacer must not panic");
+        assert!(ctx_1b.exited.load(Ordering::SeqCst));
+        assert_eq!(ctx_1b.post_unregister_callbacks.load(Ordering::SeqCst), 0);
+
+        // Free ctx_1b immediately and verify replacement cb_2 receives new events cleanly
+        drop(Arc::from_raw(raw_ctx_1b as *const UnregDrainCtx));
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b303-emit-3", "method": "fabushi.createTask", "params": {"task_id": "b303-t4"}}),
+            )["ok"],
+            true
+        );
+        assert_eq!(ctx_2.count.load(Ordering::SeqCst), 1);
+
+        telegram_bridge_register_event_callback(host, None, std::ptr::null_mut());
+        drop(Arc::from_raw(raw_ctx_2 as *const CounterCtx));
+
+        // 3. Re-entrant unregister from inside the callback itself MUST succeed with zero deadlock
+        let ctx_reent = Arc::new(ReentrantUnregCtx {
+            host_addr,
+            count: AtomicUsize::new(0),
+        });
+        let raw_ctx_reent = Arc::into_raw(Arc::clone(&ctx_reent)) as *mut c_void;
+        telegram_bridge_register_event_callback(
+            host,
+            Some(on_reentrant_unregister_cb),
+            raw_ctx_reent,
+        );
+
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b303-reent-1", "method": "fabushi.createTask", "params": {"task_id": "b303-r1"}}),
+            )["ok"],
+            true
+        );
+        assert_eq!(ctx_reent.count.load(Ordering::SeqCst), 1);
+
+        // Second task creation MUST NOT invoke the re-entrantly unregistered callback
+        assert_eq!(
+            call_dispatch(
+                host,
+                &json!({"id": "b303-reent-2", "method": "fabushi.createTask", "params": {"task_id": "b303-r2"}}),
+            )["ok"],
+            true
+        );
+        assert_eq!(ctx_reent.count.load(Ordering::SeqCst), 1);
+
+        fabushi_host_destroy(host);
+        drop(Arc::from_raw(raw_ctx_reent as *const ReentrantUnregCtx));
+    }
+}
+

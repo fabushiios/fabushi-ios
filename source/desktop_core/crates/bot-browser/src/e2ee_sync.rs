@@ -1261,6 +1261,15 @@ fn validate_argon2_params(params: Argon2KdfParams) -> Result<Argon2Params, BotBr
             "Argon2id t_cost and p_cost must be >= 1".to_string(),
         ));
     }
+    #[cfg(target_os = "ios")]
+    {
+        if params.m_cost_kib > 262_144 || params.t_cost > 32 || params.p_cost > 16 {
+            return Err(BotBrowserError::Crypto(format!(
+                "Argon2id parameters exceed iOS Jetsam ceiling (m_cost_kib={} <= 262144, t_cost={} <= 32, p_cost={} <= 16)",
+                params.m_cost_kib, params.t_cost, params.p_cost
+            )));
+        }
+    }
 
     Argon2Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
         .map_err(|e| BotBrowserError::Crypto(format!("invalid Argon2id params: {e}")))
