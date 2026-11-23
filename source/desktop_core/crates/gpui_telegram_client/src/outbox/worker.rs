@@ -47,13 +47,12 @@ fn classify_http_error(err: &HttpClientError) -> FailureClass {
     match err {
         HttpClientError::Conflict(msg) => FailureClass::Permanent(format!("409 Conflict: {msg}")),
         HttpClientError::Api { status, message } => match *status {
-            400 | 403 | 404 | 409 | 422 => {
-                FailureClass::Permanent(format!("HTTP {status}: {message}"))
-            }
+            408 | 429 => FailureClass::Transient(format!("HTTP {status}: {message}")),
+            400..=499 => FailureClass::Permanent(format!("HTTP {status}: {message}")),
             _ => FailureClass::Transient(format!("HTTP {status}: {message}")),
         },
         HttpClientError::Unauthorized(msg) => {
-            FailureClass::Transient(format!("Unauthorized: {msg}"))
+            FailureClass::Permanent(format!("Unauthorized: {msg}"))
         }
         HttpClientError::Serialization(e) => {
             FailureClass::Permanent(format!("Serialization error: {e}"))

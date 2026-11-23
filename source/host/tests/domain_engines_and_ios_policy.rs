@@ -1189,3 +1189,142 @@ fn test_transition_task_reentrant_callback_no_deadlock() {
         drop(Arc::from_raw(raw_ctx as *const ReentrantTaskCtx));
     }
 }
+
+#[test]
+fn test_nb2_03_04_06_mcp_trimmed_stdio_argon2_ios_ceiling_wol_ipv4_and_workspace_hydration() {
+    let (dir, host) = create_temp_test_host();
+    unsafe {
+        // 1. NB2-03: mcp.registerServer rejects whitespace-padded " stdio " with capability_unavailable
+        let mcp_ws = dispatch(
+            host,
+            &json!({
+                "method": "mcp.registerServer",
+                "params": {"name": "ws-stdio", "transport": " stdio ", "command": "/bin/sh"}
+            }),
+        );
+        assert_eq!(mcp_ws["ok"], false, "Whitespace-padded stdio must fail closed: {mcp_ws}");
+        assert_eq!(mcp_ws["error"]["code"], "capability_unavailable");
+
+        // Secondary Reviewer Note 3: fabushi.updateToolsets trims allowed toolset names cleanly
+        let ts_trim = dispatch(
+            host,
+            &json!({
+                "method": "fabushi.updateToolsets",
+                "params": {"enable": [" core "]}
+            }),
+        );
+        assert_eq!(ts_trim["ok"], true, "Trimmed allowed toolset ' core ' must succeed: {ts_trim}");
+
+        // 2. NB2-04: Argon2id iOS Jetsam upper-bound cap rejects m_cost_kib = 4_000_000 across
+        //    parse_kdf_params, vault.unlockWithPassphrase, vault.unlockWithSplitKey, and settings.passcodeVerify
+        let init_oom = dispatch(
+            host,
+            &json!({
+                "method": "vault.initNew",
+                "params": {
+                    "user_id": 77,
+                    "passphrase": "test-passphrase",
+                    "kdf_params": { "m_cost_kib": 4_000_000, "t_cost": 3, "p_cost": 1 }
+                }
+            }),
+        );
+        assert_eq!(init_oom["ok"], false);
+        assert_eq!(init_oom["error"]["code"], "invalid_arguments");
+
+        // Obtain a real valid envelope, then poison its kdf_params.m_cost_kib to 4_000_000
+        let valid_init = dispatch(
+            host,
+            &json!({
+                "method": "vault.initNew",
+                "params": { "user_id": 77, "passphrase": "test-passphrase", "fast_kdf": true }
+            }),
+        );
+        assert_eq!(valid_init["ok"], true);
+        let mut oom_env = valid_init["result"]["envelope"].clone();
+        oom_env["kdf_params"]["m_cost_kib"] = json!(4_000_000);
+
+        let unlock_pass_oom = dispatch(
+            host,
+            &json!({
+                "method": "vault.unlockWithPassphrase",
+                "params": { "user_id": 77, "passphrase": "test-passphrase", "envelope": oom_env }
+            }),
+        );
+        assert_eq!(unlock_pass_oom["ok"], false);
+        assert_eq!(unlock_pass_oom["error"]["code"], "invalid_arguments");
+
+        let unlock_split_oom = dispatch(
+            host,
+            &json!({
+                "method": "vault.unlockWithSplitKey",
+                "params": { "user_id": 77, "password": "test-passphrase", "envelope": oom_env }
+            }),
+        );
+        assert_eq!(unlock_split_oom["ok"], false);
+        assert_eq!(unlock_split_oom["error"]["code"], "invalid_arguments");
+
+        // Corrupt persisted passcode_hash in host_state.db with 4 GiB Argon2id cost -> must fail closed!
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+            let bogus_digest = "00".repeat(32);
+            let oom_hash = format!("argon2id$m=4000000,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA==${bogus_digest}");
+            conn.execute(
+                "INSERT INTO host_meta (key, value) VALUES ('passcode_hash', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [oom_hash],
+            )
+            .unwrap();
+        }
+        let pc_oom = dispatch(
+            host,
+            &json!({"method": "settings.passcodeVerify", "params": {"passcode": "123456"}}),
+        );
+        assert_eq!(pc_oom["ok"], false, "Oversized Argon2id passcode_hash must fail closed: {pc_oom}");
+        assert_eq!(pc_oom["error"]["code"], "invalid_arguments");
+
+        // 3. NB2-06: remote.sendWakeOnLan rejects malformed / non-IPv4 broadcast_ip
+        for bad_ip in ["not-an-ip", "999.999.999.999", "::1", ""] {
+            let wol = dispatch(
+                host,
+                &json!({
+                    "method": "remote.sendWakeOnLan",
+                    "params": {"mac_address": "AA:BB:CC:DD:EE:FF", "broadcast_ip": bad_ip}
+                }),
+            );
+            assert_eq!(wol["ok"], false, "Malformed broadcast_ip '{bad_ip}' must fail closed: {wol}");
+            assert_eq!(wol["error"]["code"], "invalid_arguments");
+        }
+
+        // 4. NB2-06: multi_agent.workspaceSet persists and hydrates across host restart
+        let ws_set = dispatch(
+            host,
+            &json!({
+                "method": "multi_agent.workspaceSet",
+                "params": {"chat_id": 777, "key": "plan", "value": {"step": "m1b-iter3"}, "updated_by": "agent_1"}
+            }),
+        );
+        assert_eq!(ws_set["ok"], true);
+        fabushi_host_destroy(host);
+
+        let cfg2 = CString::new(
+            json!({
+                "app_data_dir": dir.path().to_string_lossy(),
+                "ios_sandbox_strict": true,
+                "test_mode": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let host2 = fabushi_host_create(cfg2.as_ptr());
+        assert!(!host2.is_null());
+        let ws_get = dispatch(
+            host2,
+            &json!({"method": "multi_agent.workspaceGet", "params": {"chat_id": 777, "key": "plan"}}),
+        );
+        assert_eq!(ws_get["ok"], true);
+        assert_eq!(
+            ws_get["result"]["value"]["step"], "m1b-iter3",
+            "group_workspaces must hydrate from host_state.db on startup (NB2-06): {ws_get}"
+        );
+        fabushi_host_destroy(host2);
+    }
+}

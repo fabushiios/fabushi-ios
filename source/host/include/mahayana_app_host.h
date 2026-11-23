@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* ============================================================================
- * 1. Canonical Fabushi iOS Host C-ABI Exports (Primary v1.6.8 API)
+ * 1. Canonical Fabushi iOS Host C-ABI Exports (Primary v1.6.9 API)
  * ============================================================================ */
 
 /**

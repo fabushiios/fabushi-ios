@@ -89,6 +89,10 @@ impl HostError {
         Self::new("host_panic", message, false)
     }
 
+    pub fn host_closed() -> Self {
+        Self::new("host_closed", "Host handle is closed or shutting down", false)
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::new("unauthorized", message, false)
     }
@@ -125,12 +129,13 @@ impl HostError {
             HttpClientError::Serialization(e) => Self::invalid_json(e.to_string()),
             HttpClientError::Network(e) => Self::network(e.to_string()),
             HttpClientError::Api { status, message } => {
-                let retryable = status == 429 || status >= 500;
+                let retryable = status == 408 || status == 429 || status >= 500;
                 let code = match status {
                     400 | 422 => "invalid_arguments",
                     401 => "unauthorized",
                     403 => "permission_denied",
                     404 => "not_found",
+                    408 => "timeout",
                     409 => "conflict",
                     429 => "rate_limited",
                     501 => "upstream_not_implemented",

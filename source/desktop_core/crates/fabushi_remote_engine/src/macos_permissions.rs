@@ -15,6 +15,10 @@ pub fn mark_sck_live_verified() {
     SCK_LIVE_VERIFIED.store(true, Ordering::Release);
 }
 
+pub fn clear_sck_live_verified() {
+    SCK_LIVE_VERIFIED.store(false, Ordering::Release);
+}
+
 pub fn is_sck_live_verified() -> bool {
     SCK_LIVE_VERIFIED.load(Ordering::Acquire)
 }
@@ -120,6 +124,7 @@ mod imp {
             jpeg_quality: u8,
         ) -> FabushiSckCaptureResultC;
         fn fabushi_cg_can_read_other_window_names() -> bool;
+        fn fabushi_copy_basic_bundle_info() -> FabushiMacSigningInfoC;
         fn fabushi_copy_signing_info() -> FabushiMacSigningInfoC;
     }
 
@@ -131,6 +136,18 @@ mod imp {
         unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn signing_identity_from_raw(raw: FabushiMacSigningInfoC) -> MacSigningIdentity {
+        MacSigningIdentity {
+            is_adhoc: raw.is_adhoc,
+            is_app_bundle: raw.is_app_bundle,
+            cdhash_hex: cstr_array_to_string(&raw.cdhash_hex),
+            bundle_id: cstr_array_to_string(&raw.bundle_id),
+            bundle_path: cstr_array_to_string(&raw.bundle_path),
+            executable_path: cstr_array_to_string(&raw.executable_path),
+            team_id: cstr_array_to_string(&raw.team_id),
+        }
     }
 
     pub fn preflight_screen_capture_access() -> bool {
@@ -154,17 +171,13 @@ mod imp {
         unsafe { fabushi_cg_can_read_other_window_names() }
     }
 
+    /// Fast, main-thread-safe bundle/executable lookup without invoking Security.framework.
+    pub fn current_bundle_identity() -> MacSigningIdentity {
+        signing_identity_from_raw(unsafe { fabushi_copy_basic_bundle_info() })
+    }
+
     pub fn current_signing_identity() -> MacSigningIdentity {
-        let raw = unsafe { fabushi_copy_signing_info() };
-        MacSigningIdentity {
-            is_adhoc: raw.is_adhoc,
-            is_app_bundle: raw.is_app_bundle,
-            cdhash_hex: cstr_array_to_string(&raw.cdhash_hex),
-            bundle_id: cstr_array_to_string(&raw.bundle_id),
-            bundle_path: cstr_array_to_string(&raw.bundle_path),
-            executable_path: cstr_array_to_string(&raw.executable_path),
-            team_id: cstr_array_to_string(&raw.team_id),
-        }
+        signing_identity_from_raw(unsafe { fabushi_copy_signing_info() })
     }
 
     pub fn probe_sck_screen_access() -> SckProbeOutcome {
@@ -179,11 +192,14 @@ mod imp {
                 mark_sck_live_verified();
                 SckProbeOutcome::GrantedActive
             }
-            FABUSHI_SCK_PERMISSION_DENIED => SckProbeOutcome::PermissionDenied(if err_msg.is_empty() {
-                "ScreenCaptureKit TCC permission denied (-3801)".to_string()
-            } else {
-                err_msg
-            }),
+            FABUSHI_SCK_PERMISSION_DENIED => {
+                clear_sck_live_verified();
+                SckProbeOutcome::PermissionDenied(if err_msg.is_empty() {
+                    "ScreenCaptureKit TCC permission denied (-3801)".to_string()
+                } else {
+                    err_msg
+                })
+            }
             FABUSHI_SCK_UNAVAILABLE => SckProbeOutcome::Unavailable,
             _ => SckProbeOutcome::Error(if err_msg.is_empty() {
                 format!("SCShareableContent probe failed with code {rc}")
@@ -230,12 +246,15 @@ mod imp {
         }
 
         let err = match raw.status {
-            FABUSHI_SCK_PERMISSION_DENIED => RemoteEngineError::PermissionDenied(if err_msg.is_empty() {
-                "Screen Recording permission required in System Settings > Privacy & Security"
-                    .to_string()
-            } else {
-                err_msg
-            }),
+            FABUSHI_SCK_PERMISSION_DENIED => {
+                clear_sck_live_verified();
+                RemoteEngineError::PermissionDenied(if err_msg.is_empty() {
+                    "Screen Recording permission required in System Settings > Privacy & Security"
+                        .to_string()
+                } else {
+                    err_msg
+                })
+            }
             FABUSHI_SCK_NOT_FOUND => RemoteEngineError::NotFound(if err_msg.is_empty() {
                 format!("display index {display_index} not found")
             } else {
@@ -258,6 +277,7 @@ mod imp {
 
     pub const STATUS_UNAVAILABLE: i32 = FABUSHI_SCK_UNAVAILABLE;
     pub const STATUS_PERMISSION_DENIED: i32 = FABUSHI_SCK_PERMISSION_DENIED;
+    pub const STATUS_NOT_FOUND: i32 = FABUSHI_SCK_NOT_FOUND;
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -274,6 +294,10 @@ mod imp {
 
     pub fn can_read_other_window_names() -> bool {
         !cfg!(target_os = "ios")
+    }
+
+    pub fn current_bundle_identity() -> MacSigningIdentity {
+        MacSigningIdentity::default()
     }
 
     pub fn current_signing_identity() -> MacSigningIdentity {
@@ -302,12 +326,13 @@ mod imp {
 
     pub const STATUS_UNAVAILABLE: i32 = 2;
     pub const STATUS_PERMISSION_DENIED: i32 = 1;
+    pub const STATUS_NOT_FOUND: i32 = 3;
 }
 
 pub use imp::{
-    STATUS_PERMISSION_DENIED, STATUS_UNAVAILABLE, can_read_other_window_names,
-    current_signing_identity, is_accessibility_trusted, preflight_screen_capture_access,
-    probe_sck_screen_access, sck_capture_display,
+    STATUS_NOT_FOUND, STATUS_PERMISSION_DENIED, STATUS_UNAVAILABLE, can_read_other_window_names,
+    current_bundle_identity, current_signing_identity, is_accessibility_trusted,
+    preflight_screen_capture_access, probe_sck_screen_access, sck_capture_display,
 };
 
 /// Helper returning `Ok(())` when Accessibility permission is active on the current host.

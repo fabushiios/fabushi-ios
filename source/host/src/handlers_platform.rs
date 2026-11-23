@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::error::{HostError, HostResult};
-use crate::host::FabushiAppHost;
+use crate::host::{validate_argon2_ios_ceiling, FabushiAppHost};
 
 fn parse_req<T: serde::de::DeserializeOwned>(params: &Value) -> HostResult<T> {
     serde_json::from_value(params.clone())
@@ -91,6 +91,7 @@ fn parse_kdf_params(host: &FabushiAppHost, params: &Value) -> HostResult<Argon2K
     if let Some(p) = params.get("kdf_params") {
         let parsed: Argon2KdfParams = serde_json::from_value(p.clone())
             .map_err(|e| HostError::invalid_arguments(format!("Invalid kdf_params: {e}")))?;
+        validate_argon2_ios_ceiling(parsed.m_cost_kib, parsed.t_cost, parsed.p_cost)?;
         if !host.test_mode && (parsed.m_cost_kib < 16_384 || parsed.t_cost < 2 || parsed.p_cost == 0) {
             return Err(HostError::invalid_arguments(
                 "kdf_params below minimum production Argon2id strength (require m_cost_kib >= 16384 and t_cost >= 2)",
@@ -200,6 +201,11 @@ pub fn handle_vault(
                     .clone()
                     .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))?
             };
+            validate_argon2_ios_ceiling(
+                envelope.kdf_params.m_cost_kib,
+                envelope.kdf_params.t_cost,
+                envelope.kdf_params.p_cost,
+            )?;
             let unlocked = UserVaultCrypto::unlock_with_passphrase(user_id, passphrase, &envelope)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             *host.vault_unlocked_key.lock() = Some(unlocked);
@@ -228,6 +234,11 @@ pub fn handle_vault(
                 );
                 SplitKeyVaultKek::from_bytes(*arr)
             } else {
+                validate_argon2_ios_ceiling(
+                    envelope.kdf_params.m_cost_kib,
+                    envelope.kdf_params.t_cost,
+                    envelope.kdf_params.p_cost,
+                )?;
                 let password = req_raw_str(params, "password")?;
                 let bundle = derive_split_key(password, &envelope.kdf_salt_b64, &envelope.kdf_params)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
@@ -810,7 +821,7 @@ pub fn handle_remote(
         // Safe local RemoteControlHub lease & <10ms emergency takeover
         "hubRegisterSession" => {
             let sess: RemoteSessionDto = parse_req(params)?;
-            let registered = host.remote_hub.register_session(sess);
+            let registered = host.remote_hub().register_session(sess);
             to_val(registered)
         }
         "hubAcquireLease" => {
@@ -820,15 +831,16 @@ pub fn handle_remote(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             let granted = host
-                .remote_hub
+                .remote_hub()
                 .acquire_exclusive_lease(sess, allow_preempt_ai)
                 .map_err(|e| HostError::conflict(e.to_string()))?;
             to_val(granted)
         }
         "hubEmergencyTakeover" => {
             let start = std::time::Instant::now();
-            let disconnected = host.remote_hub.disconnect_all();
-            let epoch = host.remote_hub.override_epoch();
+            let hub = host.remote_hub();
+            let disconnected = hub.disconnect_all();
+            let epoch = hub.override_epoch();
             let elapsed_us = start.elapsed().as_micros() as u64;
             host.emit_event(
                 "remoteEmergencyTakeover",
@@ -844,11 +856,14 @@ pub fn handle_remote(
                 "elapsed_us": elapsed_us,
             }))
         }
-        "hubPreemptionStatus" => Ok(json!({
-            "override_epoch": host.remote_hub.override_epoch(),
-            "active_count": host.remote_hub.active_count(),
-            "sessions": host.remote_hub.list_sessions(),
-        })),
+        "hubPreemptionStatus" => {
+            let hub = host.remote_hub();
+            Ok(json!({
+                "override_epoch": hub.override_epoch(),
+                "active_count": hub.active_count(),
+                "sessions": hub.list_sessions(),
+            }))
+        }
         "ptyParseOsc52" => {
             let data = if let Some(b64) = params.get("data_b64").and_then(|v| v.as_str()) {
                 BASE64_STANDARD
@@ -884,10 +899,26 @@ pub fn handle_remote(
         }
         "sendWakeOnLan" => {
             let mac = req_str(params, "mac_address")?.to_string();
-            let broadcast_ip = params
-                .get("broadcast_ip")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned);
+            let broadcast_ip = match params.get("broadcast_ip") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let raw = v
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            HostError::invalid_arguments(
+                                "broadcast_ip must be a valid non-empty IPv4 address string",
+                            )
+                        })?;
+                    let ip: std::net::Ipv4Addr = raw.parse().map_err(|_| {
+                        HostError::invalid_arguments(format!(
+                            "Invalid broadcast_ip '{raw}': expected an IPv4 address"
+                        ))
+                    })?;
+                    Some(ip.to_string())
+                }
+            };
             let msg = PowerManager::execute_power_action(&PowerActionKind::WakeOnLan {
                 mac_address: mac,
                 broadcast_ip,

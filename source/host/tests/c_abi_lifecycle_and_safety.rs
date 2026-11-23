@@ -1,5 +1,5 @@
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -640,5 +640,244 @@ fn test_in_flight_generation_bump_toctou_and_monotonic_generation_set() {
         assert_eq!(stale_resp["generation"], 6);
 
         fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_b2_01_concurrent_emit_event_and_destroy_drains_callback_zero_post_destroy_uaf() {
+    let dir = tempdir().unwrap();
+    let cfg_c = CString::new(
+        json!({ "app_data_dir": dir.path().to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+
+    struct DrainCtx {
+        entered: AtomicBool,
+        release: AtomicBool,
+        exited: AtomicBool,
+        destroy_returned: AtomicBool,
+        post_destroy_callbacks: AtomicUsize,
+    }
+
+    let ctx = Arc::new(DrainCtx {
+        entered: AtomicBool::new(false),
+        release: AtomicBool::new(false),
+        exited: AtomicBool::new(false),
+        destroy_returned: AtomicBool::new(false),
+        post_destroy_callbacks: AtomicUsize::new(0),
+    });
+
+    unsafe extern "C" fn on_blocking_event(
+        event_type: *const c_char,
+        _payload: *const c_char,
+        user_ctx: *mut c_void,
+    ) {
+        if event_type.is_null() || user_ctx.is_null() {
+            return;
+        }
+        let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+        let st = unsafe { &*(user_ctx as *const DrainCtx) };
+        if st.destroy_returned.load(Ordering::SeqCst) {
+            st.post_destroy_callbacks.fetch_add(1, Ordering::SeqCst);
+        }
+        if ev == "taskStateUpdated" {
+            st.entered.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !st.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            st.exited.store(true, Ordering::SeqCst);
+        }
+    }
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        let raw_ctx = Arc::into_raw(Arc::clone(&ctx)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_blocking_event), raw_ctx);
+
+        let host_addr = host as usize;
+        let emitter = thread::spawn(move || {
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "emit-1", "method": "fabushi.createTask", "params": {"task_id": "drain-task"}}),
+            )
+        });
+
+        // Wait deterministically until the C callback is actively running on Thread 1
+        let enter_deadline = Instant::now() + Duration::from_secs(3);
+        while !ctx.entered.load(Ordering::SeqCst) && Instant::now() < enter_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ctx.entered.load(Ordering::SeqCst), "C callback must enter");
+
+        // Thread 2 invokes fabushi_host_destroy while Thread 1 is blocked inside C callback
+        let ctx_destroyer = Arc::clone(&ctx);
+        let destroyer = thread::spawn(move || {
+            fabushi_host_destroy(host_addr as *mut c_void);
+            ctx_destroyer.destroy_returned.store(true, Ordering::SeqCst);
+        });
+
+        // Give destroyer plenty of time: fabushi_host_destroy MUST NOT return while C callback is active!
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            !ctx.destroy_returned.load(Ordering::SeqCst),
+            "fabushi_host_destroy MUST block until in-flight emit_event C callback finishes (B2-01)"
+        );
+
+        // Release the C callback -> both emitter and destroyer must now complete cleanly
+        ctx.release.store(true, Ordering::SeqCst);
+        let emit_resp = emitter.join().expect("emitter must not panic");
+        assert_eq!(emit_resp["ok"], true);
+        destroyer.join().expect("destroyer must not panic");
+
+        assert!(ctx.exited.load(Ordering::SeqCst));
+        assert!(ctx.destroy_returned.load(Ordering::SeqCst));
+        assert_eq!(ctx.post_destroy_callbacks.load(Ordering::SeqCst), 0);
+
+        // Re-registering callback or dispatching on destroyed host must fail closed with zero UAF
+        telegram_bridge_register_event_callback(host, Some(on_blocking_event), raw_ctx);
+        let after = call_dispatch(host, &json!({"id": "after-1", "method": "session.ping"}));
+        assert_eq!(after["ok"], false);
+        assert_eq!(after["error"]["code"], "host_closed");
+
+        // Safe to free caller-owned user_context immediately after fabushi_host_destroy returns
+        drop(Arc::from_raw(raw_ctx as *const DrainCtx));
+    }
+}
+
+#[test]
+fn test_b2_01_concurrent_set_server_url_and_destroy_no_orphaned_pump_and_clean_error() {
+    for round in 0..4 {
+        let dir = tempdir().unwrap();
+        let cfg_c = CString::new(
+            json!({
+                "app_data_dir": dir.path().to_string_lossy(),
+                "server_url": "http://127.0.0.1:18080"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        unsafe {
+            let host = fabushi_host_create(cfg_c.as_ptr());
+            assert!(!host.is_null());
+            let host_addr = host as usize;
+            let next_url = format!("http://127.0.0.1:{}", 18081 + round);
+
+            let reconf = thread::spawn(move || {
+                call_dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": format!("reconf-{round}"),
+                        "method": "session.setServerUrl",
+                        "params": {"server_url": next_url}
+                    }),
+                )
+            });
+
+            if round % 2 == 1 {
+                thread::sleep(Duration::from_millis(5));
+            }
+            fabushi_host_destroy(host);
+
+            let resp = reconf.join().expect("concurrent setServerUrl must not panic or deadlock");
+            if resp["ok"] == false {
+                assert_eq!(
+                    resp["error"]["code"], "host_closed",
+                    "Failed concurrent setServerUrl during destroy must fail closed with host_closed: {resp}"
+                );
+            }
+
+            // Post-destroy setServerUrl MUST fail closed with host_closed
+            let post = call_dispatch(
+                host,
+                &json!({
+                    "id": "post-reconf",
+                    "method": "session.setServerUrl",
+                    "params": {"server_url": "http://127.0.0.1:18099"}
+                }),
+            );
+            assert_eq!(post["ok"], false);
+            assert_eq!(post["error"]["code"], "host_closed");
+        }
+    }
+}
+
+#[test]
+fn test_nb2_01_anonymous_rpc_cancelled_on_destroy_and_nb2_06_replay_window_registry_safety() {
+    let dir = tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = rt.block_on(async {
+        let app = Router::new().route(
+            "/health",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}")
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+        let host_addr = host as usize;
+
+        // Dispatch an anonymous RPC (omitting "id") against the 5s slow endpoint
+        let start = Instant::now();
+        let anon_thread = thread::spawn(move || {
+            call_dispatch(
+                host_addr as *mut c_void,
+                &json!({"method": "auth.health"}),
+            )
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        // External callers MUST NOT be able to cancel anonymous RPCs by guessing internal keys
+        let empty_c = CString::new("").unwrap();
+        let guessed_c = CString::new("__anon_1").unwrap();
+        assert!(!fabushi_host_cancel(host, empty_c.as_ptr()));
+        assert!(!fabushi_host_cancel(host, guessed_c.as_ptr()));
+
+        // Destroying the host MUST cancel even anonymous in-flight RPCs promptly (NB2-01)
+        fabushi_host_destroy(host);
+        let anon_resp = anon_thread.join().expect("anon RPC thread must not panic");
+        let elapsed = start.elapsed();
+        assert_eq!(anon_resp["ok"], false, "Anonymous RPC must abort on shutdown: {anon_resp}");
+        assert_eq!(anon_resp["error"]["code"], "cancelled");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Anonymous RPC must cancel promptly on shutdown (took {elapsed:?})"
+        );
+
+        // NB2-06: SlidingReplayWindow refcounted registry prevents double-destroy & post-destroy UAF
+        let win = telegram_replay_window_create();
+        assert!(!win.is_null());
+        assert!(telegram_replay_window_check_and_add(win, 10));
+        assert!(!telegram_replay_window_check_and_add(win, 10));
+        telegram_replay_window_destroy(win);
+        telegram_replay_window_destroy(win); // idempotent double-destroy no-op
+        assert!(!telegram_replay_window_check_and_add(win, 11)); // post-destroy fails closed safely
     }
 }

@@ -68,7 +68,7 @@ fn unregister_host(handle: *mut c_void) -> Option<Arc<FabushiAppHost>> {
 }
 
 // ============================================================================
-// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.8 API)
+// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.9 API)
 // ============================================================================
 
 /// Creates a canonical `FabushiAppHost` instance from optional JSON configuration.
@@ -558,10 +558,26 @@ impl SlidingReplayWindow128 {
     }
 }
 
+static NEXT_REPLAY_WINDOW_ID: AtomicUsize = AtomicUsize::new(1);
+static REPLAY_WINDOW_REGISTRY: OnceLock<
+    RwLock<HashMap<usize, Arc<Mutex<SlidingReplayWindow128>>>>,
+> = OnceLock::new();
+
+fn replay_window_registry(
+) -> &'static RwLock<HashMap<usize, Arc<Mutex<SlidingReplayWindow128>>>> {
+    REPLAY_WINDOW_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn telegram_replay_window_create() -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(Mutex::new(SlidingReplayWindow128::new()))) as *mut c_void
+        let mut guard = replay_window_registry().write();
+        let mut id = NEXT_REPLAY_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+        while id == 0 || guard.contains_key(&id) {
+            id = NEXT_REPLAY_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        guard.insert(id, Arc::new(Mutex::new(SlidingReplayWindow128::new())));
+        id as *mut c_void
     }))
     .unwrap_or(std::ptr::null_mut())
 }
@@ -575,7 +591,10 @@ pub unsafe extern "C" fn telegram_replay_window_check_and_add(
         if window.is_null() {
             return false;
         }
-        let win = unsafe { &*(window as *const Mutex<SlidingReplayWindow128>) };
+        let id = window as usize;
+        let Some(win) = replay_window_registry().read().get(&id).cloned() else {
+            return false;
+        };
         win.lock().check_and_add(seq)
     }))
     .unwrap_or(false)
@@ -585,7 +604,9 @@ pub unsafe extern "C" fn telegram_replay_window_check_and_add(
 pub unsafe extern "C" fn telegram_replay_window_destroy(window: *mut c_void) {
     if !window.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            unsafe { drop(Box::from_raw(window as *mut Mutex<SlidingReplayWindow128>)) };
+            let id = window as usize;
+            let removed = replay_window_registry().write().remove(&id);
+            drop(removed);
         }));
     }
 }

@@ -72,18 +72,22 @@ fn normalize_legacy_method(raw: &str) -> (&str, &str) {
 fn dispatch_inner(
     host: &FabushiAppHost,
     req_id: &str,
+    start_gen: u64,
     method: &str,
     params: &Value,
-) -> HostResult<Value> {
+) -> HostResult<(Value, bool)> {
     if matches!(
         method,
         "telegram.proto.getConfig" | "proto.getConfig" | "telegram.proto.maxPacketSize"
     ) {
-        return Ok(json!({
-            "max_packet_size": 16 * 1024 * 1024,
-            "current_layer": 188,
-            "min_layer": 18,
-        }));
+        return Ok((
+            json!({
+                "max_packet_size": 16 * 1024 * 1024,
+                "current_layer": 188,
+                "min_layer": 18,
+            }),
+            false,
+        ));
     }
 
     let (namespace, action) = normalize_legacy_method(method);
@@ -92,39 +96,39 @@ fn dispatch_inner(
     }
 
     match namespace {
-        "auth" => handle_auth(host, req_id, action, params),
-        "vault" => handle_vault(host, req_id, action, params),
-        "session" => handle_session(host, req_id, action, params),
-        "chats" => handle_chats(host, req_id, action, params),
-        "folders" => handle_folders(host, req_id, action, params),
-        "topics" => handle_topics(host, req_id, action, params),
-        "contacts" => handle_contacts(host, req_id, action, params),
-        "messages" => handle_messages(host, req_id, action, params),
-        "sync" => handle_sync(host, req_id, action, params),
-        "outbox" => handle_outbox(host, req_id, action, params),
-        "e2ee" => handle_e2ee(host, req_id, action, params),
-        "search" => handle_search(host, req_id, action, params),
-        "media" => handle_media(host, req_id, action, params),
-        "stories" => handle_stories(host, req_id, action, params),
-        "stickers" => handle_stickers(host, req_id, action, params),
-        "fabushi" => handle_fabushi(host, req_id, action, params),
-        "multi_agent" => handle_multi_agent(host, req_id, action, params),
-        "magpie" => handle_magpie(host, req_id, action, params),
-        "coding" => handle_coding(host, req_id, action, params),
-        "mcp" => handle_mcp(host, req_id, action, params),
-        "computers" => handle_computers(host, req_id, action, params),
-        "remote" => handle_remote(host, req_id, action, params),
-        "tailnet" => handle_tailnet(host, req_id, action, params),
-        "miniapp" => handle_miniapp(host, req_id, action, params),
-        "webmcp" => handle_webmcp(host, req_id, action, params),
-        "calls" => handle_calls(host, req_id, action, params),
-        "talk" => handle_talk(host, req_id, action, params),
-        "wallet" => handle_wallet(host, req_id, action, params),
+        "auth" => handle_auth(host, req_id, start_gen, action, params),
+        "vault" => handle_vault(host, req_id, action, params).map(|v| (v, false)),
+        "session" => handle_session(host, req_id, start_gen, action, params),
+        "chats" => handle_chats(host, req_id, action, params).map(|v| (v, false)),
+        "folders" => handle_folders(host, req_id, action, params).map(|v| (v, false)),
+        "topics" => handle_topics(host, req_id, action, params).map(|v| (v, false)),
+        "contacts" => handle_contacts(host, req_id, action, params).map(|v| (v, false)),
+        "messages" => handle_messages(host, req_id, action, params).map(|v| (v, false)),
+        "sync" => handle_sync(host, req_id, action, params).map(|v| (v, false)),
+        "outbox" => handle_outbox(host, req_id, action, params).map(|v| (v, false)),
+        "e2ee" => handle_e2ee(host, req_id, action, params).map(|v| (v, false)),
+        "search" => handle_search(host, req_id, action, params).map(|v| (v, false)),
+        "media" => handle_media(host, req_id, action, params).map(|v| (v, false)),
+        "stories" => handle_stories(host, req_id, action, params).map(|v| (v, false)),
+        "stickers" => handle_stickers(host, req_id, action, params).map(|v| (v, false)),
+        "fabushi" => handle_fabushi(host, req_id, action, params).map(|v| (v, false)),
+        "multi_agent" => handle_multi_agent(host, req_id, action, params).map(|v| (v, false)),
+        "magpie" => handle_magpie(host, req_id, action, params).map(|v| (v, false)),
+        "coding" => handle_coding(host, req_id, action, params).map(|v| (v, false)),
+        "mcp" => handle_mcp(host, req_id, action, params).map(|v| (v, false)),
+        "computers" => handle_computers(host, req_id, action, params).map(|v| (v, false)),
+        "remote" => handle_remote(host, req_id, action, params).map(|v| (v, false)),
+        "tailnet" => handle_tailnet(host, req_id, action, params).map(|v| (v, false)),
+        "miniapp" => handle_miniapp(host, req_id, action, params).map(|v| (v, false)),
+        "webmcp" => handle_webmcp(host, req_id, action, params).map(|v| (v, false)),
+        "calls" => handle_calls(host, req_id, action, params).map(|v| (v, false)),
+        "talk" => handle_talk(host, req_id, action, params).map(|v| (v, false)),
+        "wallet" => handle_wallet(host, req_id, action, params).map(|v| (v, false)),
         "settings" => handle_settings(host, req_id, action, params),
-        "proxy" => handle_proxy(host, req_id, action, params),
-        "push" => handle_push(host, req_id, action, params),
-        "actions" => handle_actions(host, req_id, action, params),
-        "generation" => handle_generation(host, req_id, action, params),
+        "proxy" => handle_proxy(host, req_id, action, params).map(|v| (v, false)),
+        "push" => handle_push(host, req_id, action, params).map(|v| (v, false)),
+        "actions" => handle_actions(host, req_id, action, params).map(|v| (v, false)),
+        "generation" => handle_generation(host, req_id, action, params).map(|v| (v, true)),
         _ => Err(HostError::unknown_command(method)),
     }
 }
@@ -163,17 +167,11 @@ pub fn route_command(host: &FabushiAppHost, request_json: &str) -> String {
     }
 
     // Generation fencing: reject any stale generation both BEFORE and AFTER dispatch_inner
-    // so an in-flight Account 1 RPC can never return stamped with Account 2's newer generation.
+    // so an in-flight Account 1 RPC (including conditional auth polls that did NOT establish a
+    // session) can never return stamped with Account 2's newer generation.
     let start_gen = host.current_generation();
     let (ns, act) = normalize_legacy_method(method);
     let exempt_from_fence = ns == "generation" || (ns == "session" && act == "ping");
-    let bumps_generation = matches!(
-        (ns, act),
-        ("auth", "login" | "register" | "logout")
-            | ("session", "setAuthSession" | "clearSession" | "switchAccount" | "setServerUrl")
-            | ("settings", "serverUrlSet")
-            | ("generation", "bump" | "set")
-    );
     if !exempt_from_fence {
         if let Some(requested_gen) = req.generation {
             if requested_gen < start_gen {
@@ -187,20 +185,46 @@ pub fn route_command(host: &FabushiAppHost, request_json: &str) -> String {
     }
 
     let params = req.params.unwrap_or(Value::Null);
-    let outcome = dispatch_inner(host, &req_id, method, &params);
+    let outcome = dispatch_inner(host, &req_id, start_gen, method, &params);
     let end_gen = host.current_generation();
-    if !exempt_from_fence && !bumps_generation {
-        let effective_req_gen = req.generation.unwrap_or(start_gen);
-        if end_gen != start_gen || effective_req_gen < end_gen {
-            return make_error_json(
-                &req_id,
-                end_gen,
-                &HostError::stale_generation(effective_req_gen, end_gen),
-            );
-        }
-    }
     match outcome {
-        Ok(result) => make_success_json(&req_id, end_gen, &result),
-        Err(err) => make_error_json(&req_id, end_gen, &err),
+        Ok((result, generation_advanced)) => {
+            if !exempt_from_fence && !generation_advanced {
+                let effective_req_gen = req.generation.unwrap_or(start_gen);
+                if end_gen != start_gen || effective_req_gen < end_gen {
+                    return make_error_json(
+                        &req_id,
+                        end_gen,
+                        &HostError::stale_generation(effective_req_gen, end_gen),
+                    );
+                }
+            }
+            make_success_json(&req_id, end_gen, &result)
+        }
+        Err(err) => {
+            let is_gen_control = matches!(
+                (ns, act),
+                ("auth", "logout")
+                    | ("session", "clearSession" | "switchAccount" | "setServerUrl")
+                    | ("settings", "serverUrlSet")
+            );
+            if !exempt_from_fence
+                && !is_gen_control
+                && !matches!(
+                    err.code.as_str(),
+                    "stale_generation" | "cancelled" | "host_closed"
+                )
+            {
+                let effective_req_gen = req.generation.unwrap_or(start_gen);
+                if end_gen != start_gen || effective_req_gen < end_gen {
+                    return make_error_json(
+                        &req_id,
+                        end_gen,
+                        &HostError::stale_generation(effective_req_gen, end_gen),
+                    );
+                }
+            }
+            make_error_json(&req_id, end_gen, &err)
+        }
     }
 }

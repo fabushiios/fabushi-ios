@@ -417,7 +417,7 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             # Valid CI-verified TEST_READY.md with anchored GitHub Actions URL and non-zero 40-hex SHA passes
             (root / "TEST_READY.md").write_text(
                 "# E2E Test Readiness\n"
-                "Exact HEAD: 424aa33cf67a11a778da2dd3b8cca7ea35072b07\n"
+                "Exact HEAD: 57a62ef92be2fa816704d7337aca3254dc8f943e\n"
                 "GitHub Actions Run: https://github.com/fabushiios/fabushi-ios/actions/runs/45114476960\n",
                 encoding="utf-8",
             )
@@ -857,6 +857,36 @@ class DesktopMainAuthorityTests(unittest.TestCase):
                     any("clean_build_garbage.py" in e for e in errs),
                     f"case {idx} unexpectedly passed: {bad_line!r} -> {errs}",
                 )
+
+
+    def test_cargo_replace_url_userinfo_at_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            toml_path = root / "Cargo.toml"
+            toml_path.write_text(
+                '[package]\nname = "replace-userinfo"\nversion = "0.1.0"\n'
+                '[replace]\n'
+                '"ssh://git@github.com/someone/gpui@0.2.2" = { version = "0.2.2" }\n'
+                '"https://user@example.com/someone/gpui@0.2.2" = { version = "0.2.2" }\n'
+                '"ssh://git@github.com/someone/openssl-sys.git@0.9.100" = { version = "0.9.100" }\n',
+                encoding="utf-8",
+            )
+            errs = []
+            validator.verify_cargo_toml_hygiene(
+                toml_path, root, validator.FORBIDDEN_MOBILE_DEPS, errs, require_path_exists=False
+            )
+            self.assertTrue(
+                any("ssh://git@github.com/someone/gpui@0.2.2" in e and "forbidden mobile dependency" in e for e in errs),
+                errs,
+            )
+            self.assertTrue(
+                any("https://user@example.com/someone/gpui@0.2.2" in e and "forbidden mobile dependency" in e for e in errs),
+                errs,
+            )
+            self.assertTrue(
+                any("ssh://git@github.com/someone/openssl-sys.git@0.9.100" in e and "forbidden mobile dependency" in e for e in errs),
+                errs,
+            )
 
 
 if __name__ == "__main__":

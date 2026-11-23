@@ -1,6 +1,6 @@
 [package]
 name = "mahayana-mobile-bridge"
-version = "1.6.8"
+version = "1.6.9"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ name = "mahayana_app_host"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-# All 11 vendored v1.6.8 pure-Rust mobile domain crates in source/desktop_core
+# All 11 vendored v1.6.9 pure-Rust mobile domain crates in source/desktop_core
 gpui_telegram_core = { path = "../desktop_core/crates/gpui_telegram_core" }
 gpui_telegram_proto = { path = "../desktop_core/crates/gpui_telegram_proto" }
 gpui_telegram_client = { path = "../desktop_core/crates/gpui_telegram_client" }

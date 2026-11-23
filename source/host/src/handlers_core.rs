@@ -4,13 +4,14 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use chrono::Utc;
+use gpui_telegram_client::client::TelegramClient;
 use gpui_telegram_client::config::{ClientConfig, DEFAULT_SERVER_URL};
 use gpui_telegram_client::net::proxy::ClientProxyConfig;
 use gpui_telegram_client::net::{
     AuthResponse, ChangePasswordRequest, EmailRegisterRequest, LoginRequest, PhoneVerifyRequest,
-    RegisterRequest, SplitKeyEmailRegisterRequest, SplitKeyLoginRequest, SplitKeyRegisterRequest,
-    StarGiftRequest, TwoFactorSetRequest, TwoFactorVerifyRequest, UpgradeSplitKeyRequest,
-    UserPrivacySettingsDto,
+    QrPairPollResponse, RegisterRequest, SplitKeyEmailRegisterRequest, SplitKeyLoginRequest,
+    SplitKeyRegisterRequest, StarGiftRequest, TwoFactorSetRequest, TwoFactorVerifyRequest,
+    UpgradeSplitKeyRequest, UserPrivacySettingsDto,
 };
 use gpui_telegram_core::action_bus::{
     ActionCategory, ActionContext, CliExporter, HermesToolExporter, McpExporter, OpenApiExporter,
@@ -23,7 +24,7 @@ use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
 
 use crate::error::{HostError, HostResult};
-use crate::host::FabushiAppHost;
+use crate::host::{validate_argon2_ios_ceiling, FabushiAppHost, RamAccountToken};
 use crate::storage::{compute_storage_metrics, purge_media_cas_dir};
 
 const ACCOUNT_TOKEN_HKDF_SALT: &[u8] = b"fabushi-ios:host-kv:account-token-salt:v1";
@@ -53,22 +54,27 @@ fn derive_account_aead_key(passphrase: &str) -> HostResult<Zeroizing<[u8; 32]>> 
 }
 
 fn persist_account_record(host: &FabushiAppHost, auth: &AuthResponse) -> HostResult<()> {
+    let server_url = host.current_server_url();
     let account_id = auth.user_id.to_string();
-    if !auth.token.is_empty() {
-        host.account_tokens
-            .lock()
-            .insert(account_id.clone(), Zeroizing::new(auth.token.clone()));
+    if !auth.token.trim().is_empty() {
+        host.account_tokens.lock().insert(
+            account_id.clone(),
+            RamAccountToken {
+                server_url: server_url.clone(),
+                token: Zeroizing::new(auth.token.clone()),
+            },
+        );
     }
 
     let (encrypted_token_b64, nonce_b64) = if let Some(ref pass) = host.storage_passphrase {
-        if !auth.token.is_empty() {
+        if !auth.token.trim().is_empty() {
             let key = derive_account_aead_key(pass.as_str())?;
             let cipher = ChaCha20Poly1305::new_from_slice(&*key)
                 .map_err(|e| HostError::crypto(format!("AEAD init failed: {e}")))?;
             let mut nonce_bytes = [0u8; 12];
             getrandom::getrandom(&mut nonce_bytes)
                 .map_err(|e| HostError::crypto(format!("CSPRNG failed: {e}")))?;
-            let aad = format!("fabushi-account-token:v1|{}", auth.user_id);
+            let aad = format!("fabushi-account-token:v1|{}|{}", auth.user_id, server_url);
             let ct = cipher
                 .encrypt(
                     Nonce::from_slice(&nonce_bytes),
@@ -98,7 +104,7 @@ fn persist_account_record(host: &FabushiAppHost, auth: &AuthResponse) -> HostRes
         first_name: auth.first_name.clone(),
         created_at: auth.created_at.clone(),
         expires_at: auth.expires_at.clone(),
-        server_url: host.current_server_url(),
+        server_url,
         encrypted_token_b64,
         nonce_b64,
     };
@@ -115,6 +121,13 @@ fn restore_account_auth(
 ) -> HostResult<AuthResponse> {
     let rec: StoredAccountRecord = serde_json::from_str(raw)
         .map_err(|e| HostError::storage(format!("Corrupt stored account record: {e}")))?;
+    let current_server_url = host.current_server_url();
+    if rec.server_url != current_server_url {
+        return Err(HostError::unauthorized(
+            "Stored account belongs to a different server URL; re-authentication required",
+        ));
+    }
+
     let token = if let (Some(ct_b64), Some(nonce_b64)) =
         (rec.encrypted_token_b64.as_deref(), rec.nonce_b64.as_deref())
     {
@@ -131,7 +144,7 @@ fn restore_account_auth(
             if nonce_vec.len() != 12 {
                 return Err(HostError::crypto("Corrupt account token nonce length"));
             }
-            let aad = format!("fabushi-account-token:v1|{}", rec.user_id);
+            let aad = format!("fabushi-account-token:v1|{}|{}", rec.user_id, current_server_url);
             let plain = Zeroizing::new(
                 cipher
                     .decrypt(
@@ -145,18 +158,36 @@ fn restore_account_auth(
             );
             String::from_utf8(plain.to_vec())
                 .map_err(|e| HostError::crypto(format!("Decrypted token is invalid UTF-8: {e}")))?
-        } else if let Some(mem_tok) = host.account_tokens.lock().get(account_id) {
-            mem_tok.as_str().to_string()
+        } else if let Some(mem_tok) = host
+            .account_tokens
+            .lock()
+            .get(account_id)
+            .filter(|entry| entry.server_url == current_server_url)
+        {
+            mem_tok.token.as_str().to_string()
         } else {
             return Err(HostError::unauthorized(
                 "Account token is encrypted and storage_passphrase is unavailable",
             ));
         }
-    } else if let Some(mem_tok) = host.account_tokens.lock().get(account_id) {
-        mem_tok.as_str().to_string()
+    } else if let Some(mem_tok) = host
+        .account_tokens
+        .lock()
+        .get(account_id)
+        .filter(|entry| entry.server_url == current_server_url)
+    {
+        mem_tok.token.as_str().to_string()
     } else {
-        String::new()
+        return Err(HostError::unauthorized(
+            "Stored account has no recoverable session token; re-authentication required",
+        ));
     };
+
+    if token.trim().is_empty() {
+        return Err(HostError::unauthorized(
+            "Stored account has no recoverable session token; re-authentication required",
+        ));
+    }
 
     Ok(AuthResponse {
         user_id: rec.user_id,
@@ -167,6 +198,104 @@ fn restore_account_auth(
         created_at: rec.created_at,
         expires_at: rec.expires_at,
     })
+}
+
+/// Canonical account-boundary commit for ALL session-establishing authentication RPCs.
+/// Fences against concurrent generation changes / server switches, wipes the prior account's
+/// unlocked vault key, E2EE sessions, Magpie masking MemoryVault, and residual engines,
+/// installs and persists the new account session, updates `active_account_id`, and bumps generation.
+fn finalize_authenticated_session(
+    host: &FabushiAppHost,
+    client: &std::sync::Arc<TelegramClient>,
+    start_gen: u64,
+    auth: &AuthResponse,
+) -> HostResult<u64> {
+    let _sess_guard = host.session_lock.lock();
+    if host.is_shutdown() {
+        return Err(HostError::host_closed());
+    }
+    let current_gen = host.current_generation();
+    let live_client = host.client();
+    if current_gen != start_gen || !std::sync::Arc::ptr_eq(client, &live_client) {
+        return Err(HostError::stale_generation(start_gen, current_gen));
+    }
+    live_client.clear_session();
+    host.reset_account_scope();
+    live_client.set_auth_session(auth.clone());
+    if let Err(err) = persist_account_record(host, auth) {
+        live_client.clear_session();
+        let _ = host.host_db.delete_meta("active_account_id");
+        host.bump_generation();
+        return Err(err);
+    }
+    if let Err(err) = host
+        .host_db
+        .set_meta("active_account_id", &auth.user_id.to_string())
+    {
+        live_client.clear_session();
+        let _ = host.host_db.delete_meta("active_account_id");
+        host.bump_generation();
+        return Err(err);
+    }
+    Ok(host.bump_generation())
+}
+
+fn finalize_token_only_session(
+    host: &FabushiAppHost,
+    client: &std::sync::Arc<TelegramClient>,
+    start_gen: u64,
+    token: &str,
+) -> HostResult<u64> {
+    let _sess_guard = host.session_lock.lock();
+    if host.is_shutdown() {
+        return Err(HostError::host_closed());
+    }
+    let current_gen = host.current_generation();
+    let live_client = host.client();
+    if current_gen != start_gen || !std::sync::Arc::ptr_eq(client, &live_client) {
+        return Err(HostError::stale_generation(start_gen, current_gen));
+    }
+    live_client.clear_session();
+    host.reset_account_scope();
+    live_client.set_token(Some(token.to_string()));
+    let _ = host.host_db.delete_meta("active_account_id");
+    Ok(host.bump_generation())
+}
+
+fn finalize_qr_pair_response(
+    host: &FabushiAppHost,
+    client: &std::sync::Arc<TelegramClient>,
+    start_gen: u64,
+    res: &QrPairPollResponse,
+) -> HostResult<bool> {
+    if let Some(ref sess) = res.session {
+        let auth = AuthResponse::from(sess.clone());
+        finalize_authenticated_session(host, client, start_gen, &auth)?;
+        Ok(true)
+    } else if let Some(tok) = res
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(ref u) = res.user {
+            let auth = AuthResponse {
+                user_id: u.user_id,
+                username: u.username.clone().unwrap_or_default(),
+                session_id: String::new(),
+                token: tok.to_string(),
+                first_name: Some(u.first_name.clone()),
+                created_at: None,
+                expires_at: None,
+            };
+            finalize_authenticated_session(host, client, start_gen, &auth)?;
+        } else {
+            finalize_token_only_session(host, client, start_gen, tok)?;
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn parse_req<T: serde::de::DeserializeOwned>(params: &Value) -> HostResult<T> {
@@ -199,22 +328,26 @@ fn to_val<T: serde::Serialize>(v: T) -> HostResult<Value> {
 pub fn handle_auth(
     host: &FabushiAppHost,
     req_id: &str,
+    start_gen: u64,
     action: &str,
     params: &Value,
-) -> HostResult<Value> {
+) -> HostResult<(Value, bool)> {
     let client = host.client();
     match action {
         "health" => {
             let ok = host.run_cancellable(req_id, async move {
                 client.check_health().await.map_err(HostError::from)
             })?;
-            Ok(json!({ "healthy": ok, "server_url": host.current_server_url() }))
+            Ok((
+                json!({ "healthy": ok, "server_url": host.current_server_url() }),
+                false,
+            ))
         }
         "status" => {
             let st = host.run_cancellable(req_id, async move {
                 client.fetch_server_status().await.map_err(HostError::from)
             })?;
-            to_val(st)
+            Ok((to_val(st)?, false))
         }
         "login" => {
             let req: LoginRequest = if params.get("device_name").is_some() {
@@ -230,41 +363,65 @@ pub fn handle_auth(
                         .to_string(),
                 }
             };
+            let c = std::sync::Arc::clone(&client);
             let auth = host.run_cancellable(req_id, async move {
-                client.login(&req).await.map_err(HostError::from)
+                c.http_client.login(&req).await.map_err(HostError::from)
             })?;
-            persist_account_record(host, &auth)?;
-            let _ = host
-                .host_db
-                .set_meta("active_account_id", &auth.user_id.to_string());
-            to_val(auth)
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "register" => {
             let req: RegisterRequest = parse_req(params)?;
+            let c = std::sync::Arc::clone(&client);
             let auth = host.run_cancellable(req_id, async move {
-                client.register(&req).await.map_err(HostError::from)
+                c.http_client.register(&req).await.map_err(HostError::from)
             })?;
-            persist_account_record(host, &auth)?;
-            let _ = host
-                .host_db
-                .set_meta("active_account_id", &auth.user_id.to_string());
-            to_val(auth)
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "logout" => {
-            let active_uid = client.current_user_id().map(|id| id.to_string());
+            let token_opt = client.token();
+            let pre_uid = client.current_user_id().map(|id| id.to_string());
             let c_logout = std::sync::Arc::clone(&client);
-            let res = host.run_cancellable(req_id, async move {
-                c_logout.logout().await.map_err(HostError::from)
-            });
-            client.clear_session();
-            if let Some(uid) = active_uid {
-                host.account_tokens.lock().remove(&uid);
-            }
-            let _ = host.host_db.delete_meta("active_account_id");
-            host.reset_account_scope();
-            host.bump_generation();
+            let res = if let Some(tok) = token_opt {
+                host.run_cancellable(req_id, async move {
+                    c_logout
+                        .http_client
+                        .logout(&tok)
+                        .await
+                        .map_err(HostError::from)
+                })
+            } else {
+                Err(HostError::unauthorized("No active session token"))
+            };
+            let new_gen = {
+                let _sess_guard = host.session_lock.lock();
+                let target_uid = client
+                    .current_user_id()
+                    .map(|id| id.to_string())
+                    .or(pre_uid)
+                    .or_else(|| {
+                        host.host_db
+                            .get_meta("active_account_id")
+                            .ok()
+                            .flatten()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    });
+                client.clear_session();
+                if let Some(uid) = target_uid {
+                    host.account_tokens.lock().remove(&uid);
+                    let _ = host.host_db.kv_delete("accounts", &uid);
+                }
+                let _ = host.host_db.delete_meta("active_account_id");
+                host.reset_account_scope();
+                host.bump_generation()
+            };
             match res {
-                Ok(()) => Ok(json!({ "logged_out": true, "generation": host.current_generation() })),
+                Ok(()) => Ok((
+                    json!({ "logged_out": true, "generation": new_gen }),
+                    true,
+                )),
                 Err(e) => Err(e),
             }
         }
@@ -278,34 +435,46 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "registerSplitKey" => {
             let req: SplitKeyRegisterRequest = parse_req(params)?;
+            let c = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client
+                c.http_client
                     .register_split_key(&req)
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(res.clone());
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(res)?, true))
         }
         "emailRegisterSplitKey" => {
             let req: SplitKeyEmailRegisterRequest = parse_req(params)?;
+            let c = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client
+                c.http_client
                     .email_register_split_key(&req)
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(res.clone());
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(res)?, true))
         }
         "loginSplitKey" => {
             let req: SplitKeyLoginRequest = parse_req(params)?;
+            let c = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client.login_split_key(&req).await.map_err(HostError::from)
+                c.http_client
+                    .login_split_key(&req)
+                    .await
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(res.clone());
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(res)?, true))
         }
         "upgradeSplitKey" => {
             let req: UpgradeSplitKeyRequest = parse_req(params)?;
@@ -315,53 +484,67 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "changePassword" => {
             let req: ChangePasswordRequest = parse_req(params)?;
             let res = host.run_cancellable(req_id, async move {
                 client.change_password(&req).await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "phoneSendCode" => {
             let phone = req_str(params, "phone")?.to_string();
             let res = host.run_cancellable(req_id, async move {
                 client.phone_send_code(&phone).await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "phoneVerify" => {
             let req: PhoneVerifyRequest = parse_req(params)?;
-            let res = host.run_cancellable(req_id, async move {
-                client.phone_verify(&req).await.map_err(HostError::from)
+            let c = std::sync::Arc::clone(&client);
+            let proto_auth = host.run_cancellable(req_id, async move {
+                c.http_client
+                    .phone_verify(&req)
+                    .await
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(proto_auth);
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "emailSendCode" => {
             let email = req_str(params, "email")?.to_string();
             let res = host.run_cancellable(req_id, async move {
                 client.email_send_code(&email).await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "emailRegister" => {
             let req: EmailRegisterRequest = parse_req(params)?;
-            let res = host.run_cancellable(req_id, async move {
-                client.email_register(&req).await.map_err(HostError::from)
+            let c = std::sync::Arc::clone(&client);
+            let auth = host.run_cancellable(req_id, async move {
+                c.http_client
+                    .email_register(&req)
+                    .await
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "emailVerify" => {
             let email = req_str(params, "email")?.to_string();
             let code = req_str(params, "code")?.to_string();
-            let res = host.run_cancellable(req_id, async move {
-                client
+            let c = std::sync::Arc::clone(&client);
+            let proto_auth = host.run_cancellable(req_id, async move {
+                c.http_client
                     .email_verify(&email, &code)
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(proto_auth);
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "alipayStart" => {
             let res = host.run_cancellable(req_id, async move {
@@ -371,40 +554,70 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "alipayPoll" => {
             let attempt_id = req_str(params, "attempt_id")?.to_string();
-            let res = host.run_cancellable(req_id, async move {
-                let poll = client
-                    .http_client
+            let c = std::sync::Arc::clone(&client);
+            let poll = host.run_cancellable(req_id, async move {
+                c.http_client
                     .alipay_poll(&attempt_id)
                     .await
-                    .map_err(HostError::from)?;
-                if let Some(ref sess) = poll.session {
-                    client.set_auth_session(sess.clone());
-                } else if let Some(ref tok) = poll.token {
-                    client.set_token(Some(tok.clone()));
-                }
-                Ok(poll)
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            let bumped = if let Some(ref sess) = poll.session {
+                finalize_authenticated_session(host, &client, start_gen, sess)?;
+                true
+            } else if let Some(tok) = poll
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(uid) = poll
+                    .user_id
+                    .or_else(|| poll.user.as_ref().map(|u| u.user_id))
+                {
+                    let auth = AuthResponse {
+                        user_id: uid,
+                        username: poll
+                            .username
+                            .clone()
+                            .or_else(|| poll.user.as_ref().and_then(|u| u.username.clone()))
+                            .unwrap_or_default(),
+                        session_id: String::new(),
+                        token: tok.to_string(),
+                        first_name: poll.user.as_ref().map(|u| u.first_name.clone()),
+                        created_at: None,
+                        expires_at: None,
+                    };
+                    finalize_authenticated_session(host, &client, start_gen, &auth)?;
+                } else {
+                    finalize_token_only_session(host, &client, start_gen, tok)?;
+                }
+                true
+            } else {
+                false
+            };
+            Ok((to_val(poll)?, bumped))
         }
         "qrPairInit" => {
             let res = host.run_cancellable(req_id, async move {
                 client.qr_pair_init().await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "qrPairPoll" => {
             let pair_token = req_str(params, "pair_token")?.to_string();
+            let c = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client
+                c.http_client
                     .qr_pair_poll(&pair_token)
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            let bumped = finalize_qr_pair_response(host, &client, start_gen, &res)?;
+            Ok((to_val(res)?, bumped))
         }
         "qrPairAccept" => {
             let pair_token = req_str(params, "pair_token")?.to_string();
@@ -414,7 +627,7 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            Ok(json!({ "accepted": true }))
+            Ok((json!({ "accepted": true }), false))
         }
         "qrPairVerify" => {
             let pair_token = req_str(params, "pair_token")?.to_string();
@@ -422,47 +635,57 @@ pub fn handle_auth(
                 .get("cloud_password")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
+            let c = std::sync::Arc::clone(&client);
             let res = host.run_cancellable(req_id, async move {
-                client
+                c.http_client
                     .qr_pair_verify(&pair_token, cloud_password.as_deref())
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            let bumped = finalize_qr_pair_response(host, &client, start_gen, &res)?;
+            Ok((to_val(res)?, bumped))
         }
         "passkeyChallenge" => {
             let username = params
                 .get("username")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
-            host.run_cancellable(req_id, async move {
+            let val = host.run_cancellable(req_id, async move {
                 client
                     .passkey_challenge(username.as_deref())
                     .await
                     .map_err(HostError::from)
-            })
+            })?;
+            Ok((val, false))
         }
         "passkeyVerify" => {
             let body = params.clone();
-            let res = host.run_cancellable(req_id, async move {
-                client.passkey_verify(&body).await.map_err(HostError::from)
+            let c = std::sync::Arc::clone(&client);
+            let proto_auth = host.run_cancellable(req_id, async move {
+                c.http_client
+                    .passkey_verify(&body)
+                    .await
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(proto_auth);
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "passkeyList" => {
             let list = host.run_cancellable(req_id, async move {
                 client.list_passkeys().await.map_err(HostError::from)
             })?;
-            to_val(list)
+            Ok((to_val(list)?, false))
         }
         "passkeyRegister" => {
             let body = params.clone();
-            host.run_cancellable(req_id, async move {
+            let val = host.run_cancellable(req_id, async move {
                 client
                     .register_passkey(&body)
                     .await
                     .map_err(HostError::from)
-            })
+            })?;
+            Ok((val, false))
         }
         "passkeyDelete" => {
             let passkey_id = req_str(params, "passkey_id")?.to_string();
@@ -472,20 +695,20 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            Ok(json!({ "deleted": true }))
+            Ok((json!({ "deleted": true }), false))
         }
         "twoFactorStatus" => {
             let res = host.run_cancellable(req_id, async move {
                 client.get_2fa_status().await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "twoFactorSet" => {
             let req: TwoFactorSetRequest = parse_req(params)?;
             let res = host.run_cancellable(req_id, async move {
                 client.set_2fa(&req).await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "twoFactorDisable" => {
             let pwd = params
@@ -498,20 +721,26 @@ pub fn handle_auth(
                     .await
                     .map_err(HostError::from)
             })?;
-            Ok(json!({ "disabled": true }))
+            Ok((json!({ "disabled": true }), false))
         }
         "twoFactorVerify" => {
             let req: TwoFactorVerifyRequest = parse_req(params)?;
-            let res = host.run_cancellable(req_id, async move {
-                client.verify_2fa(&req).await.map_err(HostError::from)
+            let c = std::sync::Arc::clone(&client);
+            let proto_auth = host.run_cancellable(req_id, async move {
+                c.http_client
+                    .verify_2fa(&req)
+                    .await
+                    .map_err(HostError::from)
             })?;
-            to_val(res)
+            let auth = AuthResponse::from(proto_auth);
+            finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((to_val(auth)?, true))
         }
         "me" => {
             let res = host.run_cancellable(req_id, async move {
                 client.get_me().await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         _ => Err(HostError::unknown_command(&format!("auth.{action}"))),
     }
@@ -520,26 +749,30 @@ pub fn handle_auth(
 pub fn handle_session(
     host: &FabushiAppHost,
     req_id: &str,
+    start_gen: u64,
     action: &str,
     params: &Value,
-) -> HostResult<Value> {
+) -> HostResult<(Value, bool)> {
     let client = host.client();
     match action {
         "ping" => {
             let nonce = params.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
-            Ok(json!({
-                "pong": true,
-                "nonce": nonce,
-                "timestamp": Utc::now().timestamp_millis(),
-                "server_url": host.current_server_url(),
-                "generation": host.current_generation(),
-            }))
+            Ok((
+                json!({
+                    "pong": true,
+                    "nonce": nonce,
+                    "timestamp": Utc::now().timestamp_millis(),
+                    "server_url": host.current_server_url(),
+                    "generation": host.current_generation(),
+                }),
+                false,
+            ))
         }
         "list" => {
             let res = host.run_cancellable(req_id, async move {
                 client.list_sessions().await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "revoke" => {
             let session_id = req_str(params, "session_id")?.to_string();
@@ -549,7 +782,7 @@ pub fn handle_session(
                     .await
                     .map_err(HostError::from)
             })?;
-            Ok(json!({ "revoked": revoked }))
+            Ok((json!({ "revoked": revoked }), false))
         }
         "revokeOther" => {
             host.run_cancellable(req_id, async move {
@@ -558,7 +791,7 @@ pub fn handle_session(
                     .await
                     .map_err(HostError::from)
             })?;
-            Ok(json!({ "revoked_others": true }))
+            Ok((json!({ "revoked_others": true }), false))
         }
         "connectWs" => {
             client.connect_ws();
@@ -567,11 +800,14 @@ pub fn handle_session(
                 "connectionStateChanged",
                 json!({ "status": status, "server_url": host.current_server_url() }),
             );
-            Ok(json!({
-                "connecting": true,
-                "status": format!("{:?}", client.status()),
-                "server_url": host.current_server_url(),
-            }))
+            Ok((
+                json!({
+                    "connecting": true,
+                    "status": format!("{:?}", client.status()),
+                    "server_url": host.current_server_url(),
+                }),
+                false,
+            ))
         }
         "disconnectWs" => {
             client.disconnect_ws();
@@ -580,15 +816,18 @@ pub fn handle_session(
                 "connectionStateChanged",
                 json!({ "status": status, "server_url": host.current_server_url() }),
             );
-            Ok(json!({ "disconnected": true, "status": status }))
+            Ok((json!({ "disconnected": true, "status": status }), false))
         }
-        "wsStatus" => Ok(json!({
-            "connected": client.is_connected(),
-            "status": format!("{:?}", client.status()),
-            "server_url": host.current_server_url(),
-            "device_id": client.device_id(),
-            "user_id": client.current_user_id(),
-        })),
+        "wsStatus" => Ok((
+            json!({
+                "connected": client.is_connected(),
+                "status": format!("{:?}", client.status()),
+                "server_url": host.current_server_url(),
+                "device_id": client.device_id(),
+                "user_id": client.current_user_id(),
+            }),
+            false,
+        )),
         "setToken" => {
             let token = params
                 .get("token")
@@ -596,42 +835,58 @@ pub fn handle_session(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             client.set_token(token.clone());
-            Ok(json!({ "has_token": token.is_some() }))
+            Ok((json!({ "has_token": token.is_some() }), false))
         }
         "setAuthSession" => {
             let auth: AuthResponse = parse_req(params)?;
-            client.set_auth_session(auth.clone());
-            persist_account_record(host, &auth)?;
-            let _ = host
-                .host_db
-                .set_meta("active_account_id", &auth.user_id.to_string());
-            Ok(json!({ "user_id": auth.user_id, "generation": host.current_generation() }))
+            let new_gen = finalize_authenticated_session(host, &client, start_gen, &auth)?;
+            Ok((
+                json!({ "user_id": auth.user_id, "generation": new_gen }),
+                true,
+            ))
         }
         "clearSession" => {
-            client.clear_session();
-            let _ = host.host_db.delete_meta("active_account_id");
-            host.reset_account_scope();
-            let generation = host.bump_generation();
-            Ok(json!({ "cleared": true, "generation": generation }))
+            let generation = {
+                let _sess_guard = host.session_lock.lock();
+                client.clear_session();
+                let _ = host.host_db.delete_meta("active_account_id");
+                host.reset_account_scope();
+                host.bump_generation()
+            };
+            Ok((json!({ "cleared": true, "generation": generation }), true))
         }
         "switchAccount" => {
             let account_id = req_str(params, "account_id")?;
+            let _sess_guard = host.session_lock.lock();
+            if host.is_shutdown() {
+                return Err(HostError::host_closed());
+            }
+            let current_gen = host.current_generation();
+            if current_gen != start_gen {
+                return Err(HostError::stale_generation(start_gen, current_gen));
+            }
             let raw = host
                 .host_db
                 .kv_get("accounts", account_id)?
                 .ok_or_else(|| HostError::not_found(format!("account not found: {account_id}")))?;
+            // Validate server binding, AEAD integrity, and non-empty recoverable token BEFORE
+            // clearing the current live session, wiping account scope, or bumping generation!
             let auth = restore_account_auth(host, account_id, &raw)?;
-            client.clear_session();
+            let live_client = host.client();
+            live_client.clear_session();
             host.reset_account_scope();
             let new_gen = host.bump_generation();
-            client.set_auth_session(auth.clone());
+            live_client.set_auth_session(auth.clone());
             host.host_db.set_meta("active_account_id", account_id)?;
-            Ok(json!({
-                "switched": true,
-                "account_id": account_id,
-                "user_id": auth.user_id,
-                "generation": new_gen,
-            }))
+            Ok((
+                json!({
+                    "switched": true,
+                    "account_id": account_id,
+                    "user_id": auth.user_id,
+                    "generation": new_gen,
+                }),
+                true,
+            ))
         }
         "listAccounts" => {
             let map = host.host_db.kv_list("accounts")?;
@@ -655,29 +910,41 @@ pub fn handle_session(
                     }
                 })
                 .collect();
-            Ok(json!({ "accounts": accounts, "active_account_id": active }))
+            Ok((
+                json!({ "accounts": accounts, "active_account_id": active }),
+                false,
+            ))
         }
         "setServerUrl" => {
             let url = req_str(params, "server_url")
                 .or_else(|_| req_str(params, "url"))?;
             let normalized = host.set_server_url(url)?;
-            Ok(json!({
-                "server_url": normalized,
-                "generation": host.current_generation(),
-            }))
+            Ok((
+                json!({
+                    "server_url": normalized,
+                    "generation": host.current_generation(),
+                }),
+                true,
+            ))
         }
-        "getServerUrl" => Ok(json!({
-            "server_url": host.current_server_url(),
-            "default_server_url": DEFAULT_SERVER_URL,
-        })),
+        "getServerUrl" => Ok((
+            json!({
+                "server_url": host.current_server_url(),
+                "default_server_url": DEFAULT_SERVER_URL,
+            }),
+            false,
+        )),
         "checkpointWal" => {
             let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
-            Ok(json!({
-                "checkpointed": true,
-                "busy": busy,
-                "log_frames": log,
-                "checkpointed_frames": checkpointed,
-            }))
+            Ok((
+                json!({
+                    "checkpointed": true,
+                    "busy": busy,
+                    "log_frames": log,
+                    "checkpointed_frames": checkpointed,
+                }),
+                false,
+            ))
         }
         _ => Err(HostError::unknown_command(&format!("session.{action}"))),
     }
@@ -724,14 +991,14 @@ pub fn handle_settings(
     req_id: &str,
     action: &str,
     params: &Value,
-) -> HostResult<Value> {
+) -> HostResult<(Value, bool)> {
     let client = host.client();
     match action {
         "privacyGet" => {
             let res = host.run_cancellable(req_id, async move {
                 client.get_my_settings().await.map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "privacySave" => {
             let req: UserPrivacySettingsDto = parse_req(params)?;
@@ -741,7 +1008,7 @@ pub fn handle_settings(
                     .await
                     .map_err(HostError::from)
             })?;
-            to_val(res)
+            Ok((to_val(res)?, false))
         }
         "localGet" => {
             let key = req_str(params, "key")?;
@@ -749,7 +1016,7 @@ pub fn handle_settings(
             let parsed = value.map(|raw| {
                 serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::String(raw))
             });
-            Ok(json!({ "key": key, "value": parsed }))
+            Ok((json!({ "key": key, "value": parsed }), false))
         }
         "localSet" => {
             let key = req_str(params, "key")?;
@@ -759,7 +1026,7 @@ pub fn handle_settings(
             let encoded = serde_json::to_string(val)
                 .map_err(|e| HostError::invalid_json(e.to_string()))?;
             host.host_db.kv_set("settings", key, &encoded)?;
-            Ok(json!({ "key": key, "saved": true }))
+            Ok((json!({ "key": key, "saved": true }), false))
         }
         "localAll" => {
             let map = host.host_db.kv_list("settings")?;
@@ -768,32 +1035,41 @@ pub fn handle_settings(
                 let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
                 out.insert(k, parsed);
             }
-            Ok(Value::Object(out))
+            Ok((Value::Object(out), false))
         }
-        "serverUrlGet" => Ok(json!({
-            "server_url": host.current_server_url(),
-            "default_server_url": DEFAULT_SERVER_URL,
-        })),
+        "serverUrlGet" => Ok((
+            json!({
+                "server_url": host.current_server_url(),
+                "default_server_url": DEFAULT_SERVER_URL,
+            }),
+            false,
+        )),
         "serverUrlSet" => {
             let url = req_str(params, "server_url").or_else(|_| req_str(params, "url"))?;
             let normalized = host.set_server_url(url)?;
-            Ok(json!({
-                "server_url": normalized,
-                "generation": host.current_generation(),
-            }))
+            Ok((
+                json!({
+                    "server_url": normalized,
+                    "generation": host.current_generation(),
+                }),
+                true,
+            ))
         }
         "storageMetrics" => {
             let metrics = compute_storage_metrics(&host.storage_dir);
-            to_val(metrics)
+            Ok((to_val(metrics)?, false))
         }
         "storagePurge" => {
             let (freed_bytes, removed_files) = purge_media_cas_dir(&host.storage_dir)?;
             let metrics = compute_storage_metrics(&host.storage_dir);
-            Ok(json!({
-                "freed_bytes": freed_bytes,
-                "removed_files": removed_files,
-                "metrics": metrics,
-            }))
+            Ok((
+                json!({
+                    "freed_bytes": freed_bytes,
+                    "removed_files": removed_files,
+                    "metrics": metrics,
+                }),
+                false,
+            ))
         }
         "passcodeSet" => {
             let passcode = req_raw_str(params, "passcode")?;
@@ -822,7 +1098,7 @@ pub fn handle_settings(
             let encoded_hash = format!("argon2id$m={m_cost},t={t_cost},p={p_cost}${salt_b64}${hash_hex}");
             host.host_db.set_meta("passcode_salt", &salt_b64)?;
             host.host_db.set_meta("passcode_hash", &encoded_hash)?;
-            Ok(json!({ "configured": true, "algorithm": "argon2id" }))
+            Ok((json!({ "configured": true, "algorithm": "argon2id" }), false))
         }
         "passcodeVerify" => {
             let passcode = req_raw_str(params, "passcode")?;
@@ -851,6 +1127,7 @@ pub fn handle_settings(
                     let (Some(m), Some(t), Some(p)) = (m_cost, t_cost, p_cost) else {
                         return Err(HostError::crypto("Corrupt Argon2id passcode parameters"));
                     };
+                    validate_argon2_ios_ceiling(m, t, p)?;
                     let salt = BASE64_STANDARD
                         .decode(parts[2].trim())
                         .map_err(|e| HostError::crypto(format!("Corrupt passcode salt: {e}")))?;
@@ -867,30 +1144,36 @@ pub fn handle_settings(
                         .hash_password_into(passcode.as_bytes(), &salt, &mut *actual)
                         .map_err(|e| HostError::crypto(format!("Argon2id verify failed: {e}")))?;
                     let valid = bool::from(actual.as_slice().ct_eq(expected.as_slice()));
-                    Ok(json!({ "valid": valid, "configured": true }))
+                    Ok((json!({ "valid": valid, "configured": true }), false))
                 }
-                None => Ok(json!({ "valid": false, "configured": false })),
+                None => Ok((json!({ "valid": false, "configured": false }), false)),
             }
         }
         "passcodeClear" => {
             host.host_db.delete_meta("passcode_salt")?;
             host.host_db.delete_meta("passcode_hash")?;
-            Ok(json!({ "cleared": true }))
+            Ok((json!({ "cleared": true }), false))
         }
-        "updateCheck" => Ok(json!({
-            "current_version": env!("CARGO_PKG_VERSION"),
-            "distribution": "app_store_testflight",
-            "self_update_supported": false,
-            "note": "iOS updates are delivered strictly through App Store / TestFlight"
-        })),
+        "updateCheck" => Ok((
+            json!({
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "distribution": "app_store_testflight",
+                "self_update_supported": false,
+                "note": "iOS updates are delivered strictly through App Store / TestFlight"
+            }),
+            false,
+        )),
         "checkpointWal" => {
             let (busy, log, checkpointed) = host.checkpoint_all_wals()?;
-            Ok(json!({
-                "checkpointed": true,
-                "busy": busy,
-                "log_frames": log,
-                "checkpointed_frames": checkpointed,
-            }))
+            Ok((
+                json!({
+                    "checkpointed": true,
+                    "busy": busy,
+                    "log_frames": log,
+                    "checkpointed_frames": checkpointed,
+                }),
+                false,
+            ))
         }
         _ => Err(HostError::unknown_command(&format!("settings.{action}"))),
     }

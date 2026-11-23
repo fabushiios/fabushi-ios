@@ -874,8 +874,10 @@ def verify_cargo_toml_hygiene(
                         )
                     if "://" in dep_key_s:
                         # Cargo 1.77+ URL with '@version' and no '#'
-                        url_part = re.split(r"@", dep_key_s, maxsplit=1)[0].split("?", 1)[0].rstrip("/")
-                        seg = url_part.rsplit("/", 1)[-1]
+                        # Extract the final path segment first so URL userinfo '@' (e.g. ssh://git@github.com/...)
+                        # is never mistaken for the '@version' separator.
+                        url_part = dep_key_s.split("?", 1)[0].rstrip("/")
+                        seg = url_part.rsplit("/", 1)[-1].split("@", 1)[0]
                         if seg.endswith(".git"):
                             seg = seg[:-4]
                         raw_dep_name = seg

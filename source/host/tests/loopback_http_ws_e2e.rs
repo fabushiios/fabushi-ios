@@ -1001,8 +1001,17 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             .as_u64()
             .unwrap();
 
-        // 1. Invalid URL MUST fail atomically without breaking live host or wiping session/vault!
-        for bad_url in ["", "   ", "ftp://invalid.example", "http://bad host:8080"] {
+        // 1. Invalid URL (including malformed bracketed IPv6 ports, NB2-02) MUST fail atomically
+        //    without breaking live host or wiping session/vault!
+        for bad_url in [
+            "",
+            "   ",
+            "ftp://invalid.example",
+            "http://bad host:8080",
+            "http://[::1]:bad",
+            "http://[::1]:",
+            "http://[::1",
+        ] {
             let bad = dispatch(
                 host,
                 &json!({"method": "session.setServerUrl", "params": {"server_url": bad_url}}),
@@ -1050,6 +1059,699 @@ fn test_set_server_url_live_reconfig_atomic_invalid_url_and_concurrent_safety() 
             assert_eq!(r["ok"], true, "concurrent setServerUrl failed: {r}");
         }
         assert_eq!(dispatch(host, &json!({"method": "auth.health"}))["result"]["healthy"], true);
+
+        // 4. Valid bracketed IPv6 authorities (with and without port, NB2-02) are accepted cleanly
+        for ok_ipv6 in ["http://[::1]", "http://[::1]:8080"] {
+            let ok_v6 = dispatch(
+                host,
+                &json!({"method": "session.setServerUrl", "params": {"server_url": ok_ipv6}}),
+            );
+            assert_eq!(ok_v6["ok"], true, "Valid IPv6 URL '{ok_ipv6}' must be accepted: {ok_v6}");
+            assert_eq!(ok_v6["result"]["server_url"], ok_ipv6);
+        }
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_b2_01_reentrant_set_server_url_from_event_pump_callback_fails_closed_no_deadlock() {
+    let dir = tempdir().unwrap();
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|| async {
+                    Json(json!({
+                        "user_id": 501,
+                        "username": "pump_reent",
+                        "session_id": "sess-pump-1",
+                        "token": "tok-pump-501",
+                        "first_name": "Pump"
+                    }))
+                }),
+            )
+            .route("/ws", get(ws_handler));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    struct PumpReentrantCtx {
+        host: usize,
+        invoked: AtomicBool,
+        rejected_conflict: AtomicBool,
+    }
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        let ctx = Arc::new(PumpReentrantCtx {
+            host: host as usize,
+            invoked: AtomicBool::new(false),
+            rejected_conflict: AtomicBool::new(false),
+        });
+
+        unsafe extern "C" fn on_pump_ws_event(
+            event_type: *const c_char,
+            _payload: *const c_char,
+            user_ctx: *mut c_void,
+        ) {
+            if event_type.is_null() || user_ctx.is_null() {
+                return;
+            }
+            let ev = unsafe { CStr::from_ptr(event_type) }.to_string_lossy();
+            if ev == "newMessage" {
+                let st = unsafe { &*(user_ctx as *const PumpReentrantCtx) };
+                if !st.invoked.swap(true, Ordering::SeqCst) {
+                    // Invoke session.setServerUrl synchronously from inside fabushi-event-pump!
+                    // MUST fail closed immediately with conflict (ZERO AB-BA deadlock, B2-01)!
+                    let res = unsafe {
+                        dispatch(
+                            st.host as *mut c_void,
+                            &json!({
+                                "id": "reent-url-1",
+                                "method": "session.setServerUrl",
+                                "params": {"server_url": "http://127.0.0.1:19876"}
+                            }),
+                        )
+                    };
+                    if res["ok"] == false && res["error"]["code"] == "conflict" {
+                        st.rejected_conflict.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        let raw_ctx = Arc::into_raw(Arc::clone(&ctx)) as *mut c_void;
+        telegram_bridge_register_event_callback(host, Some(on_pump_ws_event), raw_ctx);
+
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "pump_reent", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "session.connectWs"}))["ok"], true);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ctx.invoked.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ctx.invoked.load(Ordering::SeqCst), "WS newMessage callback must run on event pump");
+        assert!(
+            ctx.rejected_conflict.load(Ordering::SeqCst),
+            "Re-entrant session.setServerUrl from event pump callback must fail closed with conflict"
+        );
+
+        // Original server URL preserved and host remains healthy and responsive
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.getServerUrl"}))["result"]["server_url"],
+            format!("http://{addr}")
+        );
+        assert_eq!(dispatch(host, &json!({"method": "session.ping"}))["ok"], true);
+
+        fabushi_host_destroy(host);
+        drop(Arc::from_raw(raw_ctx as *const PumpReentrantCtx));
+    }
+}
+
+#[test]
+fn test_b2_02_direct_auth_and_set_auth_session_wipe_vault_magpie_bump_gen_stale_login_and_logout_delete() {
+    let dir = tempdir().unwrap();
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|Json(body): Json<Value>| async move {
+                    let user = body.get("username").and_then(|v| v.as_str()).unwrap_or("alice");
+                    match user {
+                        "bob" => Json(json!({
+                            "user_id": 202,
+                            "username": "bob",
+                            "session_id": "sess-bob",
+                            "token": "TOKEN_BOB_202",
+                            "first_name": "Bob"
+                        })),
+                        "slow_charlie" => {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            Json(json!({
+                                "user_id": 303,
+                                "username": "slow_charlie",
+                                "session_id": "sess-charlie",
+                                "token": "TOKEN_CHARLIE_303",
+                                "first_name": "Charlie"
+                            }))
+                        }
+                        _ => Json(json!({
+                            "user_id": 101,
+                            "username": "alice",
+                            "session_id": "sess-alice",
+                            "token": "TOKEN_ALICE_101",
+                            "first_name": "Alice"
+                        })),
+                    }
+                }),
+            )
+            .route("/api/v1/auth/logout", post(|| async { Json(json!({"ok": true})) }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "storage_passphrase": "keychain-b2-02-passphrase",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Account A (Alice) logs in, unlocks Vault, and masks a secret via magpie.maskText
+        let login_a = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "alice", "password": "pw"}}),
+        );
+        assert_eq!(login_a["ok"], true);
+        let gen_a = login_a["generation"].as_u64().unwrap();
+        assert!(gen_a >= 2, "auth.login must bump generation, got {gen_a}");
+
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 101, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], true);
+
+        let alice_secret = "Key=sk-ant-api03-alicesecret998877 email=alice@secretcorp.io";
+        let masked_a = dispatch(
+            host,
+            &json!({"method": "magpie.maskText", "params": {"text": alice_secret}}),
+        );
+        assert_eq!(masked_a["ok"], true);
+        let masked_a_str = masked_a["result"]["masked_text"].as_str().unwrap().to_string();
+        assert!(!masked_a_str.contains("alicesecret998877"));
+        assert_eq!(
+            dispatch(host, &json!({"method": "magpie.unmaskText", "params": {"text": masked_a_str}}))["result"]["text"],
+            alice_secret
+        );
+
+        // 2. Account B (Bob) logs in DIRECTLY via auth.login WITHOUT prior auth.logout!
+        let login_b = dispatch(
+            host,
+            &json!({"method": "auth.login", "params": {"username": "bob", "password": "pw"}}),
+        );
+        assert_eq!(login_b["ok"], true);
+        let gen_b = login_b["generation"].as_u64().unwrap();
+        assert!(gen_b > gen_a, "Direct auth.login as Account B must bump generation ({gen_b} > {gen_a})");
+        assert_eq!(
+            dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"],
+            false,
+            "Account A's unlocked Vault key MUST be wiped on direct Account B auth.login (B2-02)"
+        );
+        let unmasked_as_b = dispatch(
+            host,
+            &json!({"method": "magpie.unmaskText", "params": {"text": masked_a_str}}),
+        )["result"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !unmasked_as_b.contains("alicesecret998877") && !unmasked_as_b.contains("alice@secretcorp.io"),
+            "Account B MUST NOT unmask Account A's Magpie MemoryVault secrets: {unmasked_as_b}"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            "202"
+        );
+
+        // 3. Unlock Vault & mask secret under Account B, then directly call session.setAuthSession as Account C (404)
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 202, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        let bob_secret = "Key=sk-ant-api03-bobsecret445566 email=bob@secretcorp.io";
+        let masked_b_str = dispatch(
+            host,
+            &json!({"method": "magpie.maskText", "params": {"text": bob_secret}}),
+        )["result"]["masked_text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let set_c = dispatch(
+            host,
+            &json!({
+                "method": "session.setAuthSession",
+                "params": {
+                    "user_id": 404,
+                    "username": "carol",
+                    "session_id": "sess-carol",
+                    "token": "TOKEN_CAROL_404",
+                    "first_name": "Carol"
+                }
+            }),
+        );
+        assert_eq!(set_c["ok"], true);
+        let gen_c = set_c["generation"].as_u64().unwrap();
+        assert!(gen_c > gen_b);
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], false);
+        let unmasked_as_c = dispatch(
+            host,
+            &json!({"method": "magpie.unmaskText", "params": {"text": masked_b_str}}),
+        )["result"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !unmasked_as_c.contains("bobsecret445566") && !unmasked_as_c.contains("bob@secretcorp.io"),
+            "Account C MUST NOT unmask Account B's Magpie MemoryVault secrets: {unmasked_as_c}"
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.listAccounts"}))["result"]["active_account_id"],
+            "404"
+        );
+
+        // 4. Stale in-flight auth.login (slow_charlie, 350ms) raced by concurrent generation.bump ->
+        //    MUST fail closed with stale_generation and MUST NOT overwrite active user 404 or persist 303!
+        let host_addr = host as usize;
+        let stale_login = thread::spawn(move || {
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({"id": "stale-charlie", "method": "auth.login", "params": {"username": "slow_charlie", "password": "pw"}}),
+            )
+        });
+        thread::sleep(Duration::from_millis(80));
+        let bumped = dispatch(host, &json!({"method": "generation.bump"}));
+        assert_eq!(bumped["ok"], true);
+
+        let stale_res = stale_login.join().unwrap();
+        assert_eq!(
+            stale_res["ok"], false,
+            "Stale in-flight auth.login must fail closed: {stale_res}"
+        );
+        assert_eq!(stale_res["error"]["code"], "stale_generation");
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"],
+            404,
+            "Stale auth.login must NOT overwrite active session user_id 404"
+        );
+        let accts_after_stale = dispatch(host, &json!({"method": "session.listAccounts"}));
+        assert_eq!(accts_after_stale["result"]["active_account_id"], "404");
+        assert!(
+            !accts_after_stale["result"]["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["account_id"] == "303"),
+            "Stale auth.login must NOT persist account 303: {accts_after_stale}"
+        );
+
+        // 5. auth.logout MUST delete ("accounts", uid) from host_state.db so logged-out account cannot be re-entered!
+        assert_eq!(
+            dispatch(host, &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}))["ok"],
+            true
+        );
+        assert_eq!(dispatch(host, &json!({"method": "auth.logout"}))["ok"], true);
+
+        let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+        let bob_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM host_kv WHERE namespace = 'accounts' AND key = '202'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bob_rows, 0, "auth.logout MUST delete ('accounts', '202') from host_state.db (B2-02)");
+        drop(conn);
+
+        let accts_after_logout = dispatch(host, &json!({"method": "session.listAccounts"}));
+        assert_eq!(accts_after_logout["result"]["active_account_id"], Value::Null);
+        assert!(
+            !accts_after_logout["result"]["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["account_id"] == "202"),
+            "Logged-out account 202 must not appear in session.listAccounts"
+        );
+        let reenter = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+        );
+        assert_eq!(reenter["ok"], false);
+        assert_eq!(reenter["error"]["code"], "not_found");
+
+        fabushi_host_destroy(host);
+    }
+}
+
+#[test]
+fn test_b2_03_cross_server_token_replay_blocked_and_no_passphrase_restart_fails_closed() {
+    let dir_enc = tempdir().unwrap();
+    let dir_nopass = tempdir().unwrap();
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (addr_a, addr_b) = server_rt.block_on(async {
+        let make_app = |tag: &'static str| {
+            Router::new()
+                .route("/health", get(move || async move { tag }))
+                .route(
+                    "/api/v1/auth/login",
+                    post(move |Json(body): Json<Value>| async move {
+                        let user = body.get("username").and_then(|v| v.as_str()).unwrap_or("alice");
+                        if user == "bob" {
+                            Json(json!({
+                                "user_id": 202,
+                                "username": "bob",
+                                "session_id": format!("sess-bob-{tag}"),
+                                "token": format!("TOKEN_BOB_{tag}"),
+                                "first_name": "Bob"
+                            }))
+                        } else {
+                            Json(json!({
+                                "user_id": 101,
+                                "username": "alice",
+                                "session_id": format!("sess-alice-{tag}"),
+                                "token": format!("TOKEN_ALICE_{tag}"),
+                                "first_name": "Alice"
+                            }))
+                        }
+                    }),
+                )
+        };
+        let la_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let la = la_l.local_addr().unwrap();
+        let lb = lb_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(la_l, make_app("SERVER_A")).await;
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(lb_l, make_app("SERVER_B")).await;
+        });
+        (la, lb)
+    });
+
+    // A. Cross-server bearer token replay MUST fail closed with unauthorized without mutating live session
+    let cfg_enc = CString::new(
+        json!({
+            "app_data_dir": dir_enc.path().to_string_lossy(),
+            "server_url": format!("http://{addr_a}"),
+            "storage_passphrase": "keychain-b2-03-passphrase",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_enc.as_ptr());
+        assert!(!host.is_null());
+
+        // Login Alice on Server A
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice", "password": "pw"}})
+            )["ok"],
+            true
+        );
+
+        // Switch host to Server B and login Bob + unlock Bob's Vault
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "session.setServerUrl", "params": {"server_url": format!("http://{addr_b}")}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "bob", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 202, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        let gen_bob = dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"]
+            .as_u64()
+            .unwrap();
+
+        // Attempting to switchAccount to Server A's Alice (101) while on Server B MUST fail closed!
+        let cross_srv = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "101"}}),
+        );
+        assert_eq!(
+            cross_srv["ok"], false,
+            "Cross-server switchAccount MUST fail closed (B2-03): {cross_srv}"
+        );
+        assert_eq!(cross_srv["error"]["code"], "unauthorized");
+
+        // Bob's live session, unlocked vault, and generation MUST remain 100% intact!
+        assert_eq!(dispatch(host, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 202);
+        assert_eq!(dispatch(host, &json!({"method": "vault.status"}))["result"]["unlocked"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"],
+            gen_bob
+        );
+
+        fabushi_host_destroy(host);
+    }
+
+    // B. Host WITHOUT storage_passphrase: restart + switchAccount to metadata-only account MUST fail closed!
+    let cfg_nopass = CString::new(
+        json!({
+            "app_data_dir": dir_nopass.path().to_string_lossy(),
+            "server_url": format!("http://{addr_a}"),
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host1 = fabushi_host_create(cfg_nopass.as_ptr());
+        assert!(!host1.is_null());
+        assert_eq!(
+            dispatch(
+                host1,
+                &json!({"method": "auth.login", "params": {"username": "alice", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        fabushi_host_destroy(host1);
+
+        // Restart new host without storage_passphrase -> Alice's RAM token is gone
+        let host2 = fabushi_host_create(cfg_nopass.as_ptr());
+        assert!(!host2.is_null());
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "auth.login", "params": {"username": "bob", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host2,
+                &json!({"method": "vault.initSplitKey", "params": {"user_id": 202, "password": "pw", "fast_kdf": true}})
+            )["ok"],
+            true
+        );
+        let gen_bob2 = dispatch(host2, &json!({"method": "generation.current"}))["result"]["generation"]
+            .as_u64()
+            .unwrap();
+
+        let no_tok = dispatch(
+            host2,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "101"}}),
+        );
+        assert_eq!(
+            no_tok["ok"], false,
+            "switchAccount without recoverable token MUST fail closed (B2-03): {no_tok}"
+        );
+        assert_eq!(no_tok["error"]["code"], "unauthorized");
+        assert_eq!(dispatch(host2, &json!({"method": "session.wsStatus"}))["result"]["user_id"], 202);
+        assert_eq!(dispatch(host2, &json!({"method": "vault.status"}))["result"]["unlocked"], true);
+        assert_eq!(
+            dispatch(host2, &json!({"method": "generation.current"}))["result"]["generation"],
+            gen_bob2
+        );
+
+        fabushi_host_destroy(host2);
+    }
+}
+
+#[test]
+fn test_nb2_05_messages_send_http_401_and_413_clean_outbox_and_allow_same_nonce_retry() {
+    let dir = tempdir().unwrap();
+    let send_attempt = Arc::new(AtomicUsize::new(0));
+    let send_attempt_srv = Arc::clone(&send_attempt);
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = server_rt.block_on(async move {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|| async {
+                    Json(json!({
+                        "user_id": 77,
+                        "username": "sender_4xx",
+                        "session_id": "sess-4xx",
+                        "token": "tok-4xx",
+                        "first_name": "Sender"
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/messages/send",
+                post(move |Json(body): Json<Value>| {
+                    let attempts = Arc::clone(&send_attempt_srv);
+                    async move {
+                        let n = attempts.fetch_add(1, Ordering::SeqCst);
+                        match n {
+                            0 => (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"error": "token expired"})),
+                            )
+                                .into_response(),
+                            1 => (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                Json(json!({"error": "payload too large"})),
+                            )
+                                .into_response(),
+                            _ => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "message_id": 6002,
+                                    "id": 6002,
+                                    "pts": 55,
+                                    "pts_count": 1,
+                                    "duplicate": false,
+                                    "date_ms": Utc::now().timestamp_millis(),
+                                    "date": Utc::now().to_rfc3339(),
+                                    "sender_id": 77,
+                                    "chat_id": body["chat_id"],
+                                    "text": body["text"],
+                                    "client_nonce": body["client_nonce"],
+                                    "status": "sent"
+                                })),
+                            )
+                                .into_response(),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg_c = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}")
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg_c.as_ptr());
+        assert!(!host.is_null());
+
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "sender_4xx", "password": "pw"}})
+            )["ok"],
+            true
+        );
+
+        let payload = json!({
+            "method": "messages.send",
+            "params": {"chat_id": 500, "text": "Retryable after 401 and 413", "client_nonce": 888401}
+        });
+
+        let r1 = dispatch(host, &payload);
+        assert_eq!(r1["ok"], false, "HTTP 401 must fail closed: {r1}");
+        assert_eq!(r1["error"]["code"], "unauthorized");
+
+        let r2 = dispatch(host, &payload);
+        assert_eq!(r2["ok"], false, "HTTP 413 must fail closed without stale Pending outbox conflict: {r2}");
+        assert_eq!(r2["error"]["code"], "api_error");
+
+        let r3 = dispatch(host, &payload);
+        assert_eq!(r3["ok"], true, "Retry with identical client_nonce after 401/413 cleanup must succeed: {r3}");
+        assert_eq!(r3["result"]["id"], 6002);
+        assert_eq!(r3["result"]["status"], "sent");
 
         fabushi_host_destroy(host);
     }

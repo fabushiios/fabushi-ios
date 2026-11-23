@@ -12,6 +12,15 @@
 #include <stdio.h>
 #include <unistd.h>
 
+@interface FabushiSckShotBox : NSObject
+@property (nonatomic, assign) BOOL timedOut;
+@property (nonatomic, assign) CGImageRef capturedImage;
+@property (nonatomic, strong) NSError *shotErr;
+@end
+
+@implementation FabushiSckShotBox
+@end
+
 // Status codes returned by fabushi_sck_capture_display & fabushi_sck_probe_access
 enum {
     FABUSHI_SCK_OK = 0,
@@ -194,6 +203,19 @@ int32_t fabushi_sck_probe_access(char *err_buf, size_t err_buf_len) {
         err_buf[0] = '\0';
     }
     @autoreleasepool {
+        // Never invoke SCShareableContent when TCC preflight is denied: on macOS 15+/27,
+        // replayd escalates to a non-preflight TCCAccessRequest and pops up the OS consent
+        // dialog even when our own permission modal is open.
+        if (!CGPreflightScreenCaptureAccess()) {
+            if (err_buf && err_buf_len > 0) {
+                strlcpy(
+                    err_buf,
+                    "Screen Recording permission not granted (CGPreflightScreenCaptureAccess=false)",
+                    err_buf_len
+                );
+            }
+            return FABUSHI_SCK_PERMISSION_DENIED;
+        }
         if (@available(macOS 12.3, *)) {
             Class scContentCls = NSClassFromString(@"SCShareableContent");
             if (!scContentCls) {
@@ -257,6 +279,17 @@ FabushiSckCaptureResultC fabushi_sck_capture_display(
     out.status = FABUSHI_SCK_UNAVAILABLE;
 
     @autoreleasepool {
+        // Guard before calling SCShareableContent so missing Screen Recording permission
+        // returns PermissionDenied cleanly instead of triggering macOS's intrusive OS popup.
+        if (!CGPreflightScreenCaptureAccess()) {
+            strlcpy(
+                out.error_msg,
+                "Screen Recording permission not granted (CGPreflightScreenCaptureAccess=false)",
+                sizeof(out.error_msg)
+            );
+            out.status = FABUSHI_SCK_PERMISSION_DENIED;
+            return out;
+        }
         if (@available(macOS 14.0, *)) {
             Class scContentCls = NSClassFromString(@"SCShareableContent");
             Class scShotCls = NSClassFromString(@"SCScreenshotManager");
@@ -311,13 +344,29 @@ FabushiSckCaptureResultC fabushi_sck_capture_display(
                         break;
                     }
                 }
-            }
-            if (!selected) {
-                if ((NSUInteger)display_index < displays.count) {
-                    selected = displays[display_index];
-                } else {
-                    selected = displays[0];
+                if (!selected) {
+                    snprintf(
+                        out.error_msg,
+                        sizeof(out.error_msg),
+                        "Requested display ID %u not found among %lu active displays",
+                        target_display_id,
+                        (unsigned long)displays.count
+                    );
+                    out.status = FABUSHI_SCK_NOT_FOUND;
+                    return out;
                 }
+            } else if ((NSUInteger)display_index < displays.count) {
+                selected = displays[display_index];
+            } else {
+                snprintf(
+                    out.error_msg,
+                    sizeof(out.error_msg),
+                    "Requested display index %u out of range (%lu displays)",
+                    display_index,
+                    (unsigned long)displays.count
+                );
+                out.status = FABUSHI_SCK_NOT_FOUND;
+                return out;
             }
 
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:selected excludingWindows:@[]];
@@ -331,6 +380,12 @@ FabushiSckCaptureResultC fabushi_sck_capture_display(
             }
             if (pixelW == 0) pixelW = (size_t)selected.width;
             if (pixelH == 0) pixelH = (size_t)selected.height;
+
+            if (pixelW == 0 || pixelH == 0) {
+                strlcpy(out.error_msg, "Selected display reported zero pixel dimensions", sizeof(out.error_msg));
+                out.status = FABUSHI_SCK_ERROR;
+                return out;
+            }
 
             // Cap ultra-high retina width to keep remote frames crisp and fast while preserving aspect ratio
             if (pixelW > 2560 && pixelH > 0) {
@@ -346,23 +401,43 @@ FabushiSckCaptureResultC fabushi_sck_capture_display(
             config.scalesToFit = YES;
 
             dispatch_semaphore_t shotSem = dispatch_semaphore_create(0);
-            __block CGImageRef capturedImage = NULL;
-            __block NSError *shotErr = nil;
+            FabushiSckShotBox *shotBox = [[FabushiSckShotBox alloc] init];
 
             [SCScreenshotManager captureImageWithFilter:filter
                                           configuration:config
                                       completionHandler:^(CGImageRef _Nullable image, NSError * _Nullable error) {
-                if (image) {
-                    capturedImage = CGImageRetain(image);
+                @synchronized(shotBox) {
+                    if (!shotBox.timedOut) {
+                        if (image) {
+                            shotBox.capturedImage = CGImageRetain(image);
+                        }
+                        shotBox.shotErr = error;
+                    }
                 }
-                shotErr = error;
                 dispatch_semaphore_signal(shotSem);
             }];
 
             if (dispatch_semaphore_wait(shotSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4000 * NSEC_PER_MSEC))) != 0) {
+                CGImageRef staleImage = NULL;
+                @synchronized(shotBox) {
+                    shotBox.timedOut = YES;
+                    staleImage = shotBox.capturedImage;
+                    shotBox.capturedImage = NULL;
+                }
+                if (staleImage) {
+                    CGImageRelease(staleImage);
+                }
                 strlcpy(out.error_msg, "Timed out capturing screenshot via SCScreenshotManager", sizeof(out.error_msg));
                 out.status = FABUSHI_SCK_ERROR;
                 return out;
+            }
+
+            CGImageRef capturedImage = NULL;
+            NSError *shotErr = nil;
+            @synchronized(shotBox) {
+                capturedImage = shotBox.capturedImage;
+                shotBox.capturedImage = NULL;
+                shotErr = shotBox.shotErr;
             }
 
             if (shotErr || !capturedImage) {
@@ -430,7 +505,10 @@ bool fabushi_cg_can_read_other_window_names(void) {
                 continue;
             }
             NSString *owner = win[(__bridge NSString *)kCGWindowOwnerName];
-            if ([owner isEqualToString:@"Window Server"] || [owner isEqualToString:@"Dock"]) {
+            if ([owner isEqualToString:@"Window Server"] ||
+                [owner isEqualToString:@"WindowServer"] ||
+                [owner isEqualToString:@"Dock"] ||
+                [owner isEqualToString:@"程序坞"]) {
                 continue;
             }
             NSString *name = win[(__bridge NSString *)kCGWindowName];
@@ -443,60 +521,76 @@ bool fabushi_cg_can_read_other_window_names(void) {
     }
 }
 
+static void fabushi_fill_basic_bundle_info(FabushiMacSigningInfoC *info) {
+    if (!info) {
+        return;
+    }
+    // Resolve executable path
+    uint32_t pathSize = (uint32_t)sizeof(info->executable_path);
+    char rawExec[1024];
+    memset(rawExec, 0, sizeof(rawExec));
+    if (_NSGetExecutablePath(rawExec, &pathSize) == 0) {
+        char resolved[PATH_MAX];
+        if (realpath(rawExec, resolved)) {
+            strlcpy(info->executable_path, resolved, sizeof(info->executable_path));
+        } else {
+            strlcpy(info->executable_path, rawExec, sizeof(info->executable_path));
+        }
+    }
+
+    // Resolve .app bundle path & bundle ID without calling Security.framework (safe on main thread)
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSString *bundlePath = mainBundle.bundleURL.path;
+    NSString *bundleId = mainBundle.bundleIdentifier;
+    if (bundlePath && [[bundlePath pathExtension] caseInsensitiveCompare:@"app"] == NSOrderedSame) {
+        info->is_app_bundle = true;
+        fabushi_copy_cstr(info->bundle_path, sizeof(info->bundle_path), bundlePath);
+    } else {
+        // Walk up executable_path in case we're inside foo.app/Contents/MacOS/...
+        NSString *execStr = [NSString stringWithUTF8String:info->executable_path];
+        NSString *cursor = execStr;
+        while (cursor.length > 1) {
+            if ([[cursor pathExtension] caseInsensitiveCompare:@"app"] == NSOrderedSame) {
+                info->is_app_bundle = true;
+                fabushi_copy_cstr(info->bundle_path, sizeof(info->bundle_path), cursor);
+                NSBundle *b = [NSBundle bundleWithPath:cursor];
+                if (b.bundleIdentifier.length > 0 && bundleId.length == 0) {
+                    bundleId = b.bundleIdentifier;
+                }
+                break;
+            }
+            NSString *parent = [cursor stringByDeletingLastPathComponent];
+            if ([parent isEqualToString:cursor]) {
+                break;
+            }
+            cursor = parent;
+        }
+        if (!info->is_app_bundle) {
+            strlcpy(info->bundle_path, info->executable_path, sizeof(info->bundle_path));
+        }
+    }
+    if (bundleId.length > 0) {
+        fabushi_copy_cstr(info->bundle_id, sizeof(info->bundle_id), bundleId);
+    }
+}
+
+FabushiMacSigningInfoC fabushi_copy_basic_bundle_info(void) {
+    FabushiMacSigningInfoC info;
+    memset(&info, 0, sizeof(info));
+    @autoreleasepool {
+        fabushi_fill_basic_bundle_info(&info);
+    }
+    return info;
+}
+
 FabushiMacSigningInfoC fabushi_copy_signing_info(void) {
     FabushiMacSigningInfoC info;
     memset(&info, 0, sizeof(info));
 
     @autoreleasepool {
-        // Resolve executable path
-        uint32_t pathSize = (uint32_t)sizeof(info.executable_path);
-        char rawExec[1024];
-        memset(rawExec, 0, sizeof(rawExec));
-        if (_NSGetExecutablePath(rawExec, &pathSize) == 0) {
-            char resolved[PATH_MAX];
-            if (realpath(rawExec, resolved)) {
-                strlcpy(info.executable_path, resolved, sizeof(info.executable_path));
-            } else {
-                strlcpy(info.executable_path, rawExec, sizeof(info.executable_path));
-            }
-        }
+        fabushi_fill_basic_bundle_info(&info);
 
-        // Resolve .app bundle path & bundle ID
-        NSBundle *mainBundle = [NSBundle mainBundle];
-        NSString *bundlePath = mainBundle.bundleURL.path;
-        NSString *bundleId = mainBundle.bundleIdentifier;
-        if (bundlePath && [[bundlePath pathExtension] caseInsensitiveCompare:@"app"] == NSOrderedSame) {
-            info.is_app_bundle = true;
-            fabushi_copy_cstr(info.bundle_path, sizeof(info.bundle_path), bundlePath);
-        } else {
-            // Walk up executable_path in case we're inside foo.app/Contents/MacOS/...
-            NSString *execStr = [NSString stringWithUTF8String:info.executable_path];
-            NSString *cursor = execStr;
-            while (cursor.length > 1) {
-                if ([[cursor pathExtension] caseInsensitiveCompare:@"app"] == NSOrderedSame) {
-                    info.is_app_bundle = true;
-                    fabushi_copy_cstr(info.bundle_path, sizeof(info.bundle_path), cursor);
-                    NSBundle *b = [NSBundle bundleWithPath:cursor];
-                    if (b.bundleIdentifier.length > 0 && bundleId.length == 0) {
-                        bundleId = b.bundleIdentifier;
-                    }
-                    break;
-                }
-                NSString *parent = [cursor stringByDeletingLastPathComponent];
-                if ([parent isEqualToString:cursor]) {
-                    break;
-                }
-                cursor = parent;
-            }
-            if (!info.is_app_bundle) {
-                strlcpy(info.bundle_path, info.executable_path, sizeof(info.bundle_path));
-            }
-        }
-        if (bundleId.length > 0) {
-            fabushi_copy_cstr(info.bundle_id, sizeof(info.bundle_id), bundleId);
-        }
-
-        // Inspect dynamic & static code signature via Security.framework
+        // Inspect dynamic & static code signature via Security.framework (call off main thread)
         SecCodeRef selfCode = NULL;
         OSStatus status = SecCodeCopySelf(kSecCSDefaultFlags, &selfCode);
         if (status == errSecSuccess && selfCode) {

@@ -231,14 +231,27 @@ mod macos_capture {
                 RemoteEngineError::NotFound(format!("display index {display_index} not found"))
             })?;
 
+            // Gate on non-prompting TCC preflight BEFORE touching ScreenCaptureKit / CoreGraphics!
+            // On macOS 15+/27, calling SCShareableContent while CGPreflightScreenCaptureAccess()
+            // is false causes replayd to send a non-preflight TCCAccessRequest that pops up the
+            // intrusive OS consent dialog ("Fabushi 想要录制此电脑的屏幕和音频") on top of our UI.
+            if !crate::macos_permissions::preflight_screen_capture_access()
+                && !crate::macos_permissions::is_sck_live_verified()
+            {
+                return Err(RemoteEngineError::PermissionDenied(
+                    "Screen Recording permission required in System Settings > Privacy & Security"
+                        .to_string(),
+                ));
+            }
+
             // Primary path on macOS 14.0+ (Sequoia / macOS 26 / 27): native ScreenCaptureKit
-            // (`SCShareableContent` + `SCScreenshotManager`). We intentionally try SCK *before*
-            // consulting `CGPreflightScreenCaptureAccess()`, because `CGPreflight` can remain
-            // stale-cached `false` inside a running process even after Screen Recording is granted,
-            // and legacy `CGDisplayCreateImage` / `CGWindowListCreateImage` fail on macOS 15+.
+            // (`SCShareableContent` + `SCScreenshotManager`).
             match crate::macos_permissions::sck_capture_display(id, display_index, format, seq) {
                 Ok(frame) => return Ok(frame),
-                Err((code, err)) if code == crate::macos_permissions::STATUS_PERMISSION_DENIED => {
+                Err((code, err))
+                    if code == crate::macos_permissions::STATUS_PERMISSION_DENIED
+                        || code == crate::macos_permissions::STATUS_NOT_FOUND =>
+                {
                     return Err(err);
                 }
                 Err((code, _err)) if code == crate::macos_permissions::STATUS_UNAVAILABLE => {

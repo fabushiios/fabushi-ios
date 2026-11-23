@@ -1417,10 +1417,7 @@ impl ProviderRouter {
                 continue;
             }
             if let Some(cfg) = snap.providers.get(pid) {
-                if cfg.enabled
-                    && cfg.api_mode != ApiMode::LocalHermes
-                    && (!cfg.credentials.is_empty() || cfg.no_key_required)
-                {
+                if Self::is_provider_usable(&snap, cfg) {
                     chain.push(FallbackTarget {
                         provider_id: cfg.id.clone(),
                         model: cfg.default_model.clone(),
@@ -1430,10 +1427,7 @@ impl ProviderRouter {
         }
         for (pid, cfg) in &snap.providers {
             if pid == &active_id
-                || pid == "local_hermes"
-                || !cfg.enabled
-                || cfg.api_mode == ApiMode::LocalHermes
-                || (cfg.credentials.is_empty() && !cfg.no_key_required)
+                || !Self::is_provider_usable(&snap, cfg)
                 || chain.iter().any(|t| t.provider_id == *pid)
             {
                 continue;
@@ -1712,37 +1706,71 @@ impl ProviderRouter {
         list
     }
 
+    fn is_provider_usable(guard: &ProviderRouterState, p: &ProviderConfig) -> bool {
+        if !p.enabled || p.id == "local_hermes" || p.api_mode == ApiMode::LocalHermes {
+            return false;
+        }
+        if !p.is_subscription {
+            return !p.credentials.is_empty() || p.no_key_required;
+        }
+        !p.credentials.is_empty()
+            || guard.synced_vertex_adcs.contains_key(&p.id)
+            || guard.synced_codex_oauths.contains_key(&p.id)
+            || guard.subscriptions.iter().any(|s| {
+                s.id == p.id
+                    && (s.access_token.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        || (!s.source_path.trim().is_empty()
+                            && std::path::Path::new(&s.source_path).is_file()))
+            })
+            || p.headers
+                .get("x-adc-source-path")
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+            || p.headers
+                .get("x-codex-source-path")
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+    }
+
+    fn is_subscription_backed(guard: &ProviderRouterState, s: &SubscriptionAccount) -> bool {
+        guard.providers.get(&s.id).is_none_or(|p| p.enabled)
+            && (s.access_token.as_deref().is_some_and(|t| !t.trim().is_empty())
+                || guard.synced_vertex_adcs.contains_key(&s.id)
+                || guard.synced_codex_oauths.contains_key(&s.id)
+                || guard
+                    .providers
+                    .get(&s.id)
+                    .is_some_and(|p| p.enabled && !p.credentials.is_empty())
+                || (!s.source_path.trim().is_empty()
+                    && std::path::Path::new(&s.source_path).is_file())
+                || guard.providers.get(&s.id).is_some_and(|p| {
+                    p.enabled
+                        && (p.headers
+                            .get("x-adc-source-path")
+                            .is_some_and(|path| std::path::Path::new(path).is_file())
+                            || p.headers
+                                .get("x-codex-source-path")
+                                .is_some_and(|path| std::path::Path::new(path).is_file()))
+                }))
+    }
+
     pub fn has_active_subscription(&self) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let has_backed_sub = guard.subscriptions.iter().any(|s| {
-            s.active
-                && guard.providers.get(&s.id).is_none_or(|p| p.enabled)
-                && (s.access_token.as_deref().is_some_and(|t| !t.trim().is_empty())
-                    || guard.synced_vertex_adcs.contains_key(&s.id)
-                    || guard.synced_codex_oauths.contains_key(&s.id)
-                    || guard.providers.get(&s.id).is_some_and(|p| {
-                        p.enabled && (!p.credentials.is_empty() || p.no_key_required)
-                    })
-                    || (!s.source_path.trim().is_empty()
-                        && std::path::Path::new(&s.source_path).is_file()))
-        });
+        let has_backed_sub = guard
+            .subscriptions
+            .iter()
+            .any(|s| s.active && Self::is_subscription_backed(&guard, s));
         has_backed_sub
-            || guard.providers.values().any(|p| {
-                p.enabled
-                    && p.is_subscription
-                    && p.api_mode != ApiMode::LocalHermes
-                    && (!p.credentials.is_empty() || p.no_key_required)
-            })
+            || guard
+                .providers
+                .values()
+                .any(|p| p.is_subscription && Self::is_provider_usable(&guard, p))
     }
 
     pub fn has_configured_provider(&self) -> bool {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.providers.values().any(|p| {
-            p.enabled
-                && p.id != "local_hermes"
-                && p.api_mode != ApiMode::LocalHermes
-                && (!p.credentials.is_empty() || p.no_key_required)
-        })
+        guard
+            .providers
+            .values()
+            .any(|p| Self::is_provider_usable(&guard, p))
     }
 
     pub fn needs_provider_selection(&self) -> bool {
@@ -2130,23 +2158,44 @@ impl ProviderRouter {
             }
         }
 
-        let needs_selection = !guard.subscriptions.iter().any(|s| s.active)
-            && !guard.providers.values().any(|p| {
-                p.enabled
-                    && p.id != "local_hermes"
-                    && p.api_mode != ApiMode::LocalHermes
-                    && (!p.credentials.is_empty() || p.no_key_required)
-            });
+        let needs_selection = !guard
+            .subscriptions
+            .iter()
+            .any(|s| s.active && Self::is_subscription_backed(&guard, s))
+            && !guard
+                .providers
+                .values()
+                .any(|p| Self::is_provider_usable(&guard, p));
 
         let should_autobind = needs_selection || guard.active_provider_id == "local_hermes";
         if should_autobind {
             let best_sub = guard
                 .subscriptions
                 .iter()
-                .find(|s| s.active && s.kind == SubscriptionKind::GoogleVertex)
-                .or_else(|| guard.subscriptions.iter().find(|s| s.active && s.kind == SubscriptionKind::CodexChatGpt))
-                .or_else(|| guard.subscriptions.iter().find(|s| s.active))
-                .or_else(|| guard.subscriptions.first());
+                .find(|s| {
+                    s.active
+                        && Self::is_subscription_backed(&guard, s)
+                        && s.kind == SubscriptionKind::GoogleVertex
+                })
+                .or_else(|| {
+                    guard.subscriptions.iter().find(|s| {
+                        s.active
+                            && Self::is_subscription_backed(&guard, s)
+                            && s.kind == SubscriptionKind::CodexChatGpt
+                    })
+                })
+                .or_else(|| {
+                    guard
+                        .subscriptions
+                        .iter()
+                        .find(|s| s.active && Self::is_subscription_backed(&guard, s))
+                })
+                .or_else(|| {
+                    guard
+                        .subscriptions
+                        .iter()
+                        .find(|s| Self::is_subscription_backed(&guard, s))
+                });
 
             let best_sub_id = best_sub.map(|s| s.id.clone());
             if let Some(sub_id) = best_sub_id {
@@ -2314,25 +2363,33 @@ impl ProviderRouter {
                 }
             }
 
-            let needs_selection = !guard.providers.values().any(|p| {
-                p.enabled
-                    && p.id != "local_hermes"
-                    && p.api_mode != ApiMode::LocalHermes
-                    && (!p.credentials.is_empty() || p.no_key_required)
-            });
+            let needs_selection = !guard
+                .providers
+                .values()
+                .any(|p| Self::is_provider_usable(&guard, p));
 
             if auto_activate && (needs_selection || guard.active_provider_id == "local_hermes") {
                 let best_sub_id = guard
                     .subscriptions
                     .iter()
-                    .find(|s| s.active && s.kind == SubscriptionKind::GoogleVertex)
+                    .find(|s| {
+                        s.active
+                            && Self::is_subscription_backed(&guard, s)
+                            && s.kind == SubscriptionKind::GoogleVertex
+                    })
+                    .or_else(|| {
+                        guard.subscriptions.iter().find(|s| {
+                            s.active
+                                && Self::is_subscription_backed(&guard, s)
+                                && s.kind == SubscriptionKind::CodexChatGpt
+                        })
+                    })
                     .or_else(|| {
                         guard
                             .subscriptions
                             .iter()
-                            .find(|s| s.active && s.kind == SubscriptionKind::CodexChatGpt)
+                            .find(|s| s.active && Self::is_subscription_backed(&guard, s))
                     })
-                    .or_else(|| guard.subscriptions.iter().find(|s| s.active))
                     .map(|s| s.id.clone());
 
                 if let Some(sub_id) = best_sub_id {
@@ -2387,49 +2444,54 @@ impl ProviderRouter {
 
     pub fn find_best_available_subscription(&self) -> Option<String> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let is_enabled = |id: &str| guard.providers.get(id).is_none_or(|p| p.enabled);
 
-        if let Some(sub) = guard
-            .subscriptions
-            .iter()
-            .find(|s| s.active && is_enabled(&s.id) && s.kind == SubscriptionKind::GoogleVertex)
-        {
+        if let Some(sub) = guard.subscriptions.iter().find(|s| {
+            s.active
+                && Self::is_subscription_backed(&guard, s)
+                && s.kind == SubscriptionKind::GoogleVertex
+        }) {
+            return Some(sub.id.clone());
+        }
+        if let Some(sub) = guard.subscriptions.iter().find(|s| {
+            s.active
+                && Self::is_subscription_backed(&guard, s)
+                && s.kind == SubscriptionKind::CodexChatGpt
+        }) {
             return Some(sub.id.clone());
         }
         if let Some(sub) = guard
             .subscriptions
             .iter()
-            .find(|s| s.active && is_enabled(&s.id) && s.kind == SubscriptionKind::CodexChatGpt)
-        {
-            return Some(sub.id.clone());
-        }
-        if let Some(sub) = guard
-            .subscriptions
-            .iter()
-            .find(|s| s.active && is_enabled(&s.id))
+            .find(|s| s.active && Self::is_subscription_backed(&guard, s))
         {
             return Some(sub.id.clone());
         }
         if let Some(p) = guard.providers.values().find(|p| {
-            p.enabled
-                && p.is_subscription
+            p.is_subscription
+                && Self::is_provider_usable(&guard, p)
                 && (p.api_mode == ApiMode::GoogleVertex || p.id.contains("vertex"))
         }) {
             return Some(p.id.clone());
         }
         if let Some(p) = guard.providers.values().find(|p| {
-            p.enabled
-                && p.is_subscription
+            p.is_subscription
+                && Self::is_provider_usable(&guard, p)
                 && (p.api_mode == ApiMode::CodexResponses || p.id.contains("codex"))
         }) {
             return Some(p.id.clone());
         }
-        if let Some(p) = guard.providers.values().find(|p| {
-            p.enabled && p.is_subscription && p.api_mode != ApiMode::LocalHermes
-        }) {
+        if let Some(p) = guard
+            .providers
+            .values()
+            .find(|p| p.is_subscription && Self::is_provider_usable(&guard, p))
+        {
             return Some(p.id.clone());
         }
-        if let Some(sub) = guard.subscriptions.iter().find(|s| is_enabled(&s.id)) {
+        if let Some(sub) = guard
+            .subscriptions
+            .iter()
+            .find(|s| Self::is_subscription_backed(&guard, s))
+        {
             return Some(sub.id.clone());
         }
 
@@ -2791,11 +2853,8 @@ impl ProviderRouter {
                     .providers
                     .values()
                     .filter(|p| {
-                        p.enabled
-                            && p.id != state.active_provider_id
-                            && p.id != "local_hermes"
-                            && p.api_mode != ApiMode::LocalHermes
-                            && (!p.credentials.is_empty() || p.no_key_required)
+                        p.id != state.active_provider_id
+                            && Self::is_provider_usable(&state, p)
                     })
                     .collect();
                 extra_providers.sort_by(|a, b| {
@@ -9551,6 +9610,10 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
         vertex_cfg.enabled = true;
         router.register_provider(vertex_cfg);
 
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+        let adc_file = tmp_dir.path().join("adc.json");
+        std::fs::write(&adc_file, "{}").expect("write mock adc");
+
         let sub_account = SubscriptionAccount {
             id: "google_vertex:adc".to_string(),
             kind: SubscriptionKind::GoogleVertex,
@@ -9562,7 +9625,7 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
             base_url: Some("https://aiplatform.googleapis.com/v1".to_string()),
             protocol: ProtocolKind::GeminiGenerateContent,
             default_model: Some("gemini-2.5-flash".to_string()),
-            source_path: "/mock/adc.json".to_string(),
+            source_path: adc_file.to_string_lossy().to_string(),
             expires_at_ms: None,
             access_token: None,
             headers: [("x-goog-user-project".to_string(), "test-project-adc".to_string())].into_iter().collect(),
@@ -10108,6 +10171,225 @@ http_headers = { "x-openai-actor-authorization" = "magpie", "X-Custom" = "yes" }
         assert_eq!(
             router.find_best_available_subscription().as_deref(),
             Some("codex:enabled_user")
+        );
+    }
+
+    #[test]
+    fn tier5_find_best_available_subscription_skips_unbacked_active_accounts() {
+        let router = ProviderRouter::new();
+        {
+            let mut guard = router.inner.lock().unwrap();
+            guard.subscriptions.push(SubscriptionAccount {
+                id: "google_vertex:stripped".to_string(),
+                kind: SubscriptionKind::GoogleVertex,
+                label: "Stripped Vertex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::GeminiGenerateContent,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: None,
+                headers: Default::default(),
+            });
+        }
+        assert_eq!(
+            router.find_best_available_subscription(),
+            None,
+            "unbacked active subscription alone must return None"
+        );
+
+        {
+            let mut guard = router.inner.lock().unwrap();
+            guard.subscriptions.push(SubscriptionAccount {
+                id: "codex:valid".to_string(),
+                kind: SubscriptionKind::CodexChatGpt,
+                label: "Valid Codex".to_string(),
+                email: None,
+                account_id: None,
+                plan: None,
+                active: true,
+                base_url: None,
+                protocol: ProtocolKind::CodexResponses,
+                default_model: None,
+                source_path: String::new(),
+                expires_at_ms: None,
+                access_token: Some("eyJ-valid-token".to_string()),
+                headers: Default::default(),
+            });
+        }
+        assert_eq!(
+            router.find_best_available_subscription().as_deref(),
+            Some("codex:valid"),
+            "find_best_available_subscription must skip unbacked active google_vertex and pick backed codex:valid"
+        );
+    }
+
+    #[test]
+    fn tier5_g02_r2_ingest_and_register_reject_stripped_unbacked_subscriptions() {
+        let stripped_vertex = SubscriptionAccount {
+            id: "google_vertex:stripped".to_string(),
+            kind: SubscriptionKind::GoogleVertex,
+            label: "Stripped Vertex".to_string(),
+            email: None,
+            account_id: None,
+            plan: None,
+            active: true,
+            base_url: None,
+            protocol: ProtocolKind::GeminiGenerateContent,
+            default_model: Some("gemini-2.5-flash".to_string()),
+            source_path: String::new(),
+            expires_at_ms: None,
+            access_token: None,
+            headers: Default::default(),
+        };
+        let stripped_codex = SubscriptionAccount {
+            id: "codex:stripped".to_string(),
+            kind: SubscriptionKind::CodexChatGpt,
+            label: "Stripped Codex".to_string(),
+            email: None,
+            account_id: None,
+            plan: None,
+            active: true,
+            base_url: None,
+            protocol: ProtocolKind::CodexResponses,
+            default_model: Some("codex-mini-latest".to_string()),
+            source_path: String::new(),
+            expires_at_ms: None,
+            access_token: None,
+            headers: Default::default(),
+        };
+        let valid_codex = SubscriptionAccount {
+            id: "codex:valid".to_string(),
+            kind: SubscriptionKind::CodexChatGpt,
+            label: "Valid Codex".to_string(),
+            email: None,
+            account_id: Some("acct-valid".to_string()),
+            plan: Some("team".to_string()),
+            active: true,
+            base_url: None,
+            protocol: ProtocolKind::CodexResponses,
+            default_model: Some("codex-mini-latest".to_string()),
+            source_path: String::new(),
+            expires_at_ms: None,
+            access_token: Some("eyJ-valid-token".to_string()),
+            headers: Default::default(),
+        };
+
+        // Case A: register_provider(subscription_to_provider_config(&stripped_vertex)) alone
+        let r_reg = ProviderRouter::new();
+        r_reg.set_allow_local_fallback(false);
+        r_reg.register_provider(subscription_to_provider_config(&stripped_vertex));
+        assert!(!r_reg.has_active_subscription());
+        assert!(!r_reg.has_configured_provider());
+        assert!(r_reg.needs_provider_selection());
+        assert_eq!(r_reg.find_best_available_subscription(), None);
+
+        // Case B: ingest_client_subscriptions with ONLY stripped codex
+        let r_codex_only = ProviderRouter::new();
+        r_codex_only.set_allow_local_fallback(false);
+        r_codex_only.ingest_client_subscriptions(
+            vec![ClientSubscriptionSyncItem {
+                account: stripped_codex.clone(),
+                access_token: None,
+                raw_headers: Default::default(),
+                vertex_adc: None,
+                codex_oauth: None,
+                region_id: None,
+                available_models: Vec::new(),
+            }],
+            true,
+        );
+        assert!(!r_codex_only.has_active_subscription());
+        assert!(!r_codex_only.has_configured_provider());
+        assert!(r_codex_only.needs_provider_selection());
+        assert_eq!(r_codex_only.find_best_available_subscription(), None);
+
+        // Case C: ingest_client_subscriptions with stripped vertex + valid codex -> picks codex:valid
+        let r_both = ProviderRouter::new();
+        r_both.set_allow_local_fallback(false);
+        r_both.ingest_client_subscriptions(
+            vec![
+                ClientSubscriptionSyncItem {
+                    account: stripped_vertex,
+                    access_token: None,
+                    raw_headers: Default::default(),
+                    vertex_adc: None,
+                    codex_oauth: None,
+                    region_id: None,
+                    available_models: Vec::new(),
+                },
+                ClientSubscriptionSyncItem {
+                    account: valid_codex,
+                    access_token: Some("eyJ-valid-token".to_string()),
+                    raw_headers: Default::default(),
+                    vertex_adc: None,
+                    codex_oauth: None,
+                    region_id: None,
+                    available_models: Vec::new(),
+                },
+            ],
+            true,
+        );
+        assert!(r_both.has_active_subscription());
+        assert!(r_both.has_configured_provider());
+        assert!(!r_both.needs_provider_selection());
+        assert_eq!(
+            r_both.find_best_available_subscription().as_deref(),
+            Some("codex:valid")
+        );
+        assert_eq!(r_both.active_info().0, "codex:valid");
+    }
+
+    #[test]
+    fn fallback_chain_excludes_unbacked_subscriptions_when_primary_exists() {
+        let router = ProviderRouter::new();
+        router.set_allow_local_fallback(false);
+
+        let openai = ProviderConfig::openai_compatible(
+            "openai",
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            "sk-real-primary",
+        );
+        router.register_provider(openai);
+
+        let unbacked_vertex = ProviderConfig::google_vertex(
+            "google_vertex:adc",
+            "Google Vertex ADC",
+            "https://us-central1-aiplatform.googleapis.com",
+            "gemini-2.5-pro",
+            None,
+        );
+        router.register_provider(unbacked_vertex);
+
+        let mut backed_sub = ProviderConfig::openai_compatible(
+            "anthropic",
+            "Anthropic",
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-4-20250514",
+            "sk-ant-backed",
+        );
+        backed_sub.is_subscription = true;
+        router.register_provider(backed_sub);
+
+        let _ = router.set_active("openai", None);
+        router.rebuild_default_fallback_chain();
+        let snap = router.snapshot();
+        assert!(
+            !snap
+                .fallback_chain
+                .iter()
+                .any(|t| t.provider_id == "google_vertex:adc"),
+            "unbacked subscription must never be queued as a fallback target"
+        );
+        assert!(
+            snap.fallback_chain.iter().any(|t| t.provider_id == "anthropic"),
+            "backed subscription should remain eligible as a fallback target"
         );
     }
 }

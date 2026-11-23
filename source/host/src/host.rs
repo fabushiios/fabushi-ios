@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use bot_browser::e2ee_sync::{DeviceSyncKeypair, UnlockedUserVaultKey, UserVaultKeyEnvelope};
@@ -64,29 +65,121 @@ pub struct HostConfig {
     pub ios_sandbox_strict: Option<bool>,
 }
 
+/// iOS Jetsam-safe Argon2id upper bounds to prevent OOM DoS from untrusted server envelopes
+/// or corrupted persisted parameters.
+pub const MAX_ARGON2_M_COST_KIB: u32 = 262_144; // 256 MiB
+pub const MAX_ARGON2_T_COST: u32 = 32;
+pub const MAX_ARGON2_P_COST: u32 = 16;
+
+pub fn validate_argon2_ios_ceiling(m_cost_kib: u32, t_cost: u32, p_cost: u32) -> HostResult<()> {
+    if m_cost_kib > MAX_ARGON2_M_COST_KIB
+        || t_cost > MAX_ARGON2_T_COST
+        || p_cost > MAX_ARGON2_P_COST
+    {
+        return Err(HostError::invalid_arguments(format!(
+            "Argon2id parameters exceed iOS Jetsam safety ceiling (m_cost_kib={m_cost_kib} <= {MAX_ARGON2_M_COST_KIB}, t_cost={t_cost} <= {MAX_ARGON2_T_COST}, p_cost={p_cost} <= {MAX_ARGON2_P_COST})"
+        )));
+    }
+    Ok(())
+}
+
+/// RAM-only cached bearer token strictly bound to the `server_url` it was issued for.
+#[derive(Debug, Clone)]
+pub struct RamAccountToken {
+    pub server_url: String,
+    pub token: Zeroizing<String>,
+}
+
 struct InFlightGuard<'a> {
     host: &'a FabushiAppHost,
-    request_id: Option<String>,
+    request_id: String,
     call_seq: u64,
 }
 
 impl<'a> Drop for InFlightGuard<'a> {
     fn drop(&mut self) {
-        if let Some(ref id) = self.request_id {
-            let mut map = self.host.in_flight_cancels.lock();
-            if let Some(entries) = map.get_mut(id) {
-                entries.retain(|(seq, _)| *seq != self.call_seq);
-                if entries.is_empty() {
-                    map.remove(id);
-                }
+        let mut map = self.host.in_flight_cancels.lock();
+        if let Some(entries) = map.get_mut(&self.request_id) {
+            entries.retain(|(seq, _)| *seq != self.call_seq);
+            if entries.is_empty() {
+                map.remove(&self.request_id);
             }
         }
     }
 }
 
+struct CallbackGateState {
+    sink: Option<BridgeEventSink>,
+    shutdown: bool,
+    active_threads: HashMap<ThreadId, usize>,
+}
+
+struct ActiveCallbackGuard {
+    gate: Arc<(Mutex<CallbackGateState>, Condvar)>,
+    tid: ThreadId,
+}
+
+impl Drop for ActiveCallbackGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.0.lock();
+        if let Some(count) = state.active_threads.get_mut(&self.tid) {
+            if *count <= 1 {
+                state.active_threads.remove(&self.tid);
+            } else {
+                *count -= 1;
+            }
+        }
+        self.gate.1.notify_all();
+    }
+}
+
+fn emit_to_sink_guarded(
+    gate: &Arc<(Mutex<CallbackGateState>, Condvar)>,
+    event_type: &str,
+    payload_json: &str,
+) {
+    let tid = std::thread::current().id();
+    let sink = {
+        let mut state = gate.0.lock();
+        if state.shutdown {
+            return;
+        }
+        let Some(sink) = state.sink.clone() else {
+            return;
+        };
+        *state.active_threads.entry(tid).or_insert(0) += 1;
+        sink
+    };
+    let _active_guard = ActiveCallbackGuard {
+        gate: Arc::clone(gate),
+        tid,
+    };
+    sink.emit(event_type, payload_json);
+}
+
 struct PumpControl {
     stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct PumpLifecycleState {
+    control: Option<PumpControl>,
+    pump_tid: Option<ThreadId>,
+    stopping: bool,
+    swapping: bool,
+    shutdown: bool,
+}
+
+struct SwappingGuard<'a> {
+    lifecycle: &'a (Mutex<PumpLifecycleState>, Condvar),
+}
+
+impl<'a> Drop for SwappingGuard<'a> {
+    fn drop(&mut self) {
+        let mut state = self.lifecycle.0.lock();
+        state.swapping = false;
+        self.lifecycle.1.notify_all();
+    }
 }
 
 fn validate_server_url_input(raw_url: &str) -> HostResult<String> {
@@ -125,8 +218,15 @@ fn validate_server_url_input(raw_url: &str) -> HostResult<String> {
             "Invalid server_url authority in '{raw_url}'"
         )));
     }
-    if let Some((host_part, port_part)) = authority.rsplit_once(':') {
-        if !host_part.ends_with(']') {
+    if (authority.starts_with('[') && !authority.contains(']'))
+        || (authority.ends_with(']') && !authority.starts_with('['))
+    {
+        return Err(HostError::invalid_arguments(format!(
+            "Invalid bracketed IPv6 authority in '{raw_url}'"
+        )));
+    }
+    if !authority.ends_with(']') {
+        if let Some((host_part, port_part)) = authority.rsplit_once(':') {
             if host_part.is_empty() || port_part.is_empty() || port_part.parse::<u16>().is_err() {
                 return Err(HostError::invalid_arguments(format!(
                     "Invalid server_url host/port in '{raw_url}'"
@@ -154,19 +254,20 @@ pub struct FabushiAppHost {
     pub action_registry: Arc<ActionRegistry>,
     pub messaging_engine: Arc<Mutex<MessagingEngine>>,
     pub event_queue: Arc<EventQueue>,
-    pub event_sink: Arc<Mutex<Option<BridgeEventSink>>>,
+    callback_gate: Arc<(Mutex<CallbackGateState>, Condvar)>,
     pub generation_fence: Arc<GenerationFence>,
     gen_lock: Mutex<()>,
+    pub(crate) session_lock: Mutex<()>,
     reconfig_lock: Mutex<()>,
     is_shutdown: AtomicBool,
     pub dedup_store: Arc<Mutex<MessageDedupStore>>,
     pub next_message_id: AtomicI64,
     next_call_seq: AtomicU64,
     pub in_flight_cancels: Mutex<HashMap<String, Vec<(u64, CancellationToken)>>>,
-    pump_control: Mutex<Option<PumpControl>>,
-    /// In-memory bearer token cache keyed by account_id (used when storage_passphrase is absent;
-    /// bearer tokens are NEVER written in plaintext to host_state.db).
-    pub account_tokens: Mutex<HashMap<String, Zeroizing<String>>>,
+    pump_lifecycle: (Mutex<PumpLifecycleState>, Condvar),
+    /// In-memory bearer token cache keyed by account_id and bound to server_url
+    /// (used when storage_passphrase is absent; bearer tokens are NEVER written in plaintext to host_state.db).
+    pub account_tokens: Mutex<HashMap<String, RamAccountToken>>,
     // Domain engine state
     pub vault_unlocked_key: Mutex<Option<UnlockedUserVaultKey>>,
     pub vault_envelope: Mutex<Option<UserVaultKeyEnvelope>>,
@@ -175,7 +276,7 @@ pub struct FabushiAppHost {
     pub tool_dock: Mutex<ToolPermissionDock>,
     pub approval_ledger: Mutex<ValueBoundApprovalLedger>,
     pub cua_broker: Mutex<ComputerLeaseBroker>,
-    pub remote_hub: Arc<RemoteControlHub>,
+    remote_hub: RwLock<Arc<RemoteControlHub>>,
     pub osc52_scanner: Mutex<Osc52StreamScanner>,
     pub floor_queues: Mutex<HashMap<i64, FloorControlQueue>>,
     pub loop_budgets: Mutex<HashMap<i64, LoopBudget>>,
@@ -364,17 +465,39 @@ impl FabushiAppHost {
             }
         }
 
-        let event_queue = Arc::new(EventQueue::default());
-        let event_sink: Arc<Mutex<Option<BridgeEventSink>>> = Arc::new(Mutex::new(None));
+        let mut group_workspaces = HashMap::new();
+        if let Ok(persisted_ws) = host_db.kv_list("multi_agent_workspace") {
+            for (cid_str, raw) in persisted_ws {
+                if let (Ok(cid), Ok(ws)) = (
+                    cid_str.parse::<i64>(),
+                    serde_json::from_str::<SharedGroupWorkspace>(&raw),
+                ) {
+                    group_workspaces.insert(cid, ws);
+                }
+            }
+        }
 
-        let pump = Self::spawn_event_pump(
+        let event_queue = Arc::new(EventQueue::default());
+        let callback_gate = Arc::new((
+            Mutex::new(CallbackGateState {
+                sink: None,
+                shutdown: false,
+                active_threads: HashMap::new(),
+            }),
+            Condvar::new(),
+        ));
+
+        let (pump_control, pump_tid) = match Self::spawn_event_pump(
             Arc::downgrade(&client),
             client.outbox.subscribe_events(),
             Arc::clone(&event_queue),
-            Arc::clone(&event_sink),
+            Arc::clone(&callback_gate),
             Arc::clone(&generation_fence),
             Arc::clone(&host_db),
-        );
+        ) {
+            Some((ctrl, tid)) => (Some(ctrl), Some(tid)),
+            None => (None, None),
+        };
 
         let storage_passphrase = config
             .storage_passphrase
@@ -398,16 +521,26 @@ impl FabushiAppHost {
             action_registry,
             messaging_engine: Arc::new(Mutex::new(MessagingEngine::new())),
             event_queue,
-            event_sink,
+            callback_gate,
             generation_fence,
             gen_lock: Mutex::new(()),
+            session_lock: Mutex::new(()),
             reconfig_lock: Mutex::new(()),
             is_shutdown: AtomicBool::new(false),
             dedup_store: Arc::new(Mutex::new(dedup_store)),
             next_message_id: AtomicI64::new(next_msg_id),
             next_call_seq: AtomicU64::new(1),
             in_flight_cancels: Mutex::new(HashMap::new()),
-            pump_control: Mutex::new(pump),
+            pump_lifecycle: (
+                Mutex::new(PumpLifecycleState {
+                    control: pump_control,
+                    pump_tid,
+                    stopping: false,
+                    swapping: false,
+                    shutdown: false,
+                }),
+                Condvar::new(),
+            ),
             account_tokens: Mutex::new(HashMap::new()),
             vault_unlocked_key: Mutex::new(None),
             vault_envelope: Mutex::new(None),
@@ -416,11 +549,11 @@ impl FabushiAppHost {
             tool_dock: Mutex::new(ToolPermissionDock::new()),
             approval_ledger: Mutex::new(ValueBoundApprovalLedger::new()),
             cua_broker: Mutex::new(ComputerLeaseBroker::new()),
-            remote_hub: Arc::new(RemoteControlHub::new()),
+            remote_hub: RwLock::new(Arc::new(RemoteControlHub::new())),
             osc52_scanner: Mutex::new(Osc52StreamScanner::default()),
             floor_queues: Mutex::new(HashMap::new()),
             loop_budgets: Mutex::new(HashMap::new()),
-            group_workspaces: Mutex::new(HashMap::new()),
+            group_workspaces: Mutex::new(group_workspaces),
             magpie_groups: Mutex::new(magpie_groups),
             magpie_metrics: Mutex::new(RouteRuntimeMetrics::default()),
             magpie_masking: Mutex::new(MaskingEngine::new(MaskingConfig {
@@ -463,17 +596,17 @@ impl FabushiAppHost {
     /// 1. It NEVER creates a strong `Runtime -> Task -> Arc<TelegramClient> -> Arc<Runtime>` cycle
     ///    and NEVER triggers a Tokio `Runtime::drop` panic inside a worker thread.
     /// 2. Sync SQLite PTS writes & foreign C callbacks NEVER block the 2-thread Tokio worker pool.
-    /// 3. `event_sink.lock()` is ALWAYS cloned and released before invoking `sink.emit(...)`.
-    /// 4. `stop_event_pump()` signals the Condvar and synchronously `.join()`s the thread so ZERO
-    ///    callbacks can ever fire after `fabushi_host_destroy` returns.
+    /// 3. `callback_gate` mutex is ALWAYS dropped before invoking `sink.emit(...)`, while tracking
+    ///    active callback thread IDs so `shutdown()` drains all in-flight callbacks before returning.
+    /// 4. `stop_event_pump()` coordinates via `pump_lifecycle` Condvar and joins synchronously.
     fn spawn_event_pump(
         client_weak: Weak<TelegramClient>,
         mut outbox_rx: tokio::sync::broadcast::Receiver<OutboxStatusEvent>,
         event_queue: Arc<EventQueue>,
-        event_sink: Arc<Mutex<Option<BridgeEventSink>>>,
+        callback_gate: Arc<(Mutex<CallbackGateState>, Condvar)>,
         generation_fence: Arc<GenerationFence>,
         host_db: Arc<HostSqliteStore>,
-    ) -> Option<PumpControl> {
+    ) -> Option<(PumpControl, ThreadId)> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_bg = Arc::clone(&stop);
         let builder = std::thread::Builder::new().name("fabushi-event-pump".to_string());
@@ -494,10 +627,7 @@ impl FabushiAppHost {
                                 if *stop_bg.0.lock() {
                                     break;
                                 }
-                                let sink_opt = event_sink.lock().clone();
-                                if let Some(sink) = sink_opt {
-                                    sink.emit(&ev_type, &payload.to_string());
-                                }
+                                emit_to_sink_guarded(&callback_gate, &ev_type, &payload.to_string());
                             }
                             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -545,10 +675,7 @@ impl FabushiAppHost {
                             if *stop_bg.0.lock() {
                                 break;
                             }
-                            let sink_opt = event_sink.lock().clone();
-                            if let Some(sink) = sink_opt {
-                                sink.emit(&ev_type, &payload.to_string());
-                            }
+                            emit_to_sink_guarded(&callback_gate, &ev_type, &payload.to_string());
                         }
                     }
 
@@ -565,23 +692,64 @@ impl FabushiAppHost {
             })
             .ok()?;
 
-        Some(PumpControl {
-            stop,
-            handle: Some(handle),
-        })
+        let tid = handle.thread().id();
+        Some((
+            PumpControl {
+                stop,
+                handle: Some(handle),
+            },
+            tid,
+        ))
     }
 
-    fn stop_event_pump(&self) {
-        let control_opt = self.pump_control.lock().take();
-        if let Some(mut control) = control_opt {
-            {
-                let mut stopped = control.stop.0.lock();
-                *stopped = true;
-                control.stop.1.notify_all();
-            }
-            if let Some(handle) = control.handle.take() {
-                if handle.thread().id() != std::thread::current().id() {
-                    let _ = handle.join();
+    fn stop_event_pump(&self, mark_shutdown: bool) {
+        let my_tid = std::thread::current().id();
+        loop {
+            let control_to_stop = {
+                let mut state = self.pump_lifecycle.0.lock();
+                if mark_shutdown {
+                    state.shutdown = true;
+                }
+                if let Some(ctrl) = state.control.take() {
+                    state.stopping = true;
+                    Some(ctrl)
+                } else if state.stopping {
+                    if state.pump_tid == Some(my_tid) {
+                        // Called re-entrantly from the pump thread itself while another thread is
+                        // joining us; never self-deadlock on Condvar.
+                        break;
+                    }
+                    self.pump_lifecycle.1.wait(&mut state);
+                    continue;
+                } else {
+                    break;
+                }
+            };
+
+            if let Some(mut control) = control_to_stop {
+                {
+                    let mut stopped = control.stop.0.lock();
+                    *stopped = true;
+                    control.stop.1.notify_all();
+                }
+                let joined = if let Some(handle) = control.handle.take() {
+                    if handle.thread().id() != my_tid {
+                        let _ = handle.join();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                let mut state = self.pump_lifecycle.0.lock();
+                state.stopping = false;
+                if joined {
+                    state.pump_tid = None;
+                }
+                self.pump_lifecycle.1.notify_all();
+                if !joined {
+                    break;
                 }
             }
         }
@@ -589,6 +757,14 @@ impl FabushiAppHost {
 
     pub fn client(&self) -> Arc<TelegramClient> {
         Arc::clone(&self.client.read())
+    }
+
+    pub fn remote_hub(&self) -> Arc<RemoteControlHub> {
+        Arc::clone(&self.remote_hub.read())
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::Acquire)
     }
 
     pub fn current_server_url(&self) -> String {
@@ -671,6 +847,23 @@ impl FabushiAppHost {
         self.group_workspaces.lock().clear();
         self.chunked_sessions.lock().clear();
         self.webmcp_control_modes.lock().clear();
+        {
+            let mut guard = self.magpie_masking.lock();
+            let cfg = guard.config().clone();
+            *guard = MaskingEngine::new(cfg);
+        }
+        *self.call_engine.lock() = WebRtcCallEngine::new(Vec::new());
+        *self.sfu_bridge.lock() = SfuBridge::new();
+        *self.talk_coordinator.lock() = TalkCoordinator::new();
+        *self.cua_broker.lock() = ComputerLeaseBroker::new();
+        {
+            let old_hub = {
+                let mut guard = self.remote_hub.write();
+                std::mem::replace(&mut *guard, Arc::new(RemoteControlHub::new()))
+            };
+            let _ = old_hub.disconnect_all();
+        }
+        *self.dharma_state.lock() = FabushiClientState::new(Utc::now().timestamp_millis() as f64);
     }
 
     /// Checkpoints all 5 SQLite WAL databases cleanly for iOS `0xdead10cc` background & shutdown safety.
@@ -687,11 +880,29 @@ impl FabushiAppHost {
     }
 
     /// Atomically and serially reconfigures the backend server URL:
-    /// validates the URL and opens `new_client` FIRST before touching any live state,
-    /// then stops & joins the old pump thread, wipes prior account scope, swaps cleanly, and bumps generation.
+    /// fails closed immediately if shutting down or called re-entrantly from the event pump thread,
+    /// opens `new_client` FIRST before touching live state, coordinates safely with `shutdown()`,
+    /// persists `server_url` before swapping, wipes account scope, swaps cleanly, and bumps generation.
     pub fn set_server_url(&self, raw_url: &str) -> HostResult<String> {
+        if self.is_shutdown.load(Ordering::Acquire) {
+            return Err(HostError::host_closed());
+        }
+        {
+            let state = self.pump_lifecycle.0.lock();
+            if state.shutdown {
+                return Err(HostError::host_closed());
+            }
+            if state.pump_tid == Some(std::thread::current().id()) {
+                return Err(HostError::conflict(
+                    "session.setServerUrl cannot be invoked synchronously from an event callback thread",
+                ));
+            }
+        }
         let normalized = validate_server_url_input(raw_url)?;
         let _reconfig = self.reconfig_lock.lock();
+        if self.is_shutdown.load(Ordering::Acquire) {
+            return Err(HostError::host_closed());
+        }
         if *self.server_url.read() == normalized {
             return Ok(normalized);
         }
@@ -711,32 +922,78 @@ impl FabushiAppHost {
                 new_client.sync_coordinator.set_pts(ChatId(cid), pts);
             }
         }
-        self.host_db.set_meta("server_url", &normalized)?;
 
         // 2. Stop & join old pump synchronously so no old callbacks/client handles remain
-        self.stop_event_pump();
+        self.stop_event_pump(false);
 
-        // 3. Clear old client session & wipe cross-account secrets + cancel in-flight ops
-        let old_client = self.client();
-        old_client.clear_session();
-        self.reset_account_scope();
-
-        // 4. Swap live client & server_url, launch dedicated pump for new_client, bump generation
-        *self.client.write() = Arc::clone(&new_client);
-        *self.server_url.write() = normalized.clone();
-
-        if !self.is_shutdown.load(Ordering::Acquire) {
-            let new_pump = Self::spawn_event_pump(
-                Arc::downgrade(&new_client),
-                new_client.outbox.subscribe_events(),
-                Arc::clone(&self.event_queue),
-                Arc::clone(&self.event_sink),
-                Arc::clone(&self.generation_fence),
-                Arc::clone(&self.host_db),
-            );
-            *self.pump_control.lock() = new_pump;
+        // 3. Synchronize with shutdown before any live mutation or WAL write
+        {
+            let mut state = self.pump_lifecycle.0.lock();
+            if state.shutdown || self.is_shutdown.load(Ordering::Acquire) {
+                drop(state);
+                drop(new_client);
+                return Err(HostError::host_closed());
+            }
+            state.swapping = true;
         }
-        self.bump_generation();
+        let swapping_guard = SwappingGuard {
+            lifecycle: &self.pump_lifecycle,
+        };
+
+        // 4. Persist server_url and atomically swap client/account scope under session_lock
+        let old_client = self.client();
+        let swap_res: HostResult<()> = (|| {
+            let _sess = self.session_lock.lock();
+            self.host_db.set_meta("server_url", &normalized)?;
+            old_client.clear_session();
+            let _ = self.host_db.delete_meta("active_account_id");
+            self.reset_account_scope();
+            *self.client.write() = Arc::clone(&new_client);
+            *self.server_url.write() = normalized.clone();
+            self.bump_generation();
+            Ok(())
+        })();
+
+        if let Err(err) = swap_res {
+            {
+                let mut state = self.pump_lifecycle.0.lock();
+                if !state.shutdown && !self.is_shutdown.load(Ordering::Acquire) {
+                    if let Some((restored_pump, tid)) = Self::spawn_event_pump(
+                        Arc::downgrade(&old_client),
+                        old_client.outbox.subscribe_events(),
+                        Arc::clone(&self.event_queue),
+                        Arc::clone(&self.callback_gate),
+                        Arc::clone(&self.generation_fence),
+                        Arc::clone(&self.host_db),
+                    ) {
+                        state.control = Some(restored_pump);
+                        state.pump_tid = Some(tid);
+                    }
+                }
+            }
+            drop(swapping_guard);
+            drop(new_client);
+            return Err(err);
+        }
+
+        // 5. Launch dedicated pump for new_client ONLY if shutdown has not occurred
+        {
+            let mut state = self.pump_lifecycle.0.lock();
+            if !state.shutdown && !self.is_shutdown.load(Ordering::Acquire) {
+                if let Some((new_pump, tid)) = Self::spawn_event_pump(
+                    Arc::downgrade(&new_client),
+                    new_client.outbox.subscribe_events(),
+                    Arc::clone(&self.event_queue),
+                    Arc::clone(&self.callback_gate),
+                    Arc::clone(&self.generation_fence),
+                    Arc::clone(&self.host_db),
+                ) {
+                    state.control = Some(new_pump);
+                    state.pump_tid = Some(tid);
+                }
+            }
+        }
+        drop(swapping_guard);
         drop(old_client);
 
         Ok(normalized)
@@ -747,28 +1004,22 @@ impl FabushiAppHost {
         callback: Option<TelegramBridgeEventCallback>,
         user_context: *mut std::ffi::c_void,
     ) {
-        if self.is_shutdown.load(Ordering::Acquire) {
+        let mut gate = self.callback_gate.0.lock();
+        if gate.shutdown || self.is_shutdown.load(Ordering::Acquire) {
             return;
         }
-        let mut guard = self.event_sink.lock();
-        *guard = callback.map(|cb| BridgeEventSink::new(cb, user_context));
+        gate.sink = callback.map(|cb| BridgeEventSink::new(cb, user_context));
     }
 
     pub fn unregister_event_callback(&self) {
-        let mut guard = self.event_sink.lock();
-        *guard = None;
+        let mut gate = self.callback_gate.0.lock();
+        gate.sink = None;
     }
 
     pub fn emit_event(&self, event_type: &str, payload: Value) {
         let generation = self.current_generation();
         self.event_queue.push(generation, event_type, payload.clone());
-        if self.is_shutdown.load(Ordering::Acquire) {
-            return;
-        }
-        let sink_opt = self.event_sink.lock().clone();
-        if let Some(sink) = sink_opt {
-            sink.emit(event_type, &payload.to_string());
-        }
+        emit_to_sink_guarded(&self.callback_gate, event_type, &payload.to_string());
     }
 
     pub fn poll_events(&self, max_count: u32, timeout_ms: u32) -> Vec<HostEvent> {
@@ -795,7 +1046,7 @@ impl FabushiAppHost {
 
     pub fn cancel_request(&self, request_id: &str) -> bool {
         let trimmed = request_id.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.starts_with("__anon_") {
             return false;
         }
         let tokens: Vec<CancellationToken> = self
@@ -827,16 +1078,19 @@ impl FabushiAppHost {
 
         let token = CancellationToken::new();
         let call_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
-        let tracked_id = if request_id.trim().is_empty() {
-            None
-        } else {
-            let id = request_id.trim().to_string();
+        let tracked_id = {
+            let trimmed = request_id.trim();
+            let id = if trimmed.is_empty() {
+                format!("__anon_{call_seq}")
+            } else {
+                trimmed.to_string()
+            };
             self.in_flight_cancels
                 .lock()
                 .entry(id.clone())
                 .or_default()
                 .push((call_seq, token.clone()));
-            Some(id)
+            id
         };
         if self.is_shutdown.load(Ordering::Acquire) {
             token.cancel();
@@ -860,8 +1114,14 @@ impl FabushiAppHost {
         };
 
         if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::scope(|s| s.spawn(move || runtime.block_on(raced)).join())
-                .map_err(|_| HostError::host_panic("Scoped async worker panicked"))?
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    let _keep_client = client;
+                    runtime.block_on(raced)
+                })
+                .join()
+            })
+            .map_err(|_| HostError::host_panic("Scoped async worker panicked"))?
         } else {
             runtime.block_on(raced)
         }
@@ -872,23 +1132,49 @@ impl FabushiAppHost {
     }
 
     /// Idempotent synchronous host shutdown invoked by `fabushi_host_destroy` and `Drop`.
-    /// Clears the C callback sink FIRST and joins the event pump synchronously so ZERO callbacks
-    /// or background references can survive after `fabushi_host_destroy` returns.
+    /// Atomically closes the callback gate, joins the event pump, drains ALL in-flight C callbacks
+    /// on other threads, waits for any in-flight `set_server_url` state swap, wipes secrets,
+    /// and checkpoints all 5 SQLite WAL databases cleanly so ZERO callbacks or background writes
+    /// can ever survive after `fabushi_host_destroy` returns.
     pub fn shutdown(&self) {
-        self.is_shutdown.store(true, Ordering::SeqCst);
-        // 1. Clear C callback sink FIRST so zero callbacks can fire after shutdown begins
-        *self.event_sink.lock() = None;
+        // 1. Atomically close the callback gate & mark shutdown FIRST
+        {
+            let mut gate = self.callback_gate.0.lock();
+            gate.shutdown = true;
+            gate.sink = None;
+            self.is_shutdown.store(true, Ordering::SeqCst);
+            self.callback_gate.1.notify_all();
+        }
         // 2. Stop and synchronously join the dedicated event pump thread
-        self.stop_event_pump();
-        // 3. Cancel all in-flight RPCs and wipe in-memory account secrets
+        self.stop_event_pump(true);
+        // 3. Drain all in-flight C callbacks running on OTHER threads before returning
+        {
+            let my_tid = std::thread::current().id();
+            let mut gate = self.callback_gate.0.lock();
+            while gate
+                .active_threads
+                .iter()
+                .any(|(&tid, &count)| count > 0 && tid != my_tid)
+            {
+                self.callback_gate.1.wait(&mut gate);
+            }
+        }
+        // 4. Wait for any in-progress non-blocking state-swap in set_server_url to finish
+        {
+            let mut state = self.pump_lifecycle.0.lock();
+            while state.swapping {
+                self.pump_lifecycle.1.wait(&mut state);
+            }
+        }
+        // 5. Cancel all in-flight RPCs (including anonymous ones) and wipe in-memory account secrets
         self.reset_account_scope();
         self.account_tokens.lock().clear();
-        // 4. Wake any blocked poll_events callers cleanly
+        // 6. Wake any blocked poll_events callers cleanly
         self.event_queue.close();
-        // 5. Disconnect WS, outbox worker, and tailnet mesh
+        // 7. Disconnect WS, outbox worker, and tailnet mesh
         let client = self.client();
         client.clear_session();
-        // 6. Checkpoint all SQLite WAL databases cleanly for iOS 0xdead10cc safety
+        // 8. Checkpoint all SQLite WAL databases cleanly for iOS 0xdead10cc safety
         let _ = self.checkpoint_all_wals();
     }
 }

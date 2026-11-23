@@ -181,13 +181,13 @@ pub fn handle_fabushi(
                     }
                 }
                 for item in items {
-                    reg.enable_by_name(item)
+                    reg.enable_by_name(item.trim())
                         .map_err(HostError::invalid_arguments)?;
                 }
             }
             if let Some(disables) = params.get("disable").and_then(|v| v.as_array()) {
                 for item in disables.iter().filter_map(|v| v.as_str()) {
-                    reg.disable_by_name(item)
+                    reg.disable_by_name(item.trim())
                         .map_err(HostError::invalid_arguments)?;
                 }
             }
@@ -864,7 +864,19 @@ pub fn handle_multi_agent(
             let chat_id = req_i64(params, "chat_id")?;
             let key = req_str(params, "key")?;
             let mut wss = host.group_workspaces.lock();
-            let removed = wss.get_mut(&chat_id).and_then(|ws| ws.remove(key));
+            let removed = if let Some(ws) = wss.get_mut(&chat_id) {
+                let r = ws.remove(key);
+                if r.is_some() {
+                    let _ = host.host_db.kv_set(
+                        "multi_agent_workspace",
+                        &chat_id.to_string(),
+                        &ws.snapshot().to_string(),
+                    );
+                }
+                r
+            } else {
+                None
+            };
             Ok(json!({ "removed": removed }))
         }
         "evaluateWakeGate" => {
@@ -1391,7 +1403,7 @@ pub fn handle_mcp(
             if params
                 .get("transport")
                 .and_then(|v| v.as_str())
-                .is_some_and(|t| t.eq_ignore_ascii_case("stdio"))
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("stdio"))
             {
                 host.require_non_ios_host_capability("mcp.registerLocalStdioServer")?;
             }
