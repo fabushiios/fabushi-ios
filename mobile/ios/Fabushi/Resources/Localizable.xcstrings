@@ -1248,13 +1248,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Starting Fabushi..."
+            "value" : "Starting…"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "正在启动法布施..."
+            "value" : "正在启动法布施…"
           }
         }
       }
