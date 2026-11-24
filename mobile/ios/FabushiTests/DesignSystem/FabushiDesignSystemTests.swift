@@ -712,34 +712,29 @@ final class FabushiDesignSystemTests: XCTestCase, @unchecked Sendable {
         let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
         try await coordinator.start(appDataDirectory: persistDir, testMode: true, startNetworkMonitor: false)
 
-        do {
-            let baselineTheme = FabushiTheme(preset: .day, locale: .en)
-            baselineTheme.setBubbleCornerRadius(10)
-            let baselineSaved = await baselineTheme.persistPreferences(using: coordinator)
-            XCTAssertTrue(baselineSaved)
+        let baselineTheme = FabushiTheme(preset: .day, locale: .en)
+        baselineTheme.setBubbleCornerRadius(10)
+        let baselineSaved = await baselineTheme.persistPreferences(using: coordinator)
+        XCTAssertTrue(baselineSaved)
 
-            let mutatedTheme = FabushiTheme(preset: .classic, locale: .zhHans)
-            mutatedTheme.setBubbleCornerRadius(22)
+        let mutatedTheme = FabushiTheme(preset: .classic, locale: .zhHans)
+        mutatedTheme.setBubbleCornerRadius(22)
 
-            let cancelledTask = Task { @MainActor in
-                await mutatedTheme.persistPreferences(using: coordinator)
-            }
-            cancelledTask.cancel()
-            let cancelledSaved = await cancelledTask.value
-            XCTAssertFalse(
-                cancelledSaved,
-                "Cancelled persistPreferences task must return false without writing out-of-order state"
-            )
-
-            let reloadedTheme = FabushiTheme(preset: .night, locale: .en)
-            await reloadedTheme.loadPersistedPreferences(using: coordinator)
-            XCTAssertEqual(reloadedTheme.preset, .day)
-            XCTAssertEqual(reloadedTheme.bubbleCornerRadius, 10)
-
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
+        let cancelledTask = Task { @MainActor in
+            await mutatedTheme.persistPreferences(using: coordinator)
         }
+        cancelledTask.cancel()
+        let cancelledSaved = await cancelledTask.value
+        XCTAssertFalse(
+            cancelledSaved,
+            "Cancelled persistPreferences task must return false without writing out-of-order state"
+        )
+
+        let reloadedTheme = FabushiTheme(preset: .night, locale: .en)
+        await reloadedTheme.loadPersistedPreferences(using: coordinator)
+        XCTAssertEqual(reloadedTheme.preset, .day)
+        XCTAssertEqual(reloadedTheme.bubbleCornerRadius, 10)
+
+        await coordinator.shutdown()
     }
 }
