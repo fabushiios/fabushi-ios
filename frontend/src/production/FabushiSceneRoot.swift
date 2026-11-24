@@ -220,12 +220,17 @@ private struct FabushiCanonicalSceneHost: View {
 
     init(launchConfiguration: FabushiLaunchConfiguration) {
         self.launchConfiguration = launchConfiguration
+        let passcodeController = FabushiPasscodeLockController.shared
+        FabushiFeatureModuleRegistry.shared.register(auth: FabushiAuthModule())
+        FabushiFeatureModuleRegistry.shared.register(
+            security: FabushiSecurityModule(passcodeController: passcodeController)
+        )
         let initialTheme = FabushiTheme()
         initialTheme.applyLaunchConfiguration(launchConfiguration)
         self._theme = State(initialValue: initialTheme)
         self._router = State(
             initialValue: ShellNavigationRouter(
-                isPasscodeLockEnabled: launchConfiguration.requirePasscode
+                isPasscodeLockEnabled: launchConfiguration.requirePasscode || passcodeController.isPasscodeEnabled
             )
         )
     }
@@ -254,6 +259,10 @@ private struct FabushiCanonicalSceneHost: View {
         }
         .onChange(of: scenePhase) { _, phase in
             FabushiCoordinator.shared.handleScenePhaseChange(phase)
+            FabushiPasscodeLockController.shared.handleScenePhaseChange(
+                phase,
+                router: router
+            )
         }
     }
 
@@ -270,6 +279,10 @@ private struct FabushiCanonicalSceneHost: View {
                 testMode: launchConfiguration.isUITestMode
             )
             await theme.loadPersistedPreferences(using: FabushiCoordinator.shared)
+            let passcodeController = FabushiPasscodeLockController.shared
+            passcodeController.reloadFromKeychain()
+            router.isPasscodeLockEnabled = launchConfiguration.requirePasscode || passcodeController.isPasscodeEnabled
+            passcodeController.startIdleMonitorIfNeeded(router: router)
             router.handleAccountScopeChange(
                 generation: FabushiCoordinator.shared.accountScopeGeneration,
                 coordinator: FabushiCoordinator.shared

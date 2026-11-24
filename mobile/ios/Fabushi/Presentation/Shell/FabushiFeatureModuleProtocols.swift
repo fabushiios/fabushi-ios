@@ -171,6 +171,21 @@ public protocol SecurityModuleProviding: AnyObject {
     func makeDevicesSettingsView(
         coordinator: FabushiCoordinator
     ) -> AnyView
+
+    func makePrivacySecuritySettingsView(
+        coordinator: FabushiCoordinator,
+        router: ShellNavigationRouter
+    ) -> AnyView
+}
+
+@MainActor
+public extension SecurityModuleProviding {
+    func makePrivacySecuritySettingsView(
+        coordinator: FabushiCoordinator,
+        router: ShellNavigationRouter
+    ) -> AnyView {
+        AnyView(FabushiPrivacySecurityHubView(coordinator: coordinator))
+    }
 }
 
 // MARK: - Canonical Honest Capability Ledger (7 Tracked IDs — `TEST_INFRA.md §3.1`)

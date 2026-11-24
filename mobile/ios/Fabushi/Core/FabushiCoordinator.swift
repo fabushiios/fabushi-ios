@@ -412,6 +412,100 @@ public final class FabushiCoordinator {
 
     // MARK: - Authoritative Account & Session Transitions
 
+    /// Reconciles Swift coordinator generation and active account state from the authoritative
+    /// Rust host, enforcing lifecycle epoch fencing and monotonic generation progression.
+    @discardableResult
+    public func syncAuthoritativeSessionState() async throws -> UInt64 {
+        guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let expectedEpoch = coordinatorLifecycleEpoch
+
+        let syncedGeneration = try await host.currentGeneration()
+        guard isStarted, coordinatorLifecycleEpoch == expectedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
+        guard syncedGeneration >= accountScopeGeneration else {
+            throw FabushiCoordinatorError.staleGeneration(
+                captured: syncedGeneration,
+                current: accountScopeGeneration
+            )
+        }
+        if syncedGeneration > accountScopeGeneration {
+            applyGenerationAdvance(syncedGeneration)
+        }
+
+        let accountsInfo = try await host.listAccounts(generation: syncedGeneration)
+        guard isStarted, coordinatorLifecycleEpoch == expectedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
+        guard accountScopeGeneration == syncedGeneration else {
+            throw FabushiCoordinatorError.staleGeneration(
+                captured: syncedGeneration,
+                current: accountScopeGeneration
+            )
+        }
+
+        restoreAuthState(from: accountsInfo)
+        if case .authenticated(_, _, let activeId) = authState {
+            _ = try? keychain.loadOrCreateAccountKey(accountId: activeId)
+        }
+        return accountScopeGeneration
+    }
+
+    /// Dispatches an `auth.*` RPC that may atomically establish a session and bump Rust's
+    /// generation inside `finalize_authenticated_session`, adopting the authoritative generation,
+    /// active account identity, and per-account Keychain key without double-calling `session.setAuthSession`.
+    public func dispatchAuthTransition<Req: Encodable & Sendable, Res: Decodable & Sendable>(
+        method: String,
+        params: Req,
+        extractIdentity: (Res) -> (userId: UInt64, username: String)?
+    ) async throws -> FabushiRPCEnvelopeResult<Res> {
+        guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
+        let capturedGen = accountScopeGeneration
+        let capturedAccount = activeAccountId
+
+        let envelope: FabushiRPCEnvelopeResult<Res> = try await host.dispatchEnvelope(
+            method: method,
+            params: params,
+            generation: capturedGen,
+            accountId: capturedAccount
+        )
+
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
+        guard envelope.generation >= accountScopeGeneration else {
+            throw FabushiCoordinatorError.staleGeneration(
+                captured: envelope.generation,
+                current: accountScopeGeneration
+            )
+        }
+
+        if let identity = extractIdentity(envelope.result), identity.userId > 0 {
+            let accountId = String(identity.userId)
+            let trimmedUsername = identity.username.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedUsername = trimmedUsername.isEmpty ? "user_\(identity.userId)" : trimmedUsername
+            applyGenerationAdvance(envelope.generation)
+            activeAccountId = accountId
+            authState = .authenticated(
+                userId: identity.userId,
+                username: resolvedUsername,
+                accountId: accountId
+            )
+            _ = try? keychain.loadOrCreateAccountKey(accountId: accountId)
+        } else if envelope.generation > accountScopeGeneration {
+            await reconcileAuthoritativeSessionState(expectedEpoch: capturedEpoch)
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
+            if case .authenticated(_, _, let activeId) = authState {
+                _ = try? keychain.loadOrCreateAccountKey(accountId: activeId)
+            }
+        }
+
+        return envelope
+    }
+
     @discardableResult
     public func setAuthSession(_ params: FabushiSessionAuthParams) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }

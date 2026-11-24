@@ -929,7 +929,10 @@ public struct FabushiSettingsRootView: View {
         case .language:
             FabushiLanguageSettingsView(coordinator: coordinator)
         case .privacySecurity:
-            FabushiPrivacySecurityHubView(coordinator: coordinator)
+            registry.security.makePrivacySecuritySettingsView(
+                coordinator: coordinator,
+                router: router
+            )
         case .devices:
             registry.security.makeDevicesSettingsView(coordinator: coordinator)
         case .vault:
@@ -1448,7 +1451,7 @@ public struct FabushiLanguageSettingsView: View {
 }
 
 @MainActor
-private struct FabushiPrivacySecurityHubView: View {
+internal struct FabushiPrivacySecurityHubView: View {
     let coordinator: FabushiCoordinator
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
     @Environment(FabushiFeatureModuleRegistry.self) private var injectedRegistry: FabushiFeatureModuleRegistry?

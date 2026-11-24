@@ -368,6 +368,15 @@ public final class ShellNavigationRouter {
 
     // MARK: - Deep Link Handling (`fabushi://`)
 
+    /// Returns and clears the most recent `fabushi://auth/...` callback URL so OAuth/Alipay
+    /// callbacks are consumed exactly once and retries re-trigger SwiftUI observation cleanly.
+    @discardableResult
+    public func consumeLastAuthCallbackURL() -> URL? {
+        let url = lastAuthCallbackURL
+        lastAuthCallbackURL = nil
+        return url
+    }
+
     @discardableResult
     public func handleOpenURL(_ url: URL, coordinator: FabushiCoordinator) -> Bool {
         guard let destination = ShellDeepLinkParser.parse(url) else {
