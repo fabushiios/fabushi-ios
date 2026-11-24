@@ -76,7 +76,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator.authState,
                 .authenticated(userId: 1001, username: "alice_f01", accountId: "1001")
             )
-            XCTAssertTrue(coreKC.hasAccountKey(accountId: "1001"))
+            XCTAssertTrue(try coreKC.hasAccountKey(accountId: "1001"))
 
             // Subsequent fenced RPC MUST succeed with zero stale_generation error!
             let sessions: [FabushiActiveDeviceSessionDTO] = try await coordinator.dispatchFenced(

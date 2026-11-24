@@ -122,7 +122,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             secKC.purgeAccountSecrets(accountId: "101")
             XCTAssertGreaterThan(genAfterLogout, genAfterSwitch)
             XCTAssertEqual(coordinator.authState, .unauthenticated)
-            XCTAssertFalse(coreKC.hasAccountKey(accountId: "101"))
+            XCTAssertFalse(try coreKC.hasAccountKey(accountId: "101"))
             XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
 
             await coordinator.shutdown()
@@ -277,7 +277,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 let parts = tail.split(separator: "/", maxSplits: 1).map(String.init)
                 let category = parts.first ?? "password"
                 let itemKey = parts.count > 1 ? parts[1] : "item"
-                serverItems.withLock { $0.removeValue(forKey: "\(category):\(itemKey)") }
+                _ = serverItems.withLock { $0.removeValue(forKey: "\(category):\(itemKey)") }
                 return .json(200, #"{"ok":true,"category":"\#(category)","item_key":"\#(itemKey)","revision":2,"updated_at_ms":1700000600000}"#)
             }
             return .json(404, #"{"error":"not_found"}"#)
@@ -421,7 +421,8 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(decrypted.username, "alice@example.com")
             XCTAssertEqual(decrypted.password, "LocalOriginPassword!7")
             XCTAssertEqual(decrypted.totpCode?.count, 6)
-            XCTAssertTrue(try await vm.deleteLocalOriginCredential(credentialId: meta.credentialId))
+            let deletedOriginCredential = try await vm.deleteLocalOriginCredential(credentialId: meta.credentialId)
+            XCTAssertTrue(deletedOriginCredential)
 
             await vm.lockVault()
             XCTAssertFalse(vm.isUnlocked)
