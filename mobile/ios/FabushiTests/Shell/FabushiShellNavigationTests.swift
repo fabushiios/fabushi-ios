@@ -588,6 +588,138 @@ final class FabushiShellNavigationTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(FabushiSettingsSectionDestination.parse("   "))
         XCTAssertNil(FabushiSettingsSectionDestination.parse("nonexistent_section"))
     }
+
+    func testUnlockDeepLinkAndWorkspaceNavigationClearPriorModalSheetFlags() async throws {
+        let dir = try makeTempDir("modal_clear_r2b_m5")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.shell.modalclear.\(UUID().uuidString)",
+            account: "shell-modalclear"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            _ = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 803,
+                username: "modal_clear_user",
+                sessionId: "sess-mc-803",
+                token: "tok-mc-803"
+            ))
+
+            let toasts = FabushiToastController(autoDismissEnabled: false)
+            let router = ShellNavigationRouter(toastController: toasts, isPasscodeLockEnabled: true)
+            _ = router.handleAccountScopeChange(
+                generation: coordinator.accountScopeGeneration,
+                coordinator: coordinator
+            )
+            router.isPasscodeLocked = false
+
+            // 1. Locked deferred deep link MUST clear prior modal sheet flags (`R2b`)
+            router.navigate(to: .chats(chatId: 42, messageId: nil), coordinator: coordinator)
+            router.navigate(to: .miniApp(id: "global_dharma"), coordinator: coordinator)
+            router.isAccountSwitcherPresented = true
+            XCTAssertEqual(router.presentedMiniAppId, "global_dharma")
+            XCTAssertTrue(router.isAccountSwitcherPresented)
+
+            router.engagePasscodeLockIfEnabled()
+            XCTAssertTrue(router.isPasscodeLocked)
+
+            let aiProvidersURL = try XCTUnwrap(URL(string: "fabushi://settings/ai_providers"))
+            XCTAssertTrue(router.handleOpenURL(aiProvidersURL, coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, aiProvidersURL)
+            XCTAssertEqual(router.presentedMiniAppId, "global_dharma")
+
+            XCTAssertTrue(router.unlockPasscode(coordinator: coordinator))
+            XCTAssertFalse(router.isPasscodeLocked)
+            XCTAssertEqual(router.activeRoute, .settings(section: "ai_providers"))
+            XCTAssertEqual(coordinator.activeRoute, .settings(section: "ai_providers"))
+            XCTAssertEqual(router.activeTab, .settings)
+            XCTAssertNil(router.presentedMiniAppId, "Unlock deep-link replay must clear stale MiniApp sheet")
+            XCTAssertFalse(router.isCallsSheetPresented, "Unlock deep-link replay must clear stale Calls sheet")
+            XCTAssertFalse(router.isAccountSwitcherPresented, "Unlock deep-link replay must clear stale Account Switcher")
+            XCTAssertEqual(router.activeDeepLinkBannerText, "fabushi://settings/ai_providers")
+
+            // 2. `.calls` and `.miniApp` transitions MUST clear `isAccountSwitcherPresented`
+            router.isAccountSwitcherPresented = true
+            router.navigate(to: .calls, coordinator: coordinator)
+            XCTAssertTrue(router.isCallsSheetPresented)
+            XCTAssertNil(router.presentedMiniAppId)
+            XCTAssertFalse(router.isAccountSwitcherPresented)
+
+            router.isAccountSwitcherPresented = true
+            router.navigate(to: .miniApp(id: "dharma_live"), coordinator: coordinator)
+            XCTAssertEqual(router.presentedMiniAppId, "dharma_live")
+            XCTAssertFalse(router.isCallsSheetPresented)
+            XCTAssertFalse(router.isAccountSwitcherPresented)
+
+            // 3. Unlocked workspace transitions MUST clear prior modal sheet flags (`R2b`)
+            let workspaceRoutes: [ShellRoute] = [
+                .chats(chatId: 130, messageId: nil),
+                .compose,
+                .agentStudio(tab: "kanban"),
+                .remoteComputer(nodeId: "mac_prod_v168"),
+                .settings(section: "appearance"),
+            ]
+            for (index, targetRoute) in workspaceRoutes.enumerated() {
+                if index.isMultiple(of: 2) {
+                    router.navigate(to: .calls, coordinator: coordinator)
+                } else {
+                    router.navigate(to: .miniApp(id: "app_\(index)"), coordinator: coordinator)
+                }
+                router.isAccountSwitcherPresented = true
+
+                router.navigate(to: targetRoute, coordinator: coordinator)
+                XCTAssertEqual(router.activeRoute, targetRoute)
+                XCTAssertEqual(router.lastWorkspaceRoute, targetRoute)
+                XCTAssertFalse(router.isCallsSheetPresented, "Navigating to \(targetRoute) must clear Calls sheet")
+                XCTAssertNil(router.presentedMiniAppId, "Navigating to \(targetRoute) must clear MiniApp sheet")
+                XCTAssertFalse(router.isAccountSwitcherPresented, "Navigating to \(targetRoute) must clear Account Switcher")
+            }
+
+            // 4. `fabushi://contacts` deep link MUST clear active modal sheet flags and restore workspace route
+            router.navigate(to: .chats(chatId: 130, messageId: nil), coordinator: coordinator)
+            router.navigate(to: .miniApp(id: "global_dharma"), coordinator: coordinator)
+            router.isAccountSwitcherPresented = true
+            let contactsURL = try XCTUnwrap(URL(string: "fabushi://contacts"))
+            XCTAssertTrue(router.handleOpenURL(contactsURL, coordinator: coordinator))
+            XCTAssertEqual(router.activeTab, .contacts)
+            XCTAssertFalse(router.isCallsSheetPresented)
+            XCTAssertNil(router.presentedMiniAppId)
+            XCTAssertFalse(router.isAccountSwitcherPresented)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: 130, messageId: nil))
+            XCTAssertEqual(router.activeDeepLinkBannerText, "fabushi://contacts")
+
+            // 5. Switching from active chat 100 to `.contacts` tab clears chat-100 toasts & modal flags
+            // while preserving global toasts (`M5`)
+            router.navigate(to: .chats(chatId: 100, messageId: nil), coordinator: coordinator)
+            toasts.showStagePill("Chat 100 pill", chatId: 100)
+            toasts.showWindowToast("Chat 100 active error", chatId: 100)
+            toasts.showWindowToast("Global notice survives contacts switch", chatId: nil)
+            router.isAccountSwitcherPresented = true
+            router.isCallsSheetPresented = true
+            router.presentedMiniAppId = "stale_app"
+
+            router.selectTab(.contacts, coordinator: coordinator)
+            XCTAssertEqual(router.activeTab, .contacts)
+            XCTAssertNil(toasts.stagePill, "Switching to .contacts from chat 100 must purge chat-100 stage pill")
+            XCTAssertEqual(toasts.windowBanner?.message, "Global notice survives contacts switch")
+            XCTAssertNil(toasts.windowBanner?.scopeChatId)
+            XCTAssertTrue(toasts.windowQueue.isEmpty)
+            XCTAssertFalse(router.isAccountSwitcherPresented)
+            XCTAssertFalse(router.isCallsSheetPresented)
+            XCTAssertNil(router.presentedMiniAppId)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
 }
 
 // MARK: - Protocol Conformance Test Spies

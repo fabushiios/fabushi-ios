@@ -251,8 +251,18 @@ public final class ShellNavigationRouter {
                 targetRoute = .chats(chatId: previousChatId, messageId: nil)
             }
         case .contacts:
-            // Contacts shares the Chats/Contacts messaging root without dropping active chat state
-            // unless switching to a specific peer later.
+            // Leaving an active conversation or modal sheet to the Contacts tab clears chat-scoped
+            // toasts and dismisses any active modal sheet flags without discarding the underlying
+            // chat route until a specific peer is opened.
+            if let old = previousChatId {
+                toastController.clearToasts(forChatId: old)
+            }
+            clearModalSheetFlags()
+            if case .calls = activeRoute {
+                restoreLastWorkspaceRouteKeepingActiveTab(coordinator: coordinator)
+            } else if case .miniApp = activeRoute {
+                restoreLastWorkspaceRouteKeepingActiveTab(coordinator: coordinator)
+            }
             return
         case .studio:
             targetRoute = .agentStudio(tab: nil)
@@ -381,7 +391,7 @@ public final class ShellNavigationRouter {
         case .route(let route):
             navigate(to: route, coordinator: coordinator)
         case .contacts:
-            activeTab = .contacts
+            selectTab(.contacts, coordinator: coordinator)
         case .authCallback:
             break
         }
@@ -470,24 +480,44 @@ public final class ShellNavigationRouter {
         toastController.clearToasts(forChatId: old)
     }
 
+    private func clearModalSheetFlags() {
+        isCallsSheetPresented = false
+        presentedMiniAppId = nil
+        isAccountSwitcherPresented = false
+    }
+
+    private func restoreLastWorkspaceRouteKeepingActiveTab(coordinator: FabushiCoordinator) {
+        let restored = lastWorkspaceRoute
+        activeRoute = restored
+        if coordinator.activeRoute != restored {
+            coordinator.activeRoute = restored
+        }
+    }
+
     private func applyTabAndModalState(for route: ShellRoute) {
         switch route {
         case .chats, .compose:
             activeTab = .chats
             lastWorkspaceRoute = route
+            clearModalSheetFlags()
         case .agentStudio:
             activeTab = .studio
             lastWorkspaceRoute = route
+            clearModalSheetFlags()
         case .remoteComputer:
             activeTab = .remote
             lastWorkspaceRoute = route
+            clearModalSheetFlags()
         case .settings:
             activeTab = .settings
             lastWorkspaceRoute = route
+            clearModalSheetFlags()
         case .calls:
+            isAccountSwitcherPresented = false
             isCallsSheetPresented = true
             presentedMiniAppId = nil
         case .miniApp(let id):
+            isAccountSwitcherPresented = false
             presentedMiniAppId = id ?? "catalog"
             isCallsSheetPresented = false
         }

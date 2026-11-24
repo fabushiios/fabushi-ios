@@ -642,4 +642,104 @@ final class FabushiDesignSystemTests: XCTestCase, @unchecked Sendable {
             }
         }
     }
+
+    func testPrepareStateDirectoryRejectsCaseInsensitiveAPFSAndAncestorPaths() async throws {
+        // 1. Case-insensitive APFS & ancestor path rejection (`M1`)
+        let appSupport = try XCTUnwrap(
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        )
+        let libraryURL = appSupport.deletingLastPathComponent()
+        let appContainerURL = libraryURL.deletingLastPathComponent()
+        let simulatorParentURL = appContainerURL.deletingLastPathComponent()
+
+        let unsafePaths: [String] = [
+            appSupport.appendingPathComponent("fabushicore", isDirectory: true).path,
+            appSupport.appendingPathComponent("FABUSHICORE", isDirectory: true)
+                .appendingPathComponent("sub", isDirectory: true)
+                .path,
+            libraryURL.appendingPathComponent("application support", isDirectory: true)
+                .appendingPathComponent("FaBuShIcOrE", isDirectory: true)
+                .path,
+            libraryURL.path,
+            appContainerURL.path,
+            simulatorParentURL.path,
+            "/SYSTEM",
+            "/Private/Tmp",
+        ]
+
+        for unsafePath in unsafePaths {
+            let unsafeConfig = FabushiLaunchConfiguration(
+                environment: [
+                    "FABUSHI_APP_DATA": unsafePath,
+                    "FABUSHI_E2E_RESET_STATE": "1",
+                ],
+                arguments: []
+            )
+            XCTAssertThrowsError(try unsafeConfig.prepareStateDirectoryIfNeeded()) { error in
+                guard case FabushiLaunchConfigurationError.unsafeResetStateDirectory = error else {
+                    XCTFail("Expected unsafeResetStateDirectory for '\(unsafePath)', got: \(error)")
+                    return
+                }
+            }
+        }
+
+        // Verify a genuinely isolated temp directory STILL resets cleanly (non-vacuous guard)
+        let safeDir = try makeTempDir("safe_reset_m1")
+        defer { try? FileManager.default.removeItem(at: safeDir) }
+        let sentinelFile = safeDir.appendingPathComponent("stale.txt")
+        try Data("stale".utf8).write(to: sentinelFile)
+        let safeConfig = FabushiLaunchConfiguration(
+            environment: [
+                "FABUSHI_APP_DATA": safeDir.path,
+                "FABUSHI_E2E_RESET_STATE": "1",
+            ],
+            arguments: []
+        )
+        XCTAssertNoThrow(try safeConfig.prepareStateDirectoryIfNeeded())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sentinelFile.path))
+
+        // 2. Cancelled `persistPreferences` task aborts immediately without overwriting SQLite (`M4`)
+        let persistDir = try makeTempDir("cancelled_persist_m4")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.theme.cancel.\(UUID().uuidString)",
+            account: "theme-cancel-test"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: persistDir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: persistDir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            let baselineTheme = FabushiTheme(preset: .day, locale: .en)
+            baselineTheme.setBubbleCornerRadius(10)
+            let baselineSaved = await baselineTheme.persistPreferences(using: coordinator)
+            XCTAssertTrue(baselineSaved)
+
+            let mutatedTheme = FabushiTheme(preset: .classic, locale: .zhHans)
+            mutatedTheme.setBubbleCornerRadius(22)
+
+            let cancelledTask = Task { @MainActor in
+                await mutatedTheme.persistPreferences(using: coordinator)
+            }
+            cancelledTask.cancel()
+            let cancelledSaved = await cancelledTask.value
+            XCTAssertFalse(
+                cancelledSaved,
+                "Cancelled persistPreferences task must return false without writing out-of-order state"
+            )
+
+            let reloadedTheme = FabushiTheme(preset: .night, locale: .en)
+            await reloadedTheme.loadPersistedPreferences(using: coordinator)
+            XCTAssertEqual(reloadedTheme.preset, .day)
+            XCTAssertEqual(reloadedTheme.bubbleCornerRadius, 10)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
 }

@@ -25,6 +25,7 @@ public struct FabushiAdaptiveShellView: View {
 
     @State private var isRetryingStartup = false
     @State private var didSyncLaunchPasscodePolicy = false
+    @State private var persistentBannerHeight: CGFloat = 0
 
     public init(
         coordinator: FabushiCoordinator = .shared,
@@ -64,18 +65,36 @@ public struct FabushiAdaptiveShellView: View {
         coordinator.authState != .unauthenticated && router.isPasscodeLocked
     }
 
+    private var isPrivacyBlurActive: Bool {
+        scenePhase != .active && (router.isPasscodeLocked || router.isPasscodeLockEnabled)
+    }
+
+    private var hasPersistentTopBanner: Bool {
+        coordinator.authState != .unauthenticated
+            && (router.activeDeepLinkBannerText != nil || router.activeProviderErrorMessage != nil)
+    }
+
     private var topToastInset: CGFloat {
-        let baseInset: CGFloat = horizontalSizeClass == .compact ? 56 : 52
-        let hasTopBanner = router.activeDeepLinkBannerText != nil || router.activeProviderErrorMessage != nil
-        return hasTopBanner ? baseInset + 56 : baseInset
+        let baseNavInset: CGFloat = horizontalSizeClass == .compact ? 56 : 52
+        guard hasPersistentTopBanner else {
+            return baseNavInset
+        }
+        // Floor prevents a single-frame collision over persistent banners before GeometryReader
+        // reports, while `persistentBannerHeight` tracks exact rendered height across default and AX5.
+        let estimatedFloor: CGFloat =
+            (router.activeDeepLinkBannerText != nil ? 68 : 0)
+            + (router.activeProviderErrorMessage != nil ? 170 : 0)
+        return max(persistentBannerHeight, estimatedFloor) + baseNavInset
     }
 
     private var activeModalSheetBinding: Binding<ActiveModalSheet?> {
         Binding(
             get: {
-                // Strictly suppress modal `.sheet` presentations whenever passcode-locked or
-                // non-active so sheets never render above Passcode Lock or Privacy Blur overlays.
-                guard !router.isPasscodeLocked, scenePhase == .active else {
+                // Strictly suppress modal `.sheet` presentations whenever Passcode Lock or
+                // Privacy Blur is active so sheets never render above security overlays, while
+                // preserving live Calls/MiniApp sheets across transient `.inactive` system prompts
+                // when Passcode Lock is disabled.
+                guard !router.isPasscodeLocked, !isPrivacyBlurActive else {
                     return nil
                 }
                 if router.isAccountSwitcherPresented {
@@ -96,6 +115,9 @@ public struct FabushiAdaptiveShellView: View {
             },
             set: { newValue in
                 guard newValue == nil else { return }
+                // Do not destroy modal sheet flags when transient Passcode Lock or Privacy Blur
+                // suppresses presentation; unlocked user swipe-dismiss clears modal state cleanly.
+                guard !router.isPasscodeLocked, !isPrivacyBlurActive else { return }
                 router.dismissActiveModalSheet(
                     coordinator: coordinator,
                     dismissCompactInspector: horizontalSizeClass == .compact
@@ -108,12 +130,14 @@ public struct FabushiAdaptiveShellView: View {
         Binding(
             get: {
                 !router.isPasscodeLocked
+                    && !isPrivacyBlurActive
                     && horizontalSizeClass == .regular
                     && router.isInspectorPresented
                     && router.inspectorTarget != nil
             },
             set: { presented in
                 if !presented {
+                    guard !router.isPasscodeLocked, !isPrivacyBlurActive else { return }
                     router.dismissInspector()
                 }
             }
@@ -124,9 +148,11 @@ public struct FabushiAdaptiveShellView: View {
         ZStack(alignment: .top) {
             rootLifecycleSurface
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .allowsHitTesting(!isPasscodeOverlayActive)
+                .allowsHitTesting(!isPasscodeOverlayActive && !isPrivacyBlurActive)
 
-            if router.toastController.stagePill != nil || router.toastController.windowBanner != nil {
+            if !isPasscodeOverlayActive,
+               !isPrivacyBlurActive,
+               (router.toastController.stagePill != nil || router.toastController.windowBanner != nil) {
                 FabushiTwoLayerToastHost(controller: router.toastController)
                     .padding(.top, topToastInset)
                     .zIndex(40)
@@ -144,7 +170,7 @@ public struct FabushiAdaptiveShellView: View {
                 .zIndex(50)
             }
 
-            if scenePhase != .active, (router.isPasscodeLocked || router.isPasscodeLockEnabled) {
+            if isPrivacyBlurActive {
                 registry.security.makePrivacyBlurOverlay()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .zIndex(100)
@@ -183,6 +209,7 @@ public struct FabushiAdaptiveShellView: View {
         }
         .onChange(of: coordinator.authState) { oldState, newState in
             if newState == .unauthenticated {
+                persistentBannerHeight = 0
                 router.engagePasscodeLockIfEnabled()
             } else {
                 if oldState == .unauthenticated {
@@ -277,7 +304,20 @@ public struct FabushiAdaptiveShellView: View {
 
     @ViewBuilder
     private var authenticatedShell: some View {
-        ZStack(alignment: .top) {
+        VStack(spacing: 0) {
+            if hasPersistentTopBanner {
+                topPersistentBanners
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear
+                                .preference(
+                                    key: PersistentBannerHeightPreferenceKey.self,
+                                    value: proxy.size.height
+                                )
+                        }
+                    )
+            }
+
             Group {
                 if horizontalSizeClass == .regular {
                     regularIPadShell
@@ -286,13 +326,19 @@ public struct FabushiAdaptiveShellView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            topPersistentBanners
+        }
+        .onPreferenceChange(PersistentBannerHeightPreferenceKey.self) { height in
+            persistentBannerHeight = hasPersistentTopBanner ? height : 0
+        }
+        .onChange(of: hasPersistentTopBanner) { _, isActive in
+            if !isActive {
+                persistentBannerHeight = 0
+            }
         }
         .overlay(alignment: .bottomTrailing) {
             floatingOverlayStack
                 .padding(.trailing, 16)
-                .padding(.bottom, horizontalSizeClass == .compact ? 72 : 24)
+                .padding(.bottom, horizontalSizeClass == .compact ? 116 : 84)
         }
         .background(theme.surfacePrimary)
         .accessibilityElement(children: .contain)
@@ -316,6 +362,7 @@ public struct FabushiAdaptiveShellView: View {
             } else {
                 NavigationSplitView(columnVisibility: .constant(.all)) {
                     expandedSidebarView
+                        .toolbar(removing: .sidebarToggle)
                         .navigationSplitViewColumnWidth(
                             min: FabushiLayoutMetrics.sidebarMinWidth,
                             ideal: FabushiLayoutMetrics.sidebarDefaultWidth,
@@ -480,7 +527,9 @@ public struct FabushiAdaptiveShellView: View {
         }
     }
 
-    private var resolvedIPadWorkspaceRoute: ShellRoute {
+    /// Shared workspace route underneath modal `.calls`/`.miniApp` sheets so both iPad and
+    /// compact iPhone preserve active conversation `@State` without duplicating live modal surfaces.
+    private var resolvedWorkspaceRoute: ShellRoute {
         switch router.activeRoute {
         case .calls, .miniApp:
             return router.lastWorkspaceRoute
@@ -492,8 +541,8 @@ public struct FabushiAdaptiveShellView: View {
     @ViewBuilder
     private var stageContainerView: some View {
         NavigationStack {
-            Group {
-                switch resolvedIPadWorkspaceRoute {
+            ZStack {
+                switch resolvedWorkspaceRoute {
                 case .compose:
                     registry.messaging.makeMultiSelectComposeView(
                         coordinator: coordinator,
@@ -525,7 +574,7 @@ public struct FabushiAdaptiveShellView: View {
                         router: router
                     )
                 case .calls, .miniApp:
-                    // Calls and Mini Apps are presented exclusively as modal sheets so the iPad
+                    // Calls and Mini Apps are presented exclusively as modal sheets so the
                     // detail column never duplicates live WKWebView or Call surfaces underneath.
                     registry.messaging.makeConversationStageView(
                         chatId: nil,
@@ -544,10 +593,10 @@ public struct FabushiAdaptiveShellView: View {
     // MARK: - iPhone Compact TabView + NavigationStack Shell
 
     private var isCompactChatsDetailActive: Bool {
-        if case .compose = router.activeRoute {
+        if case .compose = resolvedWorkspaceRoute {
             return true
         }
-        if case .chats(let chatId, _) = router.activeRoute, chatId != nil {
+        if case .chats(let chatId, _) = resolvedWorkspaceRoute, chatId != nil {
             return true
         }
         return false
@@ -562,18 +611,22 @@ public struct FabushiAdaptiveShellView: View {
         ) {
             NavigationStack {
                 Group {
-                    if case .compose = router.activeRoute {
+                    if case .compose = resolvedWorkspaceRoute {
                         registry.messaging.makeMultiSelectComposeView(
                             coordinator: coordinator,
                             router: router
                         )
-                    } else if case .chats(let chatId, let messageId) = router.activeRoute, chatId != nil {
-                        registry.messaging.makeConversationStageView(
-                            chatId: chatId,
-                            messageId: messageId,
-                            coordinator: coordinator,
-                            router: router
-                        )
+                    } else if case .chats(let chatId, let messageId) = resolvedWorkspaceRoute, chatId != nil {
+                        ZStack {
+                            registry.messaging.makeConversationStageView(
+                                chatId: chatId,
+                                messageId: messageId,
+                                coordinator: coordinator,
+                                router: router
+                            )
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityElement(children: .contain)
                         .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.stageSlot)
                     } else {
                         registry.messaging.makeChatSidebarView(
@@ -750,7 +803,12 @@ public struct FabushiAdaptiveShellView: View {
                 .padding(.horizontal, 16)
             }
         }
-        .padding(.top, 8)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(theme.surfaceTopBar)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
     }
 
     @ViewBuilder
@@ -781,23 +839,31 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     private var activeStudioTab: String? {
-        if case .agentStudio(let tab) = router.activeRoute {
+        if case .agentStudio(let tab) = resolvedWorkspaceRoute {
             return tab
         }
         return nil
     }
 
     private var activeRemoteNodeId: String? {
-        if case .remoteComputer(let nodeId) = router.activeRoute {
+        if case .remoteComputer(let nodeId) = resolvedWorkspaceRoute {
             return nodeId
         }
         return nil
     }
 
     private var activeSettingsSection: String? {
-        if case .settings(let section) = router.activeRoute {
+        if case .settings(let section) = resolvedWorkspaceRoute {
             return section
         }
         return nil
+    }
+}
+
+private struct PersistentBannerHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

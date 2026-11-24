@@ -1016,7 +1016,7 @@ public final class FabushiTheme {
     /// Persists all current UI preferences to real `settings.localSet` SQLite `host_kv` storage.
     @discardableResult
     public func persistPreferences(using coordinator: FabushiCoordinator) async -> Bool {
-        guard coordinator.isStarted else { return false }
+        guard !Task.isCancelled, coordinator.isStarted else { return false }
         let entries: [(String, FabushiJSONValue)] = [
             (PreferenceKey.themeMode, .string(preset.rawValue)),
             (PreferenceKey.accentHex, customAccentHex.map { .string($0) } ?? .null),
@@ -1029,6 +1029,7 @@ public final class FabushiTheme {
 
         var allSaved = true
         for (key, value) in entries {
+            guard !Task.isCancelled else { return false }
             do {
                 let res: LocalSettingSetResult = try await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.settings.method("localSet"),
@@ -1041,7 +1042,7 @@ public final class FabushiTheme {
                 allSaved = false
             }
         }
-        return allSaved
+        return !Task.isCancelled && allSaved
     }
 
     private func applyPersistedValues(_ stored: [String: FabushiJSONValue]) {

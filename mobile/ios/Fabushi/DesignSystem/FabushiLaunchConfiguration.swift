@@ -267,17 +267,22 @@ public struct FabushiLaunchConfiguration: Sendable, Equatable {
             }
         }
 
-        if !candidates.isDisjoint(with: forbiddenExactPaths) {
+        let candidatesLower = Set(candidates.map { $0.lowercased() })
+        let forbiddenExactLower = Set(forbiddenExactPaths.map { $0.lowercased() })
+        if !candidatesLower.isDisjoint(with: forbiddenExactLower) {
             return true
         }
 
-        // Reject production `Application Support/FabushiCore` and any descendant inside it.
+        // Reject production `Application Support/FabushiCore`, any descendant inside it,
+        // and any ancestor directory containing it (case-insensitive for APFS safety).
         for appSupportURL in fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask) {
             let productionCoreURL = appSupportURL.appendingPathComponent("FabushiCore", isDirectory: true)
-            let productionPaths = candidateNormalizedPaths(for: productionCoreURL)
-            for prodPath in productionPaths {
-                for candidate in candidates {
-                    if candidate == prodPath || candidate.hasPrefix(prodPath + "/") {
+            let productionPathsLower = candidateNormalizedPaths(for: productionCoreURL).map { $0.lowercased() }
+            for prodPathLower in productionPathsLower {
+                for candidateLower in candidatesLower {
+                    if candidateLower == prodPathLower
+                        || candidateLower.hasPrefix(prodPathLower + "/")
+                        || prodPathLower.hasPrefix(candidateLower + "/") {
                         return true
                     }
                 }
