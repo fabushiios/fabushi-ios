@@ -54,10 +54,10 @@ public struct FabushiWindowToast: Identifiable, Sendable, Equatable {
 @MainActor
 @Observable
 public final class FabushiToastController {
-    public static let defaultStageDurationSeconds: TimeInterval = 2.0
-    public static let defaultWindowDurationSeconds: TimeInterval = 3.0
-    public static let minimumDurationSeconds: TimeInterval = 0.08
-    public static let maxSingleLineSummaryLength: Int = 160
+    nonisolated public static let defaultStageDurationSeconds: TimeInterval = 2.0
+    nonisolated public static let defaultWindowDurationSeconds: TimeInterval = 3.0
+    nonisolated public static let minimumDurationSeconds: TimeInterval = 0.08
+    nonisolated public static let maxSingleLineSummaryLength: Int = 160
 
     public private(set) var stagePill: FabushiStageToast?
     public private(set) var stageGeneration: UInt64 = 0
@@ -73,7 +73,7 @@ public final class FabushiToastController {
     }
 
     /// Upstream `is_error_toast_text` detector (`PROVIDER_ERROR`, `Error:`, `失败`, `错误`, `failed`, `error`).
-    public static func isErrorText(_ message: String) -> Bool {
+    nonisolated public static func isErrorText(_ message: String) -> Bool {
         let lower = message.lowercased()
         return message.contains("PROVIDER_ERROR")
             || lower.contains("error:")
@@ -84,7 +84,7 @@ public final class FabushiToastController {
     }
 
     /// Collapses newlines and caps overly verbose error payloads to a clean single line.
-    public static func sanitizeSingleLine(
+    nonisolated public static func sanitizeSingleLine(
         _ message: String,
         maxLength: Int = maxSingleLineSummaryLength
     ) -> String {

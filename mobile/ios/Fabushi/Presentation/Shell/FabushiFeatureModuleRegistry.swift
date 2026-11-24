@@ -9,7 +9,16 @@ import SwiftUI
 @MainActor
 @Observable
 public final class FabushiFeatureModuleRegistry {
-    public static let shared = FabushiFeatureModuleRegistry()
+    private static var _sharedInstance: FabushiFeatureModuleRegistry?
+
+    public static var shared: FabushiFeatureModuleRegistry {
+        if let existing = _sharedInstance {
+            return existing
+        }
+        let instance = FabushiFeatureModuleRegistry()
+        _sharedInstance = instance
+        return instance
+    }
 
     public private(set) var messaging: any MessagingModuleProviding
     public private(set) var agentStudio: any AgentStudioModuleProviding

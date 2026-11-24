@@ -652,11 +652,20 @@ public struct FabushiThemePalette: Sendable, Equatable {
 @MainActor
 @Observable
 public final class FabushiTheme {
-    public static let `default` = FabushiTheme()
+    private static var _defaultInstance: FabushiTheme?
 
-    public static let minBubbleCornerRadius: CGFloat = 6
-    public static let maxBubbleCornerRadius: CGFloat = 18
-    public static let defaultBubbleCornerRadius: CGFloat = 17
+    public static var `default`: FabushiTheme {
+        if let existing = _defaultInstance {
+            return existing
+        }
+        let instance = FabushiTheme()
+        _defaultInstance = instance
+        return instance
+    }
+
+    nonisolated public static let minBubbleCornerRadius: CGFloat = 6
+    nonisolated public static let maxBubbleCornerRadius: CGFloat = 18
+    nonisolated public static let defaultBubbleCornerRadius: CGFloat = 17
 
     public enum PreferenceKey: Sendable {
         public static let themeMode = "ui.theme_mode"
@@ -686,7 +695,7 @@ public final class FabushiTheme {
     public init(
         preset: FabushiThemePreset = .night,
         customAccentHex: String? = nil,
-        bubbleCornerRadius: CGFloat = defaultBubbleCornerRadius,
+        bubbleCornerRadius: CGFloat = FabushiTheme.defaultBubbleCornerRadius,
         wallpaper: FabushiWallpaper? = nil,
         locale: FabushiLocale = FabushiLocale.systemDefault(),
         reduceMotionOverride: Bool = false,
