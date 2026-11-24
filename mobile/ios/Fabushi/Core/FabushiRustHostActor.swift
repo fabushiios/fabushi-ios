@@ -99,16 +99,24 @@ private func dispatchCancelAttempt(
     requestId: String,
     cancelState: DispatchCancelState,
     handleBox: HostHandleBox,
+    rpcGroup: DispatchGroup,
     cancelQueue: DispatchQueue
 ) {
     if cancelState.isFinished {
         return
     }
-    guard let handle = handleBox.current() else {
+    let didCancel: Bool? = {
+        rpcGroup.enter()
+        defer { rpcGroup.leave() }
+        guard let handle = handleBox.current() else {
+            return nil
+        }
+        return requestId.withCString { cReqId in
+            fabushi_host_cancel(handle.pointer, cReqId)
+        }
+    }()
+    guard let didCancel else {
         return
-    }
-    let didCancel = requestId.withCString { cReqId in
-        fabushi_host_cancel(handle.pointer, cReqId)
     }
     if didCancel || attempt + 1 >= maxAttempts {
         return
@@ -120,6 +128,7 @@ private func dispatchCancelAttempt(
             requestId: requestId,
             cancelState: cancelState,
             handleBox: handleBox,
+            rpcGroup: rpcGroup,
             cancelQueue: cancelQueue
         )
     }
@@ -488,6 +497,7 @@ public actor FabushiRustHostActor {
             throw FabushiHostError.serializationFailed(message: "Failed to encode RPC request as UTF-8")
         }
 
+        let capturedEpoch = lifecycleEpoch
         let rawResponse = try await dispatchRawJSON(requestId: requestId, requestJSON: requestJSON)
         guard let responseData = rawResponse.data(using: .utf8) else {
             throw FabushiHostError.invalidResponse(raw: rawResponse)
@@ -503,7 +513,7 @@ public actor FabushiRustHostActor {
                let errPayload = errorOnly.error
             {
                 let respGen = errorOnly.generation ?? latestObservedGeneration
-                if respGen > latestObservedGeneration {
+                if lifecycleEpoch == capturedEpoch, respGen > latestObservedGeneration {
                     latestObservedGeneration = respGen
                 }
                 throw FabushiHostError.fromRPCError(
@@ -518,7 +528,7 @@ public actor FabushiRustHostActor {
         }
 
         let respGeneration = decoded.generation ?? latestObservedGeneration
-        if respGeneration > latestObservedGeneration {
+        if lifecycleEpoch == capturedEpoch, respGeneration > latestObservedGeneration {
             latestObservedGeneration = respGeneration
         }
 
@@ -588,18 +598,24 @@ public actor FabushiRustHostActor {
     }
 
     public func currentGeneration() async throws -> UInt64 {
+        let capturedEpoch = lifecycleEpoch
         let res: FabushiGenerationResult = try await dispatch(
             method: FabushiRPCNamespace.generation.method("current")
         )
-        latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        if lifecycleEpoch == capturedEpoch {
+            latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        }
         return res.generation
     }
 
     public func bumpGeneration() async throws -> UInt64 {
+        let capturedEpoch = lifecycleEpoch
         let res: FabushiGenerationResult = try await dispatch(
             method: FabushiRPCNamespace.generation.method("bump")
         )
-        latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        if lifecycleEpoch == capturedEpoch {
+            latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        }
         return res.generation
     }
 
@@ -607,11 +623,14 @@ public actor FabushiRustHostActor {
         struct Params: Encodable, Sendable {
             let generation: UInt64
         }
+        let capturedEpoch = lifecycleEpoch
         let res: FabushiGenerationResult = try await dispatch(
             method: FabushiRPCNamespace.generation.method("set"),
             params: Params(generation: generation)
         )
-        latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        if lifecycleEpoch == capturedEpoch {
+            latestObservedGeneration = max(latestObservedGeneration, res.generation)
+        }
         return res.generation
     }
 
@@ -619,11 +638,14 @@ public actor FabushiRustHostActor {
         struct Params: Encodable, Sendable {
             let generation: UInt64
         }
+        let capturedEpoch = lifecycleEpoch
         let res: FabushiGenerationValidationResult = try await dispatch(
             method: FabushiRPCNamespace.generation.method("validate"),
             params: Params(generation: generation)
         )
-        latestObservedGeneration = max(latestObservedGeneration, res.current)
+        if lifecycleEpoch == capturedEpoch {
+            latestObservedGeneration = max(latestObservedGeneration, res.current)
+        }
         return res
     }
 
@@ -774,6 +796,7 @@ public actor FabushiRustHostActor {
                     requestId: requestId,
                     cancelState: cancelState,
                     handleBox: box,
+                    rpcGroup: rGroup,
                     cancelQueue: cQueue
                 )
             }

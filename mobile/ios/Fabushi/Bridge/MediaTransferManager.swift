@@ -239,7 +239,18 @@ public actor MediaTransferManager {
                     method: FabushiRPCNamespace.media.method("chunkedSessionCreate"),
                     params: createParams
                 )
+            } catch is CancellationError {
+                throw MediaTransferError.transferCancelled(transferId)
+            } catch let hostError as FabushiHostError {
+                if hostError.isCancelled || isCancelled(transferId: transferId) || Task.isCancelled {
+                    throw MediaTransferError.transferCancelled(transferId)
+                }
+                progressStream?.yield(.failed(transferId: transferId, error: hostError.localizedDescription))
+                throw MediaTransferError.serverError(hostError.localizedDescription)
             } catch {
+                if isCancelled(transferId: transferId) || Task.isCancelled {
+                    throw MediaTransferError.transferCancelled(transferId)
+                }
                 progressStream?.yield(.failed(transferId: transferId, error: error.localizedDescription))
                 throw MediaTransferError.serverError(error.localizedDescription)
             }
@@ -346,7 +357,18 @@ public actor MediaTransferManager {
                 method: FabushiRPCNamespace.media.method("chunkedSessionFinalize"),
                 params: finalizeParams
             )
+        } catch is CancellationError {
+            throw MediaTransferError.transferCancelled(transferId)
+        } catch let hostError as FabushiHostError {
+            if hostError.isCancelled || isCancelled(transferId: transferId) || Task.isCancelled {
+                throw MediaTransferError.transferCancelled(transferId)
+            }
+            progressStream?.yield(.failed(transferId: transferId, error: hostError.localizedDescription))
+            throw MediaTransferError.serverError(hostError.localizedDescription)
         } catch {
+            if isCancelled(transferId: transferId) || Task.isCancelled {
+                throw MediaTransferError.transferCancelled(transferId)
+            }
             progressStream?.yield(.failed(transferId: transferId, error: error.localizedDescription))
             throw MediaTransferError.serverError(error.localizedDescription)
         }

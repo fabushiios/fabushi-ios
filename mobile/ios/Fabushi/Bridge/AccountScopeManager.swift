@@ -150,7 +150,7 @@ public actor AccountScopeManager {
     public func logout() async throws -> UInt64 {
         let currentGen = try await fetchHostGeneration()
         let listed = try? await host.listAccounts(generation: currentGen)
-        let targetAccount = listed?.activeAccountId ?? activeAccountId
+        let targetAccount = listed != nil ? listed?.activeAccountId : activeAccountId
 
         let result: FabushiClearSessionResult
         do {

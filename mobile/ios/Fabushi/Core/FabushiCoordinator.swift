@@ -130,6 +130,20 @@ public final class FabushiCoordinator {
     private var inFlightStartId: UInt64 = 0
     @ObservationIgnored
     private var inFlightStartTask: Task<Void, Error>? = nil
+    @ObservationIgnored
+    private var shutdownTaskCounter: UInt64 = 0
+    @ObservationIgnored
+    private var inFlightShutdownId: UInt64 = 0
+    @ObservationIgnored
+    private var inFlightShutdownTask: Task<Void, Never>? = nil
+
+    internal var hasInFlightStart: Bool {
+        inFlightStartTask != nil
+    }
+
+    internal var hasInFlightShutdown: Bool {
+        inFlightShutdownTask != nil
+    }
 
     public init(
         host: FabushiRustHostActor = .shared,
@@ -154,34 +168,38 @@ public final class FabushiCoordinator {
         testMode: Bool = false,
         startNetworkMonitor: Bool = true
     ) async throws {
-        if isStarted {
-            return
-        }
-        if let existingTask = inFlightStartTask {
-            try await existingTask.value
-            return
-        }
-
-        let expectedEpoch = coordinatorLifecycleEpoch
-        startTaskCounter &+= 1
-        let taskId = startTaskCounter
-
-        let task = Task<Void, Error> { @MainActor [weak self] in
-            guard let self else {
-                throw FabushiCoordinatorError.notStarted
+        while true {
+            if let shutdownTask = inFlightShutdownTask {
+                await shutdownTask.value
+                continue
             }
-            try await self.performStart(
-                appDataDirectory: appDataDirectory,
-                serverURL: serverURL,
-                testMode: testMode,
-                startNetworkMonitor: startNetworkMonitor,
-                expectedEpoch: expectedEpoch,
-                taskId: taskId
-            )
+            if isStarted {
+                return
+            }
+            if let existingTask = inFlightStartTask {
+                try await existingTask.value
+                return
+            }
+
+            let expectedEpoch = coordinatorLifecycleEpoch
+            startTaskCounter &+= 1
+            let taskId = startTaskCounter
+
+            let task = Task<Void, Error> { @MainActor in
+                try await self.performStart(
+                    appDataDirectory: appDataDirectory,
+                    serverURL: serverURL,
+                    testMode: testMode,
+                    startNetworkMonitor: startNetworkMonitor,
+                    expectedEpoch: expectedEpoch,
+                    taskId: taskId
+                )
+            }
+            inFlightStartId = taskId
+            inFlightStartTask = task
+            try await task.value
+            return
         }
-        inFlightStartId = taskId
-        inFlightStartTask = task
-        try await task.value
     }
 
     private func performStart(
@@ -241,68 +259,119 @@ public final class FabushiCoordinator {
             guard coordinatorLifecycleEpoch == expectedEpoch else {
                 throw FabushiHostError.hostClosed(message: "FabushiCoordinator shut down during generation sync")
             }
-            accountScopeGeneration = liveGeneration
 
             let urlInfo = try? await host.getServerURL()
             guard coordinatorLifecycleEpoch == expectedEpoch else {
                 throw FabushiHostError.hostClosed(message: "FabushiCoordinator shut down during server URL sync")
-            }
-            if let urlInfo {
-                settingsStore.updateServerURL(urlInfo.serverUrl)
             }
 
             let accountsInfo = try? await host.listAccounts(generation: liveGeneration)
             guard coordinatorLifecycleEpoch == expectedEpoch else {
                 throw FabushiHostError.hostClosed(message: "FabushiCoordinator shut down during account restoration")
             }
+
+            // Commit all startup state atomically on @MainActor after the final await.
+            let syncedGeneration = max(1, liveGeneration)
+            accountScopeGeneration = syncedGeneration
+            resetAllDomainStores(generation: syncedGeneration)
+            if let urlInfo {
+                settingsStore.updateServerURL(urlInfo.serverUrl)
+            }
             if let accountsInfo {
                 restoreAuthState(from: accountsInfo)
+            } else {
+                activeAccountId = nil
+                authState = .unauthenticated
             }
+            lastErrorMessage = nil
+            isStarted = true
 
-            startEventPump()
+            startEventPump(capturedEpoch: expectedEpoch)
 
             if startNetworkMonitor {
+                let capturedEpoch = expectedEpoch
                 networkMonitor.start(host: host) { [weak self] snapshot in
                     Task { @MainActor [weak self] in
-                        self?.isOnline = snapshot.isOnline
+                        guard let self,
+                              self.isStarted,
+                              self.coordinatorLifecycleEpoch == capturedEpoch
+                        else {
+                            return
+                        }
+                        self.isOnline = self.networkMonitor.currentSnapshot?.isOnline ?? snapshot.isOnline
                     }
                 }
             }
-
-            lastErrorMessage = nil
-            isStarted = true
         } catch {
-            lastErrorMessage = error.localizedDescription
+            eventPumpTask?.cancel()
+            eventPumpTask = nil
+            networkMonitor.stop()
+            if coordinatorLifecycleEpoch == expectedEpoch {
+                isStarted = false
+                activeAccountId = nil
+                authState = .unauthenticated
+                lastErrorMessage = error.localizedDescription
+            }
             throw error
         }
     }
 
     public func shutdown() async {
         coordinatorLifecycleEpoch &+= 1
-        if let startTask = inFlightStartTask {
+        clearCoordinatorStateForShutdown()
+
+        if let existingShutdown = inFlightShutdownTask {
+            await existingShutdown.value
+            return
+        }
+
+        shutdownTaskCounter &+= 1
+        let taskId = shutdownTaskCounter
+        let task = Task<Void, Never> { @MainActor in
+            await self.performShutdown(taskId: taskId)
+        }
+        inFlightShutdownId = taskId
+        inFlightShutdownTask = task
+        await task.value
+    }
+
+    private func performShutdown(taskId: UInt64) async {
+        defer {
+            if inFlightShutdownId == taskId {
+                inFlightShutdownTask = nil
+            }
+        }
+
+        // Wait for any in-flight start() to settle first so it cannot resurrect a host post-shutdown.
+        while let startTask = inFlightStartTask {
             _ = try? await startTask.value
         }
+
         eventPumpTask?.cancel()
         eventPumpTask = nil
         networkMonitor.stop()
+
         await host.shutdown()
-        isStarted = false
-        activeAccountId = nil
-        authState = .unauthenticated
+
+        clearCoordinatorStateForShutdown()
     }
 
     // MARK: - Generation Fencing Invariant
 
-    /// Executes an async operation fenced by `accountScopeGeneration`.
-    /// Checks generation before AND after `await`, dropping stale completions without mutating state.
+    /// Executes an async operation fenced by both lifecycle epoch and `accountScopeGeneration`.
+    /// Checks lifecycle + generation before AND after `await`, dropping stale completions without mutating state.
     public func executeFenced<T: Sendable>(
         _ operation: @Sendable (UInt64) async throws -> T
     ) async throws -> T {
         guard isStarted else {
             throw FabushiCoordinatorError.notStarted
         }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let capturedGen = accountScopeGeneration
         let value = try await operation(capturedGen)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard accountScopeGeneration == capturedGen else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: capturedGen,
@@ -320,6 +389,7 @@ public final class FabushiCoordinator {
         guard isStarted else {
             throw FabushiCoordinatorError.notStarted
         }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let capturedGen = accountScopeGeneration
         let capturedAccount = activeAccountId
         let envelope: FabushiRPCEnvelopeResult<Res> = try await host.dispatchEnvelope(
@@ -328,6 +398,9 @@ public final class FabushiCoordinator {
             generation: capturedGen,
             accountId: capturedAccount
         )
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard accountScopeGeneration == capturedGen else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: capturedGen,
@@ -342,7 +415,11 @@ public final class FabushiCoordinator {
     @discardableResult
     public func setAuthSession(_ params: FabushiSessionAuthParams) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.setAuthSession(params, generation: accountScopeGeneration)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard res.generation >= accountScopeGeneration else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: res.generation,
@@ -367,7 +444,11 @@ public final class FabushiCoordinator {
         beforeUsernameLookup: (@MainActor () async -> Void)?
     ) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.switchAccount(accountId: accountId, generation: accountScopeGeneration)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard res.generation >= accountScopeGeneration else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: res.generation,
@@ -382,9 +463,15 @@ public final class FabushiCoordinator {
 
         if let beforeUsernameLookup {
             await beforeUsernameLookup()
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
         }
 
         let accountsInfo = try? await host.listAccounts(generation: res.generation)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard accountScopeGeneration == res.generation else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: res.generation,
@@ -408,7 +495,11 @@ public final class FabushiCoordinator {
     @discardableResult
     public func clearLocalSession() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.clearSession(generation: accountScopeGeneration)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard res.generation >= accountScopeGeneration else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: res.generation,
@@ -424,8 +515,12 @@ public final class FabushiCoordinator {
     @discardableResult
     public func logout() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         do {
             let res = try await host.logout(generation: accountScopeGeneration)
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
             guard res.generation >= accountScopeGeneration else {
                 throw FabushiCoordinatorError.staleGeneration(
                     captured: res.generation,
@@ -436,15 +531,29 @@ public final class FabushiCoordinator {
             activeAccountId = nil
             authState = .unauthenticated
             return res.generation
+        } catch let coordinatorError as FabushiCoordinatorError {
+            throw coordinatorError
         } catch let hostError as FabushiHostError where hostError.code == "stale_generation" {
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
             // Rust rejected auth.logout pre-dispatch because another transition already
             // advanced generation; NEVER blindly wipe the newer active session.
-            await reconcileAuthoritativeSessionState()
+            await reconcileAuthoritativeSessionState(expectedEpoch: capturedEpoch)
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
             throw hostError
         } catch {
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
             // If remote logout failed (e.g. offline), Rust may have locally wiped the session
             // and bumped generation; reconcile authoritative generation and account state.
-            await reconcileAuthoritativeSessionState()
+            await reconcileAuthoritativeSessionState(expectedEpoch: capturedEpoch)
+            guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+                throw FabushiCoordinatorError.notStarted
+            }
             throw error
         }
     }
@@ -452,7 +561,11 @@ public final class FabushiCoordinator {
     @discardableResult
     public func setServerURL(_ serverUrl: String) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.setServerURL(serverUrl, generation: accountScopeGeneration)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         guard res.generation >= accountScopeGeneration else {
             throw FabushiCoordinatorError.staleGeneration(
                 captured: res.generation,
@@ -502,9 +615,13 @@ public final class FabushiCoordinator {
     @discardableResult
     public func checkpointWAL() async throws -> FabushiWalCheckpointSummary {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        let capturedEpoch = coordinatorLifecycleEpoch
         // Omit generation (nil) so device-wide SQLite WAL truncation (0xdead10cc protection)
         // is NEVER rejected with stale_generation during an account transition.
         let summary = try await host.checkpointWAL(generation: nil)
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            throw FabushiCoordinatorError.notStarted
+        }
         lastWalCheckpoint = summary
         return summary
     }
@@ -547,28 +664,33 @@ public final class FabushiCoordinator {
     public func handleScenePhaseChange(_ phase: ScenePhase) {
         guard isStarted else { return }
         if phase == .background {
+            let capturedEpoch = coordinatorLifecycleEpoch
             #if canImport(UIKit)
             // Acquire UIBackgroundTaskIdentifier SYNCHRONOUSLY before spawning the async Task
             // so iOS cannot suspend the process before WAL checkpoint begins (0xdead10cc).
             let bgGuard = acquireBackgroundWALGuard()
             Task { @MainActor [weak self] in
-                guard let self, self.isStarted else {
+                guard let self, self.isStarted, self.coordinatorLifecycleEpoch == capturedEpoch else {
                     bgGuard.endIfNeeded()
                     return
                 }
                 do {
                     _ = try await self.performBackgroundWALCheckpoint(existingGuard: bgGuard)
                 } catch {
-                    self.lastErrorMessage = error.localizedDescription
+                    if self.isStarted, self.coordinatorLifecycleEpoch == capturedEpoch {
+                        self.lastErrorMessage = error.localizedDescription
+                    }
                 }
             }
             #else
             Task { @MainActor [weak self] in
-                guard let self, self.isStarted else { return }
+                guard let self, self.isStarted, self.coordinatorLifecycleEpoch == capturedEpoch else { return }
                 do {
                     _ = try await self.performBackgroundWALCheckpoint()
                 } catch {
-                    self.lastErrorMessage = error.localizedDescription
+                    if self.isStarted, self.coordinatorLifecycleEpoch == capturedEpoch {
+                        self.lastErrorMessage = error.localizedDescription
+                    }
                 }
             }
             #endif
@@ -577,34 +699,61 @@ public final class FabushiCoordinator {
 
     // MARK: - Internal Helpers
 
+    private func clearCoordinatorStateForShutdown() {
+        isStarted = false
+        activeAccountId = nil
+        authState = .unauthenticated
+        accountScopeGeneration = 1
+        eventPumpTask?.cancel()
+        eventPumpTask = nil
+        networkMonitor.stop()
+        resetAllDomainStores(generation: 1)
+    }
+
+    private func resetAllDomainStores(generation: UInt64) {
+        chatStore.resetForAccountScopeChange(generation: generation)
+        agentStudioStore.resetForAccountScopeChange(generation: generation)
+        remoteComputerStore.resetForAccountScopeChange(generation: generation)
+        miniAppHostStore.resetForAccountScopeChange(generation: generation)
+        callSessionStore.resetForAccountScopeChange(generation: generation)
+        settingsStore.resetForAccountScopeChange(generation: generation)
+        vaultStore.resetForAccountScopeChange(generation: generation)
+    }
+
     @discardableResult
     private func applyGenerationAdvance(_ newGeneration: UInt64) -> Bool {
         guard newGeneration >= accountScopeGeneration else {
             return false
         }
         accountScopeGeneration = newGeneration
-        chatStore.resetForAccountScopeChange(generation: newGeneration)
-        agentStudioStore.resetForAccountScopeChange(generation: newGeneration)
-        remoteComputerStore.resetForAccountScopeChange(generation: newGeneration)
-        miniAppHostStore.resetForAccountScopeChange(generation: newGeneration)
-        callSessionStore.resetForAccountScopeChange(generation: newGeneration)
-        settingsStore.resetForAccountScopeChange(generation: newGeneration)
-        vaultStore.resetForAccountScopeChange(generation: newGeneration)
+        resetAllDomainStores(generation: newGeneration)
         return true
     }
 
-    private func reconcileAuthoritativeSessionState() async {
-        guard let synced = try? await host.currentGeneration(),
-              synced >= accountScopeGeneration
-        else {
+    private func reconcileAuthoritativeSessionState(expectedEpoch: UInt64? = nil) async {
+        let capturedEpoch = expectedEpoch ?? coordinatorLifecycleEpoch
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            return
+        }
+        guard let synced = try? await host.currentGeneration() else {
+            return
+        }
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            return
+        }
+        guard synced >= accountScopeGeneration else {
             return
         }
         if synced > accountScopeGeneration {
             applyGenerationAdvance(synced)
         }
-        if let accountsInfo = try? await host.listAccounts(generation: synced),
-           accountScopeGeneration == synced
-        {
+        guard let accountsInfo = try? await host.listAccounts(generation: synced) else {
+            return
+        }
+        guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
+            return
+        }
+        if accountScopeGeneration == synced {
             restoreAuthState(from: accountsInfo)
         }
     }
@@ -631,22 +780,28 @@ public final class FabushiCoordinator {
         }
     }
 
-    private func startEventPump() {
+    private func startEventPump(capturedEpoch: UInt64) {
         eventPumpTask?.cancel()
         let stream = host.makeEventStream()
         eventPumpTask = Task { @MainActor [weak self] in
             for await event in stream {
-                guard !Task.isCancelled, let self else { break }
+                guard !Task.isCancelled,
+                      let self,
+                      self.isStarted,
+                      self.coordinatorLifecycleEpoch == capturedEpoch
+                else {
+                    break
+                }
                 self.ingestDomainEvent(event)
             }
         }
     }
 
-    /// Strict generation-fenced event intake: drops any event whose generation is strictly
-    /// less than `accountScopeGeneration` (including generation 0 when active generation >= 1).
+    /// Strict generation-fenced event intake: drops any event when not started or whose generation
+    /// is strictly less than `accountScopeGeneration` (including generation 0 when active generation >= 1).
     @discardableResult
     internal func ingestDomainEvent(_ event: FabushiDomainEvent) -> Bool {
-        guard event.generation >= accountScopeGeneration else {
+        guard isStarted, event.generation >= accountScopeGeneration else {
             return false
         }
         routeDomainEvent(event)

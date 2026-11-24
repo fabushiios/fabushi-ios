@@ -260,7 +260,13 @@ final class FabushiRustHostActorTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(ping.pong)
         XCTAssertEqual(ping.nonce, 404)
 
-        // Single shutdown must drop the sole Rust handle and release all Tantivy/SQLite locks.
+        let bumpedGen = try await host.bumpGeneration()
+        XCTAssertGreaterThan(bumpedGen, 1)
+        let genBeforeShutdown = await host.latestObservedGeneration
+        XCTAssertEqual(genBeforeShutdown, bumpedGen)
+
+        // Single shutdown must drop the sole Rust handle, reset latestObservedGeneration to 1,
+        // and release all Tantivy/SQLite locks.
         await host.shutdown()
         let isInitAfter = await host.isInitialized
         XCTAssertFalse(isInitAfter)
