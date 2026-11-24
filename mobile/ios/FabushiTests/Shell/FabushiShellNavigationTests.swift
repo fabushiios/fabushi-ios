@@ -720,6 +720,156 @@ final class FabushiShellNavigationTests: XCTestCase, @unchecked Sendable {
             throw error
         }
     }
+
+    func testInspectorClearedOnNonChatRoutesDeepLinksAndContactsWhilePreservedForInAppChatSwitch() async throws {
+        let dir = try makeTempDir("inspector_clear_bi3_1")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.shell.inspectorclear.\(UUID().uuidString)",
+            account: "shell-inspectorclear"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            _ = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 804,
+                username: "inspector_clear_user",
+                sessionId: "sess-ic-804",
+                token: "tok-ic-804"
+            ))
+
+            let router = ShellNavigationRouter(
+                toastController: FabushiToastController(autoDismissEnabled: false),
+                isPasscodeLockEnabled: true
+            )
+            _ = router.handleAccountScopeChange(
+                generation: coordinator.accountScopeGeneration,
+                coordinator: coordinator
+            )
+            router.isPasscodeLocked = false
+
+            // 1. Locked + deferred deep link MUST clear stale inspector (`B-I3-1` / `R2b`)
+            router.navigate(to: .chats(chatId: 42, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 42))
+            XCTAssertTrue(router.isInspectorPresented)
+            XCTAssertEqual(router.inspectorTarget, .chat(chatId: 42))
+
+            router.engagePasscodeLockIfEnabled()
+            XCTAssertTrue(router.isPasscodeLocked)
+
+            let settingsURL = try XCTUnwrap(URL(string: "fabushi://settings/ai_providers"))
+            XCTAssertTrue(router.handleOpenURL(settingsURL, coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, settingsURL)
+            XCTAssertTrue(router.isInspectorPresented, "Inspector state stays intact while locked before unlock replay")
+
+            XCTAssertTrue(router.unlockPasscode(coordinator: coordinator))
+            XCTAssertFalse(router.isPasscodeLocked)
+            XCTAssertEqual(router.activeRoute, .settings(section: "ai_providers"))
+            XCTAssertEqual(coordinator.activeRoute, .settings(section: "ai_providers"))
+            XCTAssertEqual(router.activeTab, .settings)
+            XCTAssertFalse(router.isInspectorPresented, "Unlock deferred deep link must clear stale inspector")
+            XCTAssertNil(router.inspectorTarget, "Unlock deferred deep link must clear stale inspectorTarget")
+
+            // 2. Unlocked deep link to a DIFFERENT chat MUST clear stale inspector
+            router.navigate(to: .chats(chatId: 42, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 42))
+            let otherChatURL = try XCTUnwrap(URL(string: "fabushi://chat/130"))
+            XCTAssertTrue(router.handleOpenURL(otherChatURL, coordinator: coordinator))
+            XCTAssertEqual(router.activeRoute, .chats(chatId: 130, messageId: nil))
+            XCTAssertFalse(router.isInspectorPresented, "Cross-chat deep link must clear prior chat inspector")
+            XCTAssertNil(router.inspectorTarget)
+
+            // 3. In-app Chat A -> Chat B MUST preserve inspector (`T2_12` iPad parity)
+            router.navigate(to: .chats(chatId: 212, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 212))
+            router.navigate(to: .chats(chatId: 213, messageId: nil), coordinator: coordinator)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: 213, messageId: nil))
+            XCTAssertTrue(router.isInspectorPresented, "In-app chat-to-chat switch must preserve iPad inspector (T2_12)")
+            XCTAssertEqual(router.inspectorTarget, .chat(chatId: 212))
+
+            // 4. Back to empty chat list (`navigateBackToChatList`) MUST clear inspector
+            router.navigateBackToChatList(coordinator: coordinator)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+            XCTAssertFalse(router.isInspectorPresented)
+            XCTAssertNil(router.inspectorTarget)
+
+            // 5. All non-chat workspace routes MUST clear inspector
+            let nonChatRoutes: [ShellRoute] = [
+                .compose,
+                .agentStudio(tab: "overview"),
+                .remoteComputer(nodeId: nil),
+                .settings(section: "ai_providers"),
+            ]
+            for route in nonChatRoutes {
+                router.navigate(to: .chats(chatId: 213, messageId: nil), coordinator: coordinator)
+                router.openInspector(for: .chat(chatId: 213))
+                XCTAssertTrue(router.isInspectorPresented)
+
+                router.navigate(to: route, coordinator: coordinator)
+                XCTAssertEqual(router.activeRoute, route)
+                XCTAssertFalse(router.isInspectorPresented, "Navigating to \(route) must clear inspector")
+                XCTAssertNil(router.inspectorTarget, "Navigating to \(route) must clear inspectorTarget")
+            }
+
+            // 6. Switching to `.contacts` tab MUST clear inspector
+            router.navigate(to: .chats(chatId: 213, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 213))
+            router.selectTab(.contacts, coordinator: coordinator)
+            XCTAssertEqual(router.activeTab, .contacts)
+            XCTAssertFalse(router.isInspectorPresented, "Switching to .contacts must clear inspector")
+            XCTAssertNil(router.inspectorTarget)
+
+            // 7. `.calls` and `.miniApp` + `dismissActiveModalSheet` MUST clear inspector (`NB-I3-1`)
+            router.navigate(to: .chats(chatId: 213, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 213))
+            router.navigate(to: .calls, coordinator: coordinator)
+            XCTAssertTrue(router.isCallsSheetPresented)
+            XCTAssertFalse(router.isInspectorPresented, "Opening .calls must clear inspector")
+            XCTAssertNil(router.inspectorTarget)
+            router.dismissActiveModalSheet(coordinator: coordinator)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: 213, messageId: nil))
+            XCTAssertFalse(router.isInspectorPresented)
+            XCTAssertNil(router.inspectorTarget)
+
+            router.openInspector(for: .bot(botId: 212, chatId: 213))
+            router.navigate(to: .miniApp(id: "global_dharma"), coordinator: coordinator)
+            XCTAssertEqual(router.presentedMiniAppId, "global_dharma")
+            XCTAssertFalse(router.isInspectorPresented, "Opening .miniApp from Inspector must clear inspector (NB-I3-1)")
+            XCTAssertNil(router.inspectorTarget)
+            router.dismissActiveModalSheet(coordinator: coordinator)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: 213, messageId: nil))
+            XCTAssertNil(router.presentedMiniAppId)
+            XCTAssertFalse(router.isInspectorPresented, "Closing .miniApp must NOT pop stale compact inspector back up")
+            XCTAssertNil(router.inspectorTarget)
+
+            // 8. External `coordinator.activeRoute` reverse sync (`syncFromCoordinator`) to non-chat route
+            //    and `.chats(chatId: nil, messageId: nil)` MUST also clear inspector
+            router.openInspector(for: .chat(chatId: 213))
+            coordinator.activeRoute = .settings(section: "appearance")
+            router.syncFromCoordinator(coordinator)
+            XCTAssertEqual(router.activeRoute, .settings(section: "appearance"))
+            XCTAssertFalse(router.isInspectorPresented, "syncFromCoordinator to non-chat route must clear inspector")
+            XCTAssertNil(router.inspectorTarget)
+
+            router.navigate(to: .chats(chatId: 213, messageId: nil), coordinator: coordinator)
+            router.openInspector(for: .chat(chatId: 213))
+            coordinator.activeRoute = .chats(chatId: nil, messageId: nil)
+            router.syncFromCoordinator(coordinator)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+            XCTAssertFalse(router.isInspectorPresented, "syncFromCoordinator to empty chat list must clear inspector")
+            XCTAssertNil(router.inspectorTarget)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
 }
 
 // MARK: - Protocol Conformance Test Spies

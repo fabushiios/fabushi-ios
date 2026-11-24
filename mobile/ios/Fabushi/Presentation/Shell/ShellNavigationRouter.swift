@@ -252,12 +252,13 @@ public final class ShellNavigationRouter {
             }
         case .contacts:
             // Leaving an active conversation or modal sheet to the Contacts tab clears chat-scoped
-            // toasts and dismisses any active modal sheet flags without discarding the underlying
-            // chat route until a specific peer is opened.
+            // toasts and dismisses any active modal sheet flags and stale inspector state without
+            // discarding the underlying chat route until a specific peer is opened.
             if let old = previousChatId {
                 toastController.clearToasts(forChatId: old)
             }
             clearModalSheetFlags()
+            dismissInspector()
             if case .calls = activeRoute {
                 restoreLastWorkspaceRouteKeepingActiveTab(coordinator: coordinator)
             } else if case .miniApp = activeRoute {
@@ -386,9 +387,20 @@ public final class ShellNavigationRouter {
             return true
         }
 
+        let currentChatId: Int64? = activeChatId ?? {
+            if case .chats(let chatId, _) = lastWorkspaceRoute {
+                return chatId
+            }
+            return nil
+        }()
+
         pendingDeepLinkURL = nil
         switch destination {
         case .route(let route):
+            if case .chats(let targetChatId, _) = route,
+               targetChatId == nil || targetChatId != currentChatId {
+                dismissInspector()
+            }
             navigate(to: route, coordinator: coordinator)
         case .contacts:
             selectTab(.contacts, coordinator: coordinator)
@@ -496,28 +508,41 @@ public final class ShellNavigationRouter {
 
     private func applyTabAndModalState(for route: ShellRoute) {
         switch route {
-        case .chats, .compose:
+        case .chats(let chatId, _):
             activeTab = .chats
             lastWorkspaceRoute = route
             clearModalSheetFlags()
+            if chatId == nil {
+                dismissInspector()
+            }
+        case .compose:
+            activeTab = .chats
+            lastWorkspaceRoute = route
+            clearModalSheetFlags()
+            dismissInspector()
         case .agentStudio:
             activeTab = .studio
             lastWorkspaceRoute = route
             clearModalSheetFlags()
+            dismissInspector()
         case .remoteComputer:
             activeTab = .remote
             lastWorkspaceRoute = route
             clearModalSheetFlags()
+            dismissInspector()
         case .settings:
             activeTab = .settings
             lastWorkspaceRoute = route
             clearModalSheetFlags()
+            dismissInspector()
         case .calls:
             isAccountSwitcherPresented = false
+            dismissInspector()
             isCallsSheetPresented = true
             presentedMiniAppId = nil
         case .miniApp(let id):
             isAccountSwitcherPresented = false
+            dismissInspector()
             presentedMiniAppId = id ?? "catalog"
             isCallsSheetPresented = false
         }

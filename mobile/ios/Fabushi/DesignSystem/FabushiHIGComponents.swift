@@ -273,6 +273,7 @@ public struct FabushiTwoLayerToastHost: View {
                         .fabushiFont(.caption)
                         .foregroundStyle(theme.tooltipForeground)
                         .lineLimit(2)
+                        .truncationMode(.tail)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
@@ -303,7 +304,9 @@ public struct FabushiTwoLayerToastHost: View {
                         .fabushiFont(.subheadline)
                         .foregroundStyle(theme.textPrimary)
                         .lineLimit(2)
+                        .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel(banner.message)
 
                     Button {
                         controller.dismissWindowToast(id: banner.id)
@@ -714,14 +717,20 @@ public struct FabushiProviderErrorCard: View {
     }
 
     public var body: some View {
+        let titleText = theme.localized("hig.providerError.title")
+        let sanitizedDetail = FabushiToastController.sanitizeSingleLine(detail, maxLength: 200)
+
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(theme.destructiveColor)
                     .accessibilityHidden(true)
-                Text(theme.localized("hig.providerError.title"))
+                Text(titleText)
                     .fabushiFont(.headline)
                     .foregroundStyle(theme.textPrimary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .accessibilityLabel(titleText)
                 Spacer(minLength: 4)
                 if let onDismiss {
                     Button(action: onDismiss) {
@@ -735,9 +744,12 @@ public struct FabushiProviderErrorCard: View {
                 }
             }
 
-            Text(FabushiToastController.sanitizeSingleLine(detail, maxLength: 200))
+            Text(sanitizedDetail)
                 .fabushiFont(.footnote)
                 .foregroundStyle(theme.textSecondary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .accessibilityLabel(sanitizedDetail)
 
             FabushiGlassPillButton(
                 title: theme.localized("hig.providerError.openProviders"),
@@ -754,7 +766,7 @@ public struct FabushiProviderErrorCard: View {
                 .strokeBorder(theme.destructiveColor.opacity(0.6), lineWidth: 1.0)
         )
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(theme.localized("hig.providerError.title"))
+        .accessibilityLabel(titleText)
         .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.providerErrorCard)
     }
 }

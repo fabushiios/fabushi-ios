@@ -20,12 +20,12 @@ public struct FabushiAdaptiveShellView: View {
     public let onRetryStartup: @MainActor () async -> Void
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
 
     @State private var isRetryingStartup = false
     @State private var didSyncLaunchPasscodePolicy = false
-    @State private var persistentBannerHeight: CGFloat = 0
 
     public init(
         coordinator: FabushiCoordinator = .shared,
@@ -61,6 +61,17 @@ public struct FabushiAdaptiveShellView: View {
         }
     }
 
+    private var isAuthenticatedShellActive: Bool {
+        coordinator.isStarted && coordinator.authState != .unauthenticated
+    }
+
+    private var hasActiveChatWorkspace: Bool {
+        if case .chats(let chatId, _) = resolvedWorkspaceRoute, chatId != nil {
+            return true
+        }
+        return false
+    }
+
     private var isPasscodeOverlayActive: Bool {
         coordinator.authState != .unauthenticated && router.isPasscodeLocked
     }
@@ -74,17 +85,15 @@ public struct FabushiAdaptiveShellView: View {
             && (router.activeDeepLinkBannerText != nil || router.activeProviderErrorMessage != nil)
     }
 
-    private var topToastInset: CGFloat {
-        let baseNavInset: CGFloat = horizontalSizeClass == .compact ? 56 : 52
-        guard hasPersistentTopBanner else {
-            return baseNavInset
+    private var baseNavToastInset: CGFloat {
+        horizontalSizeClass == .compact ? 56 : 52
+    }
+
+    private var maxPersistentBannerHeight: CGFloat {
+        if horizontalSizeClass == .compact {
+            return dynamicTypeSize.isAccessibilitySize ? 168 : 220
         }
-        // Floor prevents a single-frame collision over persistent banners before GeometryReader
-        // reports, while `persistentBannerHeight` tracks exact rendered height across default and AX5.
-        let estimatedFloor: CGFloat =
-            (router.activeDeepLinkBannerText != nil ? 68 : 0)
-            + (router.activeProviderErrorMessage != nil ? 170 : 0)
-        return max(persistentBannerHeight, estimatedFloor) + baseNavInset
+        return dynamicTypeSize.isAccessibilitySize ? 220 : 280
     }
 
     private var activeModalSheetBinding: Binding<ActiveModalSheet?> {
@@ -107,6 +116,7 @@ public struct FabushiAdaptiveShellView: View {
                     return .calls
                 }
                 if horizontalSizeClass == .compact,
+                   hasActiveChatWorkspace,
                    router.isInspectorPresented,
                    let target = router.inspectorTarget {
                     return .compactInspector(target)
@@ -132,6 +142,7 @@ public struct FabushiAdaptiveShellView: View {
                 !router.isPasscodeLocked
                     && !isPrivacyBlurActive
                     && horizontalSizeClass == .regular
+                    && hasActiveChatWorkspace
                     && router.isInspectorPresented
                     && router.inspectorTarget != nil
             },
@@ -150,11 +161,12 @@ public struct FabushiAdaptiveShellView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(!isPasscodeOverlayActive && !isPrivacyBlurActive)
 
-            if !isPasscodeOverlayActive,
+            if !isAuthenticatedShellActive,
+               !isPasscodeOverlayActive,
                !isPrivacyBlurActive,
                (router.toastController.stagePill != nil || router.toastController.windowBanner != nil) {
                 FabushiTwoLayerToastHost(controller: router.toastController)
-                    .padding(.top, topToastInset)
+                    .padding(.top, baseNavToastInset)
                     .zIndex(40)
             }
 
@@ -209,7 +221,6 @@ public struct FabushiAdaptiveShellView: View {
         }
         .onChange(of: coordinator.authState) { oldState, newState in
             if newState == .unauthenticated {
-                persistentBannerHeight = 0
                 router.engagePasscodeLockIfEnabled()
             } else {
                 if oldState == .unauthenticated {
@@ -306,19 +317,10 @@ public struct FabushiAdaptiveShellView: View {
     private var authenticatedShell: some View {
         VStack(spacing: 0) {
             if hasPersistentTopBanner {
-                topPersistentBanners
-                    .background(
-                        GeometryReader { proxy in
-                            Color.clear
-                                .preference(
-                                    key: PersistentBannerHeightPreferenceKey.self,
-                                    value: proxy.size.height
-                                )
-                        }
-                    )
+                boundedTopPersistentBanners
             }
 
-            Group {
+            ZStack {
                 if horizontalSizeClass == .regular {
                     regularIPadShell
                 } else {
@@ -326,13 +328,13 @@ public struct FabushiAdaptiveShellView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .onPreferenceChange(PersistentBannerHeightPreferenceKey.self) { height in
-            persistentBannerHeight = hasPersistentTopBanner ? height : 0
-        }
-        .onChange(of: hasPersistentTopBanner) { _, isActive in
-            if !isActive {
-                persistentBannerHeight = 0
+            .overlay(alignment: .top) {
+                if !isPasscodeOverlayActive,
+                   !isPrivacyBlurActive,
+                   (router.toastController.stagePill != nil || router.toastController.windowBanner != nil) {
+                    FabushiTwoLayerToastHost(controller: router.toastController)
+                        .padding(.top, baseNavToastInset)
+                }
             }
         }
         .overlay(alignment: .bottomTrailing) {
@@ -756,17 +758,40 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     @ViewBuilder
-    private var topPersistentBanners: some View {
+    private var boundedTopPersistentBanners: some View {
+        ViewThatFits(in: .vertical) {
+            topPersistentBannersContent
+                .fixedSize(horizontal: false, vertical: true)
+
+            ScrollView(.vertical, showsIndicators: true) {
+                topPersistentBannersContent
+            }
+            .clipped()
+            .frame(maxHeight: maxPersistentBannerHeight)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: maxPersistentBannerHeight)
+        .background(theme.surfaceTopBar)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+
+    @ViewBuilder
+    private var topPersistentBannersContent: some View {
         VStack(spacing: 8) {
             if let deepLinkText = router.activeDeepLinkBannerText {
+                let bannerText = "\(theme.localized("hig.deeplink.banner")): \(deepLinkText)"
                 HStack(spacing: 8) {
                     Image(systemName: "link")
                         .foregroundStyle(theme.accentColor)
                         .accessibilityHidden(true)
-                    Text("\(theme.localized("hig.deeplink.banner")): \(deepLinkText)")
+                    Text(bannerText)
                         .fabushiFont(.caption)
                         .foregroundStyle(theme.textPrimary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .accessibilityLabel(bannerText)
                     Spacer(minLength: 4)
                     Button {
                         router.dismissDeepLinkBanner()
@@ -785,7 +810,7 @@ public struct FabushiAdaptiveShellView: View {
                 .fabushiLiquidGlass(cornerRadius: FabushiLayoutMetrics.pillButtonCornerRadius)
                 .padding(.horizontal, 16)
                 .accessibilityElement(children: .contain)
-                .accessibilityLabel(theme.localized("hig.deeplink.banner"))
+                .accessibilityLabel(bannerText)
                 .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.actionBusDeepLinkBanner)
             }
 
@@ -805,10 +830,6 @@ public struct FabushiAdaptiveShellView: View {
         }
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(theme.surfaceTopBar)
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
     }
 
     @ViewBuilder
@@ -857,13 +878,5 @@ public struct FabushiAdaptiveShellView: View {
             return section
         }
         return nil
-    }
-}
-
-private struct PersistentBannerHeightPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
