@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import SwiftUI
 
 // MARK: - Theme Preset (Exact Upstream v1.6.9 4-Theme Matrix)
@@ -354,10 +355,21 @@ public enum FabushiLocale: String, CaseIterable, Codable, Sendable, Identifiable
         }
     }
 
-    /// Resolves a key strictly from the compiled Apple String Catalog (`Localizable.xcstrings`)
-    /// using this exact locale.
+    /// Resolves a key strictly from the compiled Apple String Catalog (`Localizable.xcstrings` ->
+    /// `Localizable.loctable`) for this exact locale, supporting both OS launch languages and live
+    /// in-app `zh-Hans`/`en` switching.
     public func localized(_ key: String, bundle: Bundle = .main) -> String {
-        String(
+        if let value = FabushiLoctableCache.lookup(key: key, localeCode: rawValue, in: bundle) {
+            return value
+        }
+        if let lprojPath = bundle.path(forResource: rawValue, ofType: "lproj"),
+           let localizedBundle = Bundle(path: lprojPath) {
+            let resolved = localizedBundle.localizedString(forKey: key, value: nil, table: "Localizable")
+            if resolved != key {
+                return resolved
+            }
+        }
+        return String(
             localized: String.LocalizationValue(key),
             table: nil,
             bundle: bundle,
@@ -368,6 +380,64 @@ public enum FabushiLocale: String, CaseIterable, Codable, Sendable, Identifiable
     public func localizedFormat(_ key: String, bundle: Bundle = .main, _ arguments: CVarArg...) -> String {
         let format = localized(key, bundle: bundle)
         return String(format: format, locale: foundationLocale, arguments: arguments)
+    }
+}
+
+private enum FabushiLoctableCache {
+    private static let lock = OSAllocatedUnfairLock(initialState: [String: [String: [String: String]]]())
+
+    static func lookup(key: String, localeCode: String, in bundle: Bundle) -> String? {
+        let bundlePath = bundle.bundlePath
+        let tables: [String: [String: String]] = lock.withLock { cache in
+            if let existing = cache[bundlePath] {
+                return existing
+            }
+            let loaded = loadTables(from: bundle)
+            cache[bundlePath] = loaded
+            return loaded
+        }
+
+        if let exact = tables[localeCode]?[key] {
+            return exact
+        }
+        let normalizedTarget = localeCode.lowercased().replacingOccurrences(of: "_", with: "-")
+        for (langKey, dict) in tables {
+            if langKey.lowercased().replacingOccurrences(of: "_", with: "-") == normalizedTarget,
+               let matched = dict[key] {
+                return matched
+            }
+        }
+        return nil
+    }
+
+    private static func loadTables(from bundle: Bundle) -> [String: [String: String]] {
+        guard let url = bundle.url(forResource: "Localizable", withExtension: "loctable"),
+              let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data,
+                  options: [],
+                  format: nil
+              ),
+              let root = plist as? [String: Any]
+        else {
+            return [:]
+        }
+
+        let langContainer = (root["localizations"] as? [String: Any]) ?? root
+        var result: [String: [String: String]] = [:]
+        for (langCode, rawTable) in langContainer {
+            guard let tableDict = rawTable as? [String: Any] else { continue }
+            var strings: [String: String] = [:]
+            for (entryKey, entryVal) in tableDict {
+                if let str = entryVal as? String {
+                    strings[entryKey] = str
+                }
+            }
+            if !strings.isEmpty {
+                result[langCode] = strings
+            }
+        }
+        return result
     }
 }
 

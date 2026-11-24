@@ -56,7 +56,9 @@ final class FabushiDesignSystemTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(classic.bubbleOutgoingTopRGB, 0xEFFDDE)
         XCTAssertEqual(classic.bubbleOutgoingBottomRGB, 0xEFFDDE)
         XCTAssertEqual(classic.bubbleOutgoingTextRGB, 0x000000)
-        XCTAssertEqual(classic.accentContrast.effectiveHex, "#40A7E3")
+        XCTAssertEqual(classic.accentContrast.rawHex, "#40A7E3")
+        XCTAssertEqual(classic.accentContrast.effectiveHex, "#3EA2DC")
+        XCTAssertTrue(classic.accentContrast.wasDarkened)
         XCTAssertFalse(classic.preset.isAppleStyle)
 
         // Upstream cycle order: Night -> Tinted -> Day -> Classic -> Night
