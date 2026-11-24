@@ -146,8 +146,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 router: router,
                 launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
                 mode: .primaryGate,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             vm.serverURLText = server.baseURLString
             vm.authTab = .register
@@ -202,7 +201,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 let salt = storedSalt.withLock { $0 }
                 return .json(
                     200,
-                    #"{"auth_version":2,"auth_salt_b64":"\#(salt)","kdf_params":{"m_cost_kib":1024,"t_cost":1,"p_cost":1}}"#
+                    #"{"auth_version":2,"auth_salt_b64":"\#(salt)","kdf_params":{"m_cost_kib":16384,"t_cost":2,"p_cost":1}}"#
                 )
             case ("POST", "/api/v1/auth/login"):
                 if legacyMode.withLock({ $0 }) {
@@ -244,15 +243,15 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         )
 
         do {
-            // Prepare a genuine Rust-generated Split-Key V2 envelope for user 2002
+            // Prepare a genuine Rust-generated Split-Key V2 envelope for user 2002 with production Argon2id strength
             let initResp: FabushiVaultInitSplitKeyResponse = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.vault.method("initSplitKey"),
                 params: FabushiVaultInitSplitKeyRequest(
                     userId: 2002,
                     password: "MyV2Password!99",
                     saltB64: nil,
-                    kdfParams: nil,
-                    fastKdf: true
+                    kdfParams: FabushiArgon2KdfParamsDTO(mCostKib: 16_384, tCost: 2, pCost: 1),
+                    fastKdf: nil
                 )
             )
             let flatEnv = FabushiVaultEnvelopeConverter.toFlat(initResp.envelope)
@@ -273,8 +272,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator: coordinator,
                 router: router,
                 launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
 
             // 1. Fail-closed invalid Server URL (T2_10)
@@ -369,8 +367,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             let vm = FabushiAuthViewModel(
                 coordinator: coordinator,
                 router: router,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             vm.serverURLText = server.baseURLString
 

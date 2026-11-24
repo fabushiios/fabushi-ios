@@ -133,7 +133,7 @@ public final class FabushiAuthViewModel {
         launchConfiguration: FabushiLaunchConfiguration = .current,
         mode: FabushiAuthPresentationMode = .primaryGate,
         securityKeychain: FabushiSecurityKeychainStore = .shared,
-        useFastKdfForTests: Bool? = nil,
+        useFastKdfForTests: Bool = false,
         pollIntervalNanoseconds: UInt64 = 2_000_000_000,
         onAuthenticated: (() -> Void)? = nil
     ) {
@@ -144,7 +144,7 @@ public final class FabushiAuthViewModel {
         self.securityKeychain = securityKeychain
         self.passkeyController = FabushiWebAuthnPasskeyController()
         self.alipayWebController = FabushiAlipayWebAuthController()
-        self.useFastKdfForTests = useFastKdfForTests ?? launchConfiguration.isUITestMode
+        self.useFastKdfForTests = useFastKdfForTests
         self.pollIntervalNanoseconds = max(50_000_000, pollIntervalNanoseconds)
         self.onAuthenticatedCallback = onAuthenticated
         self.serverURLText = launchConfiguration.serverURL ?? coordinator.settingsStore.activeServerURL

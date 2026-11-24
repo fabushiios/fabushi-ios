@@ -253,8 +253,9 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             if req.method == "PUT", req.path.hasPrefix("/api/v1/user-vault/items/") {
                 let tail = String(req.path.dropFirst("/api/v1/user-vault/items/".count))
                 let parts = tail.split(separator: "/", maxSplits: 1).map(String.init)
-                let category = parts.first ?? "password"
-                let itemKey = parts.count > 1 ? parts[1] : "item"
+                let category = (parts.first ?? "password").removingPercentEncoding ?? (parts.first ?? "password")
+                let rawKey = parts.count > 1 ? parts[1] : "item"
+                let itemKey = rawKey.removingPercentEncoding ?? rawKey
                 let json = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
                 let expectedRev = (json["expected_revision"] as? Int64) ?? Int64((json["expected_revision"] as? Int) ?? 0)
                 let nextRev = expectedRev + 1
@@ -275,8 +276,9 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             if req.method == "DELETE", req.path.hasPrefix("/api/v1/user-vault/items/") {
                 let tail = String(req.path.dropFirst("/api/v1/user-vault/items/".count))
                 let parts = tail.split(separator: "/", maxSplits: 1).map(String.init)
-                let category = parts.first ?? "password"
-                let itemKey = parts.count > 1 ? parts[1] : "item"
+                let category = (parts.first ?? "password").removingPercentEncoding ?? (parts.first ?? "password")
+                let rawKey = parts.count > 1 ? parts[1] : "item"
+                let itemKey = rawKey.removingPercentEncoding ?? rawKey
                 _ = serverItems.withLock { $0.removeValue(forKey: "\(category):\(itemKey)") }
                 return .json(200, #"{"ok":true,"category":"\#(category)","item_key":"\#(itemKey)","revision":2,"updated_at_ms":1700000600000}"#)
             }
