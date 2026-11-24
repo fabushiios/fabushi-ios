@@ -480,11 +480,14 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             }
             if req.method == "POST", req.path == "/api/v1/user-vault/device-sync/req_x25519_1/approve" {
                 let json = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
+                let approverEphPub = json["approver_ephemeral_pub_b64"] as? String
+                let encryptedRootKey = json["encrypted_root_key_b64"] as? String
+                let nonce = json["nonce_b64"] as? String
                 syncStore.withLock { state in
                     state?.status = "approved"
-                    state?.approverEphPub = json["approver_ephemeral_pub_b64"] as? String
-                    state?.encryptedRootKey = json["encrypted_root_key_b64"] as? String
-                    state?.nonce = json["nonce_b64"] as? String
+                    state?.approverEphPub = approverEphPub
+                    state?.encryptedRootKey = encryptedRootKey
+                    state?.nonce = nonce
                 }
                 return .json(200, #"{"ok":true,"request_id":"req_x25519_1","status":"approved"}"#)
             }
