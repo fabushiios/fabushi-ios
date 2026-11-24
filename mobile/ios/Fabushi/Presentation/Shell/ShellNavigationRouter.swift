@@ -96,14 +96,14 @@ public struct RemoteControlStatusState: Identifiable, Sendable, Equatable {
 
 // MARK: - `fabushi://` Deep Link Parser
 
-public enum FabushiDeepLinkDestination: Sendable, Equatable {
+public enum ShellDeepLinkDestination: Sendable, Equatable {
     case route(ShellRoute)
     case contacts
     case authCallback(action: String, queryItems: [String: String])
 }
 
-public enum FabushiDeepLinkParser: Sendable {
-    public static func parse(_ url: URL) -> FabushiDeepLinkDestination? {
+public enum ShellDeepLinkParser: Sendable {
+    public static func parse(_ url: URL) -> ShellDeepLinkDestination? {
         guard let scheme = url.scheme?.lowercased(), scheme == "fabushi" else {
             return nil
         }
@@ -312,7 +312,7 @@ public final class ShellNavigationRouter {
 
     @discardableResult
     public func handleOpenURL(_ url: URL, coordinator: FabushiCoordinator) -> Bool {
-        guard let destination = FabushiDeepLinkParser.parse(url) else {
+        guard let destination = ShellDeepLinkParser.parse(url) else {
             return false
         }
 

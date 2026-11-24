@@ -58,42 +58,42 @@ final class FabushiShellNavigationTests: XCTestCase, @unchecked Sendable {
 
     func testDeepLinkParsingRoutingAndDeferredReplayAfterAuth() async throws {
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://chat/130?messageId=42"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://chat/130?messageId=42"))),
             .route(.chats(chatId: 130, messageId: 42))
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://compose"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://compose"))),
             .route(.compose)
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://contacts"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://contacts"))),
             .contacts
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://studio/kanban"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://studio/kanban"))),
             .route(.agentStudio(tab: "kanban"))
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://calls"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://calls"))),
             .route(.calls)
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://remote/mac_prod_v168"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://remote/mac_prod_v168"))),
             .route(.remoteComputer(nodeId: "mac_prod_v168"))
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://miniapp/global_dharma"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://miniapp/global_dharma"))),
             .route(.miniApp(id: "global_dharma"))
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://settings/appearance"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://settings/appearance"))),
             .route(.settings(section: "appearance"))
         )
         XCTAssertEqual(
-            FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://auth/alipay?code=ok"))),
+            ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "fabushi://auth/alipay?code=ok"))),
             .authCallback(action: "alipay", queryItems: ["code": "ok"])
         )
-        XCTAssertNil(FabushiDeepLinkParser.parse(try XCTUnwrap(URL(string: "https://example.com/chat/1"))))
+        XCTAssertNil(ShellDeepLinkParser.parse(try XCTUnwrap(URL(string: "https://example.com/chat/1"))))
 
         // Real coordinator deferred replay test
         let dir = try makeTempDir("deeplink_replay")
