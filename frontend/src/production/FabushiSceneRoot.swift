@@ -188,10 +188,90 @@ private struct FabushiRootErrorSurface: View {
     }
 }
 
-/// Production scene adapter. Product orchestration remains in FabushiRuntime
-/// and lower layers; FabushiApp stays a thin App/Scene entry point.
+/// Production scene adapter. Routes standard launches and `FABUSHI_UI_TEST_MODE=1` launches
+/// into the canonical Apple HIG `FabushiAdaptiveShellView`, while retaining legacy
+/// `ProductionRenderer` strictly for legacy protected/smoke CI modes until M6 retirement.
 @MainActor
 private struct FabushiProductionSceneRoot: View {
+    private let launchConfiguration: FabushiLaunchConfiguration
+
+    init(launchConfiguration: FabushiLaunchConfiguration = .current) {
+        self.launchConfiguration = launchConfiguration
+    }
+
+    @ViewBuilder
+    var body: some View {
+        if launchConfiguration.shouldUseLegacyProductionRenderer {
+            FabushiLegacyProductionSceneHost()
+        } else {
+            FabushiCanonicalSceneHost(launchConfiguration: launchConfiguration)
+        }
+    }
+}
+
+@MainActor
+private struct FabushiCanonicalSceneHost: View {
+    private let launchConfiguration: FabushiLaunchConfiguration
+    @State private var theme: FabushiTheme
+    @State private var router = ShellNavigationRouter()
+    @Environment(\.scenePhase) private var scenePhase
+
+    init(launchConfiguration: FabushiLaunchConfiguration) {
+        self.launchConfiguration = launchConfiguration
+        let initialTheme = FabushiTheme()
+        initialTheme.applyLaunchConfiguration(launchConfiguration)
+        self._theme = State(initialValue: initialTheme)
+    }
+
+    var body: some View {
+        FabushiAdaptiveShellView(
+            coordinator: FabushiCoordinator.shared,
+            theme: theme,
+            router: router,
+            registry: FabushiFeatureModuleRegistry.shared,
+            launchConfiguration: launchConfiguration,
+            onRetryStartup: {
+                await startCanonicalCoordinator(prepareReset: false)
+            }
+        )
+        .task {
+            await startCanonicalCoordinator(prepareReset: true)
+        }
+        .onOpenURL { url in
+            router.handleOpenURL(url, coordinator: FabushiCoordinator.shared)
+        }
+        .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+            guard let url = activity.webpageURL else { return }
+            router.handleOpenURL(url, coordinator: FabushiCoordinator.shared)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            FabushiCoordinator.shared.handleScenePhaseChange(phase)
+        }
+    }
+
+    private func startCanonicalCoordinator(prepareReset: Bool) async {
+        do {
+            if prepareReset {
+                try launchConfiguration.prepareStateDirectoryIfNeeded()
+            }
+            try await FabushiCoordinator.shared.start(
+                appDataDirectory: launchConfiguration.appDataDirectory,
+                serverURL: launchConfiguration.serverURL,
+                testMode: launchConfiguration.isUITestMode
+            )
+            await theme.loadPersistedPreferences(using: FabushiCoordinator.shared)
+            router.syncFromCoordinator(FabushiCoordinator.shared)
+            router.replayPendingDeepLinkIfReady(coordinator: FabushiCoordinator.shared)
+        } catch {
+            // Fail-closed: FabushiCoordinator.shared.lastErrorMessage drives FabushiStartupRetryView.
+        }
+    }
+}
+
+/// Retained legacy scene host for pre-M6 protected/smoke UITest workflows and active
+/// `AccountSessionFrontendParityTests` source verification (`\.fabushiRuntimeReloadAction`).
+@MainActor
+private struct FabushiLegacyProductionSceneHost: View {
     @State private var lifecycle = FabushiRuntimeLifecycle()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL

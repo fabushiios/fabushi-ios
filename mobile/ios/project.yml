@@ -1,6 +1,7 @@
 name: Fabushi
 options:
   bundleIdPrefix: com.ombhrum
+  developmentLanguage: en
   deploymentTarget:
     iOS: '17.0'
 packages:

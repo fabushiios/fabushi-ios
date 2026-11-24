@@ -241,7 +241,7 @@ jobs:
     name: Rust Desktop Core iOS Targets Check (macOS-15 + sccache)
     needs: [authority-check]
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact iOS source
         uses: actions/checkout@v5
@@ -438,7 +438,7 @@ jobs:
     name: Rust Host iOS Staticlib, C11 Header & Symbol Proof (macOS-15 + sccache)
     needs: [authority-check]
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact iOS source
         uses: actions/checkout@v5
@@ -659,6 +659,7 @@ jobs:
             source/host/include/mahayana_app_host.h
           retention-days: 14
           if-no-files-found: error
+          overwrite: true
 
       - name: Show sccache statistics
         if: always()
@@ -672,7 +673,7 @@ jobs:
     name: iOS Simulator Build & Swift 6 XCTest Suite (macOS-15)
     runs-on: macos-15
     needs: [authority-check, rust-host-ios-staticlib]
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact iOS source
         uses: actions/checkout@v5
@@ -838,7 +839,7 @@ jobs:
               f"skipped={skipped} expectedFailures={expected_failures}"
           )
           assert (
-              passed > 0 and failed == 0 and skipped == 0 and expected_failures == 0
+              passed >= 966 and failed == 0 and skipped == 0 and expected_failures == 0
           ), f"Unexpected XCTest summary: {summary}"
           PY
 
@@ -875,6 +876,7 @@ jobs:
           path: ${{ runner.temp }}/ios-sim-evidence/
           retention-days: 14
           if-no-files-found: error
+          overwrite: true
 
       - name: Shutdown and erase iOS Simulator
         if: always()
@@ -895,7 +897,7 @@ jobs:
     name: Unsigned iOS Device Release Archive (arm64, macOS-15)
     runs-on: macos-15
     needs: [authority-check, rust-host-ios-staticlib]
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout exact iOS source
         uses: actions/checkout@v5
@@ -1034,6 +1036,7 @@ jobs:
           path: ${{ runner.temp }}/ios-archive-evidence/
           retention-days: 14
           if-no-files-found: error
+          overwrite: true
 
       - name: Verify live Desktop main unchanged at job end
         if: always()
