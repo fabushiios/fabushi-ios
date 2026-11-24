@@ -210,7 +210,7 @@ public final class DefaultPlatformModulesProvider: PlatformModulesProviding {
         coordinator: FabushiCoordinator,
         router: ShellNavigationRouter
     ) -> AnyView {
-        AnyView(DefaultMiniAppHostSurface(miniAppId: miniAppId, router: router))
+        AnyView(DefaultMiniAppHostSurface(miniAppId: miniAppId, coordinator: coordinator, router: router))
     }
 
     public func makeMiniAppFloatingPipView(
@@ -380,12 +380,14 @@ private struct DefaultContactsSurface: View {
 
     var body: some View {
         List {
-            FabushiEmptyStateView(
-                title: theme.localized("hig.empty.contactsTitle"),
-                systemImage: "person.2",
-                descriptionText: theme.localized("hig.empty.contactsDescription"),
-                accessibilityID: FabushiAccessibilityIDs.ChatList.contactsList
-            )
+            ContentUnavailableView {
+                Label(theme.localized("hig.empty.contactsTitle"), systemImage: "person.2")
+                    .foregroundStyle(theme.textPrimary)
+            } description: {
+                Text(theme.localized("hig.empty.contactsDescription"))
+                    .fabushiFont(.body)
+                    .foregroundStyle(theme.textSecondary)
+            }
             .listRowBackground(Color.clear)
         }
         .listStyle(.insetGrouped)
@@ -405,12 +407,14 @@ private struct DefaultConversationStageSurface: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            FabushiEmptyStateView(
-                title: theme.localized("hig.tab.chats"),
-                systemImage: "text.bubble",
-                descriptionText: theme.localized("hig.empty.selectChat"),
-                accessibilityID: FabushiAccessibilityIDs.Stage.root
-            )
+            ContentUnavailableView {
+                Label(theme.localized("hig.tab.chats"), systemImage: "text.bubble")
+                    .foregroundStyle(theme.textPrimary)
+            } description: {
+                Text(theme.localized("hig.empty.selectChat"))
+                    .fabushiFont(.body)
+                    .foregroundStyle(theme.textSecondary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.surfacePrimary)
@@ -659,6 +663,7 @@ private struct DefaultRemoteControlledPillSurface: View {
 @MainActor
 private struct DefaultMiniAppHostSurface: View {
     let miniAppId: String?
+    let coordinator: FabushiCoordinator
     let router: ShellNavigationRouter
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
     private var theme: FabushiTheme { injectedTheme ?? .default }
@@ -675,7 +680,7 @@ private struct DefaultMiniAppHostSurface: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        router.presentedMiniAppId = nil
+                        router.dismissActiveModalSheet(coordinator: coordinator)
                     } label: {
                         Image(systemName: "xmark")
                             .fabushiMinimumTouchTarget()
@@ -767,6 +772,98 @@ private struct DefaultCallsDisclosureSurface: View {
 
 // MARK: - Canonical M2a Apple HIG Settings Surface (Real Theme/Accent/WCAG/Language/Capabilities)
 
+/// Programmatic Settings section destinations supporting `fabushi://settings/<section>` deep links
+/// and `FabushiProviderErrorCard` "Open AI Providers" CTA routing.
+public enum FabushiSettingsSectionDestination: String, CaseIterable, Hashable, Sendable, Identifiable {
+    case appearance
+    case language
+    case privacySecurity
+    case devices
+    case vault
+    case aiProviders
+    case capabilities
+
+    public var id: String { rawValue }
+
+    /// Case-insensitive parser accepting canonical camelCase, snake_case, kebab-case,
+    /// and common deep-link aliases (`"ai_providers"`, `"privacy_security"`, `"privacy"`,
+    /// `"security"`, `"theme"`, `"locale"`, `"ledger"`, etc.).
+    public static func parse(_ raw: String?) -> FabushiSettingsSectionDestination? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else {
+            return nil
+        }
+
+        let normalized = trimmed
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: " ", with: "")
+
+        switch normalized {
+        case "appearance", "theme", "themes", "display", "accent":
+            return .appearance
+        case "language", "lang", "locale", "locales":
+            return .language
+        case "privacysecurity", "privacy", "security", "passcode":
+            return .privacySecurity
+        case "devices", "device", "sessions", "activesessions":
+            return .devices
+        case "vault", "credentialvault", "credentials", "totp":
+            return .vault
+        case "aiproviders", "aiprovider", "providers", "provider", "magpie", "models":
+            return .aiProviders
+        case "capabilities", "capability", "capabilityledger", "ledger":
+            return .capabilities
+        default:
+            return nil
+        }
+    }
+}
+
+@MainActor
+private struct FabushiSettingsDetailBackButtonModifier: ViewModifier {
+    let onBack: () -> Void
+    @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
+    private var theme: FabushiTheme { injectedTheme ?? .default }
+
+    func body(content: Content) -> some View {
+        content
+            .navigationBarBackButtonHidden(true)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(action: onBack) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.backward")
+                                .fabushiFont(.headline)
+                                .accessibilityHidden(true)
+                            Text(theme.localized("hig.common.back"))
+                                .fabushiFont(.body)
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(theme.accentColor)
+                        .fabushiMinimumTouchTarget()
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(theme.localized("hig.common.back"))
+                    .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.backButton)
+                }
+            }
+    }
+}
+
+@MainActor
+private struct FabushiSettingsDismissBackButtonModifier: ViewModifier {
+    @Environment(\.dismiss) private var dismiss
+
+    func body(content: Content) -> some View {
+        content.modifier(FabushiSettingsDetailBackButtonModifier {
+            dismiss()
+        })
+    }
+}
+
 @MainActor
 public struct FabushiSettingsRootView: View {
     public let initialSection: String?
@@ -776,6 +873,7 @@ public struct FabushiSettingsRootView: View {
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
     @Environment(FabushiFeatureModuleRegistry.self) private var injectedRegistry: FabushiFeatureModuleRegistry?
     @State private var searchQuery: String = ""
+    @State private var selectedSection: FabushiSettingsSectionDestination?
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
     private var registry: FabushiFeatureModuleRegistry { injectedRegistry ?? .shared }
@@ -794,6 +892,56 @@ public struct FabushiSettingsRootView: View {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return true }
         return labels.contains { $0.lowercased().contains(query) }
+    }
+
+    private func settingsRowButton(
+        destination: FabushiSettingsSectionDestination,
+        title: String,
+        systemImage: String,
+        accessibilityID: String
+    ) -> some View {
+        Button {
+            selectedSection = destination
+        } label: {
+            HStack(spacing: 12) {
+                Label(title, systemImage: systemImage)
+                    .fabushiFont(.body)
+                    .foregroundStyle(theme.textPrimary)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.forward")
+                    .fabushiFont(.footnote)
+                    .foregroundStyle(theme.textMuted)
+                    .accessibilityHidden(true)
+            }
+            .frame(maxWidth: .infinity, minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(accessibilityID)
+    }
+
+    @ViewBuilder
+    private func destinationView(for section: FabushiSettingsSectionDestination) -> some View {
+        switch section {
+        case .appearance:
+            FabushiAppearanceSettingsView(coordinator: coordinator)
+        case .language:
+            FabushiLanguageSettingsView(coordinator: coordinator)
+        case .privacySecurity:
+            FabushiPrivacySecurityHubView(coordinator: coordinator)
+        case .devices:
+            registry.security.makeDevicesSettingsView(coordinator: coordinator)
+        case .vault:
+            registry.security.makeVaultSettingsView(coordinator: coordinator)
+        case .aiProviders:
+            registry.agentStudio.makeMagpieAiProvidersSettingsView(
+                coordinator: coordinator,
+                router: router
+            )
+        case .capabilities:
+            DefaultCapabilityLedgerView()
+        }
     }
 
     public var body: some View {
@@ -826,136 +974,84 @@ public struct FabushiSettingsRootView: View {
                     theme.localized("hig.settings.appearance"),
                     "appearance", "theme", "accent", "contrast", "motion", "外观", "主题",
                 ]) {
-                    NavigationLink {
-                        FabushiAppearanceSettingsView(coordinator: coordinator)
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.appearance"),
-                            systemImage: "paintbrush.fill"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.appearance"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionAppearance)
+                    settingsRowButton(
+                        destination: .appearance,
+                        title: theme.localized("hig.settings.appearance"),
+                        systemImage: "paintbrush.fill",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionAppearance
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.language"),
                     "language", "locale", "chinese", "english", "语言",
                 ]) {
-                    NavigationLink {
-                        FabushiLanguageSettingsView(coordinator: coordinator)
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.language"),
-                            systemImage: "globe"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.language"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionLanguage)
+                    settingsRowButton(
+                        destination: .language,
+                        title: theme.localized("hig.settings.language"),
+                        systemImage: "globe",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionLanguage
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.privacySecurity"),
                     "privacy", "security", "passcode", "vault", "devices", "隐私", "安全",
                 ]) {
-                    NavigationLink {
-                        FabushiPrivacySecurityHubView(coordinator: coordinator)
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.privacySecurity"),
-                            systemImage: "lock.shield.fill"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.privacySecurity"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionPrivacySecurity)
+                    settingsRowButton(
+                        destination: .privacySecurity,
+                        title: theme.localized("hig.settings.privacySecurity"),
+                        systemImage: "lock.shield.fill",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionPrivacySecurity
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.devices"),
                     "devices", "sessions", "设备",
                 ]) {
-                    NavigationLink {
-                        registry.security.makeDevicesSettingsView(coordinator: coordinator)
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.devices"),
-                            systemImage: "laptopcomputer.and.iphone"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.devices"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionDevices)
+                    settingsRowButton(
+                        destination: .devices,
+                        title: theme.localized("hig.settings.devices"),
+                        systemImage: "laptopcomputer.and.iphone",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionDevices
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.vault"),
                     "vault", "totp", "凭证",
                 ]) {
-                    NavigationLink {
-                        registry.security.makeVaultSettingsView(coordinator: coordinator)
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.vault"),
-                            systemImage: "key.fill"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.vault"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionVault)
+                    settingsRowButton(
+                        destination: .vault,
+                        title: theme.localized("hig.settings.vault"),
+                        systemImage: "key.fill",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionVault
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.aiProviders"),
                     "ai", "providers", "magpie", "供应商",
                 ]) {
-                    NavigationLink {
-                        registry.agentStudio.makeMagpieAiProvidersSettingsView(
-                            coordinator: coordinator,
-                            router: router
-                        )
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.aiProviders"),
-                            systemImage: "cpu"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.aiProviders"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionAIProviders)
+                    settingsRowButton(
+                        destination: .aiProviders,
+                        title: theme.localized("hig.settings.aiProviders"),
+                        systemImage: "cpu",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionAIProviders
+                    )
                 }
 
                 if matchesSearch([
                     theme.localized("hig.settings.capabilities"),
                     "capabilities", "ledger", "ocrm", "fbcp", "能力",
                 ]) {
-                    NavigationLink {
-                        DefaultCapabilityLedgerView()
-                    } label: {
-                        Label(
-                            theme.localized("hig.settings.capabilities"),
-                            systemImage: "checkmark.seal.fill"
-                        )
-                        .fabushiFont(.body)
-                        .foregroundStyle(theme.textPrimary)
-                        .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
-                    }
-                    .accessibilityLabel(theme.localized("hig.settings.capabilities"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.sectionCapabilities)
+                    settingsRowButton(
+                        destination: .capabilities,
+                        title: theme.localized("hig.settings.capabilities"),
+                        systemImage: "checkmark.seal.fill",
+                        accessibilityID: FabushiAccessibilityIDs.Settings.sectionCapabilities
+                    )
                 }
             }
             .listStyle(.insetGrouped)
@@ -964,6 +1060,25 @@ public struct FabushiSettingsRootView: View {
         }
         .background(theme.surfacePrimary)
         .navigationTitle(theme.localized("hig.tab.settings"))
+        .navigationDestination(item: $selectedSection) { section in
+            destinationView(for: section)
+                .modifier(
+                    FabushiSettingsDetailBackButtonModifier {
+                        selectedSection = nil
+                        if case .settings(let currentSection) = router.activeRoute, currentSection != nil {
+                            router.navigate(to: .settings(section: nil), coordinator: coordinator)
+                        }
+                    }
+                )
+        }
+        .onAppear {
+            if let target = FabushiSettingsSectionDestination.parse(initialSection) {
+                selectedSection = target
+            }
+        }
+        .onChange(of: initialSection) { _, newValue in
+            selectedSection = FabushiSettingsSectionDestination.parse(newValue)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.root)
     }
@@ -974,12 +1089,52 @@ public struct FabushiSettingsRootView: View {
 public struct FabushiAppearanceSettingsView: View {
     public let coordinator: FabushiCoordinator
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
+    @ScaledMetric(relativeTo: .caption2) private var accentPreviewSize: CGFloat = 28
     @State private var accentDraft: String = ""
+    @State private var persistTask: Task<Void, Never>?
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
     public init(coordinator: FabushiCoordinator) {
         self.coordinator = coordinator
+    }
+
+    private func schedulePersist() {
+        persistTask?.cancel()
+        persistTask = Task {
+            _ = await theme.persistPreferences(using: coordinator)
+        }
+    }
+
+    private func applyAccentDraft() {
+        if theme.applyCustomAccentHex(accentDraft) {
+            schedulePersist()
+        }
+    }
+
+    private var accentHexTextField: some View {
+        TextField(
+            theme.localized("hig.appearance.accentHexPlaceholder"),
+            text: $accentDraft
+        )
+        .fabushiFont(.body)
+        .textInputAutocapitalization(.characters)
+        .autocorrectionDisabled()
+        .onSubmit {
+            applyAccentDraft()
+        }
+        .accessibilityLabel(theme.localized("hig.appearance.accentHexPlaceholder"))
+        .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.accentHexField)
+    }
+
+    private var accentApplyButton: some View {
+        FabushiGlassPillButton(
+            title: theme.localized("hig.common.apply"),
+            accessibilityID: "fabushi.settings.accentApplyButton",
+            isProminent: true
+        ) {
+            applyAccentDraft()
+        }
     }
 
     public var body: some View {
@@ -993,7 +1148,7 @@ public struct FabushiAppearanceSettingsView: View {
                         let isSelected = theme.preset == preset
                         Button {
                             theme.selectPreset(preset)
-                            Task { _ = await theme.persistPreferences(using: coordinator) }
+                            schedulePersist()
                         } label: {
                             HStack(spacing: 8) {
                                 Circle()
@@ -1024,25 +1179,15 @@ public struct FabushiAppearanceSettingsView: View {
             }
 
             Section {
-                HStack(spacing: 8) {
-                    TextField(
-                        theme.localized("hig.appearance.accentHexPlaceholder"),
-                        text: $accentDraft
-                    )
-                    .fabushiFont(.body)
-                    .textInputAutocapitalization(.characters)
-                    .autocorrectionDisabled()
-                    .accessibilityLabel(theme.localized("hig.appearance.accentHexPlaceholder"))
-                    .accessibilityIdentifier(FabushiAccessibilityIDs.Settings.accentHexField)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        accentHexTextField
+                        accentApplyButton
+                    }
 
-                    FabushiGlassPillButton(
-                        title: theme.localized("hig.common.apply"),
-                        accessibilityID: "fabushi.settings.accentApplyButton",
-                        isProminent: true
-                    ) {
-                        if theme.applyCustomAccentHex(accentDraft) {
-                            Task { _ = await theme.persistPreferences(using: coordinator) }
-                        }
+                    VStack(alignment: .leading, spacing: 8) {
+                        accentHexTextField
+                        accentApplyButton
                     }
                 }
 
@@ -1058,13 +1203,15 @@ public struct FabushiAppearanceSettingsView: View {
                     ? theme.localized("hig.appearance.contrastAdjusted")
                     : theme.localized("hig.appearance.contrastPass")
                 HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(theme.accentColor)
-                        .frame(width: 28, height: 28)
-                        .overlay(
-                            Text("Aa")
-                                .fabushiFont(.caption2)
-                                .foregroundStyle(theme.accentForegroundColor)
+                    Text("Aa")
+                        .fabushiFont(.caption2)
+                        .foregroundStyle(theme.accentForegroundColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .frame(minWidth: accentPreviewSize, minHeight: accentPreviewSize)
+                        .background(
+                            theme.accentColor,
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                         )
                         .accessibilityHidden(true)
 
@@ -1089,7 +1236,7 @@ public struct FabushiAppearanceSettingsView: View {
                             Button {
                                 accentDraft = swatch.hexString
                                 if theme.applyCustomAccentHex(swatch.hexString) {
-                                    Task { _ = await theme.persistPreferences(using: coordinator) }
+                                    schedulePersist()
                                 }
                             } label: {
                                 Circle()
@@ -1104,7 +1251,7 @@ public struct FabushiAppearanceSettingsView: View {
                                     .fabushiMinimumTouchTarget()
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel(swatch.name)
+                            .accessibilityLabel(theme.localized(swatch.nameKey))
                         }
                     }
                 }
@@ -1113,7 +1260,7 @@ public struct FabushiAppearanceSettingsView: View {
                     Button(theme.localized("hig.appearance.resetAccent")) {
                         theme.clearCustomAccent()
                         accentDraft = theme.rawAccentHex
-                        Task { _ = await theme.persistPreferences(using: coordinator) }
+                        schedulePersist()
                     }
                     .fabushiFont(.callout)
                     .frame(minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
@@ -1138,7 +1285,7 @@ public struct FabushiAppearanceSettingsView: View {
                             get: { Double(theme.bubbleCornerRadius) },
                             set: { newValue in
                                 theme.setBubbleCornerRadius(CGFloat(newValue))
-                                Task { _ = await theme.persistPreferences(using: coordinator) }
+                                schedulePersist()
                             }
                         ),
                         in: Double(FabushiTheme.minBubbleCornerRadius)...Double(FabushiTheme.maxBubbleCornerRadius),
@@ -1151,7 +1298,7 @@ public struct FabushiAppearanceSettingsView: View {
                         ForEach(FabushiWallpaper.presets) { item in
                             Button {
                                 theme.selectWallpaper(item)
-                                Task { _ = await theme.persistPreferences(using: coordinator) }
+                                schedulePersist()
                             } label: {
                                 VStack(spacing: 4) {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -1186,7 +1333,7 @@ public struct FabushiAppearanceSettingsView: View {
                         get: { theme.reduceMotionOverride },
                         set: { enabled in
                             theme.setReduceMotion(enabled)
-                            Task { _ = await theme.persistPreferences(using: coordinator) }
+                            schedulePersist()
                         }
                     )
                 ) {
@@ -1203,7 +1350,7 @@ public struct FabushiAppearanceSettingsView: View {
                         get: { theme.highContrastOverride },
                         set: { enabled in
                             theme.setHighContrast(enabled)
-                            Task { _ = await theme.persistPreferences(using: coordinator) }
+                            schedulePersist()
                         }
                     )
                 ) {
@@ -1233,17 +1380,25 @@ public struct FabushiAppearanceSettingsView: View {
 public struct FabushiLanguageSettingsView: View {
     public let coordinator: FabushiCoordinator
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
+    @State private var persistTask: Task<Void, Never>?
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
     public init(coordinator: FabushiCoordinator) {
         self.coordinator = coordinator
     }
 
+    private func schedulePersist() {
+        persistTask?.cancel()
+        persistTask = Task {
+            _ = await theme.persistPreferences(using: coordinator)
+        }
+    }
+
     public var body: some View {
         List {
             Button {
                 theme.setLocale(.zhHans)
-                Task { _ = await theme.persistPreferences(using: coordinator) }
+                schedulePersist()
             } label: {
                 HStack {
                     Text(theme.localized("hig.language.simplifiedChinese"))
@@ -1265,7 +1420,7 @@ public struct FabushiLanguageSettingsView: View {
 
             Button {
                 theme.setLocale(.en)
-                Task { _ = await theme.persistPreferences(using: coordinator) }
+                schedulePersist()
             } label: {
                 HStack {
                     Text(theme.localized("hig.language.english"))
@@ -1304,6 +1459,7 @@ private struct FabushiPrivacySecurityHubView: View {
         List {
             NavigationLink {
                 registry.security.makeVaultSettingsView(coordinator: coordinator)
+                    .modifier(FabushiSettingsDismissBackButtonModifier())
             } label: {
                 Label(theme.localized("hig.settings.vault"), systemImage: "key.fill")
                     .fabushiFont(.body)
@@ -1312,6 +1468,7 @@ private struct FabushiPrivacySecurityHubView: View {
 
             NavigationLink {
                 registry.security.makeDevicesSettingsView(coordinator: coordinator)
+                    .modifier(FabushiSettingsDismissBackButtonModifier())
             } label: {
                 Label(theme.localized("hig.settings.devices"), systemImage: "laptopcomputer.and.iphone")
                     .fabushiFont(.body)
@@ -1333,6 +1490,19 @@ public struct DefaultCapabilityLedgerView: View {
 
     public init() {}
 
+    private func dispositionBadge(for item: FabushiTrackedCapabilityItem) -> some View {
+        Text(theme.localized(item.disposition.localizationKey))
+            .fabushiFont(.caption)
+            .foregroundStyle(
+                item.disposition == .serverBlocked
+                    ? theme.warningColor
+                    : theme.textSecondary
+            )
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(theme.surfaceInput, in: Capsule())
+    }
+
     public var body: some View {
         List {
             Section {
@@ -1345,21 +1515,23 @@ public struct DefaultCapabilityLedgerView: View {
             Section {
                 ForEach(FabushiCapabilityLedger.canonicalItems) { item in
                     VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(item.id)
-                                .fabushiFont(.headline)
-                                .foregroundStyle(theme.textPrimary)
-                            Spacer()
-                            Text(theme.localized(item.disposition.localizationKey))
-                                .fabushiFont(.caption)
-                                .foregroundStyle(
-                                    item.disposition == .serverBlocked
-                                        ? theme.warningColor
-                                        : theme.textSecondary
-                                )
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(theme.surfaceInput, in: Capsule())
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 8) {
+                                Text(item.id)
+                                    .fabushiFont(.headline)
+                                    .foregroundStyle(theme.textPrimary)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                Spacer(minLength: 8)
+                                dispositionBadge(for: item)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(item.id)
+                                    .fabushiFont(.headline)
+                                    .foregroundStyle(theme.textPrimary)
+                                dispositionBadge(for: item)
+                            }
                         }
                         Text(item.summary)
                             .fabushiFont(.footnote)
@@ -1531,6 +1703,11 @@ private struct DefaultAuthGateSurface: View {
                 params: LoginParams(username: trimmedUser, password: passwordText)
             )
             _ = try await coordinator.setAuthSession(authResp)
+            router.engagePasscodeLockIfEnabled()
+            router.handleAccountScopeChange(
+                generation: coordinator.accountScopeGeneration,
+                coordinator: coordinator
+            )
             router.replayPendingDeepLinkIfReady(coordinator: coordinator)
         } catch {
             errorMessage = error.localizedDescription
@@ -1754,12 +1931,14 @@ private struct DefaultVaultSettingsSurface: View {
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
     var body: some View {
-        FabushiEmptyStateView(
-            title: theme.localized("hig.settings.vault"),
-            systemImage: "key.fill",
-            descriptionText: theme.localized("hig.settings.privacySecurity"),
-            accessibilityID: FabushiAccessibilityIDs.Settings.sectionVault
-        )
+        ContentUnavailableView {
+            Label(theme.localized("hig.settings.vault"), systemImage: "key.fill")
+                .foregroundStyle(theme.textPrimary)
+        } description: {
+            Text(theme.localized("hig.settings.privacySecurity"))
+                .fabushiFont(.body)
+                .foregroundStyle(theme.textSecondary)
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.surfacePrimary)
         .navigationTitle(theme.localized("hig.settings.vault"))

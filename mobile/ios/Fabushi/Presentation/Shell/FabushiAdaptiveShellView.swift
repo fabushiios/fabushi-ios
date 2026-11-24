@@ -16,6 +16,7 @@ public struct FabushiAdaptiveShellView: View {
     public let router: ShellNavigationRouter
     public let registry: FabushiFeatureModuleRegistry
     public let launchConfiguration: FabushiLaunchConfiguration
+    public let startupErrorMessage: String?
     public let onRetryStartup: @MainActor () async -> Void
 
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -23,7 +24,7 @@ public struct FabushiAdaptiveShellView: View {
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
 
     @State private var isRetryingStartup = false
-    @State private var isPasscodeLocked: Bool
+    @State private var didSyncLaunchPasscodePolicy = false
 
     public init(
         coordinator: FabushiCoordinator = .shared,
@@ -31,6 +32,7 @@ public struct FabushiAdaptiveShellView: View {
         router: ShellNavigationRouter,
         registry: FabushiFeatureModuleRegistry = .shared,
         launchConfiguration: FabushiLaunchConfiguration = .current,
+        startupErrorMessage: String? = nil,
         onRetryStartup: @escaping @MainActor () async -> Void = {}
     ) {
         self.coordinator = coordinator
@@ -38,8 +40,8 @@ public struct FabushiAdaptiveShellView: View {
         self.router = router
         self.registry = registry
         self.launchConfiguration = launchConfiguration
+        self.startupErrorMessage = startupErrorMessage
         self.onRetryStartup = onRetryStartup
-        self._isPasscodeLocked = State(initialValue: launchConfiguration.requirePasscode)
     }
 
     private enum ActiveModalSheet: Identifiable {
@@ -58,9 +60,24 @@ public struct FabushiAdaptiveShellView: View {
         }
     }
 
+    private var isPasscodeOverlayActive: Bool {
+        coordinator.authState != .unauthenticated && router.isPasscodeLocked
+    }
+
+    private var topToastInset: CGFloat {
+        let baseInset: CGFloat = horizontalSizeClass == .compact ? 56 : 52
+        let hasTopBanner = router.activeDeepLinkBannerText != nil || router.activeProviderErrorMessage != nil
+        return hasTopBanner ? baseInset + 56 : baseInset
+    }
+
     private var activeModalSheetBinding: Binding<ActiveModalSheet?> {
         Binding(
             get: {
+                // Strictly suppress modal `.sheet` presentations whenever passcode-locked or
+                // non-active so sheets never render above Passcode Lock or Privacy Blur overlays.
+                guard !router.isPasscodeLocked, scenePhase == .active else {
+                    return nil
+                }
                 if router.isAccountSwitcherPresented {
                     return .accountSwitcher
                 }
@@ -79,12 +96,10 @@ public struct FabushiAdaptiveShellView: View {
             },
             set: { newValue in
                 guard newValue == nil else { return }
-                router.isAccountSwitcherPresented = false
-                router.presentedMiniAppId = nil
-                router.isCallsSheetPresented = false
-                if horizontalSizeClass == .compact {
-                    router.dismissInspector()
-                }
+                router.dismissActiveModalSheet(
+                    coordinator: coordinator,
+                    dismissCompactInspector: horizontalSizeClass == .compact
+                )
             }
         )
     }
@@ -92,7 +107,8 @@ public struct FabushiAdaptiveShellView: View {
     private var regularInspectorBinding: Binding<Bool> {
         Binding(
             get: {
-                horizontalSizeClass == .regular
+                !router.isPasscodeLocked
+                    && horizontalSizeClass == .regular
                     && router.isInspectorPresented
                     && router.inspectorTarget != nil
             },
@@ -105,30 +121,34 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     public var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             rootLifecycleSurface
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(!isPasscodeOverlayActive)
 
-            if coordinator.authState != .unauthenticated, isPasscodeLocked {
+            if router.toastController.stagePill != nil || router.toastController.windowBanner != nil {
+                FabushiTwoLayerToastHost(controller: router.toastController)
+                    .padding(.top, topToastInset)
+                    .zIndex(40)
+            }
+
+            if isPasscodeOverlayActive {
                 registry.security.makePasscodeLockOverlay(
                     coordinator: coordinator,
                     launchConfiguration: launchConfiguration
                 ) {
-                    isPasscodeLocked = false
+                    _ = router.unlockPasscode(coordinator: coordinator)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .transition(.opacity)
                 .zIndex(50)
             }
 
-            if scenePhase != .active, (isPasscodeLocked || launchConfiguration.requirePasscode) {
+            if scenePhase != .active, (router.isPasscodeLocked || router.isPasscodeLockEnabled) {
                 registry.security.makePrivacyBlurOverlay()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .zIndex(100)
             }
-        }
-        .overlay(alignment: .bottom) {
-            FabushiTwoLayerToastHost(controller: router.toastController)
-                .padding(.bottom, horizontalSizeClass == .compact ? 64 : 20)
-                .zIndex(40)
         }
         .preferredColorScheme(theme.colorScheme)
         .tint(theme.accentColor)
@@ -143,24 +163,44 @@ public struct FabushiAdaptiveShellView: View {
                 transaction.disablesAnimations = true
             }
         }
+        .onAppear {
+            if !didSyncLaunchPasscodePolicy {
+                didSyncLaunchPasscodePolicy = true
+                if launchConfiguration.requirePasscode && !router.isPasscodeLockEnabled {
+                    router.isPasscodeLockEnabled = true
+                    router.engagePasscodeLockIfEnabled()
+                }
+            }
+        }
         .onChange(of: coordinator.accountScopeGeneration) { _, newGeneration in
             router.handleAccountScopeChange(generation: newGeneration, coordinator: coordinator)
+            if coordinator.authState != .unauthenticated, !router.isPasscodeLocked {
+                router.replayPendingDeepLinkIfReady(coordinator: coordinator)
+            }
         }
         .onChange(of: coordinator.activeRoute) { _, _ in
             router.syncFromCoordinator(coordinator)
         }
-        .onChange(of: coordinator.authState) { _, newState in
-            if newState != .unauthenticated {
-                if launchConfiguration.requirePasscode {
-                    isPasscodeLocked = true
+        .onChange(of: coordinator.authState) { oldState, newState in
+            if newState == .unauthenticated {
+                router.engagePasscodeLockIfEnabled()
+            } else {
+                if oldState == .unauthenticated {
+                    router.engagePasscodeLockIfEnabled()
                 }
-                router.replayPendingDeepLinkIfReady(coordinator: coordinator)
+                router.handleAccountScopeChange(
+                    generation: coordinator.accountScopeGeneration,
+                    coordinator: coordinator
+                )
+                if !router.isPasscodeLocked {
+                    router.replayPendingDeepLinkIfReady(coordinator: coordinator)
+                }
             }
         }
         .onChange(of: scenePhase) { _, phase in
             router.handleScenePhaseChange(phase)
-            if phase == .background, launchConfiguration.requirePasscode {
-                isPasscodeLocked = true
+            if phase == .background {
+                router.engagePasscodeLockIfEnabled()
             }
         }
     }
@@ -169,7 +209,8 @@ public struct FabushiAdaptiveShellView: View {
 
     @ViewBuilder
     private var rootLifecycleSurface: some View {
-        if !coordinator.isStarted, let errorMessage = coordinator.lastErrorMessage {
+        let effectiveStartupError = startupErrorMessage ?? coordinator.lastErrorMessage
+        if !coordinator.isStarted, let errorMessage = effectiveStartupError {
             FabushiStartupRetryView(
                 errorMessage: errorMessage,
                 isRetrying: isRetryingStartup
@@ -181,6 +222,18 @@ public struct FabushiAdaptiveShellView: View {
                     isRetryingStartup = false
                 }
             }
+        } else if !coordinator.isStarted {
+            VStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.large)
+                Text(theme.localized("hig.status.starting"))
+                    .fabushiFont(.subheadline)
+                    .foregroundStyle(theme.textSecondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.surfacePrimary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(theme.localized("hig.status.starting"))
         } else if coordinator.authState == .unauthenticated {
             registry.auth.makeAuthGateView(
                 coordinator: coordinator,
@@ -261,7 +314,7 @@ public struct FabushiAdaptiveShellView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.splitView)
             } else {
-                NavigationSplitView {
+                NavigationSplitView(columnVisibility: .constant(.all)) {
                     expandedSidebarView
                         .navigationSplitViewColumnWidth(
                             min: FabushiLayoutMetrics.sidebarMinWidth,
@@ -271,6 +324,8 @@ public struct FabushiAdaptiveShellView: View {
                 } detail: {
                     stageContainerView
                 }
+                .navigationSplitViewStyle(.balanced)
+                .accessibilityElement(children: .contain)
                 .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.splitView)
             }
         }
@@ -425,11 +480,20 @@ public struct FabushiAdaptiveShellView: View {
         }
     }
 
+    private var resolvedIPadWorkspaceRoute: ShellRoute {
+        switch router.activeRoute {
+        case .calls, .miniApp:
+            return router.lastWorkspaceRoute
+        default:
+            return router.activeRoute
+        }
+    }
+
     @ViewBuilder
     private var stageContainerView: some View {
         NavigationStack {
             Group {
-                switch router.activeRoute {
+                switch resolvedIPadWorkspaceRoute {
                 case .compose:
                     registry.messaging.makeMultiSelectComposeView(
                         coordinator: coordinator,
@@ -460,14 +524,12 @@ public struct FabushiAdaptiveShellView: View {
                         coordinator: coordinator,
                         router: router
                     )
-                case .calls:
-                    registry.platform.makeCallsTabView(
-                        coordinator: coordinator,
-                        router: router
-                    )
-                case .miniApp(let id):
-                    registry.platform.makeMiniAppHostSheetView(
-                        miniAppId: id,
+                case .calls, .miniApp:
+                    // Calls and Mini Apps are presented exclusively as modal sheets so the iPad
+                    // detail column never duplicates live WKWebView or Call surfaces underneath.
+                    registry.messaging.makeConversationStageView(
+                        chatId: nil,
+                        messageId: nil,
                         coordinator: coordinator,
                         router: router
                     )
@@ -480,6 +542,16 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     // MARK: - iPhone Compact TabView + NavigationStack Shell
+
+    private var isCompactChatsDetailActive: Bool {
+        if case .compose = router.activeRoute {
+            return true
+        }
+        if case .chats(let chatId, _) = router.activeRoute, chatId != nil {
+            return true
+        }
+        return false
+    }
 
     private var compactIPhoneShell: some View {
         TabView(
@@ -512,7 +584,27 @@ public struct FabushiAdaptiveShellView: View {
                 }
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
-                        accountSwitcherButton
+                        if isCompactChatsDetailActive {
+                            Button {
+                                router.navigateBackToChatList(coordinator: coordinator)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "chevron.backward")
+                                        .fabushiFont(.headline)
+                                        .accessibilityHidden(true)
+                                    Text(theme.localized("hig.common.back"))
+                                        .fabushiFont(.body)
+                                        .lineLimit(1)
+                                }
+                                .foregroundStyle(theme.accentColor)
+                                .fabushiMinimumTouchTarget()
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(theme.localized("hig.common.back"))
+                            .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.backButton)
+                        } else {
+                            accountSwitcherButton
+                        }
                     }
                     ToolbarItem(placement: .principal) {
                         FabushiConnectionStatusPill(

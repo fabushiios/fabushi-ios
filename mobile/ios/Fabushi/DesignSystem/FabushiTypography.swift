@@ -48,7 +48,7 @@ public enum FabushiTextStyle: Sendable, CaseIterable {
 public enum FabushiLayoutMetrics: Sendable {
     public static let minTouchTarget: CGFloat = 44
     public static let sidebarDefaultWidth: CGFloat = 288
-    public static let sidebarMinWidth: CGFloat = 240
+    public static let sidebarMinWidth: CGFloat = 260
     public static let sidebarMaxWidth: CGFloat = 360
     public static let sidebarCollapsedWidth: CGFloat = 68
     public static let inspectorMinWidth: CGFloat = 280

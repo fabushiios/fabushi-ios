@@ -217,19 +217,20 @@ public struct FabushiWallpaper: Sendable, Equatable, Hashable, Identifiable {
 public struct FabushiAccentSwatch: Sendable, Equatable, Hashable, Identifiable {
     public let id: String
     public let name: String
+    public let nameKey: String
     public let rgb: UInt32
 
     public var hexString: String { FabushiColorHex.format(rgb) }
 
     public static let curated: [FabushiAccentSwatch] = [
-        FabushiAccentSwatch(id: "system_blue", name: "System Blue", rgb: 0x007AFF),
-        FabushiAccentSwatch(id: "sky_blue", name: "Sky Blue", rgb: 0x40A7E3),
-        FabushiAccentSwatch(id: "teal_mint", name: "Teal Mint", rgb: 0x3FC1B0),
-        FabushiAccentSwatch(id: "emerald", name: "Emerald", rgb: 0x34C759),
-        FabushiAccentSwatch(id: "amber_gold", name: "Amber Gold", rgb: 0xE5A030),
-        FabushiAccentSwatch(id: "coral_orange", name: "Coral Orange", rgb: 0xE86C52),
-        FabushiAccentSwatch(id: "crimson_rose", name: "Crimson Rose", rgb: 0xE16794),
-        FabushiAccentSwatch(id: "lavender", name: "Lavender", rgb: 0x8544D6),
+        FabushiAccentSwatch(id: "system_blue", name: "System Blue", nameKey: "hig.swatch.systemBlue", rgb: 0x007AFF),
+        FabushiAccentSwatch(id: "sky_blue", name: "Sky Blue", nameKey: "hig.swatch.skyBlue", rgb: 0x40A7E3),
+        FabushiAccentSwatch(id: "teal_mint", name: "Teal Mint", nameKey: "hig.swatch.tealMint", rgb: 0x3FC1B0),
+        FabushiAccentSwatch(id: "emerald", name: "Emerald", nameKey: "hig.swatch.emerald", rgb: 0x34C759),
+        FabushiAccentSwatch(id: "amber_gold", name: "Amber Gold", nameKey: "hig.swatch.amberGold", rgb: 0xE5A030),
+        FabushiAccentSwatch(id: "coral_orange", name: "Coral Orange", nameKey: "hig.swatch.coralOrange", rgb: 0xE86C52),
+        FabushiAccentSwatch(id: "crimson_rose", name: "Crimson Rose", nameKey: "hig.swatch.crimsonRose", rgb: 0xE16794),
+        FabushiAccentSwatch(id: "lavender", name: "Lavender", nameKey: "hig.swatch.lavender", rgb: 0x8544D6),
     ]
 }
 
@@ -381,14 +382,19 @@ public enum FabushiLocale: String, CaseIterable, Codable, Sendable, Identifiable
         let format = localized(key, bundle: bundle)
         return String(format: format, locale: foundationLocale, arguments: arguments)
     }
+
+    /// Returns all localization keys present across compiled `Localizable.loctable` or `.lproj` tables.
+    public static func allCatalogKeys(in bundle: Bundle = .main) -> Set<String> {
+        FabushiLoctableCache.allKeys(in: bundle)
+    }
 }
 
 private enum FabushiLoctableCache {
     private static let lock = OSAllocatedUnfairLock(initialState: [String: [String: [String: String]]]())
 
-    static func lookup(key: String, localeCode: String, in bundle: Bundle) -> String? {
+    private static func cachedTables(in bundle: Bundle) -> [String: [String: String]] {
         let bundlePath = bundle.bundlePath
-        let tables: [String: [String: String]] = lock.withLock { cache in
+        return lock.withLock { cache in
             if let existing = cache[bundlePath] {
                 return existing
             }
@@ -396,6 +402,35 @@ private enum FabushiLoctableCache {
             cache[bundlePath] = loaded
             return loaded
         }
+    }
+
+    static func allKeys(in bundle: Bundle) -> Set<String> {
+        let tables = cachedTables(in: bundle)
+        var keys = Set<String>()
+        for dict in tables.values {
+            keys.formUnion(dict.keys)
+        }
+        if keys.isEmpty {
+            for locale in FabushiLocale.allCases {
+                if let lprojPath = bundle.path(forResource: locale.rawValue, ofType: "lproj"),
+                   let localizedBundle = Bundle(path: lprojPath),
+                   let stringsURL = localizedBundle.url(forResource: "Localizable", withExtension: "strings"),
+                   let data = try? Data(contentsOf: stringsURL),
+                   let plist = try? PropertyListSerialization.propertyList(
+                       from: data,
+                       options: [],
+                       format: nil
+                   ),
+                   let dict = plist as? [String: String] {
+                    keys.formUnion(dict.keys)
+                }
+            }
+        }
+        return keys
+    }
+
+    static func lookup(key: String, localeCode: String, in bundle: Bundle) -> String? {
+        let tables = cachedTables(in: bundle)
 
         if let exact = tables[localeCode]?[key] {
             return exact
@@ -542,7 +577,13 @@ public struct FabushiThemePalette: Sendable, Equatable {
             msgOutBaseRGB = base.msgOutBase
             msgOutTopRGB = base.msgOutTop
             msgOutBottomRGB = base.msgOutBottom
-            msgOutFgRGB = highContrast ? contrast.foregroundRGB : base.msgOutFg
+            if highContrast {
+                msgOutFgRGB = FabushiColorHex.wcagRelativeLuminance(base.msgOutBase) > FabushiColorHex.wcagInkLuminanceMidpoint
+                    ? 0x000000
+                    : 0xFFFFFF
+            } else {
+                msgOutFgRGB = base.msgOutFg
+            }
             msgOutSecondaryFgRGB = base.msgOutSecondaryFg
             textLinkRGB = base.textLink
             accentHoverRGB = base.accentHover
@@ -869,6 +910,10 @@ public final class FabushiTheme {
     // MARK: - Mutations
 
     public func applyLaunchConfiguration(_ config: FabushiLaunchConfiguration) {
+        if let launchLocale = config.preferredLocale {
+            locale = launchLocale
+            hasLaunchLocaleOverride = true
+        }
         if let launchPreset = config.themePreset {
             preset = launchPreset
             wallpaper = FabushiWallpaper.defaultFor(launchPreset)
@@ -878,19 +923,15 @@ public final class FabushiTheme {
             customAccentHex = launchAccent
             lastAccentValidationError = nil
             hasLaunchAccentOverride = true
-        } else if let invalid = config.invalidLaunchAccentHex {
-            lastAccentValidationError = invalid
+        } else if config.invalidLaunchAccentHex != nil {
+            lastAccentValidationError = localized("hig.appearance.invalidHexError")
         }
-        if let launchLocale = config.preferredLocale {
-            locale = launchLocale
-            hasLaunchLocaleOverride = true
-        }
-        if config.reduceMotion {
-            reduceMotionOverride = true
+        if let launchReduceMotion = config.reduceMotionLaunchOverride {
+            reduceMotionOverride = launchReduceMotion
             hasLaunchReduceMotionOverride = true
         }
-        if config.highContrast {
-            highContrastOverride = true
+        if let launchHighContrast = config.highContrastLaunchOverride {
+            highContrastOverride = launchHighContrast
             hasLaunchHighContrastOverride = true
         }
     }

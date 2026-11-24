@@ -183,6 +183,7 @@ public enum ShellDeepLinkParser: Sendable {
 public final class ShellNavigationRouter {
     public var activeTab: FabushiShellTab = .chats
     public private(set) var activeRoute: ShellRoute = .chats(chatId: nil, messageId: nil)
+    public private(set) var lastWorkspaceRoute: ShellRoute = .chats(chatId: nil, messageId: nil)
     public var isSidebarCollapsed: Bool = false
 
     public private(set) var inspectorTarget: InspectorTarget?
@@ -198,6 +199,11 @@ public final class ShellNavigationRouter {
     public var isCallsSheetPresented: Bool = false
     public var presentedMiniAppId: String?
 
+    /// Runtime passcode lock policy and lock state (initialized from `launchConfiguration.requirePasscode`,
+    /// writable by M2b Security when user enables/disables passcode at runtime).
+    public var isPasscodeLockEnabled: Bool
+    public var isPasscodeLocked: Bool
+
     public var activeMiniAppPip: MiniAppPipOverlayState?
     public var activeCallPip: CallPipOverlayState?
     public var activeRemoteControlStatus: RemoteControlStatusState?
@@ -211,8 +217,13 @@ public final class ShellNavigationRouter {
     public private(set) var observedGeneration: UInt64 = 1
     public private(set) var lastScenePhase: ScenePhase = .active
 
-    public init(toastController: FabushiToastController = FabushiToastController()) {
+    public init(
+        toastController: FabushiToastController = FabushiToastController(),
+        isPasscodeLockEnabled: Bool = false
+    ) {
         self.toastController = toastController
+        self.isPasscodeLockEnabled = isPasscodeLockEnabled
+        self.isPasscodeLocked = isPasscodeLockEnabled
     }
 
     public var activeChatId: Int64? {
@@ -225,13 +236,20 @@ public final class ShellNavigationRouter {
     // MARK: - Navigation & Coordinator Bidirectional Sync
 
     public func selectTab(_ tab: FabushiShellTab, coordinator: FabushiCoordinator) {
+        let wasAlreadyOnChatsTab = activeTab == .chats
         let previousChatId = activeChatId
         activeTab = tab
 
         let targetRoute: ShellRoute
         switch tab {
         case .chats:
-            targetRoute = .chats(chatId: previousChatId, messageId: nil)
+            // Re-tapping the already-active Chats tab while inside a conversation or compose
+            // pops back to the root chat list cleanly (matching native Apple HIG TabView behavior).
+            if wasAlreadyOnChatsTab && (previousChatId != nil || activeRoute == .compose) {
+                targetRoute = .chats(chatId: nil, messageId: nil)
+            } else {
+                targetRoute = .chats(chatId: previousChatId, messageId: nil)
+            }
         case .contacts:
             // Contacts shares the Chats/Contacts messaging root without dropping active chat state
             // unless switching to a specific peer later.
@@ -247,22 +265,15 @@ public final class ShellNavigationRouter {
         navigate(to: targetRoute, coordinator: coordinator)
     }
 
+    /// Pops from an active conversation or compose screen back to the root chat list,
+    /// synchronously purging any chat-scoped Layer 1 / Layer 2 toasts.
+    public func navigateBackToChatList(coordinator: FabushiCoordinator) {
+        navigate(to: .chats(chatId: nil, messageId: nil), coordinator: coordinator)
+    }
+
     public func navigate(to route: ShellRoute, coordinator: FabushiCoordinator) {
         let previousChatId = activeChatId
-
-        // Clear chat-scoped toasts synchronously on chat switch or compose-mode entry.
-        switch route {
-        case .chats(let newChatId, _):
-            if let old = previousChatId, old != newChatId {
-                toastController.clearToasts(forChatId: old)
-            }
-        case .compose:
-            if let old = previousChatId {
-                toastController.clearToasts(forChatId: old)
-            }
-        default:
-            break
-        }
+        clearChatScopedToastsIfLeavingChat(previousChatId: previousChatId, destination: route)
 
         activeRoute = route
         if coordinator.activeRoute != route {
@@ -276,14 +287,36 @@ public final class ShellNavigationRouter {
         guard incoming != activeRoute else { return }
 
         let previousChatId = activeChatId
-        if case .chats(let newChatId, _) = incoming, let old = previousChatId, old != newChatId {
-            toastController.clearToasts(forChatId: old)
-        } else if case .compose = incoming, let old = previousChatId {
-            toastController.clearToasts(forChatId: old)
-        }
+        clearChatScopedToastsIfLeavingChat(previousChatId: previousChatId, destination: incoming)
 
         activeRoute = incoming
         applyTabAndModalState(for: incoming)
+    }
+
+    /// Dismisses active modal sheets and restores `activeRoute` & `coordinator.activeRoute`
+    /// back to `lastWorkspaceRoute` whenever dismissing `.calls` or `.miniApp`.
+    public func dismissActiveModalSheet(
+        coordinator: FabushiCoordinator,
+        dismissCompactInspector: Bool = false
+    ) {
+        isAccountSwitcherPresented = false
+        presentedMiniAppId = nil
+        isCallsSheetPresented = false
+        if dismissCompactInspector {
+            dismissInspector()
+        }
+
+        switch activeRoute {
+        case .calls, .miniApp:
+            let restored = lastWorkspaceRoute
+            activeRoute = restored
+            if coordinator.activeRoute != restored {
+                coordinator.activeRoute = restored
+            }
+            applyTabAndModalState(for: restored)
+        default:
+            break
+        }
     }
 
     public func openInspector(for target: InspectorTarget) {
@@ -308,6 +341,20 @@ public final class ShellNavigationRouter {
         activeProviderErrorMessage = nil
     }
 
+    // MARK: - Runtime Passcode Lock Hooks (M2b Security Integration)
+
+    public func engagePasscodeLockIfEnabled() {
+        if isPasscodeLockEnabled {
+            isPasscodeLocked = true
+        }
+    }
+
+    @discardableResult
+    public func unlockPasscode(coordinator: FabushiCoordinator) -> Bool {
+        isPasscodeLocked = false
+        return replayPendingDeepLinkIfReady(coordinator: coordinator)
+    }
+
     // MARK: - Deep Link Handling (`fabushi://`)
 
     @discardableResult
@@ -321,7 +368,9 @@ public final class ShellNavigationRouter {
             return true
         }
 
-        let isReadyForShellNavigation = coordinator.isStarted && coordinator.authState != .unauthenticated
+        let isReadyForShellNavigation = coordinator.isStarted
+            && coordinator.authState != .unauthenticated
+            && !isPasscodeLocked
         guard isReadyForShellNavigation else {
             pendingDeepLinkURL = url
             return true
@@ -341,12 +390,27 @@ public final class ShellNavigationRouter {
         return true
     }
 
+    /// Replays a deferred deep link ONLY when started, authenticated, and NOT passcode-locked.
+    /// Reconciles `coordinator.accountScopeGeneration` strictly BEFORE replaying so a delayed
+    /// SwiftUI `.onChange(of: coordinator.accountScopeGeneration)` tick can never wipe the
+    /// newly replayed route or deep-link banner.
     @discardableResult
     public func replayPendingDeepLinkIfReady(coordinator: FabushiCoordinator) -> Bool {
         guard coordinator.isStarted,
               coordinator.authState != .unauthenticated,
-              let pending = pendingDeepLinkURL
+              !isPasscodeLocked
         else {
+            return false
+        }
+
+        if coordinator.accountScopeGeneration > observedGeneration {
+            _ = handleAccountScopeChange(
+                generation: coordinator.accountScopeGeneration,
+                coordinator: coordinator
+            )
+        }
+
+        guard let pending = pendingDeepLinkURL else {
             return false
         }
         pendingDeepLinkURL = nil
@@ -357,6 +421,7 @@ public final class ShellNavigationRouter {
 
     /// Resets transient navigation, inspector, overlay, and toast state when `generation` advances.
     /// Rejects stale generations (`generation <= observedGeneration`) without mutating state.
+    /// Preserves `pendingDeepLinkURL` so pre-auth / cold-start deep links can replay immediately after.
     @discardableResult
     public func handleAccountScopeChange(
         generation: UInt64,
@@ -382,6 +447,7 @@ public final class ShellNavigationRouter {
         activeTab = .chats
         let defaultRoute: ShellRoute = .chats(chatId: nil, messageId: nil)
         activeRoute = defaultRoute
+        lastWorkspaceRoute = defaultRoute
         if coordinator.activeRoute != defaultRoute {
             coordinator.activeRoute = defaultRoute
         }
@@ -393,20 +459,37 @@ public final class ShellNavigationRouter {
         lastScenePhase = phase
     }
 
+    private func clearChatScopedToastsIfLeavingChat(
+        previousChatId: Int64?,
+        destination route: ShellRoute
+    ) {
+        guard let old = previousChatId else { return }
+        if case .chats(let newChatId, _) = route, newChatId == old {
+            return
+        }
+        toastController.clearToasts(forChatId: old)
+    }
+
     private func applyTabAndModalState(for route: ShellRoute) {
         switch route {
         case .chats, .compose:
             activeTab = .chats
+            lastWorkspaceRoute = route
         case .agentStudio:
             activeTab = .studio
+            lastWorkspaceRoute = route
         case .remoteComputer:
             activeTab = .remote
+            lastWorkspaceRoute = route
         case .settings:
             activeTab = .settings
+            lastWorkspaceRoute = route
         case .calls:
             isCallsSheetPresented = true
+            presentedMiniAppId = nil
         case .miniApp(let id):
             presentedMiniAppId = id ?? "catalog"
+            isCallsSheetPresented = false
         }
     }
 }

@@ -440,10 +440,206 @@ final class FabushiDesignSystemTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(launchOverrideTheme.effectiveAccentHex, "#A9A9A9")
             XCTAssertEqual(launchOverrideTheme.locale, .en)
 
+            // Verify UI-test-mode cold restart omits env flags and overrides stale persisted toggles to false
+            let uiTestLaunchTheme = FabushiTheme(preset: .night, locale: .en)
+            let uiTestLaunch2 = FabushiLaunchConfiguration(
+                environment: [
+                    "FABUSHI_UI_TEST_MODE": "1",
+                    "FABUSHI_UI_THEME": "tinted",
+                ],
+                arguments: []
+            )
+            uiTestLaunchTheme.applyLaunchConfiguration(uiTestLaunch2)
+            await uiTestLaunchTheme.loadPersistedPreferences(using: coordinator)
+            XCTAssertFalse(uiTestLaunchTheme.reduceMotionOverride)
+            XCTAssertFalse(uiTestLaunchTheme.highContrastOverride)
+
             await coordinator.shutdown()
         } catch {
             await coordinator.shutdown()
             throw error
+        }
+    }
+
+    func testPrepareStateDirectoryNeverWipesProductionWhenAppDataNil() throws {
+        // 1. resetState == true with appDataDirectory == nil MUST be a safe no-op (never fallback to production)
+        let nilDataDirReset = FabushiLaunchConfiguration(
+            environment: ["FABUSHI_E2E_RESET_STATE": "1"],
+            arguments: []
+        )
+        XCTAssertTrue(nilDataDirReset.resetState)
+        XCTAssertNil(nilDataDirReset.appDataDirectory)
+        XCTAssertNoThrow(try nilDataDirReset.prepareStateDirectoryIfNeeded())
+
+        // 2. Root `/`, `$HOME`, `temporaryDirectory` root, and production `Application Support/FabushiCore`
+        // MUST all be rejected fail-closed with `FabushiLaunchConfigurationError.unsafeResetStateDirectory`.
+        var unsafePaths: [String] = [
+            "/",
+            NSHomeDirectory(),
+            FileManager.default.temporaryDirectory.path,
+        ]
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            unsafePaths.append(appSupport.path)
+            unsafePaths.append(appSupport.appendingPathComponent("FabushiCore", isDirectory: true).path)
+            unsafePaths.append(
+                appSupport
+                    .appendingPathComponent("FabushiCore", isDirectory: true)
+                    .appendingPathComponent("nested_db", isDirectory: true)
+                    .path
+            )
+        }
+
+        for unsafePath in unsafePaths {
+            let unsafeConfig = FabushiLaunchConfiguration(
+                environment: [
+                    "FABUSHI_APP_DATA": unsafePath,
+                    "FABUSHI_E2E_RESET_STATE": "1",
+                ],
+                arguments: []
+            )
+            XCTAssertThrowsError(try unsafeConfig.prepareStateDirectoryIfNeeded()) { error in
+                guard case FabushiLaunchConfigurationError.unsafeResetStateDirectory = error else {
+                    XCTFail("Expected unsafeResetStateDirectory for '\(unsafePath)', got: \(error)")
+                    return
+                }
+            }
+        }
+
+        // 3. Explicit "0"/"1" reduceMotion/highContrast overrides & localized invalid launch hex error
+        let explicitZero = FabushiLaunchConfiguration(
+            environment: [
+                "FABUSHI_UI_REDUCE_MOTION": "0",
+                "FABUSHI_UI_HIGH_CONTRAST": "0",
+                "FABUSHI_UI_ACCENT_HEX": "fabushi.raw_env_leak",
+            ],
+            arguments: ["-AppleLanguages", "(en)"]
+        )
+        XCTAssertEqual(explicitZero.reduceMotionLaunchOverride, false)
+        XCTAssertEqual(explicitZero.highContrastLaunchOverride, false)
+        let theme = FabushiTheme(preset: .night, reduceMotionOverride: true, highContrastOverride: true)
+        theme.applyLaunchConfiguration(explicitZero)
+        XCTAssertFalse(theme.reduceMotionOverride)
+        XCTAssertFalse(theme.highContrastOverride)
+        let errText = try XCTUnwrap(theme.lastAccentValidationError)
+        XCTAssertFalse(errText.contains("fabushi."), "Untrusted raw env input must never leak into UI error text")
+    }
+
+    func testHighContrastOutgoingBubbleInkMaintainsWCAGAAAcrossDefaultFamily() {
+        // Explicit regression check for Night + #40A7E3 (default family) + highContrast == true
+        let nightSkyHC = FabushiThemePalette.resolve(
+            preset: .night,
+            customAccentRGB: 0x40A7E3,
+            highContrast: true
+        )
+        XCTAssertEqual(nightSkyHC.bubbleOutgoingBaseRGB, 0x116DD2)
+        XCTAssertEqual(nightSkyHC.bubbleOutgoingTextRGB, 0xFFFFFF)
+        XCTAssertGreaterThanOrEqual(
+            FabushiColorHex.contrastRatio(
+                foreground: nightSkyHC.bubbleOutgoingTextRGB,
+                background: nightSkyHC.bubbleOutgoingBaseRGB
+            ),
+            4.5
+        )
+
+        // Exhaustive check across all 4 presets & representative default-family / custom accents
+        let candidateAccents: [UInt32?] = [
+            nil, 0x0A84FF, 0x007AFF, 0x40A7E3, 0x419FD9, 0x2AABEE, 0x3FC1B0, 0xFFFF00, 0xFFFFFF, 0xE86C52,
+        ]
+        for preset in FabushiThemePreset.allCases {
+            for accent in candidateAccents {
+                let palette = FabushiThemePalette.resolve(
+                    preset: preset,
+                    customAccentRGB: accent,
+                    highContrast: true
+                )
+                let ratio = FabushiColorHex.contrastRatio(
+                    foreground: palette.bubbleOutgoingTextRGB,
+                    background: palette.bubbleOutgoingBaseRGB
+                )
+                XCTAssertGreaterThanOrEqual(
+                    ratio,
+                    4.5,
+                    "High Contrast outgoing bubble ink must guarantee >= 4.5:1 for \(preset.rawValue) + \(accent.map(FabushiColorHex.format) ?? "default"), got \(ratio)"
+                )
+            }
+        }
+    }
+
+    func testFullLocalizableCatalogBilingualParityAllKeys() throws {
+        let hanRegex = try NSRegularExpression(pattern: "\\p{Han}")
+        let asciiLetterRegex = try NSRegularExpression(pattern: "[A-Za-z]")
+        let forbiddenSampleTitles = [
+            "Saved Messages",
+            "Fabushi Community",
+            "Sample Chat",
+            "Demo Bot Chat",
+            "Chief of Staff",
+        ]
+
+        let allKeys = FabushiLocale.allCatalogKeys(in: .main)
+        XCTAssertGreaterThanOrEqual(
+            allKeys.count,
+            101,
+            "Expected all >= 101 compiled Localizable.xcstrings keys in Bundle.main, found \(allKeys.count)"
+        )
+
+        // Verify newly added Iteration 2 keys are present
+        let mustIncludeKeys = [
+            "hig.avatar.botBadge",
+            "hig.status.starting",
+            "hig.swatch.systemBlue",
+            "hig.swatch.skyBlue",
+            "hig.swatch.tealMint",
+            "hig.swatch.emerald",
+            "hig.swatch.amberGold",
+            "hig.swatch.coralOrange",
+            "hig.swatch.crimsonRose",
+            "hig.swatch.lavender",
+        ]
+        for key in mustIncludeKeys {
+            XCTAssertTrue(allKeys.contains(key), "Missing required catalog key '\(key)' in compiled bundle")
+        }
+
+        for key in allKeys.sorted() {
+            let zh = FabushiLocale.zhHans.localized(key, bundle: .main)
+            let en = FabushiLocale.en.localized(key, bundle: .main)
+
+            XCTAssertFalse(zh.isEmpty, "Empty zh-Hans translation for \(key)")
+            XCTAssertFalse(en.isEmpty, "Empty en translation for \(key)")
+            XCTAssertNotEqual(zh, key, "zh-Hans key \(key) fell back to raw key")
+            XCTAssertNotEqual(en, key, "en key \(key) fell back to raw key")
+            XCTAssertNotEqual(zh, en, "zh-Hans and en must differ for \(key)")
+
+            let zhRange = NSRange(zh.startIndex..<zh.endIndex, in: zh)
+            XCTAssertNotNil(
+                hanRegex.firstMatch(in: zh, range: zhRange),
+                "Expected Han characters in zh-Hans translation for \(key), got: \(zh)"
+            )
+
+            let enRange = NSRange(en.startIndex..<en.endIndex, in: en)
+            XCTAssertNotNil(
+                asciiLetterRegex.firstMatch(in: en, range: enRange),
+                "Expected ASCII letters in en translation for \(key), got: \(en)"
+            )
+            XCTAssertNil(
+                hanRegex.firstMatch(in: en, range: enRange),
+                "Unexpected Han characters in en translation for \(key): \(en)"
+            )
+
+            for value in [zh, en] {
+                for prefix in FabushiAccessibilityIDs.forbiddenRawLocalizationKeyPrefixes {
+                    XCTAssertFalse(
+                        value.lowercased().contains(prefix),
+                        "Raw key prefix '\(prefix)' leaked in localized string '\(value)' for key \(key)"
+                    )
+                }
+                for forbiddenSample in forbiddenSampleTitles {
+                    XCTAssertFalse(
+                        value.localizedCaseInsensitiveContains(forbiddenSample),
+                        "Forbidden sample chat title '\(forbiddenSample)' appeared in localized string '\(value)'"
+                    )
+                }
+            }
         }
     }
 }

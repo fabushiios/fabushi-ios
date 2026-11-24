@@ -116,9 +116,14 @@ public final class FabushiToastController {
         )
 
         guard autoDismissEnabled else { return }
-        let clampedSeconds = max(durationSeconds, Self.minimumDurationSeconds)
+        let resolvedSeconds: TimeInterval
+        if durationSeconds.isFinite && durationSeconds > 0 {
+            resolvedSeconds = min(max(durationSeconds, Self.minimumDurationSeconds), 3600)
+        } else {
+            resolvedSeconds = Self.defaultStageDurationSeconds
+        }
         stageDismissTask = Task { @MainActor [weak self] in
-            let nanos = UInt64(clampedSeconds * 1_000_000_000)
+            let nanos = UInt64(resolvedSeconds * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
             guard !Task.isCancelled, let self, self.stageGeneration == capturedGeneration else {
                 return
@@ -143,21 +148,22 @@ public final class FabushiToastController {
         let message = Self.sanitizeSingleLine(rawMessage)
         guard !message.isEmpty else { return }
 
-        // v1.6.9 popup spam guard: suppress duplicate consecutive / in-flight (chatId, message).
+        // v1.6.9 popup spam guard: suppress duplicate in-flight or already-queued (chatId, message).
         if let active = windowBanner,
            active.scopeChatId == chatId,
            active.message == message {
             return
         }
-        if let lastQueued = windowQueue.last,
-           lastQueued.scopeChatId == chatId,
-           lastQueued.message == message {
+        if windowQueue.contains(where: { $0.scopeChatId == chatId && $0.message == message }) {
             return
         }
 
-        let resolvedDuration = durationSeconds <= 0
-            ? Self.defaultWindowDurationSeconds
-            : max(durationSeconds, Self.minimumDurationSeconds)
+        let resolvedDuration: TimeInterval
+        if durationSeconds.isFinite && durationSeconds > 0 {
+            resolvedDuration = min(max(durationSeconds, Self.minimumDurationSeconds), 3600)
+        } else {
+            resolvedDuration = Self.defaultWindowDurationSeconds
+        }
 
         let toast = FabushiWindowToast(
             message: message,
@@ -220,7 +226,12 @@ public final class FabushiToastController {
         guard autoDismissEnabled else { return }
 
         let targetID = toast.id
-        let duration = max(toast.durationSeconds, Self.minimumDurationSeconds)
+        let duration: TimeInterval
+        if toast.durationSeconds.isFinite && toast.durationSeconds > 0 {
+            duration = min(max(toast.durationSeconds, Self.minimumDurationSeconds), 3600)
+        } else {
+            duration = Self.defaultWindowDurationSeconds
+        }
         windowDismissTask = Task { @MainActor [weak self] in
             let nanos = UInt64(duration * 1_000_000_000)
             try? await Task.sleep(nanoseconds: nanos)
@@ -237,7 +248,8 @@ public final class FabushiToastController {
 }
 
 /// Renders Layer 1 (`fabushi.shell.toast.stagePill`) and Layer 2 (`fabushi.shell.toast.windowBanner`)
-/// cleanly above safe-area / bottom controls without overlapping input chrome.
+/// top-anchored inside the root shell `ZStack`, strictly above bottom `Composer.inputWrap` chrome
+/// and strictly beneath Passcode Lock and Background Privacy Blur overlays.
 @MainActor
 public struct FabushiTwoLayerToastHost: View {
     public let controller: FabushiToastController
@@ -323,6 +335,7 @@ public struct FabushiTwoLayerToastHost: View {
             }
         }
         .padding(.horizontal, 16)
+        .allowsHitTesting(controller.stagePill != nil || controller.windowBanner != nil)
         .animation(
             theme.effectiveReduceMotion(systemReduceMotion: systemReduceMotion)
                 ? nil
@@ -468,6 +481,7 @@ public struct FabushiAvatarBadge: View {
                         .fabushiFont(.headline)
                         .foregroundStyle(Color.white)
                 }
+                .accessibilityHidden(true)
 
             if isBot {
                 Image(systemName: "sparkles")
@@ -475,15 +489,16 @@ public struct FabushiAvatarBadge: View {
                     .foregroundStyle(Color.white)
                     .padding(3)
                     .background(theme.accentColor, in: Circle())
+                    .accessibilityLabel(theme.localized("hig.avatar.botBadge"))
                     .accessibilityIdentifier(FabushiAccessibilityIDs.ChatList.botAvatarBadge)
             } else if isOnline {
                 Circle()
                     .fill(theme.successColor)
                     .frame(width: 11, height: 11)
                     .overlay(Circle().stroke(theme.surfacePrimary, lineWidth: 2))
+                    .accessibilityHidden(true)
             }
         }
-        .accessibilityHidden(true)
     }
 }
 

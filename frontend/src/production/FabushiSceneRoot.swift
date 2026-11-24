@@ -213,7 +213,9 @@ private struct FabushiProductionSceneRoot: View {
 private struct FabushiCanonicalSceneHost: View {
     private let launchConfiguration: FabushiLaunchConfiguration
     @State private var theme: FabushiTheme
-    @State private var router = ShellNavigationRouter()
+    @State private var router: ShellNavigationRouter
+    @State private var startupErrorMessage: String?
+    @State private var didPrepareStateDirectory = false
     @Environment(\.scenePhase) private var scenePhase
 
     init(launchConfiguration: FabushiLaunchConfiguration) {
@@ -221,6 +223,11 @@ private struct FabushiCanonicalSceneHost: View {
         let initialTheme = FabushiTheme()
         initialTheme.applyLaunchConfiguration(launchConfiguration)
         self._theme = State(initialValue: initialTheme)
+        self._router = State(
+            initialValue: ShellNavigationRouter(
+                isPasscodeLockEnabled: launchConfiguration.requirePasscode
+            )
+        )
     }
 
     var body: some View {
@@ -230,8 +237,9 @@ private struct FabushiCanonicalSceneHost: View {
             router: router,
             registry: FabushiFeatureModuleRegistry.shared,
             launchConfiguration: launchConfiguration,
+            startupErrorMessage: startupErrorMessage,
             onRetryStartup: {
-                await startCanonicalCoordinator(prepareReset: false)
+                await startCanonicalCoordinator(prepareReset: !didPrepareStateDirectory)
             }
         )
         .task {
@@ -250,9 +258,11 @@ private struct FabushiCanonicalSceneHost: View {
     }
 
     private func startCanonicalCoordinator(prepareReset: Bool) async {
+        startupErrorMessage = nil
         do {
             if prepareReset {
                 try launchConfiguration.prepareStateDirectoryIfNeeded()
+                didPrepareStateDirectory = true
             }
             try await FabushiCoordinator.shared.start(
                 appDataDirectory: launchConfiguration.appDataDirectory,
@@ -260,10 +270,15 @@ private struct FabushiCanonicalSceneHost: View {
                 testMode: launchConfiguration.isUITestMode
             )
             await theme.loadPersistedPreferences(using: FabushiCoordinator.shared)
+            router.handleAccountScopeChange(
+                generation: FabushiCoordinator.shared.accountScopeGeneration,
+                coordinator: FabushiCoordinator.shared
+            )
             router.syncFromCoordinator(FabushiCoordinator.shared)
             router.replayPendingDeepLinkIfReady(coordinator: FabushiCoordinator.shared)
         } catch {
-            // Fail-closed: FabushiCoordinator.shared.lastErrorMessage drives FabushiStartupRetryView.
+            // Fail-closed: surface BOTH preflight and coordinator startup errors into FabushiStartupRetryView.
+            startupErrorMessage = error.localizedDescription
         }
     }
 }

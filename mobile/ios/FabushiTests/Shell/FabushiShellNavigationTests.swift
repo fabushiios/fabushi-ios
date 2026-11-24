@@ -333,6 +333,261 @@ final class FabushiShellNavigationTests: XCTestCase, @unchecked Sendable {
             "STOREKIT_SERVER_BINDING",
         ])
     }
+
+    func testDeferredDeepLinkSurvivesDelayedAccountScopeGenerationChangeAfterLogin() async throws {
+        let dir = try makeTempDir("deeplink_gen_fence")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.shell.genfence.\(UUID().uuidString)",
+            account: "shell-genfence"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
+            let remoteURL = try XCTUnwrap(URL(string: "fabushi://remote/mac_prod_v168"))
+            XCTAssertEqual(router.observedGeneration, 1)
+            XCTAssertEqual(coordinator.accountScopeGeneration, 1)
+
+            // Queue deep link pre-auth
+            XCTAssertTrue(router.handleOpenURL(remoteURL, coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, remoteURL)
+
+            // Sign in advances coordinator.accountScopeGeneration (1 -> 2)
+            _ = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 801,
+                username: "gen_fence_user",
+                sessionId: "sess-gf-801",
+                token: "tok-gf-801"
+            ))
+            let postLoginGeneration = coordinator.accountScopeGeneration
+            XCTAssertGreaterThan(postLoginGeneration, 1)
+
+            // Replay reconciles generation fence strictly BEFORE navigating
+            XCTAssertTrue(router.replayPendingDeepLinkIfReady(coordinator: coordinator))
+            XCTAssertEqual(router.observedGeneration, postLoginGeneration)
+            XCTAssertEqual(router.activeRoute, .remoteComputer(nodeId: "mac_prod_v168"))
+            XCTAssertEqual(router.activeDeepLinkBannerText, "fabushi://remote/mac_prod_v168")
+
+            // Delayed SwiftUI `.onChange(of: coordinator.accountScopeGeneration)` tick arrives AFTER replay
+            XCTAssertFalse(
+                router.handleAccountScopeChange(generation: postLoginGeneration, coordinator: coordinator),
+                "Delayed generation tick must be rejected as already observed"
+            )
+            XCTAssertEqual(
+                router.activeRoute,
+                .remoteComputer(nodeId: "mac_prod_v168"),
+                "Delayed accountScopeGeneration tick must NOT wipe replayed deep-link route"
+            )
+            XCTAssertEqual(
+                coordinator.activeRoute,
+                .remoteComputer(nodeId: "mac_prod_v168")
+            )
+            XCTAssertEqual(
+                router.activeDeepLinkBannerText,
+                "fabushi://remote/mac_prod_v168",
+                "Delayed accountScopeGeneration tick must NOT wipe activeDeepLinkBannerText"
+            )
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    func testDeferredDeepLinkBlockedWhilePasscodeLockedAndReplayedOnUnlock() async throws {
+        let dir = try makeTempDir("deeplink_passcode")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.shell.passcode.\(UUID().uuidString)",
+            account: "shell-passcode"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            let router = ShellNavigationRouter(
+                toastController: FabushiToastController(autoDismissEnabled: false),
+                isPasscodeLockEnabled: true
+            )
+            XCTAssertTrue(router.isPasscodeLockEnabled)
+            XCTAssertTrue(router.isPasscodeLocked)
+
+            let miniAppURL = try XCTUnwrap(URL(string: "fabushi://miniapp/global_dharma"))
+            XCTAssertTrue(router.handleOpenURL(miniAppURL, coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, miniAppURL)
+
+            // Authenticate while passcode lock is engaged
+            _ = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 802,
+                username: "passcode_lock_user",
+                sessionId: "sess-pc-802",
+                token: "tok-pc-802"
+            ))
+
+            // Replay MUST remain blocked while passcode-locked (zero modal sheet bypass!)
+            XCTAssertFalse(router.replayPendingDeepLinkIfReady(coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, miniAppURL)
+            XCTAssertNil(router.presentedMiniAppId)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+
+            // A deep link arriving while already authenticated & locked MUST also defer cleanly
+            let settingsURL = try XCTUnwrap(URL(string: "fabushi://settings/ai_providers"))
+            XCTAssertTrue(router.handleOpenURL(settingsURL, coordinator: coordinator))
+            XCTAssertEqual(router.pendingDeepLinkURL, settingsURL)
+            XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+
+            // Unlocking passcode replays deferred deep link AND reconciles generation cleanly
+            XCTAssertTrue(router.unlockPasscode(coordinator: coordinator))
+            XCTAssertFalse(router.isPasscodeLocked)
+            XCTAssertNil(router.pendingDeepLinkURL)
+            XCTAssertEqual(router.activeRoute, .settings(section: "ai_providers"))
+            XCTAssertEqual(router.activeTab, .settings)
+            XCTAssertEqual(router.activeDeepLinkBannerText, "fabushi://settings/ai_providers")
+
+            // Runtime passcode lock hook re-engages cleanly when enabled, and no-ops when disabled
+            router.engagePasscodeLockIfEnabled()
+            XCTAssertTrue(router.isPasscodeLocked)
+            router.isPasscodeLockEnabled = false
+            router.isPasscodeLocked = false
+            router.engagePasscodeLockIfEnabled()
+            XCTAssertFalse(router.isPasscodeLocked)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    func testChatScopedToastsClearedWhenNavigatingToNonChatRoutesAndCompactBack() {
+        let controller = FabushiToastController(autoDismissEnabled: false)
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor())
+        let router = ShellNavigationRouter(toastController: controller)
+
+        // 1. Chat 100 -> Settings -> Chat 200 MUST purge Chat 100 active & queued toasts
+        router.navigate(to: .chats(chatId: 100, messageId: nil), coordinator: coordinator)
+        controller.showStagePill("Chat 100 pill", chatId: 100)
+        controller.showWindowToast("Chat 100 active error", chatId: 100)
+        controller.showWindowToast("Chat 100 queued notice", chatId: 100)
+        controller.showWindowToast("Global system notice", chatId: nil)
+
+        // Alternating duplicate `[A, B, A]` inside queue must also be deduplicated
+        controller.showWindowToast("Chat 100 queued notice", chatId: 100)
+        XCTAssertEqual(controller.windowQueue.count, 2)
+
+        router.navigate(to: .settings(section: nil), coordinator: coordinator)
+        XCTAssertNil(controller.stagePill, "Leaving chat 100 to Settings must clear chat-100 stage pill")
+        XCTAssertEqual(controller.windowBanner?.message, "Global system notice")
+        XCTAssertTrue(controller.windowQueue.isEmpty, "Chat 100 queued toasts must be purged on leaving chat")
+
+        // Entering chat 200 sees ZERO leaked chat-100 toasts
+        controller.dismissWindowToast(id: controller.windowBanner?.id)
+        router.navigate(to: .chats(chatId: 200, messageId: nil), coordinator: coordinator)
+        XCTAssertNil(controller.stagePill)
+        XCTAssertNil(controller.windowBanner)
+
+        // 2. Coordinator reverse sync to non-chat route (.agentStudio) also clears active chat toasts
+        controller.showStagePill("Chat 200 pill", chatId: 200)
+        controller.showWindowToast("Chat 200 toast", chatId: 200)
+        coordinator.activeRoute = .agentStudio(tab: "kanban")
+        router.syncFromCoordinator(coordinator)
+        XCTAssertNil(controller.stagePill)
+        XCTAssertNil(controller.windowBanner)
+
+        // 3. Compact Back button (`navigateBackToChatList`) returns to chat list & clears toasts
+        router.navigate(to: .chats(chatId: 300, messageId: nil), coordinator: coordinator)
+        controller.showStagePill("Chat 300 pill", chatId: 300)
+        controller.showWindowToast("Chat 300 error", chatId: 300)
+        router.navigateBackToChatList(coordinator: coordinator)
+        XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+        XCTAssertEqual(coordinator.activeRoute, .chats(chatId: nil, messageId: nil))
+        XCTAssertNil(router.activeChatId)
+        XCTAssertNil(controller.stagePill)
+        XCTAssertNil(controller.windowBanner)
+
+        // 4. Re-tapping already-active `.chats` tab pops back to chat list & clears toasts
+        router.navigate(to: .chats(chatId: 400, messageId: nil), coordinator: coordinator)
+        controller.showStagePill("Chat 400 pill", chatId: 400)
+        router.selectTab(.chats, coordinator: coordinator)
+        XCTAssertEqual(router.activeRoute, .chats(chatId: nil, messageId: nil))
+        XCTAssertNil(controller.stagePill)
+
+        // 5. Non-finite / non-positive durations fall back safely without crashing
+        let autoController = FabushiToastController(autoDismissEnabled: true)
+        autoController.showStagePill("NaN safe pill", chatId: nil, durationSeconds: .nan)
+        XCTAssertEqual(autoController.stagePill?.message, "NaN safe pill")
+        autoController.showWindowToast("Infinity safe toast", chatId: nil, durationSeconds: .infinity)
+        XCTAssertEqual(autoController.windowBanner?.durationSeconds, FabushiToastController.defaultWindowDurationSeconds)
+        autoController.clearAll()
+    }
+
+    func testModalCallsAndMiniAppSheetDismissalRestoresLastWorkspaceRoute() {
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor())
+        let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
+
+        // Workspace route #1: active chat 42 -> Calls modal sheet -> dismiss restores chat 42
+        router.navigate(to: .chats(chatId: 42, messageId: 99), coordinator: coordinator)
+        XCTAssertEqual(router.lastWorkspaceRoute, .chats(chatId: 42, messageId: 99))
+
+        router.navigate(to: .calls, coordinator: coordinator)
+        XCTAssertTrue(router.isCallsSheetPresented)
+        XCTAssertNil(router.presentedMiniAppId)
+        XCTAssertEqual(router.activeRoute, .calls)
+        XCTAssertEqual(router.lastWorkspaceRoute, .chats(chatId: 42, messageId: 99))
+
+        router.dismissActiveModalSheet(coordinator: coordinator)
+        XCTAssertFalse(router.isCallsSheetPresented)
+        XCTAssertEqual(router.activeRoute, .chats(chatId: 42, messageId: 99))
+        XCTAssertEqual(coordinator.activeRoute, .chats(chatId: 42, messageId: 99))
+
+        // Workspace route #2: Remote Computer -> MiniApp sheet -> dismiss restores Remote Computer
+        router.navigate(to: .remoteComputer(nodeId: "mac_prod_v168"), coordinator: coordinator)
+        XCTAssertEqual(router.lastWorkspaceRoute, .remoteComputer(nodeId: "mac_prod_v168"))
+
+        router.navigate(to: .miniApp(id: "global_dharma"), coordinator: coordinator)
+        XCTAssertEqual(router.presentedMiniAppId, "global_dharma")
+        XCTAssertFalse(router.isCallsSheetPresented)
+        XCTAssertEqual(router.activeRoute, .miniApp(id: "global_dharma"))
+        XCTAssertEqual(router.lastWorkspaceRoute, .remoteComputer(nodeId: "mac_prod_v168"))
+
+        router.dismissActiveModalSheet(coordinator: coordinator)
+        XCTAssertNil(router.presentedMiniAppId)
+        XCTAssertEqual(router.activeRoute, .remoteComputer(nodeId: "mac_prod_v168"))
+        XCTAssertEqual(coordinator.activeRoute, .remoteComputer(nodeId: "mac_prod_v168"))
+    }
+
+    func testSettingsSectionDestinationParsingForDeepLinksAndProviderError() {
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("aiProviders"), .aiProviders)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("ai_providers"), .aiProviders)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("AI-Providers"), .aiProviders)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("magpie"), .aiProviders)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("appearance"), .appearance)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("THEME"), .appearance)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("language"), .language)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("locale"), .language)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("privacySecurity"), .privacySecurity)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("privacy_security"), .privacySecurity)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("privacy"), .privacySecurity)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("devices"), .devices)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("vault"), .vault)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("capabilities"), .capabilities)
+        XCTAssertEqual(FabushiSettingsSectionDestination.parse("capability_ledger"), .capabilities)
+        XCTAssertNil(FabushiSettingsSectionDestination.parse(nil))
+        XCTAssertNil(FabushiSettingsSectionDestination.parse(""))
+        XCTAssertNil(FabushiSettingsSectionDestination.parse("   "))
+        XCTAssertNil(FabushiSettingsSectionDestination.parse("nonexistent_section"))
+    }
 }
 
 // MARK: - Protocol Conformance Test Spies

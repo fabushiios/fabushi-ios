@@ -1,5 +1,17 @@
 import Foundation
 
+/// Fail-closed errors thrown when launch environment configuration requests an unsafe state-reset target.
+public enum FabushiLaunchConfigurationError: LocalizedError, Sendable, Equatable {
+    case unsafeResetStateDirectory(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsafeResetStateDirectory(let path):
+            return "Refusing to reset unsafe or production state directory: \(path)"
+        }
+    }
+}
+
 /// Deterministic parser for Fabushi iOS launch environment variables and CLI arguments
 /// (`TEST_INFRA.md §4.2`). NEVER enables mocks, fake tokens, or synthetic sample chats.
 public struct FabushiLaunchConfiguration: Sendable, Equatable {
@@ -15,6 +27,8 @@ public struct FabushiLaunchConfiguration: Sendable, Equatable {
     public let invalidLaunchAccentHex: String?
     public let reduceMotion: Bool
     public let highContrast: Bool
+    public let reduceMotionLaunchOverride: Bool?
+    public let highContrastLaunchOverride: Bool?
     public let requirePasscode: Bool
     public let simulateCallPermissionDenied: Bool
     public let simulateReplayKitDenied: Bool
@@ -87,8 +101,16 @@ public struct FabushiLaunchConfiguration: Sendable, Equatable {
             self.invalidLaunchAccentHex = nil
         }
 
-        self.reduceMotion = environment["FABUSHI_UI_REDUCE_MOTION"] == "1"
-        self.highContrast = environment["FABUSHI_UI_HIGH_CONTRAST"] == "1"
+        // Explicit `"1"`/`"0"` launch overrides are authoritative; under `FABUSHI_UI_TEST_MODE=1`,
+        // omitted flags also default authoritatively to `false` so consecutive E2E cold restarts
+        // (e.g. `T4_08`) never inherit stale persisted toggle states from an earlier launch.
+        let explicitReduceMotion = Self.parseOptionalBoolEnv("FABUSHI_UI_REDUCE_MOTION", in: environment)
+        let explicitHighContrast = Self.parseOptionalBoolEnv("FABUSHI_UI_HIGH_CONTRAST", in: environment)
+        self.reduceMotionLaunchOverride = explicitReduceMotion ?? (uiTestMode ? false : nil)
+        self.highContrastLaunchOverride = explicitHighContrast ?? (uiTestMode ? false : nil)
+        self.reduceMotion = self.reduceMotionLaunchOverride ?? false
+        self.highContrast = self.highContrastLaunchOverride ?? false
+
         self.requirePasscode = environment["FABUSHI_E2E_REQUIRE_PASSCODE"] == "1"
         self.simulateCallPermissionDenied = environment["FABUSHI_E2E_SIMULATE_CALL_PERMISSION_DENIED"] == "1"
         self.simulateReplayKitDenied = environment["FABUSHI_E2E_SIMULATE_REPLAYKIT_DENIED"] == "1"
@@ -111,11 +133,20 @@ public struct FabushiLaunchConfiguration: Sendable, Equatable {
             .appendingPathComponent("FabushiCore", isDirectory: true)
     }
 
-    /// Cleans ephemeral local state ONLY when `resetState == true` (`FABUSHI_E2E_RESET_STATE=1`).
-    /// Preserves all persisted files untouched on normal launches and cold restarts (`resetState == false`).
+    /// Cleans an explicit isolated ephemeral state directory ONLY when `resetState == true`
+    /// (`FABUSHI_E2E_RESET_STATE=1`) AND an explicit `FABUSHI_APP_DATA` path was provided.
+    ///
+    /// Fail-safe invariants:
+    /// - When `resetState == false`, preserves all persisted files untouched (cold-restart durability).
+    /// - When `appDataDirectory == nil`, performs a safe no-op and NEVER falls back to production
+    ///   `Application Support/FabushiCore`.
+    /// - Rejects root (`/`), `$HOME`, system roots, and production Application Support paths.
     public func prepareStateDirectoryIfNeeded(fileManager: FileManager = .default) throws {
-        guard resetState else { return }
-        guard let targetDirectory = resolvedAppDataDirectory(fileManager: fileManager) else { return }
+        guard resetState, let targetDirectory = appDataDirectory else { return }
+
+        if Self.isUnsafeResetDirectory(targetDirectory, fileManager: fileManager) {
+            throw FabushiLaunchConfigurationError.unsafeResetStateDirectory(targetDirectory.path)
+        }
 
         if fileManager.fileExists(atPath: targetDirectory.path) {
             let contents = try fileManager.contentsOfDirectory(
@@ -157,6 +188,103 @@ public struct FabushiLaunchConfiguration: Sendable, Equatable {
             return nil
         }
         return value
+    }
+
+    private static func parseOptionalBoolEnv(_ key: String, in environment: [String: String]) -> Bool? {
+        guard let raw = nonEmptyEnv(key, in: environment)?.lowercased() else {
+            return nil
+        }
+        switch raw {
+        case "1", "true", "yes":
+            return true
+        case "0", "false", "no":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private static func normalizedPath(_ rawPath: String) -> String {
+        let standardized = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        if standardized.count > 1, standardized.hasSuffix("/") {
+            return String(standardized.dropLast())
+        }
+        return standardized
+    }
+
+    private static func candidateNormalizedPaths(for url: URL) -> Set<String> {
+        var paths: Set<String> = [
+            normalizedPath(url.standardizedFileURL.path),
+            normalizedPath(url.resolvingSymlinksInPath().standardizedFileURL.path),
+        ]
+        if url.path == "/" {
+            paths.insert("/")
+        }
+        return paths
+    }
+
+    private static func isUnsafeResetDirectory(_ targetDirectory: URL, fileManager: FileManager) -> Bool {
+        let candidates = candidateNormalizedPaths(for: targetDirectory)
+        guard !candidates.isEmpty else { return true }
+
+        var forbiddenExactPaths: Set<String> = [
+            "",
+            "/",
+            "/System",
+            "/Applications",
+            "/Library",
+            "/Users",
+            "/var",
+            "/private",
+            "/private/var",
+            "/etc",
+            "/usr",
+            "/tmp",
+            "/private/tmp",
+        ]
+
+        let homePath = NSHomeDirectory()
+        if !homePath.isEmpty {
+            forbiddenExactPaths.formUnion(candidateNormalizedPaths(for: URL(fileURLWithPath: homePath, isDirectory: true)))
+        }
+        if let envHome = ProcessInfo.processInfo.environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envHome.isEmpty {
+            forbiddenExactPaths.formUnion(candidateNormalizedPaths(for: URL(fileURLWithPath: envHome, isDirectory: true)))
+        }
+
+        // Exact temporary directory root is unsafe (subdirectories under temp are allowed).
+        forbiddenExactPaths.formUnion(candidateNormalizedPaths(for: fileManager.temporaryDirectory))
+
+        let protectedSearchPaths: [FileManager.SearchPathDirectory] = [
+            .applicationSupportDirectory,
+            .documentDirectory,
+            .libraryDirectory,
+            .cachesDirectory,
+        ]
+        for searchPath in protectedSearchPaths {
+            for url in fileManager.urls(for: searchPath, in: .userDomainMask) {
+                forbiddenExactPaths.formUnion(candidateNormalizedPaths(for: url))
+            }
+        }
+
+        if !candidates.isDisjoint(with: forbiddenExactPaths) {
+            return true
+        }
+
+        // Reject production `Application Support/FabushiCore` and any descendant inside it.
+        for appSupportURL in fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask) {
+            let productionCoreURL = appSupportURL.appendingPathComponent("FabushiCore", isDirectory: true)
+            let productionPaths = candidateNormalizedPaths(for: productionCoreURL)
+            for prodPath in productionPaths {
+                for candidate in candidates {
+                    if candidate == prodPath || candidate.hasPrefix(prodPath + "/") {
+                        return true
+                    }
+                }
+            }
+        }
+
+        return false
     }
 
     private static func extractCLIServerURL(from arguments: [String]) -> String? {
