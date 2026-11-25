@@ -158,6 +158,18 @@ public final class FabushiMessagingStore {
     public private(set) var isSearching: Bool = false
     public private(set) var isUsingOfflineSearchFallback: Bool = false
 
+    // MARK: M3b Stage Actions, Slash Commands (`D11-01`), Approvals, Floor, E2EE & Media (`#13`..`#20`)
+    public private(set) var slashCommands: [FabushiSlashCommand] = []
+    public private(set) var distilledScriptsByChat: [Int64: [FabushiDistilledBrowserScript]] = [:]
+    public private(set) var pendingApprovals: [FabushiApprovalItem] = []
+    public private(set) var floorSpeakerByChat: [Int64: String] = [:]
+    public private(set) var verifiedE2EEChatIds: Set<Int64> = []
+    public private(set) var e2eeSafetyByChat: [Int64: FabushiE2EESafetyInfo] = [:]
+    public var editingMessageByChat: [Int64: FabushiMessageRecord] = [:]
+    public var activeTopicIdByChat: [Int64: Int64] = [:]
+    public var botReplyKeyboardByChat: [Int64: [[String]]] = [:]
+    public private(set) var lastBrowserTakeoverAction: String? = nil
+
     // MARK: Private Runtime State
     @ObservationIgnored private var eventLoopTask: Task<Void, Never>?
     @ObservationIgnored private var prefetchTask: Task<Void, Never>?
@@ -290,6 +302,18 @@ public final class FabushiMessagingStore {
         searchResults.removeAll()
         isSearching = false
         isUsingOfflineSearchFallback = false
+
+        slashCommands.removeAll()
+        distilledScriptsByChat.removeAll()
+        pendingApprovals.removeAll()
+        floorSpeakerByChat.removeAll()
+        verifiedE2EEChatIds.removeAll()
+        e2eeSafetyByChat.removeAll()
+        editingMessageByChat.removeAll()
+        activeTopicIdByChat.removeAll()
+        botReplyKeyboardByChat.removeAll()
+        lastBrowserTakeoverAction = nil
+
         overlayController.dismissAll()
     }
 
@@ -548,6 +572,33 @@ public final class FabushiMessagingStore {
         case "connectionStateChanged":
             if case .connectionStateChanged(let status, _) = event.kind {
                 handleConnectionStateChange(status: status)
+                return true
+            }
+            return false
+
+        case "agentFloorChanged":
+            if case .agentFloorChanged(let chatId, let currentSpeaker, _, _) = event.kind {
+                if let speaker = currentSpeaker?.trimmingCharacters(in: .whitespacesAndNewlines), !speaker.isEmpty {
+                    floorSpeakerByChat[chatId] = speaker
+                } else {
+                    floorSpeakerByChat.removeValue(forKey: chatId)
+                }
+                return true
+            }
+            return false
+
+        case "toolApprovalRequested":
+            if case .toolApprovalRequested(let approvalId, let toolName, let summary) = event.kind {
+                let item = FabushiApprovalItem(
+                    id: approvalId,
+                    sessionId: nil,
+                    command: summary.isEmpty ? toolName : "\(toolName): \(summary)",
+                    riskLevel: "high",
+                    patternName: toolName,
+                    status: "pending"
+                )
+                pendingApprovals.removeAll { $0.id == approvalId }
+                pendingApprovals.insert(item, at: 0)
                 return true
             }
             return false
@@ -1666,7 +1717,8 @@ public final class FabushiMessagingStore {
         forwardFromChatId: Int64? = nil,
         forwardFromMsgId: Int64? = nil,
         topicId: Int64? = nil,
-        silent: Bool = false
+        silent: Bool = false,
+        scheduledAtMs: Int64? = nil
     ) async throws -> FabushiSendMessageResponse {
         let capturedGen = coordinator.accountScopeGeneration
         let nonce = nextClientNonce()
@@ -1681,6 +1733,7 @@ public final class FabushiMessagingStore {
             forwardFromChatId: forwardFromChatId,
             forwardFromMsgId: forwardFromMsgId,
             silent: silent,
+            scheduledAtMs: scheduledAtMs,
             sendAsPeerId: selectedSendAsPeerByChat[chatId]
         )
         let response = try await client.sendDurable(request)
@@ -2644,6 +2697,877 @@ public final class FabushiMessagingStore {
         let next = provisionalIdCounter
         provisionalIdCounter -= 1
         return next
+    }
+
+    // MARK: - M3b Stage Actions, Reactions, Polls, Todos, Pins, Export & Approvals (`#13`, `#14`, `D10-08`)
+
+    @discardableResult
+    public func editMessage(
+        chatId: Int64,
+        messageId: Int64,
+        newText: String,
+        entities: [FabushiMessageEntity] = [],
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let capturedGen = coordinator.accountScopeGeneration
+        let previous = messagesByChat[chatId]?.first(where: { $0.messageId == messageId })
+        do {
+            try await client.editMessage(chatId: chatId, messageId: messageId, text: newText, entities: entities)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            applyEditedMessage(
+                chatId: chatId,
+                messageId: messageId,
+                text: newText,
+                entities: entities,
+                editDateMs: FabushiWireDateParser.nowMs()
+            )
+            editingMessageByChat.removeValue(forKey: chatId)
+            return true
+        } catch {
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            if let previous {
+                updateMessage(chatId: chatId, messageId: messageId) { msg in
+                    msg.text = previous.text
+                    msg.entities = previous.entities
+                }
+            }
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.localized(.messageSendFailedToast, locale: locale),
+                chatId: chatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: true
+            )
+            return false
+        }
+    }
+
+    @discardableResult
+    public func deleteMessages(
+        chatId: Int64,
+        messageIds: [Int64],
+        forEveryone: Bool = true,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        guard !messageIds.isEmpty else { return false }
+        let capturedGen = coordinator.accountScopeGeneration
+        var succeededIds: [Int64] = []
+        for mid in messageIds {
+            if mid < 0 {
+                succeededIds.append(mid)
+                continue
+            }
+            do {
+                try await client.deleteMessage(chatId: chatId, messageId: mid, revoke: forEveryone)
+                succeededIds.append(mid)
+            } catch {
+                // Keep authoritative state for items that failed remote deletion.
+            }
+        }
+        guard coordinator.accountScopeGeneration == capturedGen else { return false }
+        if !succeededIds.isEmpty {
+            applyDeletedMessages(chatId: chatId, messageIds: succeededIds, forEveryone: forEveryone)
+            return succeededIds.count == messageIds.count
+        }
+        _ = router?.showChatToastIfVisible(
+            FabushiMessagingStrings.localized(.messageSendFailedToast, locale: locale),
+            chatId: chatId,
+            coordinator: coordinator,
+            isCompact: isCompact,
+            isError: true
+        )
+        return false
+    }
+
+    /// Multi-forward via `messages.sendDurable` (`sendNonComposerMessage` preserves target chat's unsent draft per `D10-07`).
+    @discardableResult
+    public func forwardMessages(
+        fromChatId: Int64,
+        messageIds: [Int64],
+        toChatId: Int64,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Int {
+        guard !messageIds.isEmpty else { return 0 }
+        let capturedGen = coordinator.accountScopeGeneration
+        let sourceList = messagesByChat[fromChatId] ?? []
+        let sourceById = Dictionary(uniqueKeysWithValues: sourceList.map { ($0.messageId, $0) })
+        var sentCount = 0
+        for mid in messageIds {
+            let sourceText = sourceById[mid]?.text
+            do {
+                _ = try await sendNonComposerMessage(
+                    chatId: toChatId,
+                    text: sourceText,
+                    forwardFromChatId: fromChatId,
+                    forwardFromMsgId: mid
+                )
+                guard coordinator.accountScopeGeneration == capturedGen else { return sentCount }
+                sentCount += 1
+            } catch {
+                // Continue forwarding remaining selected messages.
+            }
+        }
+        if sentCount > 0 {
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.format(.forwardSentToastFormat, locale: locale, sentCount),
+                chatId: fromChatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: false
+            )
+        }
+        return sentCount
+    }
+
+    /// PTS-fenced reaction toggle (`messages.react`, preserving `is_chosen_by_me` and `chosen`).
+    @discardableResult
+    public func toggleReaction(chatId: Int64, messageId: Int64, emoji: String) async -> [FabushiMessageReaction] {
+        let capturedGen = coordinator.accountScopeGeneration
+        let previousReactions = messagesByChat[chatId]?.first(where: { $0.messageId == messageId })?.reactions ?? []
+        let alreadyChosen = previousReactions.first(where: { $0.emoji == emoji })?.isChosenByMe ?? false
+
+        do {
+            let updated = try await client.reactToMessage(
+                chatId: chatId,
+                messageId: messageId,
+                emoji: emoji,
+                action: alreadyChosen ? "remove" : "add"
+            )
+            guard coordinator.accountScopeGeneration == capturedGen else { return previousReactions }
+            applyReactionsUpdate(chatId: chatId, messageId: messageId, reactions: updated)
+            return updated
+        } catch {
+            guard coordinator.accountScopeGeneration == capturedGen else { return previousReactions }
+            applyReactionsUpdate(chatId: chatId, messageId: messageId, reactions: previousReactions)
+            return previousReactions
+        }
+    }
+
+    @discardableResult
+    public func pinMessage(
+        chatId: Int64,
+        messageId: Int64,
+        router: ShellNavigationRouter? = nil,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            let record = try await client.pinMessage(chatId: chatId, messageId: messageId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            var list = pinnedMessagesByChat[chatId] ?? []
+            list.removeAll { $0.messageId == messageId }
+            list.insert(record, at: 0)
+            pinnedMessagesByChat[chatId] = list
+            if let idx = chats.firstIndex(where: { $0.chatId == chatId }) {
+                chats[idx].pinnedMessageId = messageId
+            }
+            persistSnapshotToDisk()
+            router?.toastController.showStagePill(
+                FabushiMessagingStrings.localized(.messagePinnedPill, locale: locale),
+                chatId: chatId
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    public func unpinMessage(
+        chatId: Int64,
+        messageId: Int64,
+        router: ShellNavigationRouter? = nil,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            try await client.unpinMessage(chatId: chatId, messageId: messageId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            pinnedMessagesByChat[chatId]?.removeAll { $0.messageId == messageId }
+            if let idx = chats.firstIndex(where: { $0.chatId == chatId }) {
+                chats[idx].pinnedMessageId = pinnedMessagesByChat[chatId]?.first?.messageId
+            }
+            persistSnapshotToDisk()
+            router?.toastController.showStagePill(
+                FabushiMessagingStrings.localized(.messageUnpinnedPill, locale: locale),
+                chatId: chatId
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    public func createPoll(
+        chatId: Int64,
+        question: String,
+        options: [String],
+        isAnonymous: Bool = true,
+        multipleChoice: Bool = false,
+        isQuiz: Bool = false,
+        correctOptionId: UInt8? = nil,
+        solution: String? = nil,
+        topicId: Int64? = nil
+    ) async -> FabushiPollCard? {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            let poll = try await client.createPoll(
+                chatId: chatId,
+                question: question,
+                options: options,
+                isAnonymous: isAnonymous,
+                multipleChoice: multipleChoice,
+                isQuiz: isQuiz,
+                correctOptionId: correctOptionId,
+                solution: solution,
+                topicId: topicId,
+                clientNonce: nextClientNonce()
+            )
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            let mySenderId: UInt64
+            if case .authenticated(let uid, _, _) = coordinator.authState {
+                mySenderId = uid
+            } else {
+                mySenderId = 0
+            }
+            let message = FabushiMessageRecord(
+                messageId: Int64(bitPattern: poll.pollId > 0 ? poll.pollId : UInt64(bitPattern: nextProvisionalMessageId())),
+                chatId: chatId,
+                senderId: mySenderId,
+                topicId: topicId,
+                text: poll.question,
+                content: .poll(poll),
+                dateMs: FabushiWireDateParser.nowMs(),
+                isOutgoing: true,
+                deliveryStatus: .sent
+            )
+            appendOrReplaceMessage(message)
+            persistSnapshotToDisk()
+            return poll
+        } catch {
+            return nil
+        }
+    }
+
+    @discardableResult
+    public func votePoll(chatId: Int64, messageId: Int64, pollId: UInt64, optionIds: [UInt8]) async -> FabushiPollCard? {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            let updated = try await client.votePoll(pollId: pollId, optionIds: optionIds)
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            updateMessage(chatId: chatId, messageId: messageId) { msg in
+                msg.content = .poll(updated)
+            }
+            persistSnapshotToDisk()
+            return updated
+        } catch {
+            return nil
+        }
+    }
+
+    @discardableResult
+    public func closePoll(chatId: Int64, messageId: Int64, pollId: UInt64) async -> FabushiPollCard? {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            let closed = try await client.closePoll(pollId: pollId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            updateMessage(chatId: chatId, messageId: messageId) { msg in
+                msg.content = .poll(closed)
+            }
+            persistSnapshotToDisk()
+            return closed
+        } catch {
+            return nil
+        }
+    }
+
+    public func toggleTodoItem(chatId: Int64, messageId: Int64, itemId: String) {
+        updateMessage(chatId: chatId, messageId: messageId) { msg in
+            guard case .todo(var card) = msg.content else { return }
+            for idx in card.items.indices where card.items[idx].id == itemId {
+                card.items[idx].completed.toggle()
+            }
+            let updatedCard = FabushiTodoCard(
+                id: card.id,
+                title: card.title,
+                items: card.items,
+                completedCount: card.items.filter(\.completed).count,
+                actionButtons: card.actionButtons
+            )
+            msg.content = .todo(updatedCard)
+        }
+        persistSnapshotToDisk()
+    }
+
+    @discardableResult
+    public func clearChatHistory(
+        chatId: Int64,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            try await client.clearChatHistory(chatId: chatId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            messagesByChat[chatId] = []
+            if let idx = chats.firstIndex(where: { $0.chatId == chatId }) {
+                chats[idx].lastMessagePreview = nil
+                chats[idx].unreadCount = 0
+            }
+            persistSnapshotToDisk()
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.localized(.clearHistoryDoneToast, locale: locale),
+                chatId: chatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: false
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    public func leaveChat(
+        chatId: Int64,
+        router: ShellNavigationRouter? = nil,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            try await client.leaveChat(chatId: chatId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            chats.removeAll { $0.chatId == chatId }
+            messagesByChat.removeValue(forKey: chatId)
+            pinnedMessagesByChat.removeValue(forKey: chatId)
+            subscribedWsChatIds.remove(chatId)
+            if activeChatId == chatId {
+                activeChatId = nil
+            }
+            persistSnapshotToDisk()
+            router?.dismissInspector()
+            router?.navigateBackToChatList(coordinator: coordinator)
+            return true
+        } catch {
+            router?.toastController.showNonChatToast(
+                FabushiMessagingStrings.localized(.inspectorSaveFailedToast, locale: locale),
+                isError: true
+            )
+            return false
+        }
+    }
+
+    public func exportChatHistoryJSON(chatId: Int64) async throws -> String {
+        do {
+            return try await client.exportChatHistory(chatId: chatId, format: "json")
+        } catch let hostError as FabushiHostError {
+            if hostError.code == "stale_generation" || hostError.isCancelled {
+                throw hostError
+            }
+            let localMessages = messagesByChat[chatId] ?? []
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(localMessages)
+            return String(data: data, encoding: .utf8) ?? "[]"
+        }
+    }
+
+    /// `D10-08`: Authoritative media download — NEVER reports `"Saved"` on failure; emits localized
+    /// `"Download failed: <name>"` chat-scoped error toast when download fails!
+    public func downloadAttachment(
+        fileId: String,
+        fileName: String,
+        chatId: Int64,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Data? {
+        let capturedGen = coordinator.accountScopeGeneration
+        if let cached = try? await client.casGet(fileId: fileId), !cached.isEmpty {
+            return cached
+        }
+        do {
+            let bytes = try await client.downloadMedia(fileId: fileId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            try? await client.casPut(fileId: fileId, data: bytes)
+            return bytes
+        } catch {
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            let displayName = fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fileId : fileName
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.format(.downloadFailedToastFormat, locale: locale, displayName),
+                chatId: chatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: true
+            )
+            return nil
+        }
+    }
+
+    /// `D10-07`: Re-checks `coordinator.accountScopeGeneration == capturedGen` between `media.upload`
+    /// and `messages.sendDurable` so an account switch mid-upload never leaks media into another account!
+    @discardableResult
+    public func uploadAndSendAttachment(
+        chatId: Int64,
+        fileName: String,
+        mimeType: String,
+        data: Data,
+        caption: String? = nil,
+        topicId: Int64? = nil,
+        silent: Bool = false,
+        scheduledAtMs: Int64? = nil,
+        contentBuilder: (FabushiMediaUploadResponse) -> FabushiMessageContent,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> FabushiSendMessageResponse? {
+        let capturedGen = coordinator.accountScopeGeneration
+        let capturedAccount = coordinator.activeAccountId
+        do {
+            let uploaded = try await client.uploadMedia(
+                filename: fileName,
+                mimeType: mimeType,
+                dataB64: data.base64EncodedString()
+            )
+            // Strict `D10-07` generation & account fence between upload and send!
+            guard coordinator.accountScopeGeneration == capturedGen,
+                  coordinator.activeAccountId == capturedAccount
+            else {
+                return nil
+            }
+            try? await client.casPut(fileId: uploaded.fileId, data: data, mimeType: mimeType)
+            let content = contentBuilder(uploaded)
+            let response = try await sendNonComposerMessage(
+                chatId: chatId,
+                text: caption,
+                content: content,
+                topicId: topicId,
+                silent: silent,
+                scheduledAtMs: scheduledAtMs
+            )
+            if coordinator.accountScopeGeneration == capturedGen {
+                let mySenderId: UInt64
+                if case .authenticated(let uid, _, _) = coordinator.authState {
+                    mySenderId = uid
+                } else {
+                    mySenderId = 0
+                }
+                let record = FabushiMessageRecord(
+                    messageId: response.messageId > 0 ? response.messageId : nextProvisionalMessageId(),
+                    chatId: chatId,
+                    senderId: mySenderId,
+                    topicId: topicId,
+                    text: caption ?? content.previewSummary,
+                    content: content,
+                    dateMs: response.dateMs,
+                    isOutgoing: true,
+                    clientNonce: response.clientNonce,
+                    deliveryStatus: FabushiMessageDeliveryStatus(wireStatus: response.status),
+                    sendAsPeerId: selectedSendAsPeerByChat[chatId]
+                )
+                appendOrReplaceMessage(record)
+                persistSnapshotToDisk()
+            }
+            return response
+        } catch {
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.localized(.messageSendFailedToast, locale: locale),
+                chatId: chatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: true
+            )
+            return nil
+        }
+    }
+
+    // MARK: - Approvals, Floor Control, Slash Commands (`D11-01`) & Inline Keyboard (`D11-02`, `D10-08`)
+
+    public func refreshApprovals(sessionId: String? = nil) async {
+        let capturedGen = coordinator.accountScopeGeneration
+        if let items = try? await client.listApprovals(sessionId: sessionId, pendingOnly: true),
+           coordinator.accountScopeGeneration == capturedGen {
+            pendingApprovals = items
+        }
+    }
+
+    @discardableResult
+    public func decideApproval(
+        approvalId: String,
+        approved: Bool,
+        router: ShellNavigationRouter? = nil,
+        chatId: Int64? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        let status = approved ? "approved_once" : "denied"
+        do {
+            try await client.decideApproval(approvalId: approvalId, status: status)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            pendingApprovals.removeAll { $0.id == approvalId }
+            return true
+        } catch {
+            if let chatId {
+                _ = router?.showChatToastIfVisible(
+                    FabushiMessagingStrings.localized(.inspectorSaveFailedToast, locale: locale),
+                    chatId: chatId,
+                    coordinator: coordinator,
+                    isCompact: isCompact,
+                    isError: true
+                )
+            }
+            return false
+        }
+    }
+
+    public func preemptFloor(chatId: Int64) async {
+        let capturedGen = coordinator.accountScopeGeneration
+        try? await client.preemptFloorForUser(chatId: chatId)
+        if coordinator.accountScopeGeneration == capturedGen {
+            floorSpeakerByChat.removeValue(forKey: chatId)
+        }
+    }
+
+    public func refreshSlashCommands() async {
+        let capturedGen = coordinator.accountScopeGeneration
+        if let commands = try? await client.listSlashCommands(),
+           coordinator.accountScopeGeneration == capturedGen {
+            slashCommands = commands
+        }
+    }
+
+    /// `D11-01`: Dispatches slash commands (including `/distill` & `/distill-script`) through real
+    /// `fabushi.runCommand` and processes every `CommandUiEffect` cleanly.
+    @discardableResult
+    public func executeSlashCommand(
+        _ commandText: String,
+        chatId: Int64,
+        botId: UInt64? = nil,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> FabushiCommandExecutionResponse? {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            let response = try await client.runSlashCommand(
+                command: commandText,
+                sessionId: nil,
+                chatId: chatId,
+                botId: botId
+            )
+            guard coordinator.accountScopeGeneration == capturedGen else { return nil }
+            applyCommandEffects(
+                response.effects,
+                chatId: chatId,
+                router: router,
+                isCompact: isCompact,
+                locale: locale
+            )
+            let displayText = response.replyText ?? response.output
+            if !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let botMsg = FabushiMessageRecord(
+                    messageId: nextProvisionalMessageId(),
+                    chatId: chatId,
+                    senderId: botId ?? 0,
+                    text: displayText,
+                    content: .text(text: displayText, entities: []),
+                    dateMs: FabushiWireDateParser.nowMs(),
+                    isOutgoing: false,
+                    inlineKeyboard: response.inlineKeyboard,
+                    deliveryStatus: .sent
+                )
+                appendOrReplaceMessage(botMsg)
+                persistSnapshotToDisk()
+            }
+            return response
+        } catch {
+            return nil
+        }
+    }
+
+    public func applyCommandEffects(
+        _ rawEffects: [FabushiJSONValue],
+        chatId: Int64,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) {
+        for raw in rawEffects {
+            guard let effect = FabushiCommandUiEffect.parse(from: raw) else { continue }
+            switch effect {
+            case .distillBrowserScript(let script):
+                var existing = distilledScriptsByChat[chatId] ?? []
+                existing.removeAll { $0.id == script.id }
+                existing.insert(script, at: 0)
+                distilledScriptsByChat[chatId] = existing
+                router?.toastController.showStagePill(
+                    "\(FabushiMessagingStrings.localized(.slashDistillCardTitle, locale: locale)): \(script.name)",
+                    chatId: chatId
+                )
+            case .openRemoteComputer:
+                router?.navigate(to: .remoteComputer(nodeId: nil), coordinator: coordinator)
+            case .openHermesStudio(let tab):
+                router?.navigate(to: .agentStudio(tab: tab), coordinator: coordinator)
+            case .openTalkMode:
+                router?.navigate(to: .calls, coordinator: coordinator)
+            case .clearChatDisplay:
+                messagesByChat[chatId] = []
+            case .refreshSessionState:
+                Task { @MainActor [weak self] in
+                    await self?.refreshWorkspace(trigger: .manual)
+                }
+            case .showDiff:
+                router?.navigate(to: .agentStudio(tab: "coding"), coordinator: coordinator)
+            case .exportFile, .unknown:
+                break
+            }
+        }
+    }
+
+    /// `D11-02` & `D10-08` & TRAP #5 honest inline keyboard router (zero fake successes).
+    public func handleInlineKeyboardAction(
+        button: FabushiInlineKeyboardButton,
+        chatId: Int64,
+        messageId: Int64,
+        router: ShellNavigationRouter,
+        isCompact: Bool,
+        locale: FabushiLocale
+    ) async {
+        if let webAppURL = button.webAppUrl, !webAppURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            router.navigate(to: .miniApp(id: webAppURL), coordinator: coordinator)
+            return
+        }
+
+        if let urlString = button.url, !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let doc = FabushiInstantViewDocument(
+                url: urlString,
+                siteName: URL(string: urlString)?.host ?? urlString,
+                title: button.text,
+                blocks: [.paragraph(urlString)]
+            )
+            overlayController.openInstantView(doc)
+            return
+        }
+
+        guard let callback = button.callbackData?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !callback.isEmpty
+        else {
+            return
+        }
+
+        // `D10-08`: `computer:` -> Remote Computers Hub navigation
+        if callback.hasPrefix("computer:") {
+            let nodeId = String(callback.dropFirst("computer:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            router.navigate(
+                to: .remoteComputer(nodeId: nodeId.isEmpty ? nil : nodeId),
+                coordinator: coordinator
+            )
+            return
+        }
+
+        // `D11-02`: `browser_takeover:<sid>`, `browser_resume:<sid>`, `browser_cancel:<sid>`
+        if callback.hasPrefix("browser_takeover:")
+            || callback.hasPrefix("browser_resume:")
+            || callback.hasPrefix("browser_cancel:")
+        {
+            lastBrowserTakeoverAction = callback
+            let response = try? await client.runSlashCommand(
+                command: "/\(callback)",
+                sessionId: nil,
+                chatId: chatId,
+                botId: nil
+            )
+            if let response, response.handled {
+                applyCommandEffects(
+                    response.effects,
+                    chatId: chatId,
+                    router: router,
+                    isCompact: isCompact,
+                    locale: locale
+                )
+            } else {
+                _ = router.showChatToastIfVisible(
+                    FabushiMessagingStrings.localized(.browserTakeoverUnavailableToast, locale: locale),
+                    chatId: chatId,
+                    coordinator: coordinator,
+                    isCompact: isCompact,
+                    isError: false
+                )
+            }
+            return
+        }
+
+        if callback.hasPrefix("/") {
+            _ = await executeSlashCommand(
+                callback,
+                chatId: chatId,
+                botId: nil,
+                router: router,
+                isCompact: isCompact,
+                locale: locale
+            )
+            return
+        }
+
+        // TRAP #5: Honest non-destructive notice for unmapped server callback queries (M6 `messages.callback`).
+        _ = router.showChatToastIfVisible(
+            FabushiMessagingStrings.localized(.inlineCallbackPendingNotice, locale: locale),
+            chatId: chatId,
+            coordinator: coordinator,
+            isCompact: isCompact,
+            isError: false
+        )
+    }
+
+    // MARK: - Stories (`#20`)
+
+    public func refreshStories() async {
+        let capturedGen = coordinator.accountScopeGeneration
+        if let fetched = try? await client.listStories(),
+           coordinator.accountScopeGeneration == capturedGen {
+            stories = fetched
+        }
+    }
+
+    @discardableResult
+    public func createStory(
+        mediaId: String? = nil,
+        mediaType: String = "photo",
+        caption: String?,
+        privacy: String = "everyone"
+    ) async -> FabushiStoryItem? {
+        let capturedGen = coordinator.accountScopeGeneration
+        guard let created = try? await client.createStory(
+            mediaId: mediaId,
+            mediaType: mediaType,
+            caption: caption,
+            privacy: privacy
+        ),
+        coordinator.accountScopeGeneration == capturedGen
+        else {
+            return nil
+        }
+        upsertStory(created)
+        return created
+    }
+
+    @discardableResult
+    public func deleteStory(storyId: String) async -> Bool {
+        let capturedGen = coordinator.accountScopeGeneration
+        do {
+            try await client.deleteStory(storyId: storyId)
+            guard coordinator.accountScopeGeneration == capturedGen else { return false }
+            stories.removeAll { $0.storyId == storyId }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    // MARK: - E2EE Safety Numbers & Fail-Closed Send (`#19`)
+
+    public func loadE2EESafetyInfo(
+        chatId: Int64,
+        peerTitle: String,
+        remoteIdentityKeyB64: String? = nil
+    ) async throws -> FabushiE2EESafetyInfo {
+        let capturedGen = coordinator.accountScopeGeneration
+        let identity = try await client.e2eeIdentity()
+        let peerKey = (remoteIdentityKeyB64?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? remoteIdentityKeyB64!
+            : identity.x25519PubB64
+        let emojis = try await client.e2eeSafetyFingerprint(
+            localIdentityKeyB64: identity.x25519PubB64,
+            remoteIdentityKeyB64: peerKey
+        )
+        let qrPayload = "fabushi-e2ee://v1/\(identity.deviceId)/\(identity.x25519PubB64)/\(peerKey)"
+        let info = FabushiE2EESafetyInfo(
+            chatId: chatId,
+            peerTitle: peerTitle,
+            localIdentityKeyB64: identity.x25519PubB64,
+            remoteIdentityKeyB64: remoteIdentityKeyB64,
+            safetyEmojis: emojis,
+            qrPayload: qrPayload,
+            isVerified: verifiedE2EEChatIds.contains(chatId),
+            peerEnrolledOnServer: remoteIdentityKeyB64 != nil
+        )
+        if coordinator.accountScopeGeneration == capturedGen {
+            e2eeSafetyByChat[chatId] = info
+        }
+        return info
+    }
+
+    public func markE2EEVerified(chatId: Int64, verified: Bool) {
+        if verified {
+            verifiedE2EEChatIds.insert(chatId)
+        } else {
+            verifiedE2EEChatIds.remove(chatId)
+        }
+        if var info = e2eeSafetyByChat[chatId] {
+            info.isVerified = verified
+            e2eeSafetyByChat[chatId] = info
+        }
+        if var active = overlayController.presentedSafetyInfo, active.chatId == chatId {
+            active.isVerified = verified
+            overlayController.presentedSafetyInfo = active
+        }
+    }
+
+    /// Strictly fail-closed E2EE send: NEVER silently downgrades to plaintext when server prekey
+    /// endpoints are unprovisioned or the peer has not enrolled!
+    public func sendEncryptedMessageFailClosed(
+        chatId: Int64,
+        recipientUserId: UInt64?,
+        memberUserIds: [UInt64] = [],
+        isGroup: Bool,
+        plaintext: String,
+        router: ShellNavigationRouter? = nil,
+        isCompact: Bool = true,
+        locale: FabushiLocale = .en
+    ) async -> Result<FabushiSendMessageResponse, Error> {
+        do {
+            let response: FabushiSendMessageResponse
+            if isGroup {
+                response = try await client.e2eeSendEncryptedGroup(
+                    chatId: chatId,
+                    memberUserIds: memberUserIds,
+                    plaintext: plaintext
+                )
+            } else {
+                guard let recipientUserId else {
+                    throw FabushiHostError.invalidArguments(message: "Missing recipient user ID")
+                }
+                response = try await client.e2eeSendEncryptedDm(
+                    chatId: chatId,
+                    recipientUserId: recipientUserId,
+                    plaintext: plaintext
+                )
+            }
+            return .success(response)
+        } catch {
+            _ = router?.showChatToastIfVisible(
+                FabushiMessagingStrings.localized(.e2eePeerNotEnrolledNotice, locale: locale),
+                chatId: chatId,
+                coordinator: coordinator,
+                isCompact: isCompact,
+                isError: true
+            )
+            return .failure(error)
+        }
     }
 }
 

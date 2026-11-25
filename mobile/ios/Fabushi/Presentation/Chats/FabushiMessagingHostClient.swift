@@ -994,6 +994,127 @@ public final class FabushiMessagingHostClient {
         )
     }
 
+    public func e2eeRatchetInitPair(
+        aliceSessionId: String,
+        bobSessionId: String,
+        associatedData: String = "fabushi-dr-v1"
+    ) async throws -> FabushiJSONValue {
+        struct Params: Encodable, Sendable {
+            let alice_session_id: String
+            let bob_session_id: String
+            let associated_data: String
+        }
+        return try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("ratchetInitPair"),
+            params: Params(
+                alice_session_id: aliceSessionId,
+                bob_session_id: bobSessionId,
+                associated_data: associatedData
+            )
+        )
+    }
+
+    public func e2eeRatchetEncrypt(
+        sessionId: String,
+        plaintext: String
+    ) async throws -> (header: FabushiJSONValue, ciphertextB64: String) {
+        struct Params: Encodable, Sendable {
+            let session_id: String
+            let plaintext: String
+        }
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("ratchetEncrypt"),
+            params: Params(session_id: sessionId, plaintext: plaintext)
+        )
+        guard let header = raw["header"],
+              let ciphertextB64 = raw["ciphertext_b64"]?.stringValue
+        else {
+            throw FabushiHostError.invalidResponse(raw: "Missing header/ciphertext_b64 in e2ee.ratchetEncrypt")
+        }
+        return (header, ciphertextB64)
+    }
+
+    public func e2eeRatchetDecrypt(
+        sessionId: String,
+        header: FabushiJSONValue,
+        ciphertextB64: String
+    ) async throws -> String {
+        struct Params: Encodable, Sendable {
+            let session_id: String
+            let header: FabushiJSONValue
+            let ciphertext_b64: String
+        }
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("ratchetDecrypt"),
+            params: Params(session_id: sessionId, header: header, ciphertext_b64: ciphertextB64)
+        )
+        return raw["plaintext_utf8"]?.stringValue ?? ""
+    }
+
+    public func e2eeSenderKeyCreate(
+        keyId: String,
+        chatId: Int64,
+        senderUserId: UInt64,
+        senderDeviceId: String
+    ) async throws -> FabushiJSONValue {
+        struct Params: Encodable, Sendable {
+            let key_id: String
+            let chat_id: Int64
+            let sender_user_id: UInt64
+            let sender_device_id: String
+        }
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("senderKeyCreate"),
+            params: Params(
+                key_id: keyId,
+                chat_id: chatId,
+                sender_user_id: senderUserId,
+                sender_device_id: senderDeviceId
+            )
+        )
+        guard let dist = raw["distribution"] else {
+            throw FabushiHostError.invalidResponse(raw: "Missing distribution in e2ee.senderKeyCreate")
+        }
+        return dist
+    }
+
+    public func e2eeSenderKeyImportDistribution(
+        keyId: String,
+        distribution: FabushiJSONValue
+    ) async throws {
+        struct Params: Encodable, Sendable {
+            let key_id: String
+            let distribution: FabushiJSONValue
+        }
+        let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("senderKeyImportDistribution"),
+            params: Params(key_id: keyId, distribution: distribution)
+        )
+    }
+
+    public func e2eeSenderKeyEncrypt(keyId: String, plaintext: String) async throws -> FabushiJSONValue {
+        struct Params: Encodable, Sendable {
+            let key_id: String
+            let plaintext: String
+        }
+        return try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("senderKeyEncrypt"),
+            params: Params(key_id: keyId, plaintext: plaintext)
+        )
+    }
+
+    public func e2eeSenderKeyDecrypt(keyId: String, ciphertext: FabushiJSONValue) async throws -> String {
+        struct Params: Encodable, Sendable {
+            let key_id: String
+            let ciphertext: FabushiJSONValue
+        }
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.e2ee.method("senderKeyDecrypt"),
+            params: Params(key_id: keyId, ciphertext: ciphertext)
+        )
+        return raw["plaintext_utf8"]?.stringValue ?? ""
+    }
+
     // MARK: - 9. `media.*`, `stories.*`, `stickers.*`
 
     public func uploadMedia(filename: String, mimeType: String, dataB64: String) async throws -> FabushiMediaUploadResponse {
@@ -1295,6 +1416,47 @@ public final class FabushiMessagingHostClient {
             params: Params(remote: remote)
         )
         return FabushiAiModelCatalog.fromMagpieStateJSON(raw)
+    }
+
+    public func listMagpiePresets() async throws -> FabushiJSONValue {
+        try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.magpie.method("listPresets"),
+            params: FabushiEmptyParams()
+        )
+    }
+
+    public func listMagpieGroups() async throws -> [FabushiJSONValue] {
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
+            method: FabushiRPCNamespace.magpie.method("listGroups"),
+            params: FabushiEmptyParams()
+        )
+        return raw.arrayValue ?? []
+    }
+
+    /// `D10-09`: Fetches the live `FabushiAiModelCatalog` strictly from `magpie.state(remote: true)`
+    /// with offline fallback to local `magpie.state(remote: false)` + `magpie.listGroups`.
+    /// ZERO hardcoded model defaults.
+    public func fetchEffectiveAiModelCatalog() async -> FabushiAiModelCatalog {
+        if let remoteCatalog = try? await fetchMagpieState(remote: true),
+           remoteCatalog.hasConfiguredProvider || !remoteCatalog.routingGroups.isEmpty {
+            return remoteCatalog
+        }
+        if let localCatalog = try? await fetchMagpieState(remote: false) {
+            if !localCatalog.routingGroups.isEmpty || localCatalog.hasConfiguredProvider {
+                return localCatalog
+            }
+        }
+        if let groups = try? await listMagpieGroups() {
+            let names = groups.compactMap { $0["name"]?.stringValue ?? $0["id"]?.stringValue }.filter { !$0.isEmpty }
+            return FabushiAiModelCatalog(
+                activeProvider: nil,
+                activeModel: nil,
+                models: [],
+                routingGroups: names,
+                hasConfiguredProvider: false
+            )
+        }
+        return FabushiAiModelCatalog()
     }
 
     public func listComputers() async throws -> [FabushiBotComputer] {

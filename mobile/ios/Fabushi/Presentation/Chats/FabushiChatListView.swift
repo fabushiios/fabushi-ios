@@ -162,6 +162,17 @@ public struct FabushiChatListView: View {
                 pendingDeleteChat = nil
             }
         }
+        .fullScreenCover(isPresented: Binding(
+            get: { store.overlayController.isStoriesOverlayPresented },
+            set: { if !$0 { store.overlayController.dismissStories() } }
+        )) {
+            FabushiStoriesView(
+                coordinator: coordinator,
+                router: router,
+                store: store,
+                onDismiss: { store.overlayController.dismissStories() }
+            )
+        }
     }
 
     // MARK: - Inline Header & Search Bar

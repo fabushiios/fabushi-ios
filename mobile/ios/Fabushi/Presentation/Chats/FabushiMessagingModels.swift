@@ -3418,6 +3418,26 @@ public struct FabushiApprovalItem: Identifiable, Codable, Sendable, Equatable, H
         case createdAt = "created_at"
     }
 
+    public init(
+        id: String,
+        sessionId: String? = nil,
+        command: String,
+        riskLevel: String = "medium",
+        patternName: String? = nil,
+        status: String = "pending",
+        decidedBy: String? = nil,
+        createdAt: String? = nil
+    ) {
+        self.id = id
+        self.sessionId = sessionId
+        self.command = command
+        self.riskLevel = riskLevel
+        self.patternName = patternName
+        self.status = status
+        self.decidedBy = decidedBy
+        self.createdAt = createdAt
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
@@ -3428,6 +3448,88 @@ public struct FabushiApprovalItem: Identifiable, Codable, Sendable, Equatable, H
         self.status = try container.decodeIfPresent(String.self, forKey: .status) ?? "pending"
         self.decidedBy = try container.decodeIfPresent(String.self, forKey: .decidedBy)
         self.createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+    }
+}
+
+// MARK: - Slash Command UI Effects & Distilled Browser Script (`D11-01`, `D11-02`)
+
+public struct FabushiDistilledBrowserScript: Identifiable, Codable, Sendable, Equatable, Hashable {
+    public var id: String { appId.isEmpty ? slug : appId }
+
+    public let appId: String
+    public let slug: String
+    public let name: String
+    public let appJSON: String
+    public let createdAtMs: Int64
+
+    public init(
+        appId: String,
+        slug: String,
+        name: String,
+        appJSON: String,
+        createdAtMs: Int64 = FabushiWireDateParser.nowMs()
+    ) {
+        self.appId = appId
+        self.slug = slug
+        self.name = name
+        self.appJSON = appJSON
+        self.createdAtMs = createdAtMs
+    }
+}
+
+public enum FabushiCommandUiEffect: Sendable, Equatable {
+    case openTalkMode
+    case openRemoteComputer
+    case openHermesStudio(tab: String)
+    case clearChatDisplay
+    case refreshSessionState
+    case distillBrowserScript(FabushiDistilledBrowserScript)
+    case showDiff
+    case exportFile(filename: String, format: String, content: String)
+    case unknown(type: String)
+
+    public static func parse(from raw: FabushiJSONValue) -> FabushiCommandUiEffect? {
+        guard let type = raw["type"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !type.isEmpty,
+              type != "none"
+        else {
+            return nil
+        }
+        switch type {
+        case "open_talk_mode":
+            return .openTalkMode
+        case "open_remote_computer":
+            return .openRemoteComputer
+        case "open_hermes_studio":
+            return .openHermesStudio(tab: raw["tab"]?.stringValue ?? "overview")
+        case "clear_chat_display":
+            return .clearChatDisplay
+        case "refresh_session_state":
+            return .refreshSessionState
+        case "distill_browser_script":
+            let appId = raw["app_id"]?.stringValue ?? ""
+            let slug = raw["slug"]?.stringValue ?? ""
+            let name = raw["name"]?.stringValue ?? (slug.isEmpty ? appId : slug)
+            let appJSON = raw["app_json"]?.stringValue ?? "{}"
+            return .distillBrowserScript(
+                FabushiDistilledBrowserScript(
+                    appId: appId,
+                    slug: slug,
+                    name: name,
+                    appJSON: appJSON
+                )
+            )
+        case "show_diff":
+            return .showDiff
+        case "export_file":
+            return .exportFile(
+                filename: raw["filename"]?.stringValue ?? "export.txt",
+                format: raw["format"]?.stringValue ?? "text",
+                content: raw["content"]?.stringValue ?? ""
+            )
+        default:
+            return .unknown(type: type)
+        }
     }
 }
 
@@ -3486,7 +3588,9 @@ public struct FabushiE2EEIdentity: Codable, Sendable, Equatable {
     }
 }
 
-public struct FabushiE2EESafetyInfo: Codable, Sendable, Equatable, Hashable {
+public struct FabushiE2EESafetyInfo: Identifiable, Codable, Sendable, Equatable, Hashable {
+    public var id: Int64 { chatId }
+
     public let chatId: Int64
     public let peerTitle: String
     public let localIdentityKeyB64: String
