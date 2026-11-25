@@ -5,14 +5,14 @@ Canonical Spec: `docs/specs/gpui-telegram-main-ios-parity.md`
 Machine authority: `manifests/desktop-main-authority.json`
 
 - Desktop repository: `bhrumom/gpui-telegram`
-- Desktop live branch: `main`
-- Desktop observed snapshot at `2026-11-25`: `Fabushi v1.6.14 + feat(community)` (`e577d52f9159aa02538c5495777288871f75f572`, untagged +1 commit ahead of lightweight tag/release `v1.6.14` `6fec7854f87a33929edddb42869db3949bd6c658`)
-- Desktop snapshot root tree: `0963ca28ab41290872387d19c4a593fac06357d1`
+- Desktop live branch: `main` (`authorityPinMode: "fixed-baseline"` per user directive `2026-11-25T12:28:00Z`)
+- Desktop fixed baseline snapshot at `2026-11-25`: `Fabushi v1.6.15` (`2ca3fffd32c9cb5b9aa8b7c4d5092b6b901914d2`, annotated tag `v1.6.15` object SHA `5a0446c2a0ba5ba7484c169e406b8ba140527f1f` tagged `2026-11-25T12:19:32Z`; latest published GitHub Release `v1.6.14`)
+- Desktop snapshot root tree: `82ab74d1bfa95addfba162330e3cf22048b90900`
 - Desktop tracked inventory at this snapshot: `11,406` blobs (`3,110` `crates/**` across 19 directories + `7,713` `inherited/**` + `583` root/docs/scripts/tests/vendor), `0` gitlinks
 - Target repository: `fabushiios/fabushi-ios` (historical redirects: `fabushi-ios/fabushi-ios`, `bhrumom/fabushi-ios`)
-- Target release: `Fabushi v1.6.14` (`MARKETING_VERSION: 1.6.14`, `CURRENT_PROJECT_VERSION: 35`)
+- Target release: `Fabushi v1.6.15` (`MARKETING_VERSION: 1.6.15`, `CURRENT_PROJECT_VERSION: 35`)
 
-Never parse this Markdown for an authoritative SHA. Each migration/validation/acceptance cycle reads the JSON machine lock and resolves the live Desktop main exact ref. A new main SHA requires rebaseline before current parity can be accepted, including selected source manifest, full tracked tree, dependency/owner-impact review, ledger and exact iOS evidence.
+Never parse this Markdown for an authoritative SHA. Each migration/validation/acceptance cycle reads the JSON machine lock (`manifests/desktop-main-authority.json`) and strictly verifies the exact pinned upstream commit SHA, root tree SHA, non-truncated tracked inventory, and SHA-256 tree digests (in `fixed-baseline` mode, advancing upstream `main` commits are logged informatively without invalidating the user-locked `v1.6.15` baseline).
 
 Naming and historical lineage notes:
 - `bhrunom/gpui-telegram` returns HTTP 404 (`users/bhrunom` does not exist) and is a verified 1-character typo for `bhrumom/gpui-telegram`.

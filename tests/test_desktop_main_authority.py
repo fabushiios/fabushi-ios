@@ -417,7 +417,7 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             # Valid CI-verified TEST_READY.md with anchored GitHub Actions URL and non-zero 40-hex SHA passes
             (root / "TEST_READY.md").write_text(
                 "# E2E Test Readiness\n"
-                "Exact HEAD: e577d52f9159aa02538c5495777288871f75f572\n"
+                "Exact HEAD: 2ca3fffd32c9cb5b9aa8b7c4d5092b6b901914d2\n"
                 "GitHub Actions Run: https://github.com/fabushiios/fabushi-ios/actions/runs/45114476960\n",
                 encoding="utf-8",
             )
@@ -1059,6 +1059,211 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             validator.verify_ios_swift_anti_mock(root, errs_frontend)
             self.assertTrue(any("frontend/src/production/CleanView.swift" in e and "0xAA/0xBB" in e for e in errs_frontend), errs_frontend)
             self.assertTrue(any("frontend/src/production/CleanView.swift" in e and "acc_primary/acc_work" in e for e in errs_frontend), errs_frontend)
+
+    def test_fixed_baseline_passes_when_live_main_advances_and_pinned_commit_matches(self):
+        real_lock = validator.document(validator.LOCK)
+        real_mf = validator.document(validator.MANIFEST_INDEX)
+        real_ld = validator.document(validator.LEDGER_INDEX)
+        real_snap_errors = []
+        validator.verify_snapshot(real_lock, real_mf, real_ld, real_snap_errors)
+        self.assertEqual(real_snap_errors, [])
+        self.assertEqual(real_lock.get("authorityPinMode"), "fixed-baseline")
+        self.assertTrue(real_lock.get("pinnedByUserDirective"))
+
+        base_tree, lock = make_base_tree_and_lock(file_ledger_mode="legacy-predecessor-archived")
+        lock["authorityPinMode"] = "fixed-baseline"
+        lock["pinnedByUserDirective"] = "2026-11-25T12:28:00Z"
+        fake_mf = {
+            "authority": {
+                "repository": "bhrumom/fabushi-desktop",
+                "branch": "main",
+                "commit": "3" * 40,
+                "tree": "4" * 40,
+                "mode": "live-main",
+            },
+            "fileCount": 2,
+        }
+        fake_ld = {"source": fake_mf["authority"], "rowCount": 2}
+        orig_doc = validator.document
+
+        def fake_doc(path):
+            if path == validator.LOCK:
+                return lock
+            if path == validator.MANIFEST_INDEX:
+                return fake_mf
+            if path == validator.LEDGER_INDEX:
+                return fake_ld
+            return orig_doc(path)
+
+        api_tree_entries = [
+            {"path": p, "mode": m, "type": k, "sha": sha, "size": sz}
+            for p, (m, k, sha, sz) in base_tree.items()
+        ]
+
+        def fake_api(url):
+            if f"/git/commits/{lock['commit']}" in url:
+                return {"sha": lock["commit"], "tree": {"sha": lock["rootTreeSha"]}}
+            if f"/commits/{lock['commit']}" in url:
+                return {"sha": lock["commit"], "commit": {"tree": {"sha": lock["rootTreeSha"]}}}
+            if f"/git/trees/{lock['rootTreeSha']}?recursive=1" in url:
+                return {"sha": lock["rootTreeSha"], "truncated": False, "tree": api_tree_entries}
+            raise AssertionError(f"unexpected GitHub API URL: {url}")
+
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--authority-only", "--verify-api-tree"]), \
+             mock.patch.object(validator, "document", side_effect=fake_doc), \
+             mock.patch.object(validator, "github_api_json", side_effect=fake_api), \
+             mock.patch.object(validator, "live_head", return_value="9" * 40), \
+             contextlib.redirect_stdout(buf):
+            rc = validator.run()
+        output = buf.getvalue()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("INFO: fixed-baseline pin active", output)
+        self.assertIn("PASS: fixed-baseline Desktop pin", output)
+        self.assertIn(f"fullTreeSha256={lock['inventory']['fullTreeSha256']}", output)
+        self.assertIn(f"selectedTreeSha256={lock['inventory']['selectedTreeSha256']}", output)
+
+    def test_fixed_baseline_fails_closed_on_pinned_commit_tree_digest_or_inventory_mismatch(self):
+        base_tree, lock = make_base_tree_and_lock(file_ledger_mode="legacy-predecessor-archived")
+        lock["authorityPinMode"] = "fixed-baseline"
+        lock["pinnedByUserDirective"] = "2026-11-25T12:28:00Z"
+        fake_mf = {
+            "authority": {
+                "repository": "bhrumom/fabushi-desktop",
+                "branch": "main",
+                "commit": "3" * 40,
+                "tree": "4" * 40,
+                "mode": "live-main",
+            },
+            "fileCount": 2,
+        }
+        fake_ld = {"source": fake_mf["authority"], "rowCount": 2}
+        orig_doc = validator.document
+
+        # Case 1: invalid authorityPinMode fails closed
+        bad_mode_lock = copy.deepcopy(lock)
+        bad_mode_lock["authorityPinMode"] = "floating"
+        mode_errs = []
+        validator.verify_snapshot(bad_mode_lock, fake_mf, fake_ld, mode_errs)
+        self.assertTrue(any("invalid authorityPinMode" in e for e in mode_errs), mode_errs)
+
+        # Case 2: missing pinnedByUserDirective in fixed-baseline fails closed
+        no_dir_lock = copy.deepcopy(lock)
+        no_dir_lock.pop("pinnedByUserDirective")
+        dir_errs = []
+        validator.verify_snapshot(no_dir_lock, fake_mf, fake_ld, dir_errs)
+        self.assertTrue(any("pinnedByUserDirective" in e for e in dir_errs), dir_errs)
+
+        def fake_doc(path):
+            if path == validator.LOCK:
+                return lock
+            if path == validator.MANIFEST_INDEX:
+                return fake_mf
+            if path == validator.LEDGER_INDEX:
+                return fake_ld
+            return orig_doc(path)
+
+        api_tree_entries = [
+            {"path": p, "mode": m, "type": k, "sha": sha, "size": sz}
+            for p, (m, k, sha, sz) in base_tree.items()
+        ]
+
+        # Case 3: pinned commit SHA mismatch fails closed
+        def api_wrong_sha(url):
+            if f"/commits/{lock['commit']}" in url:
+                return {"sha": "f" * 40, "commit": {"tree": {"sha": lock["rootTreeSha"]}}}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        buf_sha = io.StringIO()
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--authority-only"]), \
+             mock.patch.object(validator, "document", side_effect=fake_doc), \
+             mock.patch.object(validator, "github_api_json", side_effect=api_wrong_sha), \
+             mock.patch.object(validator, "live_head", return_value="9" * 40), \
+             contextlib.redirect_stdout(buf_sha):
+            rc_sha = validator.run()
+        self.assertEqual(rc_sha, 1, buf_sha.getvalue())
+        self.assertIn("pinned Desktop commit SHA mismatch", buf_sha.getvalue())
+
+        # Case 4: pinned root tree SHA mismatch fails closed
+        def api_wrong_tree(url):
+            if f"/commits/{lock['commit']}" in url:
+                return {"sha": lock["commit"], "commit": {"tree": {"sha": "e" * 40}}}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        buf_tree = io.StringIO()
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--authority-only"]), \
+             mock.patch.object(validator, "document", side_effect=fake_doc), \
+             mock.patch.object(validator, "github_api_json", side_effect=api_wrong_tree), \
+             mock.patch.object(validator, "live_head", return_value="9" * 40), \
+             contextlib.redirect_stdout(buf_tree):
+            rc_tree = validator.run()
+        self.assertEqual(rc_tree, 1, buf_tree.getvalue())
+        self.assertIn("pinned Desktop root tree SHA mismatch", buf_tree.getvalue())
+
+        # Case 5: recursive tree inventory / digest mismatch fails closed
+        drifted_entries = api_tree_entries + [
+            {"path": "EXTRA.md", "mode": "100644", "type": "blob", "sha": "f" * 40, "size": 5}
+        ]
+
+        def api_drifted_tree(url):
+            if f"/git/commits/{lock['commit']}" in url:
+                return {"sha": lock["commit"], "tree": {"sha": lock["rootTreeSha"]}}
+            if f"/commits/{lock['commit']}" in url:
+                return {"sha": lock["commit"], "commit": {"tree": {"sha": lock["rootTreeSha"]}}}
+            if f"/git/trees/{lock['rootTreeSha']}?recursive=1" in url:
+                return {"sha": lock["rootTreeSha"], "truncated": False, "tree": drifted_entries}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        buf_drift = io.StringIO()
+        with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--authority-only", "--verify-api-tree"]), \
+             mock.patch.object(validator, "document", side_effect=fake_doc), \
+             mock.patch.object(validator, "github_api_json", side_effect=api_drifted_tree), \
+             mock.patch.object(validator, "live_head", return_value="9" * 40), \
+             contextlib.redirect_stdout(buf_drift):
+            rc_drift = validator.run()
+        self.assertEqual(rc_drift, 1, buf_drift.getvalue())
+        self.assertIn("full tracked Desktop blob count drift", buf_drift.getvalue())
+        self.assertIn("full tracked Desktop root tree inventory SHA256 drift", buf_drift.getvalue())
+
+    def test_live_main_pin_mode_still_fails_closed_when_live_main_advances(self):
+        _, lock = make_base_tree_and_lock(file_ledger_mode="legacy-predecessor-archived")
+        fake_mf = {
+            "authority": {
+                "repository": "bhrumom/fabushi-desktop",
+                "branch": "main",
+                "commit": "3" * 40,
+                "tree": "4" * 40,
+                "mode": "live-main",
+            },
+            "fileCount": 2,
+        }
+        fake_ld = {"source": fake_mf["authority"], "rowCount": 2}
+        orig_doc = validator.document
+
+        for pin_mode in (None, "live-main"):
+            case_lock = copy.deepcopy(lock)
+            if pin_mode is None:
+                case_lock.pop("authorityPinMode", None)
+            else:
+                case_lock["authorityPinMode"] = pin_mode
+
+            def fake_doc(path, cur_lock=case_lock):
+                if path == validator.LOCK:
+                    return cur_lock
+                if path == validator.MANIFEST_INDEX:
+                    return fake_mf
+                if path == validator.LEDGER_INDEX:
+                    return fake_ld
+                return orig_doc(path)
+
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv", ["check-desktop-main-ios-architecture.py", "--authority-only"]), \
+                 mock.patch.object(validator, "document", side_effect=fake_doc), \
+                 mock.patch.object(validator, "live_head", return_value="9" * 40), \
+                 contextlib.redirect_stdout(buf):
+                rc = validator.run()
+            self.assertEqual(rc, 1, (pin_mode, buf.getvalue()))
+            self.assertIn("STALE Desktop main lock", buf.getvalue())
 
 
 if __name__ == "__main__":

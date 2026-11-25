@@ -61,7 +61,11 @@ jobs:
           from pathlib import Path
           lock = json.loads(Path("manifests/desktop-main-authority.json").read_text(encoding="utf-8"))
           assert lock["repository"] == "bhrumom/gpui-telegram" and lock["branch"] == "main", lock
+          pin_mode = lock.get("authorityPinMode", "live-main")
+          assert pin_mode in {"live-main", "fixed-baseline"}, lock
           print("sha=" + lock["commit"])
+          print("tree=" + lock["rootTreeSha"])
+          print("pin_mode=" + pin_mode)
           PY
 
       - name: Checkout exact bhrumom/gpui-telegram@main snapshot
@@ -74,7 +78,12 @@ jobs:
           persist-credentials: false
 
       - name: Verify strict authority lock & full tracked Git tree
-        run: python3 scripts/check-desktop-main-ios-architecture.py --strict --desktop-checkout desktop-main-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C desktop-main-source rev-parse HEAD)" = "${{ steps.desktop-main-lock.outputs.sha }}"
+          test "$(git -C desktop-main-source rev-parse 'HEAD^{tree}')" = "${{ steps.desktop-main-lock.outputs.tree }}"
+          python3 scripts/check-desktop-main-ios-architecture.py --strict --desktop-checkout desktop-main-source
 
       - name: Run authority checker unit tests
         run: python3 -m unittest discover -s tests -p 'test_desktop_main_authority.py' -v

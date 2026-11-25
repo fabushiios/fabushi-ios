@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -42,6 +43,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DISPOSITIONS = {"unreviewed", "direct-port", "ios-adapted", "not-applicable-with-replacement"}
 STATUSES = {"unreviewed", "understood", "mapped", "implemented", "verified", "not-applicable"}
+AUTHORITY_PIN_MODES = {"live-main", "fixed-baseline"}
 EXCLUDED_DESKTOP_CRATES = {
     "gpui_telegram_desktop",
     "fabushi_remote_daemon",
@@ -133,6 +135,11 @@ def document(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def authority_pin_mode(lock):
+    mode = lock.get("authorityPinMode")
+    return "live-main" if mode is None else mode
+
+
 def tree_digest(records):
     """SHA-256 of canonical full Git tracked identities (including symlink/gitlink)."""
     stream = "".join(
@@ -184,12 +191,25 @@ def github_api_json(url):
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise ValueError(f"GitHub API request failed for {url}: {exc}") from exc
+    last_exc = None
+    for attempt in range(2):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code in {500, 502, 503, 504} and attempt == 0:
+                time.sleep(2)
+                continue
+            raise ValueError(f"GitHub API request failed for {url}: {exc}") from exc
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            raise ValueError(f"GitHub API request failed for {url}: {exc}") from exc
+    raise ValueError(f"GitHub API request failed for {url}: {last_exc}") from last_exc
 
 
 def github_api_commit_tree(repo, commit_sha, fetch_json=None):
@@ -201,6 +221,25 @@ def github_api_commit_tree(repo, commit_sha, fetch_json=None):
     if not HEX40.fullmatch(tree_sha or ""):
         raise ValueError(f"GitHub API commit response missing valid tree SHA: {tree_sha!r}")
     return tree_sha
+
+
+def github_api_verify_pinned_commit(repo, commit_sha, expected_tree_sha, fetch_json=None):
+    """Prove pinned commit exists in upstream repo with exact commit SHA and root tree SHA."""
+    fetcher = fetch_json or github_api_json
+    data = fetcher(f"https://api.github.com/repos/{repo}/commits/{commit_sha}")
+    actual_sha = data.get("sha")
+    if actual_sha != commit_sha:
+        raise ValueError(
+            f"pinned Desktop commit SHA mismatch: got={actual_sha!r} expected={commit_sha!r}"
+        )
+    tree_sha = ((data.get("commit") or {}).get("tree") or {}).get("sha")
+    if not HEX40.fullmatch(tree_sha or ""):
+        raise ValueError(f"pinned Desktop commit missing valid commit.tree.sha: {tree_sha!r}")
+    if tree_sha != expected_tree_sha:
+        raise ValueError(
+            f"pinned Desktop root tree SHA mismatch: got={tree_sha!r} expected={expected_tree_sha!r}"
+        )
+    return actual_sha, tree_sha
 
 
 def github_api_tree(repo, tree_sha, fetch_json=None):
@@ -352,6 +391,15 @@ def check_status(row, path, complete, errors, warnings, locked_commit):
 def verify_snapshot(lock, manifest_index, ledger_index, errors):
     if lock.get("schemaVersion") != 3 or lock.get("authorityMode") != "live-main":
         errors.append("missing v3 live-main authority lock")
+    pin_mode = authority_pin_mode(lock)
+    if pin_mode not in AUTHORITY_PIN_MODES:
+        errors.append(
+            f"invalid authorityPinMode: {pin_mode!r}; expected one of {sorted(AUTHORITY_PIN_MODES)}"
+        )
+    elif pin_mode == "fixed-baseline":
+        directive = lock.get("pinnedByUserDirective")
+        if not isinstance(directive, str) or not directive.strip():
+            errors.append("fixed-baseline authorityPinMode requires non-empty pinnedByUserDirective")
     sha, tree = lock.get("commit"), lock.get("rootTreeSha")
     if not HEX40.fullmatch(sha or "") or not HEX40.fullmatch(tree or ""):
         errors.append("authority lock missing exact 40-hex commit and root tree")
@@ -1381,9 +1429,32 @@ def run():
             raise ValueError("; ".join(errors))
         lock, manifest, ledger = (document(x) for x in (LOCK, MANIFEST_INDEX, LEDGER_INDEX))
         verify_snapshot(lock, manifest, ledger, errors)
-        observed = live_head()
-        if observed != lock.get("commit"):
-            errors.append(f"STALE Desktop main lock: recorded={lock.get('commit')} live={observed}")
+        pin_mode = authority_pin_mode(lock)
+        if pin_mode == "fixed-baseline":
+            if (
+                lock.get("repository") == UPSTREAM_REPO
+                and HEX40.fullmatch(lock.get("commit") or "")
+                and HEX40.fullmatch(lock.get("rootTreeSha") or "")
+            ):
+                try:
+                    github_api_verify_pinned_commit(
+                        lock["repository"], lock["commit"], lock["rootTreeSha"]
+                    )
+                except ValueError as exc:
+                    errors.append(str(exc))
+            try:
+                observed_live = live_head()
+                if observed_live != lock.get("commit"):
+                    print(
+                        f"INFO: fixed-baseline pin active (pinned={lock.get('commit')}, "
+                        f"live_main={observed_live}, directive={lock.get('pinnedByUserDirective')})"
+                    )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"INFO: live main head lookup skipped in fixed-baseline mode ({exc})")
+        elif pin_mode == "live-main":
+            observed = live_head()
+            if observed != lock.get("commit"):
+                errors.append(f"STALE Desktop main lock: recorded={lock.get('commit')} live={observed}")
         expected = os.environ.get("IOS_EXPECTED_HEAD")
         if expected:
             own_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
@@ -1442,8 +1513,13 @@ def run():
             print("HISTORICAL:", message)
         if len(warnings) > 15:
             print(f"HISTORICAL: {len(warnings)-15} additional row statuses are not current-main acceptance")
+        mode_label = (
+            f"fixed-baseline Desktop pin ({lock['commit'][:12]})"
+            if pin_mode == "fixed-baseline"
+            else "live Desktop main authority"
+        )
         print(
-            "PASS: live Desktop main authority"
+            f"PASS: {mode_label}"
             + (" and source/ledger identity" if not args.authority_only else "")
             + "; full product/release completeness is NOT implied"
         )
