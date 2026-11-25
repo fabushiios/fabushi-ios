@@ -5188,6 +5188,60 @@ fn test_vault_cross_account_isolation_concurrent_argon2_and_vault_db_wipe() {
             "unlockWithPassphrase must return exact root_key_b64 for Keychain persistence"
         );
 
+        // 5b. FIX-2: vault.lock default preserves envelope; clear_envelope: true scrubs orphan envelope;
+        // explicit JSON `"kdf_params": null` is treated cleanly as absent.
+        let lock_default = dispatch(host, &json!({"method": "vault.lock"}));
+        assert_eq!(lock_default["ok"], true);
+        let status_after_default_lock = dispatch(host, &json!({"method": "vault.status"}));
+        assert_eq!(status_after_default_lock["result"]["unlocked"], false);
+        assert_eq!(status_after_default_lock["result"]["has_envelope"], true);
+
+        let lock_clear_env = dispatch(
+            host,
+            &json!({"method": "vault.lock", "params": { "clear_envelope": true }}),
+        );
+        assert_eq!(lock_clear_env["ok"], true);
+        let status_after_clear_env = dispatch(host, &json!({"method": "vault.status"}));
+        assert_eq!(status_after_clear_env["result"]["unlocked"], false);
+        assert_eq!(
+            status_after_clear_env["result"]["has_envelope"], false,
+            "vault.lock(clear_envelope: true) must clear orphan vault_envelope from Rust RAM"
+        );
+
+        let derive_null_kdf = dispatch(
+            host,
+            &json!({
+                "method": "vault.deriveSplitKey",
+                "params": { "password": "null-kdf-check", "kdf_params": null, "fast_kdf": true }
+            }),
+        );
+        assert_eq!(
+            derive_null_kdf["ok"], true,
+            "Explicit JSON kdf_params: null must be treated as absent: {derive_null_kdf}"
+        );
+
+        // 5c. FIX-8: read-only settings.passcodeStatus reflects passcodeSet/passcodeClear without running Argon2id
+        let passcode_status_before = dispatch(host, &json!({"method": "settings.passcodeStatus"}));
+        assert_eq!(passcode_status_before["ok"], true);
+        assert_eq!(passcode_status_before["result"]["configured"], false);
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "settings.passcodeSet", "params": { "passcode": "RustStatus!9" }})
+            )["ok"],
+            true
+        );
+        let passcode_status_set = dispatch(host, &json!({"method": "settings.passcodeStatus"}));
+        assert_eq!(passcode_status_set["ok"], true);
+        assert_eq!(passcode_status_set["result"]["configured"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "settings.passcodeClear"}))["ok"],
+            true
+        );
+        let passcode_status_cleared = dispatch(host, &json!({"method": "settings.passcodeStatus"}));
+        assert_eq!(passcode_status_cleared["ok"], true);
+        assert_eq!(passcode_status_cleared["result"]["configured"], false);
+
         // 6. D7-R1 Subcase A: Concurrent slow Argon2id during session.switchAccount MUST NOT pollute Account B!
         assert_eq!(
             dispatch(
@@ -5204,21 +5258,19 @@ fn test_vault_cross_account_isolation_concurrent_argon2_and_vault_db_wipe() {
         let worker_started_clone = Arc::clone(&worker_started);
         let worker_switch = thread::spawn(move || {
             worker_started_clone.store(true, Ordering::SeqCst);
-            unsafe {
-                dispatch(
-                    host_addr as *mut c_void,
-                    &json!({
-                        "id": "slow-argon-switch",
-                        "method": "vault.initSplitKey",
-                        "generation": gen_a,
-                        "params": {
-                            "user_id": 101,
-                            "password": "slow-argon-switch-pw",
-                            "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
-                        }
-                    }),
-                )
-            }
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({
+                    "id": "slow-argon-switch",
+                    "method": "vault.initSplitKey",
+                    "generation": gen_a,
+                    "params": {
+                        "user_id": 101,
+                        "password": "slow-argon-switch-pw",
+                        "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
+                    }
+                }),
+            )
         });
         while !worker_started.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(2));
@@ -5256,21 +5308,19 @@ fn test_vault_cross_account_isolation_concurrent_argon2_and_vault_db_wipe() {
         let logout_started_clone = Arc::clone(&logout_started);
         let worker_logout = thread::spawn(move || {
             logout_started_clone.store(true, Ordering::SeqCst);
-            unsafe {
-                dispatch(
-                    host_addr as *mut c_void,
-                    &json!({
-                        "id": "slow-argon-logout",
-                        "method": "vault.initSplitKey",
-                        "generation": gen_b,
-                        "params": {
-                            "user_id": 202,
-                            "password": "slow-argon-logout-pw",
-                            "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
-                        }
-                    }),
-                )
-            }
+            dispatch(
+                host_addr as *mut c_void,
+                &json!({
+                    "id": "slow-argon-logout",
+                    "method": "vault.initSplitKey",
+                    "generation": gen_b,
+                    "params": {
+                        "user_id": 202,
+                        "password": "slow-argon-logout-pw",
+                        "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
+                    }
+                }),
+            )
         });
         while !logout_started.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(2));

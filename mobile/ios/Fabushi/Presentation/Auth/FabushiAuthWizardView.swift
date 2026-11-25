@@ -55,6 +55,11 @@ public struct FabushiAuthWizardView: View {
                 scrollContent
                     .navigationTitle(theme.localized("hig.accountSwitcher.addAccount"))
                     .navigationBarTitleDisplayMode(.inline)
+                    .navigationBarBackButtonHidden(
+                        onCancelAddAccount != nil
+                            || viewModel.isAwaitingEmergencyKitBackup
+                            || viewModel.isSubmitting
+                    )
                     .toolbar {
                         if let onCancelAddAccount, !viewModel.isAwaitingEmergencyKitBackup {
                             ToolbarItem(placement: .topBarLeading) {
@@ -64,12 +69,13 @@ public struct FabushiAuthWizardView: View {
                                 }
                                 .fabushiFont(.body)
                                 .fabushiMinimumTouchTarget()
+                                .disabled(viewModel.isSubmitting)
                             }
                         }
                     }
             }
         }
-        .interactiveDismissDisabled(viewModel.isAwaitingEmergencyKitBackup)
+        .interactiveDismissDisabled(viewModel.isAwaitingEmergencyKitBackup || viewModel.isSubmitting)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(FabushiAccessibilityIDs.Auth.root)
         .onChange(of: router.lastAuthCallbackURL) { _, newURL in
@@ -79,6 +85,7 @@ public struct FabushiAuthWizardView: View {
             }
         }
         .onAppear {
+            viewModel.handleViewAppear()
             if let callbackURL = router.consumeLastAuthCallbackURL() {
                 Task {
                     await viewModel.handleAuthCallbackURL(callbackURL, theme: theme)
@@ -86,7 +93,7 @@ public struct FabushiAuthWizardView: View {
             }
         }
         .onDisappear {
-            viewModel.cancelActiveTasks()
+            viewModel.handleViewDisappear()
         }
     }
 
@@ -692,7 +699,6 @@ public struct FabushiAuthWizardView: View {
             Text(emergencyKit)
                 .fabushiFont(.monospacedCaption)
                 .foregroundStyle(theme.textPrimary)
-                .textSelection(.enabled)
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(theme.surfaceInput, in: RoundedRectangle(cornerRadius: 10, style: .continuous))

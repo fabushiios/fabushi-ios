@@ -335,8 +335,9 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(loginReqBody.contains("auth_verifier_b64"))
             XCTAssertFalse(loginReqBody.contains("MyV2Password!99"))
 
-            // 3. Legacy V1 fallback + silent Split-Key V2 upgrade (D4 Hybrid: non-blocking Shell banner!)
+            // 3. Legacy V1 fallback + silent Split-Key V2 upgrade (fresh account with nil server envelope -> D4 Hybrid non-blocking Shell banner!)
             legacyMode.withLock { $0 = true }
+            storedEnvelopeJSON.withLock { $0 = nil }
             _ = try await coordinator.clearLocalSession()
             vm.usernameText = "legacy_v1"
             vm.passwordText = "LegacyPass!42"
@@ -360,8 +361,28 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 router.pendingEmergencyKit?.hasPrefix("EK-") == true,
                 "Silent Legacy V1 upgrade must surface one-time Emergency Kit in persistent Shell banner"
             )
-            router.acknowledgePendingEmergencyKit()
-            XCTAssertNil(router.pendingEmergencyKit)
+
+            // Verify router.pendingEmergencyKit auto-clears on switchAccount to another account and on logout
+            let switchedGen = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 2002,
+                username: "split_login_user",
+                sessionId: "s-2002-sw",
+                token: "tok-2002-sw"
+            ))
+            XCTAssertTrue(router.handleAccountScopeChange(generation: switchedGen, coordinator: coordinator))
+            XCTAssertNil(
+                router.pendingEmergencyKit,
+                "Switching to another account must auto-clear prior account pendingEmergencyKit"
+            )
+
+            router.presentPendingEmergencyKit("EK-LOGOUT-CLEAR-2002", forAccountId: "2002")
+            XCTAssertEqual(router.pendingEmergencyKit, "EK-LOGOUT-CLEAR-2002")
+            let clearedGen = try await coordinator.clearLocalSession()
+            XCTAssertTrue(router.handleAccountScopeChange(generation: clearedGen, coordinator: coordinator))
+            XCTAssertNil(
+                router.pendingEmergencyKit,
+                "Logging out / clearing session must auto-clear pendingEmergencyKit"
+            )
 
             await coordinator.shutdown()
         } catch {
@@ -671,6 +692,23 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                     0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
                 ])
             )
+            // FIX-9: Uppercase 64-char hex decodes identically to 32 raw bytes
+            let upperHexDecoded = try XCTUnwrap(
+                FabushiWebAuthnPasskeyController.decodeChallengeData(
+                    "00112233445566778899AABBCCDDEEFF0123456789ABCDEF0F1E2D3C4B5A6978"
+                )
+            )
+            XCTAssertEqual(upperHexDecoded, hexDecoded)
+
+            // FIX-9: 64-char non-hex Base64 falls through from decodeExactHex64 to exact 48 raw bytes
+            let raw48 = Data((0..<48).map { UInt8(($0 * 7 + 3) & 0xFF) })
+            let base64Len64 = raw48.base64EncodedString()
+            XCTAssertEqual(base64Len64.count, 64)
+            XCTAssertEqual(
+                FabushiWebAuthnPasskeyController.decodeChallengeData(base64Len64),
+                raw48
+            )
+
             // Standard Base64 exact bytes
             XCTAssertEqual(
                 FabushiWebAuthnPasskeyController.decodeChallengeData("dGVzdC1jaGFsbGVuZ2UtMzJi"),
@@ -686,8 +724,9 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 FabushiWebAuthnPasskeyController.decodeChallengeData("pkchal_1_test"),
                 Data("pkchal_1_test".utf8)
             )
-            // Empty / whitespace returns nil
+            // Empty / whitespace / padding-only returns nil (FIX-9)
             XCTAssertNil(FabushiWebAuthnPasskeyController.decodeChallengeData("   "))
+            XCTAssertNil(FabushiWebAuthnPasskeyController.decodeChallengeData("===="))
 
             // D8-2: Base64URL unpadded encoding strips '+', '/', '=' and round-trips losslessly
             let binarySample = Data([0xFB, 0xFF, 0xFE, 0x3E, 0x3F])
@@ -1084,6 +1123,11 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 rustStatusAfterFail.unlocked,
                 "Failed envelopePut during registration MUST roll back Rust vault via vault.lock"
             )
+            XCTAssertEqual(
+                rustStatusAfterFail.hasEnvelope,
+                false,
+                "Failed envelopePut rollback MUST scrub orphan vault_envelope from Rust RAM (FIX-2)"
+            )
 
             // 3. .addAccount registration preserves isAccountSwitcherPresented while holding for Emergency Kit ack
             failEnvelopePut.withLock { $0 = false }
@@ -1179,6 +1223,563 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
 
             await coordinator.shutdown()
         } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - FIX-1 Regression: Legacy V1 Upgrade Non-Clobbering + Mismatched Split-Key & device_keychain_v2 Bootstrap
+
+    func testFix1LegacyV1UpgradePreservesExistingEnvelopesAndMismatchedSplitKeyBootstrap() async throws {
+        struct ScenarioState: Sendable {
+            var legacyMode: Bool = true
+            var activeUserId: UInt64 = 9201
+            var activeUsername: String = "legacy_argon"
+            var kdfSaltB64: String = ""
+            var kdfTCost: UInt32 = 2
+            var storedEnvelopeJSON: String? = nil
+            var envelopePutCount: Int = 0
+            var envelopeGetCount: Int = 0
+        }
+        let state = OSAllocatedUnfairLock<ScenarioState>(initialState: ScenarioState())
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("GET", "/api/v1/auth/kdf-params"):
+                let s = state.withLock { $0 }
+                if s.legacyMode {
+                    return .json(404, #"{"error":"not_found"}"#)
+                }
+                return .json(
+                    200,
+                    #"{"auth_version":2,"auth_salt_b64":"\#(s.kdfSaltB64)","kdf_params":{"m_cost_kib":16384,"t_cost":\#(s.kdfTCost),"p_cost":1}}"#
+                )
+            case ("POST", "/api/v1/auth/login"):
+                let s = state.withLock { $0 }
+                let authVer = s.legacyMode ? 1 : 2
+                return .json(
+                    200,
+                    #"{"user_id":\#(s.activeUserId),"username":"\#(s.activeUsername)","session_id":"s-\#(s.activeUserId)","token":"tok-\#(s.activeUserId)","first_name":"User","auth_version":\#(authVer)}"#
+                )
+            case ("POST", "/api/v1/auth/upgrade-split-key"):
+                return .json(200, #"{"ok":true,"auth_version":2}"#)
+            case ("GET", "/api/v1/user-vault/envelope"):
+                let env = state.withLock { s -> String? in
+                    s.envelopeGetCount += 1
+                    return s.storedEnvelopeJSON
+                }
+                if let env {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            case ("PUT", "/api/v1/user-vault/envelope"):
+                state.withLock { s in
+                    s.envelopePutCount += 1
+                    s.storedEnvelopeJSON = req.bodyString
+                }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("fix1_legacy_v1_non_clobber")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            for uid in ["9201", "9202", "9203", "9204"] {
+                try? coreKC.deleteAccountKey(accountId: uid)
+                secKC.purgeAccountSecrets(accountId: uid)
+            }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            struct InitNewParams: Encodable, Sendable {
+                let userId: UInt64
+                let passphrase: String
+                let kdfParams: FabushiArgon2KdfParamsDTO
+                enum CodingKeys: String, CodingKey {
+                    case userId = "user_id"
+                    case passphrase
+                    case kdfParams = "kdf_params"
+                }
+            }
+            struct InitNewResp: Decodable, Sendable {
+                let envelope: FabushiVaultNestedEnvelopeDTO
+                let rootKeyB64: String
+                enum CodingKeys: String, CodingKey {
+                    case envelope
+                    case rootKeyB64 = "root_key_b64"
+                }
+            }
+
+            let router = ShellNavigationRouter()
+            let theme = FabushiTheme(locale: .en)
+            let vm = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC
+            )
+            vm.serverURLText = server.baseURLString
+
+            // Case A: Legacy V1 silent upgrade when server ALREADY holds an `argon2id` envelope
+            let argonInit: InitNewResp = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("initNew"),
+                params: InitNewParams(
+                    userId: 9201,
+                    passphrase: "LegacyArgon!2026",
+                    kdfParams: FabushiArgon2KdfParamsDTO(mCostKib: 16_384, tCost: 2, pCost: 1)
+                )
+            )
+            let flatArgonJSON = String(
+                decoding: try JSONEncoder().encode(FabushiVaultEnvelopeConverter.toFlat(argonInit.envelope)),
+                as: UTF8.self
+            )
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiVaultLockRequest(clearEnvelope: true)
+            )
+            coordinator.vaultStore.setUnlocked(false)
+
+            state.withLock { s in
+                s.legacyMode = true
+                s.activeUserId = 9201
+                s.activeUsername = "legacy_argon"
+                s.storedEnvelopeJSON = flatArgonJSON
+                s.envelopeGetCount = 0
+                s.envelopePutCount = 0
+            }
+
+            vm.usernameText = "legacy_argon"
+            vm.passwordText = "LegacyArgon!2026"
+            await vm.submitLogin(theme: theme)
+
+            let countsA = state.withLock { ($0.envelopeGetCount, $0.envelopePutCount, $0.storedEnvelopeJSON) }
+            XCTAssertEqual(countsA.0, 1, "Legacy V1 silent upgrade MUST issue GET /api/v1/user-vault/envelope first")
+            XCTAssertEqual(countsA.1, 0, "Legacy V1 silent upgrade MUST NOT clobber existing argon2id cloud envelope")
+            XCTAssertEqual(countsA.2, flatArgonJSON)
+            XCTAssertTrue(coordinator.vaultStore.isUnlocked)
+            XCTAssertTrue(vm.lastCompletedVaultBootstrap)
+            XCTAssertEqual(try secKC.loadVaultRootKeyBase64(accountId: "9201"), argonInit.rootKeyB64)
+            XCTAssertNil(router.pendingEmergencyKit, "Existing unlocked vault must not mint a replacement Emergency Kit")
+
+            // Case B: Legacy V1 silent upgrade when server ALREADY holds a `device_keychain_v2` envelope
+            _ = try await coordinator.clearLocalSession()
+            let deviceKeychainEnv = #"{"key_version":2,"kdf_alg":"device_keychain_v2","kdf_salt_b64":"","kdf_m_cost_kib":65536,"kdf_t_cost":3,"kdf_p_cost":1,"wrapped_root_key_b64":"","recovery_wrapped_root_key_b64":"cmVjb3Zlcnk=","updated_at_ms":1700000000000}"#
+            state.withLock { s in
+                s.legacyMode = true
+                s.activeUserId = 9202
+                s.activeUsername = "legacy_dkc"
+                s.storedEnvelopeJSON = deviceKeychainEnv
+                s.envelopeGetCount = 0
+                s.envelopePutCount = 0
+            }
+
+            vm.usernameText = "legacy_dkc"
+            vm.passwordText = "LegacyDKC!2026"
+            await vm.submitLogin(theme: theme)
+
+            let countsB = state.withLock { ($0.envelopeGetCount, $0.envelopePutCount, $0.storedEnvelopeJSON) }
+            XCTAssertEqual(countsB.0, 1)
+            XCTAssertEqual(countsB.1, 0, "Legacy V1 silent upgrade MUST NOT overwrite existing device_keychain_v2 envelope")
+            XCTAssertEqual(countsB.2, deviceKeychainEnv)
+            XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertFalse(vm.lastCompletedVaultBootstrap)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "9202"))
+            XCTAssertNil(router.pendingEmergencyKit)
+
+            // Case C: Split-Key V2 login with MISMATCHED envelope salt/KDF params (`paramsMatch == false` fallback to password)
+            _ = try await coordinator.clearLocalSession()
+            let splitInit: FabushiVaultInitSplitKeyResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("initSplitKey"),
+                params: FabushiVaultInitSplitKeyRequest(
+                    userId: 9203,
+                    password: "MismatchSplit!99",
+                    saltB64: nil,
+                    kdfParams: FabushiArgon2KdfParamsDTO(mCostKib: 16_384, tCost: 2, pCost: 1),
+                    fastKdf: nil
+                )
+            )
+            let flatSplitJSON = String(
+                decoding: try JSONEncoder().encode(FabushiVaultEnvelopeConverter.toFlat(splitInit.envelope)),
+                as: UTF8.self
+            )
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiVaultLockRequest(clearEnvelope: true)
+            )
+            coordinator.vaultStore.setUnlocked(false)
+
+            // Server auth kdf-params intentionally use a DIFFERENT salt and t_cost than the stored vault envelope!
+            let differentAuthSalt = Data(repeating: 0x5A, count: 16).base64EncodedString()
+            XCTAssertNotEqual(differentAuthSalt, splitInit.authSaltB64)
+            state.withLock { s in
+                s.legacyMode = false
+                s.activeUserId = 9203
+                s.activeUsername = "split_mismatch"
+                s.kdfSaltB64 = differentAuthSalt
+                s.kdfTCost = 3
+                s.storedEnvelopeJSON = flatSplitJSON
+                s.envelopeGetCount = 0
+                s.envelopePutCount = 0
+            }
+
+            vm.usernameText = "split_mismatch"
+            vm.passwordText = "MismatchSplit!99"
+            await vm.submitLogin(theme: theme)
+
+            let countsC = state.withLock { ($0.envelopeGetCount, $0.envelopePutCount) }
+            XCTAssertEqual(countsC.0, 1)
+            XCTAssertEqual(countsC.1, 0)
+            XCTAssertTrue(coordinator.vaultStore.isUnlocked)
+            XCTAssertTrue(vm.lastCompletedVaultBootstrap)
+            XCTAssertEqual(
+                try secKC.loadVaultRootKeyBase64(accountId: "9203"),
+                splitInit.rootKeyB64,
+                "paramsMatch == false must fall back to password derivation and recover exact VaultRootKey"
+            )
+
+            // Case D: Split-Key V2 login encountering `device_keychain_v2` envelope leaves vault locked & cloud envelope intact
+            _ = try await coordinator.clearLocalSession()
+            state.withLock { s in
+                s.legacyMode = false
+                s.activeUserId = 9204
+                s.activeUsername = "split_dkc"
+                s.kdfSaltB64 = differentAuthSalt
+                s.kdfTCost = 2
+                s.storedEnvelopeJSON = deviceKeychainEnv
+                s.envelopeGetCount = 0
+                s.envelopePutCount = 0
+            }
+
+            vm.usernameText = "split_dkc"
+            vm.passwordText = "SplitDKC!99"
+            await vm.submitLogin(theme: theme)
+
+            let countsD = state.withLock { ($0.envelopeGetCount, $0.envelopePutCount, $0.storedEnvelopeJSON) }
+            XCTAssertEqual(countsD.0, 1)
+            XCTAssertEqual(countsD.1, 0)
+            XCTAssertEqual(countsD.2, deviceKeychainEnv)
+            XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertFalse(vm.lastCompletedVaultBootstrap)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "9204"))
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - FIX-4 Regression: .addAccount Teardown Kit Rescue, In-Flight Teardown & Unauth Hold Clearing
+
+    func testFix4AddAccountTeardownRescuesEmergencyKitAndClearsHolds() async throws {
+        let holdEnvelopePut = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let envelopePutArrived = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("POST", "/api/v1/auth/register"):
+                if req.bodyString.contains("inflight_add") {
+                    return .json(200, #"{"user_id":9302,"username":"inflight_add","session_id":"s-9302","token":"tok-9302","first_name":"InFlight","auth_version":2}"#)
+                }
+                return .json(200, #"{"user_id":9301,"username":"teardown_add","session_id":"s-9301","token":"tok-9301","first_name":"Teardown","auth_version":2}"#)
+            case ("PUT", "/api/v1/user-vault/envelope"):
+                envelopePutArrived.withLock { $0 = true }
+                let deadline = Date().addingTimeInterval(3.0)
+                while holdEnvelopePut.withLock({ $0 }) && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("fix4_add_account_teardown")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            for uid in ["9301", "9302"] {
+                try? coreKC.deleteAccountKey(accountId: uid)
+                secKC.purgeAccountSecrets(accountId: uid)
+            }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let router = ShellNavigationRouter()
+            let theme = FabushiTheme(locale: .en)
+
+            // 1. Unexpected .addAccount teardown while awaiting Emergency Kit backup rescues kit into Shell banner & releases hold
+            router.isAccountSwitcherPresented = true
+            let addVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC
+            )
+            addVM.handleViewAppear()
+            addVM.serverURLText = server.baseURLString
+            addVM.authTab = .register
+            addVM.usernameText = "teardown_add"
+            addVM.passwordText = "TeardownPass!1"
+            await addVM.submitRegistration(theme: theme)
+
+            let expectedKit = try XCTUnwrap(addVM.generatedEmergencyKit)
+            XCTAssertTrue(expectedKit.hasPrefix("EK-"))
+            XCTAssertTrue(addVM.isAwaitingEmergencyKitBackup)
+            XCTAssertTrue(router.isHoldingAddAccountGate)
+
+            addVM.handleViewDisappear()
+            XCTAssertNil(addVM.generatedEmergencyKit, "handleViewDisappear must wipe ViewModel copy after rescue")
+            XCTAssertFalse(addVM.isAwaitingEmergencyKitBackup)
+            XCTAssertFalse(router.isHoldingAddAccountGate, "handleViewDisappear must release .addAccount hold")
+            XCTAssertEqual(
+                router.pendingEmergencyKit,
+                expectedKit,
+                "Unexpected .addAccount teardown must rescue unacknowledged Emergency Kit into Shell banner"
+            )
+            router.acknowledgePendingEmergencyKit()
+
+            // 2. In-flight teardown during registration must rescue generated kit & never leak hold
+            holdEnvelopePut.withLock { $0 = true }
+            envelopePutArrived.withLock { $0 = false }
+            router.isAccountSwitcherPresented = true
+            let inFlightVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC
+            )
+            inFlightVM.handleViewAppear()
+            inFlightVM.serverURLText = server.baseURLString
+            inFlightVM.authTab = .register
+            inFlightVM.usernameText = "inflight_add"
+            inFlightVM.passwordText = "InFlightPass!2"
+
+            let regTask = Task { @MainActor in
+                await inFlightVM.submitRegistration(theme: theme)
+            }
+            let waitDeadline = Date().addingTimeInterval(5.0)
+            while !envelopePutArrived.withLock({ $0 }) && Date() < waitDeadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(envelopePutArrived.withLock { $0 })
+            // View disappears while PUT /envelope is still in flight
+            inFlightVM.handleViewDisappear()
+            holdEnvelopePut.withLock { $0 = false }
+            await regTask.value
+
+            XCTAssertNil(inFlightVM.generatedEmergencyKit)
+            XCTAssertFalse(router.isHoldingAddAccountGate, "In-flight teardown must not re-hold detached ViewModel")
+            XCTAssertTrue(
+                router.pendingEmergencyKit?.hasPrefix("EK-") == true,
+                "In-flight teardown must promote newly created Emergency Kit into Shell banner"
+            )
+
+            // 3. External .unauthenticated transition clears BOTH onboarding holds, Account Switcher & pendingEmergencyKit
+            router.beginAuthOnboardingHold(isAddAccount: false)
+            router.beginAuthOnboardingHold(isAddAccount: true)
+            router.isAccountSwitcherPresented = true
+            XCTAssertTrue(router.isHoldingPrimaryAuthGate)
+            XCTAssertTrue(router.isHoldingAddAccountGate)
+
+            let unauthGen = try await coordinator.clearLocalSession()
+            XCTAssertTrue(router.handleAccountScopeChange(generation: unauthGen, coordinator: coordinator))
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            XCTAssertFalse(router.isHoldingAddAccountGate)
+            XCTAssertFalse(router.isAccountSwitcherPresented)
+            XCTAssertNil(router.pendingEmergencyKit)
+
+            await coordinator.shutdown()
+        } catch {
+            holdEnvelopePut.withLock { $0 = false }
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - FIX-6 Regression: Async Login Vault Bootstrap Must Not Re-Lock Passcode or Complete Stale Generation
+
+    func testFix6SubmitLoginAsyncBootstrapDoesNotReLockPasscodeOrCompleteStaleGeneration() async throws {
+        let holdEnvelopeGet = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let envelopeGetArrived = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let storedSalt = OSAllocatedUnfairLock<String>(initialState: "")
+        let storedEnvelopeJSON = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("GET", "/api/v1/auth/kdf-params"):
+                let salt = storedSalt.withLock { $0 }
+                return .json(
+                    200,
+                    #"{"auth_version":2,"auth_salt_b64":"\#(salt)","kdf_params":{"m_cost_kib":16384,"t_cost":2,"p_cost":1}}"#
+                )
+            case ("POST", "/api/v1/auth/login"):
+                return .json(200, #"{"user_id":9401,"username":"race_login_user","session_id":"s-9401","token":"tok-9401","first_name":"Race","auth_version":2}"#)
+            case ("GET", "/api/v1/user-vault/envelope"):
+                envelopeGetArrived.withLock { $0 = true }
+                let deadline = Date().addingTimeInterval(3.0)
+                while holdEnvelopeGet.withLock({ $0 }) && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                if let env = storedEnvelopeJSON.withLock({ $0 }) {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            case ("PUT", "/api/v1/user-vault/envelope"):
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("fix6_login_async_race")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            try? coreKC.deleteAccountKey(accountId: "9401")
+            secKC.purgeAccountSecrets(accountId: "9401")
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let initResp: FabushiVaultInitSplitKeyResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("initSplitKey"),
+                params: FabushiVaultInitSplitKeyRequest(
+                    userId: 9401,
+                    password: "RaceLoginPass!1",
+                    saltB64: nil,
+                    kdfParams: FabushiArgon2KdfParamsDTO(mCostKib: 16_384, tCost: 2, pCost: 1),
+                    fastKdf: nil
+                )
+            )
+            let flatEnvJSON = String(
+                decoding: try JSONEncoder().encode(FabushiVaultEnvelopeConverter.toFlat(initResp.envelope)),
+                as: UTF8.self
+            )
+            storedSalt.withLock { $0 = initResp.authSaltB64 }
+            storedEnvelopeJSON.withLock { $0 = flatEnvJSON }
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiVaultLockRequest(clearEnvelope: true)
+            )
+            coordinator.vaultStore.setUnlocked(false)
+
+            // 1. User unlocks Passcode during async login vault bootstrap -> MUST NOT re-lock when bootstrap finishes!
+            let router = ShellNavigationRouter(isPasscodeLockEnabled: true)
+            router.isPasscodeLocked = false
+            let theme = FabushiTheme(locale: .en)
+            var callbackCount = 0
+            let vm = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC,
+                onAuthenticated: {
+                    callbackCount += 1
+                }
+            )
+            vm.serverURLText = server.baseURLString
+            vm.usernameText = "race_login_user"
+            vm.passwordText = "RaceLoginPass!1"
+
+            holdEnvelopeGet.withLock { $0 = true }
+            envelopeGetArrived.withLock { $0 = false }
+            let loginTask1 = Task { @MainActor in
+                await vm.submitLogin(theme: theme)
+            }
+            let deadline1 = Date().addingTimeInterval(5.0)
+            while !envelopeGetArrived.withLock({ $0 }) && Date() < deadline1 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(envelopeGetArrived.withLock { $0 })
+
+            // Shell's .onChange(of: authState) fires immediately upon dispatchAuthTransition
+            let loginGen1 = coordinator.accountScopeGeneration
+            XCTAssertTrue(router.engagePasscodeLockIfEnabledForGeneration(loginGen1))
+            XCTAssertTrue(router.isPasscodeLocked)
+            // User unlocks passcode while vault bootstrap is still running
+            _ = router.unlockPasscode(coordinator: coordinator)
+            XCTAssertFalse(router.isPasscodeLocked)
+
+            holdEnvelopeGet.withLock { $0 = false }
+            await loginTask1.value
+
+            XCTAssertFalse(
+                router.isPasscodeLocked,
+                "Post-login async vault bootstrap completion must NOT re-lock passcode after user unlocked (FIX-6)"
+            )
+            XCTAssertTrue(vm.lastCompletedVaultBootstrap)
+            XCTAssertEqual(callbackCount, 1)
+
+            // 2. Generation change (logout/clearLocalSession) during async bootstrap MUST abort stale completeAuthentication()!
+            _ = try await coordinator.clearLocalSession()
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiVaultLockRequest(clearEnvelope: true)
+            )
+            callbackCount = 0
+            vm.usernameText = "race_login_user"
+            vm.passwordText = "RaceLoginPass!1"
+
+            holdEnvelopeGet.withLock { $0 = true }
+            envelopeGetArrived.withLock { $0 = false }
+            let loginTask2 = Task { @MainActor in
+                await vm.submitLogin(theme: theme)
+            }
+            let deadline2 = Date().addingTimeInterval(5.0)
+            while !envelopeGetArrived.withLock({ $0 }) && Date() < deadline2 {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(envelopeGetArrived.withLock { $0 })
+
+            // Session logs out while bootstrap is in flight
+            _ = try await coordinator.clearLocalSession()
+            holdEnvelopeGet.withLock { $0 = false }
+            await loginTask2.value
+
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertEqual(
+                callbackCount,
+                0,
+                "Stale generation after logout during async bootstrap must NOT invoke onAuthenticatedCallback (FIX-6)"
+            )
+            XCTAssertNil(router.pendingEmergencyKit)
+
+            await coordinator.shutdown()
+        } catch {
+            holdEnvelopeGet.withLock { $0 = false }
             await coordinator.shutdown()
             throw error
         }

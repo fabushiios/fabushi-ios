@@ -99,16 +99,53 @@ public struct FabushiUserActivityObserverView: UIViewRepresentable {
         }
     }
 
+    private final class NotificationObserverTokenStorage: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tokens: [NSObjectProtocol] = []
+
+        var isEmpty: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return tokens.isEmpty
+        }
+
+        func append(_ token: NSObjectProtocol) {
+            lock.lock()
+            tokens.append(token)
+            lock.unlock()
+        }
+
+        func removeAll() {
+            lock.lock()
+            let current = tokens
+            tokens.removeAll()
+            lock.unlock()
+            guard !current.isEmpty else { return }
+            let center = NotificationCenter.default
+            for token in current {
+                center.removeObserver(token)
+            }
+        }
+
+        deinit {
+            removeAll()
+        }
+    }
+
     @MainActor
     public final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         public var onActivity: @MainActor () -> Void
         private weak var attachedWindow: UIWindow?
         private var recognizer: FabushiActivityObservationGestureRecognizer?
-        private var notificationTokens: [NSObjectProtocol] = []
+        private let notificationTokenStorage = NotificationObserverTokenStorage()
 
         public init(onActivity: @escaping @MainActor () -> Void) {
             self.onActivity = onActivity
             super.init()
+        }
+
+        deinit {
+            notificationTokenStorage.removeAll()
         }
 
         public func attach(to window: UIWindow?) {
@@ -153,7 +190,7 @@ public struct FabushiUserActivityObserverView: UIViewRepresentable {
         }
 
         private func startTextNotificationsIfNeeded() {
-            guard notificationTokens.isEmpty else { return }
+            guard notificationTokenStorage.isEmpty else { return }
             let center = NotificationCenter.default
             let names: [Notification.Name] = [
                 UITextField.textDidChangeNotification,
@@ -165,17 +202,12 @@ public struct FabushiUserActivityObserverView: UIViewRepresentable {
                         self?.handleActivity()
                     }
                 }
-                notificationTokens.append(token)
+                notificationTokenStorage.append(token)
             }
         }
 
         private func stopTextNotifications() {
-            guard !notificationTokens.isEmpty else { return }
-            let center = NotificationCenter.default
-            for token in notificationTokens {
-                center.removeObserver(token)
-            }
-            notificationTokens.removeAll()
+            notificationTokenStorage.removeAll()
         }
 
         public func gestureRecognizer(

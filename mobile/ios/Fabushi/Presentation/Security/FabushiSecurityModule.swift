@@ -38,6 +38,9 @@ public final class FabushiSecurityModule: SecurityModuleProviding {
         coordinator.registerAccountSecretsPurger(id: "fabushi.security.keychain") { accountId in
             keychain.purgeAccountSecrets(accountId: accountId)
         }
+        coordinator.registerServerSwitchSecretsPurger(id: "fabushi.security.keychain") {
+            keychain.purgeAllAccountScopedSecrets()
+        }
     }
 
     public func makeAccountSwitcherSheet(

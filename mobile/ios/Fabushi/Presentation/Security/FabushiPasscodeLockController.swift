@@ -147,6 +147,10 @@ public final class FabushiPasscodeLockController {
         let configured: Bool
     }
 
+    private struct RustPasscodeStatusResult: Decodable, Sendable {
+        let configured: Bool
+    }
+
     public init(
         keychainStore: FabushiSecurityKeychainStore = .shared,
         useFastIterationsForTests: Bool = false,
@@ -198,13 +202,24 @@ public final class FabushiPasscodeLockController {
 
     // MARK: - Configure / Clear Passcode & Preferences
 
-    private func hasConfiguredPasscode() -> Bool {
+    /// Fail-closed check for whether a passcode is configured in memory, Keychain, or Rust `host_meta`.
+    /// Propagates Keychain read/decoding errors and Rust RPC errors instead of failing open.
+    private func hasConfiguredPasscode(coordinator: FabushiCoordinator?) async throws -> Bool {
         if isPasscodeEnabled {
             return true
         }
-        if (try? keychainStore.loadPasscodeRecord())?.isEnabled == true {
+        if let record = try keychainStore.loadPasscodeRecord(), record.isEnabled {
             reloadFromKeychain()
             return true
+        }
+        if let coordinator, coordinator.isStarted {
+            let rustStatus: RustPasscodeStatusResult = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeStatus"),
+                params: FabushiEmptyParams()
+            )
+            if rustStatus.configured {
+                return true
+            }
         }
         return false
     }
@@ -251,7 +266,7 @@ public final class FabushiPasscodeLockController {
         currentAuthorization: FabushiPasscodeReauthAuthorization? = nil,
         coordinator: FabushiCoordinator?
     ) async throws {
-        let alreadyConfigured = hasConfiguredPasscode()
+        let alreadyConfigured = try await hasConfiguredPasscode(coordinator: coordinator)
         if alreadyConfigured {
             guard currentAuthorization != nil else {
                 throw FabushiPasscodePolicyError.reauthenticationRequired
@@ -304,7 +319,7 @@ public final class FabushiPasscodeLockController {
         authorization: FabushiPasscodeReauthAuthorization? = nil,
         coordinator: FabushiCoordinator?
     ) async throws {
-        if hasConfiguredPasscode() {
+        if try await hasConfiguredPasscode(coordinator: coordinator) {
             try await enforceReauthentication(authorization, coordinator: coordinator)
         }
         try keychainStore.deletePasscodeRecord()
@@ -516,7 +531,7 @@ public final class FabushiPasscodeLockController {
     public func shouldEngageIdleAutoLock() -> Bool {
         guard isPasscodeEnabled, autoLockTimeoutSeconds > 0 else { return false }
         let elapsed = nowProvider().timeIntervalSince(lastActivityDate)
-        return elapsed >= TimeInterval(autoLockTimeoutSeconds)
+        return elapsed < 0 || elapsed >= TimeInterval(autoLockTimeoutSeconds)
     }
 
     @discardableResult
@@ -534,23 +549,29 @@ public final class FabushiPasscodeLockController {
                 backgroundedAtDate = nowProvider()
             }
             // Do NOT unconditionally engage passcode lock here.
-            // Privacy blur shields the snapshot immediately via FabushiAdaptiveShellView.isPrivacyBlurActive,
+            // Privacy blur shields the snapshot immediately via top-level overlay UIWindow,
             // while passcode locking strictly respects autoLockTimeoutSeconds (0 == Disabled / Never auto-lock).
         case .inactive:
             break
         case .active:
             if let backgrounded = backgroundedAtDate {
                 backgroundedAtDate = nil
-                let elapsed = nowProvider().timeIntervalSince(backgrounded)
+                let now = nowProvider()
+                let backgroundElapsed = now.timeIntervalSince(backgrounded)
+                let totalIdleElapsed = now.timeIntervalSince(lastActivityDate)
+                let timeout = TimeInterval(autoLockTimeoutSeconds)
                 if isPasscodeEnabled,
                    autoLockTimeoutSeconds > 0,
-                   elapsed >= TimeInterval(autoLockTimeoutSeconds) {
+                   (backgroundElapsed < 0
+                       || totalIdleElapsed < 0
+                       || backgroundElapsed >= timeout
+                       || totalIdleElapsed >= timeout) {
                     router.isPasscodeLockEnabled = true
                     router.engagePasscodeLockIfEnabled()
                 } else if !router.isPasscodeLocked {
                     // Returning from a brief app switch (e.g. Alipay OAuth / SMS / 2FA code)
-                    // within autoLockTimeoutSeconds (or when auto-lock is disabled) refreshes
-                    // activity without locking out the user. Already-locked sessions stay locked.
+                    // within the remaining autoLockTimeoutSeconds budget (or when auto-lock is disabled)
+                    // refreshes activity without locking out the user. Already-locked sessions stay locked.
                     recordUserActivity()
                 }
             } else {

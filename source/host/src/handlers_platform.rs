@@ -89,7 +89,7 @@ fn parse_kdf_params(host: &FabushiAppHost, params: &Value) -> HostResult<Argon2K
             "fast_kdf is prohibited on production handles",
         ));
     }
-    if let Some(p) = params.get("kdf_params") {
+    if let Some(p) = params.get("kdf_params").filter(|v| !v.is_null()) {
         let parsed: Argon2KdfParams = serde_json::from_value(p.clone())
             .map_err(|e| HostError::invalid_arguments(format!("Invalid kdf_params: {e}")))?;
         validate_argon2_ios_ceiling(parsed.m_cost_kib, parsed.t_cost, parsed.p_cost)?;
@@ -333,8 +333,15 @@ pub fn handle_vault(
             Ok(json!({ "unlocked": true }))
         }
         "lock" => {
+            let clear_envelope = params
+                .get("clear_envelope")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             host.with_fenced_session_read(&client, || {
                 *host.vault_unlocked_key.lock() = None;
+                if clear_envelope {
+                    *host.vault_envelope.lock() = None;
+                }
                 Ok(())
             })?;
             Ok(json!({ "unlocked": false }))

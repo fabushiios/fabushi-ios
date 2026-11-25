@@ -973,6 +973,18 @@ public struct FabushiVaultUnlockWithKeyBytesRequest: Encodable, Sendable, Equata
     }
 }
 
+public struct FabushiVaultLockRequest: Encodable, Sendable, Equatable {
+    public let clearEnvelope: Bool?
+
+    public init(clearEnvelope: Bool? = nil) {
+        self.clearEnvelope = clearEnvelope
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case clearEnvelope = "clear_envelope"
+    }
+}
+
 public struct FabushiVaultUnlockStatusResponse: Codable, Sendable, Equatable {
     public let unlocked: Bool
     public let hasEnvelope: Bool?

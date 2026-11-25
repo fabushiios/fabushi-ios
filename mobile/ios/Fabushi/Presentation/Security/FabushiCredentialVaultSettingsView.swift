@@ -13,21 +13,55 @@ public struct FabushiCredentialVaultSettingsView: View {
     @Environment(ShellNavigationRouter.self) private var injectedRouter: ShellNavigationRouter?
     @State private var viewModel: FabushiCredentialVaultViewModel
 
+    private enum ActiveVaultSheet: Identifiable, Equatable {
+        case addItem
+        case addTotp
+        case totpQrScanner
+        case unlockOptions
+        case deviceSync
+        case emergencyKitBackup
+
+        var id: String {
+            switch self {
+            case .addItem: return "addItem"
+            case .addTotp: return "addTotp"
+            case .totpQrScanner: return "totpQrScanner"
+            case .unlockOptions: return "unlockOptions"
+            case .deviceSync: return "deviceSync"
+            case .emergencyKitBackup: return "emergencyKitBackup"
+            }
+        }
+    }
+
     // Reveal & Modal States
     @State private var revealedItemIds: Set<String> = []
-    @State private var showingAddItemSheet = false
+    @State private var activeSheet: ActiveVaultSheet?
+    @State private var queuedSheetAfterDismiss: ActiveVaultSheet?
     @State private var newItemKey = ""
     @State private var newItemPlaintext = ""
-    @State private var showingAddTotpSheet = false
     @State private var newTotpLabel = ""
     @State private var newTotpIssuer = ""
     @State private var newTotpSecret = ""
-    @State private var showingTotpQrScanner = false
-    @State private var showingUnlockOptionsSheet = false
     @State private var unlockPassphraseInput = ""
     @State private var unlockEmergencyKitInput = ""
-    @State private var showingDeviceSyncSheet = false
     @State private var hasAcknowledgedEmergencyKit = false
+
+    private var presentedSheetBinding: Binding<ActiveVaultSheet?> {
+        Binding(
+            get: {
+                if viewModel.pendingEmergencyKit != nil {
+                    return .emergencyKitBackup
+                }
+                return activeSheet
+            },
+            set: { newValue in
+                if viewModel.pendingEmergencyKit != nil {
+                    return
+                }
+                activeSheet = newValue
+            }
+        )
+    }
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
@@ -61,43 +95,61 @@ public struct FabushiCredentialVaultSettingsView: View {
         .task {
             await viewModel.refreshVaultStatus()
         }
+        .onChange(of: viewModel.isUnlocked) { _, unlocked in
+            if !unlocked {
+                revealedItemIds.removeAll()
+            }
+        }
         .onDisappear {
             revealedItemIds.removeAll()
             viewModel.stopTotpTicker()
         }
-        .sheet(isPresented: $showingAddItemSheet) {
-            addEncryptedItemSheet
-        }
-        .sheet(isPresented: $showingAddTotpSheet) {
-            addTotpSheet
-        }
-        .sheet(isPresented: $showingTotpQrScanner) {
-            FabushiQRScannerSheet(
-                titleKey: "hig.vault.scanTotpQr",
-                manualPlaceholderKey: "hig.vault.totpSecretPlaceholder",
-                onScannedPayload: { payload in
-                    showingTotpQrScanner = false
-                    newTotpSecret = payload
-                    showingAddTotpSheet = true
-                },
-                onCancel: {
-                    showingTotpQrScanner = false
-                }
-            )
-        }
-        .sheet(isPresented: $showingUnlockOptionsSheet) {
-            advancedUnlockSheet
-        }
-        .sheet(isPresented: $showingDeviceSyncSheet) {
-            deviceSyncModalSheet
-        }
         .sheet(
-            isPresented: Binding(
-                get: { viewModel.pendingEmergencyKit != nil },
-                set: { _ in }
-            )
-        ) {
-            emergencyKitBackupSheet
+            item: presentedSheetBinding,
+            onDismiss: {
+                guard viewModel.pendingEmergencyKit == nil,
+                      let nextSheet = queuedSheetAfterDismiss
+                else {
+                    return
+                }
+                queuedSheetAfterDismiss = nil
+                activeSheet = nextSheet
+                if nextSheet == .deviceSync && viewModel.isUnlocked {
+                    Task {
+                        do {
+                            try await viewModel.loadPendingDeviceSyncRequests()
+                        } catch {
+                            viewModel.errorMessage = error.localizedDescription
+                        }
+                    }
+                }
+            }
+        ) { sheet in
+            switch sheet {
+            case .addItem:
+                addEncryptedItemSheet
+            case .addTotp:
+                addTotpSheet
+            case .totpQrScanner:
+                FabushiQRScannerSheet(
+                    titleKey: "hig.vault.scanTotpQr",
+                    manualPlaceholderKey: "hig.vault.totpSecretPlaceholder",
+                    onScannedPayload: { payload in
+                        newTotpSecret = payload
+                        queuedSheetAfterDismiss = .addTotp
+                        activeSheet = nil
+                    },
+                    onCancel: {
+                        activeSheet = nil
+                    }
+                )
+            case .unlockOptions:
+                advancedUnlockSheet
+            case .deviceSync:
+                deviceSyncModalSheet
+            case .emergencyKitBackup:
+                emergencyKitBackupSheet
+            }
         }
     }
 
@@ -168,7 +220,7 @@ public struct FabushiCredentialVaultSettingsView: View {
                         if !viewModel.isUnlocked, viewModel.unlockPromptReason != nil {
                             unlockPassphraseInput = ""
                             unlockEmergencyKitInput = ""
-                            showingUnlockOptionsSheet = true
+                            activeSheet = .unlockOptions
                         }
                     }
                 }
@@ -178,7 +230,7 @@ public struct FabushiCredentialVaultSettingsView: View {
                 Button {
                     unlockPassphraseInput = ""
                     unlockEmergencyKitInput = ""
-                    showingUnlockOptionsSheet = true
+                    activeSheet = .unlockOptions
                 } label: {
                     Label(theme.localized("hig.vault.unlockWithKeyOrKit"), systemImage: "key.viewfinder")
                         .fabushiFont(.footnote)
@@ -326,7 +378,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             newTotpLabel = ""
             newTotpIssuer = ""
             newTotpSecret = ""
-            showingAddTotpSheet = true
+            activeSheet = .addTotp
         } label: {
             Label(theme.localized("hig.vault.addTotp"), systemImage: "plus.circle.fill")
                 .fabushiFont(.callout)
@@ -339,7 +391,7 @@ public struct FabushiCredentialVaultSettingsView: View {
 
     private var scanTotpQrButton: some View {
         Button {
-            showingTotpQrScanner = true
+            activeSheet = .totpQrScanner
         } label: {
             Label(theme.localized("hig.vault.scanTotpQr"), systemImage: "qrcode.viewfinder")
                 .fabushiFont(.callout)
@@ -443,7 +495,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             Button {
                 newItemKey = ""
                 newItemPlaintext = ""
-                showingAddItemSheet = true
+                activeSheet = .addItem
             } label: {
                 Label(theme.localized("hig.vault.addItem"), systemImage: "plus.circle.fill")
                     .fabushiFont(.body)
@@ -460,9 +512,16 @@ public struct FabushiCredentialVaultSettingsView: View {
     private var deviceSyncSection: some View {
         Section(header: Text(theme.localized("hig.vault.deviceSyncHeader"))) {
             Button {
-                showingDeviceSyncSheet = true
+                viewModel.errorMessage = nil
+                activeSheet = .deviceSync
                 if viewModel.isUnlocked {
-                    Task { try? await viewModel.loadPendingDeviceSyncRequests() }
+                    Task {
+                        do {
+                            try await viewModel.loadPendingDeviceSyncRequests()
+                        } catch {
+                            viewModel.errorMessage = error.localizedDescription
+                        }
+                    }
                 }
             } label: {
                 Label(theme.localized("hig.vault.openDeviceSync"), systemImage: "arrow.triangle.2.circlepath.circle.fill")
@@ -518,7 +577,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(theme.localized("hig.common.cancel")) {
-                        showingAddItemSheet = false
+                        activeSheet = nil
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -530,10 +589,10 @@ public struct FabushiCredentialVaultSettingsView: View {
                                     itemKey: newItemKey,
                                     plaintext: newItemPlaintext
                                 )
-                                showingAddItemSheet = false
+                                activeSheet = nil
                             } catch {
                                 viewModel.errorMessage = error.localizedDescription
-                                showingAddItemSheet = false
+                                activeSheet = nil
                             }
                         }
                     }
@@ -562,7 +621,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(theme.localized("hig.common.cancel")) {
-                        showingAddTotpSheet = false
+                        activeSheet = nil
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -574,10 +633,10 @@ public struct FabushiCredentialVaultSettingsView: View {
                                     issuer: newTotpIssuer,
                                     secretOrURI: newTotpSecret
                                 )
-                                showingAddTotpSheet = false
+                                activeSheet = nil
                             } catch {
                                 viewModel.errorMessage = error.localizedDescription
-                                showingAddTotpSheet = false
+                                activeSheet = nil
                             }
                         }
                     }
@@ -604,8 +663,9 @@ public struct FabushiCredentialVaultSettingsView: View {
 
                         if promptReason == .existingRemoteEnvelopeRequiresCredentials {
                             Button {
-                                showingUnlockOptionsSheet = false
-                                showingDeviceSyncSheet = true
+                                viewModel.errorMessage = nil
+                                queuedSheetAfterDismiss = .deviceSync
+                                activeSheet = nil
                             } label: {
                                 Label(
                                     theme.localized("hig.vault.openDeviceSync"),
@@ -635,7 +695,7 @@ public struct FabushiCredentialVaultSettingsView: View {
                     Button(theme.localized("hig.common.cancel")) {
                         unlockPassphraseInput = ""
                         unlockEmergencyKitInput = ""
-                        showingUnlockOptionsSheet = false
+                        activeSheet = nil
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -644,7 +704,7 @@ public struct FabushiCredentialVaultSettingsView: View {
                         let kit = trimmedKit.isEmpty ? nil : trimmedKit
                         unlockPassphraseInput = ""
                         unlockEmergencyKitInput = ""
-                        showingUnlockOptionsSheet = false
+                        activeSheet = nil
                         Task {
                             await viewModel.unlockVault(
                                 passphraseOrPassword: pass,
@@ -670,7 +730,6 @@ public struct FabushiCredentialVaultSettingsView: View {
                         Text(kit)
                             .fabushiFont(.monospacedCaption)
                             .foregroundStyle(theme.textPrimary)
-                            .textSelection(.enabled)
                             .padding(.vertical, 6)
                             .accessibilityLabel(kit)
                             .accessibilityIdentifier("fabushi.internal.vault.emergencyKitValue")
@@ -738,13 +797,45 @@ public struct FabushiCredentialVaultSettingsView: View {
                         }
                         .padding(.vertical, 4)
 
+                        if let syncStatus = viewModel.activeSyncStatusMessage, !syncStatus.isEmpty {
+                            Text("\(theme.localized("hig.vault.deviceSyncStatusLabel")): \(syncStatus)")
+                                .fabushiFont(.footnote)
+                                .foregroundStyle(theme.textSecondary)
+                        }
+
                         Button(theme.localized("hig.vault.deviceSyncCheckStatus")) {
-                            Task { _ = try? await viewModel.checkDeviceSyncStatusAndOpenIfApproved() }
+                            Task {
+                                viewModel.errorMessage = nil
+                                let wasUnlocked = viewModel.isUnlocked
+                                do {
+                                    _ = try await viewModel.checkDeviceSyncStatusAndOpenIfApproved()
+                                    if !wasUnlocked && viewModel.isUnlocked {
+                                        activeSheet = nil
+                                    }
+                                } catch {
+                                    viewModel.errorMessage = error.localizedDescription
+                                }
+                            }
                         }
                     }
 
                     Button(theme.localized("hig.vault.deviceSyncStartRequest")) {
-                        Task { _ = try? await viewModel.startDeviceSyncRequest() }
+                        Task {
+                            viewModel.errorMessage = nil
+                            do {
+                                _ = try await viewModel.startDeviceSyncRequest()
+                            } catch {
+                                viewModel.errorMessage = error.localizedDescription
+                            }
+                        }
+                    }
+                }
+
+                if let errorMessage = viewModel.errorMessage, !errorMessage.isEmpty {
+                    Section {
+                        Text(errorMessage)
+                            .fabushiFont(.footnote)
+                            .foregroundStyle(theme.destructiveColor)
                     }
                 }
 
@@ -766,12 +857,26 @@ public struct FabushiCredentialVaultSettingsView: View {
 
                                     HStack(spacing: 12) {
                                         Button(theme.localized("hig.vault.deviceSyncApprove")) {
-                                            Task { _ = try? await viewModel.approvePendingDeviceSync(pending) }
+                                            Task {
+                                                viewModel.errorMessage = nil
+                                                do {
+                                                    _ = try await viewModel.approvePendingDeviceSync(pending)
+                                                } catch {
+                                                    viewModel.errorMessage = error.localizedDescription
+                                                }
+                                            }
                                         }
                                         .buttonStyle(.borderedProminent)
 
                                         Button(theme.localized("hig.vault.deviceSyncDeny"), role: .destructive) {
-                                            Task { _ = try? await viewModel.denyPendingDeviceSync(pending) }
+                                            Task {
+                                                viewModel.errorMessage = nil
+                                                do {
+                                                    _ = try await viewModel.denyPendingDeviceSync(pending)
+                                                } catch {
+                                                    viewModel.errorMessage = error.localizedDescription
+                                                }
+                                            }
                                         }
                                         .buttonStyle(.bordered)
                                     }
@@ -787,7 +892,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(theme.localized("hig.common.done")) {
-                        showingDeviceSyncSheet = false
+                        activeSheet = nil
                     }
                 }
             }

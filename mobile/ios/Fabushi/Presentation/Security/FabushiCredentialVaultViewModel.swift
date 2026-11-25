@@ -642,6 +642,14 @@ public final class FabushiCredentialVaultViewModel {
 
     // MARK: - Vault Lock & Unlock (Fail-Closed 4-Case State Machine — Zero Random-Key Fallback)
 
+    private func scrubUnlockedMemoryState() {
+        stopTotpTicker()
+        items = []
+        totpAccounts = []
+        liveTotpCodes = [:]
+        remoteEncryptedTotpCount = 0
+    }
+
     public func refreshVaultStatus() async {
         guard coordinator.isStarted else { return }
         if let status: FabushiVaultUnlockStatusResponse = try? await coordinator.dispatchFenced(
@@ -652,6 +660,8 @@ public final class FabushiCredentialVaultViewModel {
             coordinator.vaultStore.setUnlocked(status.unlocked)
             if status.unlocked {
                 await loadUnlockedVaultContents()
+            } else {
+                scrubUnlockedMemoryState()
             }
         }
     }
@@ -792,18 +802,26 @@ public final class FabushiCredentialVaultViewModel {
                             params: flatEnvelope
                         )
                     } catch {
-                        // CRITICAL: vault.initSplitKey already unlocked Rust's in-memory key!
-                        // Roll back immediately so vault remains fail-closed locked on upload failure.
+                        // CRITICAL rollback (FIX-2): vault.initSplitKey installed BOTH vault_unlocked_key
+                        // and vault_envelope in Rust RAM; lock with clear_envelope: true so failed upload
+                        // leaves neither unlocked key nor orphan envelope in Rust RAM.
                         let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
                             method: FabushiRPCNamespace.vault.method("lock"),
-                            params: FabushiEmptyParams()
+                            params: FabushiVaultLockRequest(clearEnvelope: true)
                         )
                         coordinator.vaultStore.setUnlocked(false)
                         isUnlocked = false
                         throw FabushiVaultValidationError.envelopeUploadFailed(error.localizedDescription)
                     }
-                    try securityKeychain.saveVaultRootKeyBase64(initRes.rootKeyB64, accountId: accountId)
+                    // FIX-3: Surface one-time Emergency Kit immediately after cloud upload succeeds,
+                    // independent of Keychain cache errors so the kit is never lost and isUnlocked
+                    // remains consistent with Rust's unlocked vault key.
                     pendingEmergencyKit = initRes.emergencyKit
+                    do {
+                        try securityKeychain.saveVaultRootKeyBase64(initRes.rootKeyB64, accountId: accountId)
+                    } catch {
+                        errorMessage = error.localizedDescription
+                    }
                 }
             } else if let storedRootKeyB64 = try securityKeychain.loadVaultRootKeyBase64(accountId: accountId) {
                 // Case A: Local Keychain already stores this account's 32-byte VaultRootKey
@@ -839,11 +857,7 @@ public final class FabushiCredentialVaultViewModel {
     }
 
     public func lockVault() async {
-        stopTotpTicker()
-        items = []
-        totpAccounts = []
-        liveTotpCodes = [:]
-        remoteEncryptedTotpCount = 0
+        scrubUnlockedMemoryState()
         unlockPromptReason = nil
         isUnlocked = false
         coordinator.vaultStore.setUnlocked(false)

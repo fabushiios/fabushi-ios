@@ -176,6 +176,7 @@ public struct FabushiAccountSwitcherSheet: View {
                             .fabushiMinimumTouchTarget()
                     }
                     .buttonStyle(.plain)
+                    .disabled(router.isHoldingAddAccountGate)
                     .accessibilityLabel(theme.localized("hig.common.close"))
                     .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.accountSwitcherCloseButton)
                 }
@@ -196,6 +197,7 @@ public struct FabushiAccountSwitcherSheet: View {
                 )
             }
         }
+        .interactiveDismissDisabled(router.isHoldingAddAccountGate)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(FabushiAccessibilityIDs.Shell.accountSwitcherSheet)
         .task {

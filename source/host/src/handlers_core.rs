@@ -1319,6 +1319,16 @@ pub fn handle_settings(
                 None => Ok(json!({ "valid": false, "configured": false })),
             }
         }
+        "passcodeStatus" => {
+            let configured = host.with_fenced_session_read(&client, || {
+                Ok(host
+                    .host_db
+                    .get_meta("passcode_hash")?
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false))
+            })?;
+            Ok(json!({ "configured": configured }))
+        }
         "passcodeClear" => {
             host.with_fenced_session_read(&client, || {
                 host.host_db.delete_meta("passcode_salt")?;

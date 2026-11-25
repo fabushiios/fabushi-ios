@@ -231,6 +231,7 @@ public final class ShellNavigationRouter {
 
     public let toastController: FabushiToastController
     public private(set) var observedGeneration: UInt64 = 1
+    public private(set) var lastPasscodeLockTransitionGeneration: UInt64 = 0
     public private(set) var lastScenePhase: ScenePhase = .active
 
     public init(
@@ -406,6 +407,17 @@ public final class ShellNavigationRouter {
         }
     }
 
+    /// Engages passcode lock at most once per `accountScopeGeneration` auth transition so
+    /// asynchronous post-login vault bootstrap cannot re-lock a session the user already unlocked.
+    @discardableResult
+    public func engagePasscodeLockIfEnabledForGeneration(_ generation: UInt64) -> Bool {
+        guard isPasscodeLockEnabled else { return false }
+        guard generation > lastPasscodeLockTransitionGeneration else { return false }
+        lastPasscodeLockTransitionGeneration = generation
+        isPasscodeLocked = true
+        return true
+    }
+
     @discardableResult
     public func unlockPasscode(coordinator: FabushiCoordinator) -> Bool {
         isPasscodeLocked = false
@@ -513,6 +525,15 @@ public final class ShellNavigationRouter {
         }
         observedGeneration = generation
 
+        if coordinator.authState == .unauthenticated {
+            isHoldingPrimaryAuthGate = false
+            isHoldingAddAccountGate = false
+            acknowledgePendingEmergencyKit()
+        } else if let kitAccount = pendingEmergencyKitAccountId,
+                  coordinator.activeAccountId != kitAccount {
+            acknowledgePendingEmergencyKit()
+        }
+
         toastController.clearAll()
         inspectorTarget = nil
         isInspectorPresented = false
@@ -526,13 +547,6 @@ public final class ShellNavigationRouter {
         activeRemoteControlStatus = nil
         activeDeepLinkBannerText = nil
         activeProviderErrorMessage = nil
-
-        if coordinator.authState == .unauthenticated {
-            acknowledgePendingEmergencyKit()
-        } else if let kitAccount = pendingEmergencyKitAccountId,
-                  coordinator.activeAccountId != kitAccount {
-            acknowledgePendingEmergencyKit()
-        }
 
         activeTab = .chats
         let defaultRoute: ShellRoute = .chats(chatId: nil, messageId: nil)

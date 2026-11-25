@@ -263,6 +263,18 @@ public final class FabushiSecurityKeychainStore: Sendable {
         try? deleteTotpAccounts(accountId: accountId)
     }
 
+    /// Purges all server-scoped account vault root keys and TOTP entries when switching servers,
+    /// preventing cross-server `user_id` collisions while preserving the device-level passcode record.
+    public func purgeAllAccountScopedSecrets() {
+        for service in [vaultKeyService, totpService] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+            ]
+            _ = SecItemDelete(query as CFDictionary)
+        }
+    }
+
     // MARK: - Low-Level SecItem Helpers
 
     private func vaultKeyAccount(for accountId: String) -> String {

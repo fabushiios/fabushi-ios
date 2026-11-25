@@ -141,7 +141,7 @@ public final class FabushiWebAuthnPasskeyController:
     /// 3. Fallback UTF-8 bytes for opaque non-Base64 tokens (e.g. `pkchal_...`).
     nonisolated public static func decodeChallengeData(_ raw: String) -> Data? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.isEmpty, trimmed.contains(where: { $0 != "=" }) else { return nil }
 
         if let hex32 = decodeExactHex64(trimmed) {
             return hex32

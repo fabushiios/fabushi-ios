@@ -131,6 +131,8 @@ public final class FabushiCoordinator {
     @ObservationIgnored
     private var accountSecretsPurgers: [String: @MainActor (String) -> Void] = [:]
     @ObservationIgnored
+    private var serverSwitchSecretsPurgers: [String: @MainActor () -> Void] = [:]
+    @ObservationIgnored
     private var inFlightStartTask: Task<Void, Error>? = nil
     @ObservationIgnored
     private var shutdownTaskCounter: UInt64 = 0
@@ -601,11 +603,31 @@ public final class FabushiCoordinator {
         accountSecretsPurgers.removeValue(forKey: id)
     }
 
+    public func registerServerSwitchSecretsPurger(
+        id: String = "default",
+        _ purger: @escaping @MainActor () -> Void
+    ) {
+        serverSwitchSecretsPurgers[id] = purger
+    }
+
+    public func unregisterServerSwitchSecretsPurger(id: String) {
+        serverSwitchSecretsPurgers.removeValue(forKey: id)
+    }
+
     private func purgeDepartingAccountSecrets(accountId: String?) {
         guard let accountId, !accountId.isEmpty else { return }
         try? keychain.deleteAccountKey(accountId: accountId)
         for purger in accountSecretsPurgers.values {
             purger(accountId)
+        }
+    }
+
+    private func purgeServerSwitchSecrets(departingAccountId: String?) {
+        if let departingAccountId, !departingAccountId.isEmpty {
+            try? keychain.deleteAccountKey(accountId: departingAccountId)
+        }
+        for purger in serverSwitchSecretsPurgers.values {
+            purger()
         }
     }
 
@@ -686,6 +708,8 @@ public final class FabushiCoordinator {
     public func setServerURL(_ serverUrl: String) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
         let capturedEpoch = coordinatorLifecycleEpoch
+        let previousServerURL = settingsStore.activeServerURL
+        let departingAccountId = activeAccountId
         let res = try await host.setServerURL(serverUrl, generation: accountScopeGeneration)
         guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
             throw FabushiCoordinatorError.notStarted
@@ -700,6 +724,9 @@ public final class FabushiCoordinator {
         activeAccountId = nil
         authState = .unauthenticated
         settingsStore.updateServerURL(res.serverUrl)
+        if previousServerURL != res.serverUrl {
+            purgeServerSwitchSecrets(departingAccountId: departingAccountId)
+        }
         return res.generation
     }
 

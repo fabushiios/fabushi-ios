@@ -38,7 +38,7 @@ public struct FabushiPrivacySecuritySettingsView: View {
     @State private var qrPairStatusMessage: String?
     @State private var isWorking = false
 
-    private let passkeyController = FabushiWebAuthnPasskeyController()
+    @State private var passkeyController = FabushiWebAuthnPasskeyController()
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
     private var registry: FabushiFeatureModuleRegistry { injectedRegistry ?? .shared }
@@ -634,7 +634,7 @@ public struct FabushiPrivacySecuritySettingsView: View {
             showingPasscodeSheet = false
         } catch {
             currentPasscodeInput = ""
-            passcodeStatusError = error.localizedDescription
+            passcodeStatusError = localizedPasscodeErrorMessage(for: error)
         }
     }
 
@@ -668,7 +668,31 @@ public struct FabushiPrivacySecuritySettingsView: View {
             showingPasscodeDisableSheet = false
         } catch {
             disablePasscodeInput = ""
-            disablePasscodeError = error.localizedDescription
+            disablePasscodeError = localizedPasscodeErrorMessage(for: error)
+        }
+    }
+
+    private func localizedPasscodeErrorMessage(for error: Error) -> String {
+        guard let policyError = error as? FabushiPasscodePolicyError else {
+            return error.localizedDescription
+        }
+        switch policyError {
+        case .tooShort:
+            return theme.localized("hig.passcode.tooShortError")
+        case .confirmationMismatch:
+            return theme.localized("hig.passcode.mismatchError")
+        case .reauthenticationRequired:
+            return theme.localized("hig.passcode.reauthRequiredError")
+        case .currentPasscodeIncorrect(let attempts):
+            return "\(theme.localized("hig.auth.passcodeIncorrect")) (\(attempts))"
+        case .lockedOut(let remaining, let attempts):
+            return "\(theme.localized("hig.passcode.lockoutActive")) \(remaining)s (\(attempts))"
+        case .biometricVerificationFailed(let reason):
+            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                return theme.localized("hig.passcode.biometricFailedError")
+            }
+            return "\(theme.localized("hig.passcode.biometricFailedError")): \(trimmed)"
         }
     }
 

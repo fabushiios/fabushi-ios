@@ -76,6 +76,7 @@ public final class FabushiAuthViewModel {
     @ObservationIgnored private let alipayWebController: FabushiAlipayWebAuthController
     @ObservationIgnored private let onAuthenticatedCallback: (() -> Void)?
     @ObservationIgnored private let taskBag = FabushiCancellableTaskBag()
+    @ObservationIgnored private var hasViewDisappeared: Bool = false
 
     // Core F01 Form State
     public var serverURLText: String
@@ -166,6 +167,26 @@ public final class FabushiAuthViewModel {
         alipayWebController.cancel()
     }
 
+    public func handleViewAppear() {
+        hasViewDisappeared = false
+    }
+
+    /// Teardown safety net invoked from `FabushiAuthWizardView.onDisappear`.
+    /// Always cancels active tasks, rescues any unacknowledged one-time Emergency Kit into the
+    /// persistent Shell banner so it can never be lost, wipes the ViewModel copy, and releases
+    /// any onboarding hold so `ShellNavigationRouter` can never leak a stuck gate.
+    public func handleViewDisappear() {
+        hasViewDisappeared = true
+        cancelActiveTasks()
+        if let kit = generatedEmergencyKit, !kit.isEmpty {
+            router.presentPendingEmergencyKit(kit, forAccountId: coordinator.activeAccountId)
+            generatedEmergencyKit = nil
+            hasAcknowledgedEmergencyKitSaved = false
+            didCopyEmergencyKit = false
+        }
+        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+    }
+
     public func clearErrors() {
         serverURLError = nil
         errorMessage = nil
@@ -238,10 +259,16 @@ public final class FabushiAuthViewModel {
                         password: passwordText,
                         vaultKekB64: derived.vaultKekB64,
                         saltB64: derived.authSaltB64,
-                        kdfParams: derived.kdfParams
+                        kdfParams: derived.kdfParams,
+                        expectedGeneration: envelope.generation
                     )
                 }
-                completeAuthentication()
+                guard coordinator.accountScopeGeneration == envelope.generation,
+                      coordinator.authState != .unauthenticated
+                else {
+                    return
+                }
+                completeAuthentication(expectedGeneration: envelope.generation)
             } else {
                 let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                     method: FabushiRPCNamespace.auth.method("login"),
@@ -256,10 +283,16 @@ public final class FabushiAuthViewModel {
                 if let identity = envelope.result.identityTuple {
                     await silentlyUpgradeLegacyV1ToSplitKeyV2(
                         userId: identity.userId,
-                        oldPassword: passwordText
+                        oldPassword: passwordText,
+                        expectedGeneration: envelope.generation
                     )
                 }
-                completeAuthentication()
+                guard coordinator.accountScopeGeneration == envelope.generation,
+                      coordinator.authState != .unauthenticated
+                else {
+                    return
+                }
+                completeAuthentication(expectedGeneration: envelope.generation)
             }
         } catch {
             handleAuthError(error, isQrPair: false)
@@ -299,7 +332,9 @@ public final class FabushiAuthViewModel {
             let trimmedEmail = emailText.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedOtp = otpCodeText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            if !hasViewDisappeared {
+                router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            }
 
             let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse>
             if !trimmedEmail.isEmpty && !trimmedOtp.isEmpty && FabushiAuthValidation.isValidEmail(trimmedEmail) {
@@ -345,10 +380,11 @@ public final class FabushiAuthViewModel {
                     password: passwordText,
                     saltB64: derived.authSaltB64,
                     kdfParams: derived.kdfParams,
-                    presentInShellBanner: false
+                    presentInShellBanner: false,
+                    expectedGeneration: envelope.generation
                 )
             }
-            finishAuthenticationOrRequireEmergencyKitBackup()
+            finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
         } catch {
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             handleAuthError(error, isQrPair: false)
@@ -467,7 +503,9 @@ public final class FabushiAuthViewModel {
                     let resolvedFirst = firstNameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? trimmedUsername
                         : firstNameText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                    if !hasViewDisappeared {
+                        router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                    }
                     let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                         method: FabushiRPCNamespace.auth.method("emailRegisterSplitKey"),
                         params: FabushiSplitKeyEmailRegisterRequest(
@@ -491,10 +529,11 @@ public final class FabushiAuthViewModel {
                             password: passwordText,
                             saltB64: derived.authSaltB64,
                             kdfParams: derived.kdfParams,
-                            presentInShellBanner: false
+                            presentInShellBanner: false,
+                            expectedGeneration: envelope.generation
                         )
                     }
-                    finishAuthenticationOrRequireEmergencyKitBackup()
+                    finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
                 } else {
                     let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                         method: FabushiRPCNamespace.auth.method("emailVerify"),
@@ -872,14 +911,20 @@ public final class FabushiAuthViewModel {
         password: String,
         vaultKekB64: String,
         saltB64: String,
-        kdfParams: FabushiArgon2KdfParamsDTO
+        kdfParams: FabushiArgon2KdfParamsDTO,
+        expectedGeneration: UInt64? = nil
     ) async {
         let accountId = String(userId)
+        lastCompletedVaultBootstrap = false
         do {
             let envelopeResp: FabushiVaultEnvelopeResponseDTO = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.vault.method("envelopeGet"),
                 params: FabushiEmptyParams()
             )
+            if let expectedGeneration,
+               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+                return
+            }
             if let flatEnv = envelopeResp.envelope {
                 let nested = FabushiVaultEnvelopeConverter.toNested(flatEnv)
                 let alg = flatEnv.kdfAlg.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -892,6 +937,10 @@ public final class FabushiAuthViewModel {
                             envelope: nested
                         )
                     )
+                    if let expectedGeneration,
+                       coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+                        return
+                    }
                     if unlocked.unlocked {
                         if let rootKeyB64 = unlocked.rootKeyB64, !rootKeyB64.isEmpty {
                             try? securityKeychain.saveVaultRootKeyBase64(rootKeyB64, accountId: accountId)
@@ -913,11 +962,19 @@ public final class FabushiAuthViewModel {
                             password: paramsMatch ? nil : password
                         )
                     )
+                    if let expectedGeneration,
+                       coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+                        return
+                    }
                     if unlocked.unlocked {
                         try? securityKeychain.saveVaultRootKeyBase64(unlocked.rootKeyB64, accountId: accountId)
                         coordinator.vaultStore.setUnlocked(true)
                         lastCompletedVaultBootstrap = true
                     }
+                } else {
+                    // Preserve `device_keychain_v2` or unrecognized cloud envelopes untouched;
+                    // vault stays locked so user can unlock via Emergency Kit or Device Sync.
+                    lastCompletedVaultBootstrap = false
                 }
             } else {
                 await initializeAndUploadSplitKeyVault(
@@ -925,7 +982,8 @@ public final class FabushiAuthViewModel {
                     password: password,
                     saltB64: saltB64,
                     kdfParams: kdfParams,
-                    presentInShellBanner: true
+                    presentInShellBanner: true,
+                    expectedGeneration: expectedGeneration
                 )
             }
         } catch {
@@ -939,7 +997,8 @@ public final class FabushiAuthViewModel {
         password: String,
         saltB64: String,
         kdfParams: FabushiArgon2KdfParamsDTO,
-        presentInShellBanner: Bool
+        presentInShellBanner: Bool,
+        expectedGeneration: UInt64? = nil
     ) async {
         let accountId = String(userId)
         do {
@@ -953,6 +1012,10 @@ public final class FabushiAuthViewModel {
                     fastKdf: useFastKdfForTests ? true : nil
                 )
             )
+            if let expectedGeneration,
+               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+                return
+            }
             let flatEnvelope = FabushiVaultEnvelopeConverter.toFlat(initResp.envelope)
             do {
                 let _: FabushiJSONValue = try await coordinator.dispatchFenced(
@@ -960,14 +1023,20 @@ public final class FabushiAuthViewModel {
                     params: flatEnvelope
                 )
             } catch {
-                // CRITICAL rollback: vault.initSplitKey unlocked Rust in-memory key before upload;
-                // lock immediately so failed cloud upload never leaves an unuploaded key in RAM.
+                // CRITICAL rollback (FIX-2): vault.initSplitKey installed BOTH vault_unlocked_key
+                // and vault_envelope in Rust RAM before upload; lock with clear_envelope: true so
+                // failed cloud upload leaves neither unlocked key nor orphan envelope in RAM.
                 let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.vault.method("lock"),
-                    params: FabushiEmptyParams()
+                    params: FabushiVaultLockRequest(clearEnvelope: true)
                 )
                 coordinator.vaultStore.setUnlocked(false)
                 lastCompletedVaultBootstrap = false
+                return
+            }
+
+            if let expectedGeneration,
+               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
                 return
             }
 
@@ -975,7 +1044,9 @@ public final class FabushiAuthViewModel {
             coordinator.vaultStore.setUnlocked(initResp.unlocked)
             lastCompletedVaultBootstrap = true
             if presentInShellBanner {
-                router.presentPendingEmergencyKit(initResp.emergencyKit, forAccountId: accountId)
+                if coordinator.authState != .unauthenticated, coordinator.activeAccountId == accountId {
+                    router.presentPendingEmergencyKit(initResp.emergencyKit, forAccountId: accountId)
+                }
             } else {
                 generatedEmergencyKit = initResp.emergencyKit
             }
@@ -986,7 +1057,8 @@ public final class FabushiAuthViewModel {
 
     private func silentlyUpgradeLegacyV1ToSplitKeyV2(
         userId: UInt64,
-        oldPassword: String
+        oldPassword: String,
+        expectedGeneration: UInt64? = nil
     ) async {
         do {
             let derived: FabushiDeriveSplitKeyResponse = try await coordinator.dispatchFenced(
@@ -1007,22 +1079,45 @@ public final class FabushiAuthViewModel {
                     kdfParams: derived.kdfParams
                 )
             )
-            await initializeAndUploadSplitKeyVault(
+            // FIX-1: Delegate to bootstrapVaultAfterSplitKeyLogin so vault.envelopeGet runs FIRST,
+            // preserving/unlocking existing argon2id/split_key_v2 envelopes, leaving device_keychain_v2
+            // intact, and only initializing/uploading when server envelope is confirmed nil.
+            await bootstrapVaultAfterSplitKeyLogin(
                 userId: userId,
                 password: oldPassword,
+                vaultKekB64: derived.vaultKekB64,
                 saltB64: derived.authSaltB64,
                 kdfParams: derived.kdfParams,
-                presentInShellBanner: true
+                expectedGeneration: expectedGeneration
             )
         } catch {
             // Silent upgrade is intentionally non-fatal for legacy servers.
         }
     }
 
-    private func finishAuthenticationOrRequireEmergencyKitBackup() {
+    private func finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: UInt64? = nil) {
         passwordText = ""
         otpCodeText = ""
         twoFactorPasswordText = ""
+        if let expectedGeneration,
+           coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+            generatedEmergencyKit = nil
+            hasAcknowledgedEmergencyKitSaved = false
+            didCopyEmergencyKit = false
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            return
+        }
+        if hasViewDisappeared {
+            if let kit = generatedEmergencyKit, !kit.isEmpty {
+                router.presentPendingEmergencyKit(kit, forAccountId: coordinator.activeAccountId)
+                generatedEmergencyKit = nil
+                hasAcknowledgedEmergencyKitSaved = false
+                didCopyEmergencyKit = false
+            }
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            completeAuthentication(expectedGeneration: expectedGeneration)
+            return
+        }
         if isAwaitingEmergencyKitBackup {
             cancelActiveTasks()
             hasAcknowledgedEmergencyKitSaved = false
@@ -1030,17 +1125,23 @@ public final class FabushiAuthViewModel {
             router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
         } else {
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
-            completeAuthentication()
+            completeAuthentication(expectedGeneration: expectedGeneration)
         }
     }
 
-    private func completeAuthentication() {
+    private func completeAuthentication(expectedGeneration: UInt64? = nil) {
+        if let expectedGeneration,
+           coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            return
+        }
         cancelActiveTasks()
         passwordText = ""
         otpCodeText = ""
         twoFactorPasswordText = ""
+        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
         if mode == .primaryGate {
-            router.engagePasscodeLockIfEnabled()
+            _ = router.engagePasscodeLockIfEnabledForGeneration(coordinator.accountScopeGeneration)
         }
         router.handleAccountScopeChange(
             generation: coordinator.accountScopeGeneration,

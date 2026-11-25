@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Security
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -844,12 +845,54 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(attached.canPrevent(UITapGestureRecognizer()))
         XCTAssertFalse(attached.canBePrevented(by: UITapGestureRecognizer()))
 
+        // FIX-9: Direct touchesBegan / touchesMoved / touchesEnded / pressesBegan + repeated attach idempotency + window swap
+        clock.withLock { $0 = $0.addingTimeInterval(2.0) }
+        attached.touchesBegan(Set(), with: UIEvent())
+        XCTAssertGreaterThan(controller.lastActivityDate, baselineActivity)
+
+        clock.withLock { $0 = $0.addingTimeInterval(2.0) }
+        let beforeMoved = controller.lastActivityDate
+        attached.touchesMoved(Set(), with: UIEvent())
+        XCTAssertGreaterThan(controller.lastActivityDate, beforeMoved)
+
+        clock.withLock { $0 = $0.addingTimeInterval(2.0) }
+        let beforeEnded = controller.lastActivityDate
+        attached.touchesEnded(Set(), with: UIEvent())
+        XCTAssertGreaterThan(controller.lastActivityDate, beforeEnded)
+        XCTAssertEqual(attached.state, .failed, "Passive observer must fail cleanly on touchesEnded without claiming gestures")
+
+        clock.withLock { $0 = $0.addingTimeInterval(2.0) }
+        let beforePress = controller.lastActivityDate
+        attached.pressesBegan(Set(), with: UIPressesEvent())
+        XCTAssertGreaterThan(controller.lastActivityDate, beforePress)
+
+        // Repeated attach(to: sameWindow) must be strictly idempotent (single recognizer instance)
+        observerCoord.attach(to: window)
+        observerCoord.attach(to: window)
+        let matchingAfterRepeated = (window.gestureRecognizers ?? []).filter {
+            $0 is FabushiActivityObservationGestureRecognizer
+        }
+        XCTAssertEqual(matchingAfterRepeated.count, 1)
+        XCTAssertTrue(matchingAfterRepeated.first === attached)
+
+        // Window swap moves recognizer cleanly from window1 -> window2
+        let window2 = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        observerCoord.attach(to: window2)
+        XCTAssertFalse(
+            (window.gestureRecognizers ?? []).contains(where: { $0 is FabushiActivityObservationGestureRecognizer })
+        )
+        XCTAssertTrue(
+            (window2.gestureRecognizers ?? []).contains(where: { $0 === attached })
+        )
+        observerCoord.attach(to: window)
+
         // Advance +45s and simulate software keyboard typing notification -> resets idle timer!
+        let beforeTyping = controller.lastActivityDate
         clock.withLock { $0 = $0.addingTimeInterval(45) }
         NotificationCenter.default.post(name: UITextField.textDidChangeNotification, object: nil)
         await Task.yield()
         try await Task.sleep(nanoseconds: 20_000_000)
-        XCTAssertGreaterThan(controller.lastActivityDate, baselineActivity)
+        XCTAssertGreaterThan(controller.lastActivityDate, beforeTyping)
 
         // Advance another +45s (90s total, 45s since typing) -> MUST NOT lock yet!
         clock.withLock { $0 = $0.addingTimeInterval(45) }
@@ -865,6 +908,24 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         observerCoord.detach()
         XCTAssertFalse(
             (window.gestureRecognizers ?? []).contains(where: { $0 is FabushiActivityObservationGestureRecognizer })
+        )
+
+        // FIX-9: Coordinator deinit automatically removes NotificationCenter observers even without detach()
+        let deinitCallbackCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+        do {
+            let scopedWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+            let scopedCoord = FabushiUserActivityObserverView.Coordinator {
+                deinitCallbackCount.withLock { $0 += 1 }
+            }
+            scopedCoord.attach(to: scopedWindow)
+        }
+        NotificationCenter.default.post(name: UITextField.textDidChangeNotification, object: nil)
+        await Task.yield()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(
+            deinitCallbackCount.withLock { $0 },
+            0,
+            "Deallocated Coordinator must remove text observers in deinit"
         )
         #endif
     }
@@ -922,6 +983,51 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         clock.withLock { $0 = $0.addingTimeInterval(5) }
         controller.handleScenePhaseChange(.active, router: router)
         XCTAssertTrue(router.isPasscodeLocked)
+
+        // 5. FIX-7: Pre-background idle time + background time >= timeout MUST lock on .active (55s idle + 20s bg >= 60s)
+        router.isPasscodeLocked = false
+        try controller.setAutoLockTimeoutSeconds(60)
+        controller.recordUserActivity()
+        clock.withLock { $0 = $0.addingTimeInterval(55) }
+        controller.handleScenePhaseChange(.inactive, router: router)
+        controller.handleScenePhaseChange(.background, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        clock.withLock { $0 = $0.addingTimeInterval(20) }
+        controller.handleScenePhaseChange(.inactive, router: router)
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertTrue(
+            router.isPasscodeLocked,
+            "55s foreground idle + 20s background (75s >= 60s) must engage passcode lock on .active (FIX-7)"
+        )
+
+        // 6. FIX-7: Full .active -> .inactive -> .background -> .inactive -> .active brief switch (5s + 10s = 15s < 60s) stays unlocked
+        router.isPasscodeLocked = false
+        controller.recordUserActivity()
+        clock.withLock { $0 = $0.addingTimeInterval(5) }
+        controller.handleScenePhaseChange(.inactive, router: router)
+        controller.handleScenePhaseChange(.background, router: router)
+        clock.withLock { $0 = $0.addingTimeInterval(10) }
+        controller.handleScenePhaseChange(.inactive, router: router)
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        XCTAssertEqual(controller.lastActivityDate, clock.withLock { $0 })
+
+        // 7. FIX-7: Backward wall-clock jump fails closed both while foreground idle and while backgrounded
+        clock.withLock { $0 = $0.addingTimeInterval(-10) }
+        XCTAssertTrue(controller.shouldEngageIdleAutoLock())
+        XCTAssertTrue(controller.evaluateIdleAutoLock(router: router))
+        XCTAssertTrue(router.isPasscodeLocked)
+
+        router.isPasscodeLocked = false
+        clock.withLock { $0 = $0.addingTimeInterval(20) }
+        controller.recordUserActivity()
+        controller.handleScenePhaseChange(.background, router: router)
+        clock.withLock { $0 = $0.addingTimeInterval(-5) }
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertTrue(
+            router.isPasscodeLocked,
+            "Backward wall-clock jump during background must fail closed to locked (FIX-7)"
+        )
     }
 
     // MARK: - D3 Regression: Fail-Closed 4-Case Vault Unlock State Machine, Envelope Upload Rollback & Recovery
@@ -1032,6 +1138,11 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 statusRollback.unlocked,
                 "Failed envelopePut MUST roll back Rust vault_unlocked_key via vault.lock"
             )
+            XCTAssertEqual(
+                statusRollback.hasEnvelope,
+                false,
+                "Failed envelopePut MUST also clear orphan vault_envelope in Rust RAM via clear_envelope: true (FIX-2)"
+            )
 
             // Case C2-Positive: initSplitKey + envelopePut + Emergency Kit + Keychain + seal item
             failEnvelopePut.withLock { $0 = false }
@@ -1048,6 +1159,26 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(uploadedEnv.contains("recovery_wrapped_root_key_b64"))
 
             _ = try await vm.saveEncryptedItem(category: .password, itemKey: "proof_item", plaintext: "secret-proof-1")
+            try await vm.addTotpAccount(
+                label: "ext-lock@test",
+                issuer: "Fabushi",
+                secretOrURI: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+            )
+            XCTAssertFalse(vm.items.isEmpty)
+            XCTAssertFalse(vm.totpAccounts.isEmpty)
+            XCTAssertFalse(vm.liveTotpCodes.isEmpty)
+
+            // FIX-3: External Rust lock -> refreshVaultStatus() MUST scrub items, TOTP accounts & live codes
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiEmptyParams()
+            )
+            await vm.refreshVaultStatus()
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertTrue(vm.items.isEmpty, "External lock via refreshVaultStatus must scrub decrypted items")
+            XCTAssertTrue(vm.totpAccounts.isEmpty, "External lock via refreshVaultStatus must scrub TOTP accounts")
+            XCTAssertTrue(vm.liveTotpCodes.isEmpty, "External lock via refreshVaultStatus must scrub live TOTP codes")
+            XCTAssertEqual(vm.remoteEncryptedTotpCount, 0)
 
             // Case A: Lock -> unlock from local Keychain without passphrase -> decrypts item
             await vm.lockVault()
@@ -1244,6 +1375,120 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertFalse(rustCleared.configured)
             XCTAssertFalse(rustCleared.valid)
 
+            // FIX-8 Subcase A: Fresh controller with stale in-memory isPasscodeEnabled == false
+            // while Keychain record exists MUST reject unauthenticated setPasscode & clearPasscode!
+            let staleController = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true,
+                nowProvider: { clock.withLock { $0 } }
+            )
+            XCTAssertFalse(staleController.isPasscodeEnabled)
+            try await controller.setPasscode("Keychain!77", coordinator: nil)
+            XCTAssertFalse(staleController.isPasscodeEnabled)
+            do {
+                try await staleController.setPasscode("Bypass!1", coordinator: nil)
+                XCTFail("Expected .reauthenticationRequired when Keychain already holds enabled passcode")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            do {
+                try await staleController.clearPasscode(coordinator: nil)
+                XCTFail("Expected .reauthenticationRequired on stale controller clearPasscode")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            try await staleController.clearPasscode(
+                authorization: .currentPasscode("Keychain!77"),
+                coordinator: nil
+            )
+
+            // FIX-8 Subcase B: Corrupted/undecodable Keychain record MUST fail closed (propagate decodingFailed, NOT bypass re-auth!)
+            let corruptQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: secKC.passcodeService,
+                kSecAttrAccount as String: secKC.passcodeAccount,
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                kSecValueData as String: Data("not-valid-json".utf8),
+            ]
+            XCTAssertEqual(SecItemAdd(corruptQuery as CFDictionary, nil), errSecSuccess)
+            let corruptController = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true,
+                nowProvider: { clock.withLock { $0 } }
+            )
+            XCTAssertFalse(corruptController.isPasscodeEnabled)
+            do {
+                try await corruptController.setPasscode("Overwrite!9", coordinator: nil)
+                XCTFail("Expected fail-closed Keychain error on corrupted passcode record")
+            } catch let kcErr as FabushiSecurityKeychainError {
+                XCTAssertEqual(kcErr, .decodingFailed)
+            }
+            do {
+                try await corruptController.clearPasscode(coordinator: nil)
+                XCTFail("Expected fail-closed Keychain error on clearPasscode with corrupted record")
+            } catch let kcErr as FabushiSecurityKeychainError {
+                XCTAssertEqual(kcErr, .decodingFailed)
+            }
+            try secKC.deletePasscodeRecord()
+
+            // FIX-8 Subcase C: Rust-only configured passcode (no Keychain record) MUST enforce mandatory re-auth!
+            struct RustSetParams: Encodable, Sendable { let passcode: String }
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeSet"),
+                params: RustSetParams(passcode: "RustOnly!88")
+            )
+            let rustOnlyController = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true,
+                nowProvider: { clock.withLock { $0 } }
+            )
+            XCTAssertFalse(rustOnlyController.isPasscodeEnabled)
+            XCTAssertNil(try secKC.loadPasscodeRecord())
+
+            do {
+                try await rustOnlyController.setPasscode("Hijack!1", coordinator: coordinator)
+                XCTFail("Expected .reauthenticationRequired when Rust host_meta has configured passcode")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            do {
+                try await rustOnlyController.clearPasscode(coordinator: coordinator)
+                XCTFail("Expected .reauthenticationRequired on clearPasscode for Rust-only passcode")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            do {
+                try await rustOnlyController.clearPasscode(
+                    authorization: .currentPasscode("WrongRustPass"),
+                    coordinator: coordinator
+                )
+                XCTFail("Expected .currentPasscodeIncorrect for wrong Rust-only passcode")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .currentPasscodeIncorrect(failedAttempts: 1))
+            }
+            try await rustOnlyController.clearPasscode(
+                authorization: .currentPasscode("RustOnly!88"),
+                coordinator: coordinator
+            )
+            let rustAfterClear: VerifyResp = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeVerify"),
+                params: VerifyParams(passcode: "RustOnly!88")
+            )
+            XCTAssertFalse(rustAfterClear.configured)
+
+            // FIX-9: Bilingual localization verification for new passcode & vault status keys
+            for key in [
+                "hig.passcode.reauthRequiredError",
+                "hig.passcode.biometricFailedError",
+                "hig.vault.deviceSyncStatusLabel",
+            ] {
+                let enVal = FabushiLocale.en.localized(key, bundle: .main)
+                let zhVal = FabushiLocale.zhHans.localized(key, bundle: .main)
+                XCTAssertNotEqual(enVal, key)
+                XCTAssertNotEqual(zhVal, key)
+                XCTAssertNotEqual(enVal, zhVal)
+            }
+
             await coordinator.shutdown()
         } catch {
             await coordinator.shutdown()
@@ -1413,10 +1658,150 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
             XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "101").isEmpty)
 
+            // 4. FIX-8 / reviewer_2 note #4: Explicit clearLocalSession() MUST invoke registered account-secrets purger!
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("login"),
+                params: FabushiLegacyLoginRequest(username: "alice_d7", password: "pwA"),
+                extractIdentity: { $0.identityTuple }
+            )
+            try secKC.saveVaultRootKeyBase64(
+                try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString(),
+                accountId: "101"
+            )
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "clear@d7", issuer: "D7", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "101"
+            )
+            _ = try await coordinator.clearLocalSession()
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertFalse(try coreKC.hasAccountKey(accountId: "101"))
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
+            XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "101").isEmpty)
+
+            // 5. FIX-9 / challenger_2 LOW-1: setServerURL to a different server purges Server A vault/TOTP Keychain secrets
+            // while preserving the device-level local passcode record!
+            let passcodeCtrl = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true
+            )
+            defer { try? secKC.deletePasscodeRecord() }
+            try await passcodeCtrl.setPasscode("KeepMe!1", coordinator: nil)
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("login"),
+                params: FabushiLegacyLoginRequest(username: "alice_d7", password: "pwA"),
+                extractIdentity: { $0.identityTuple }
+            )
+            try secKC.saveVaultRootKeyBase64(
+                try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString(),
+                accountId: "101"
+            )
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "srvA@d7", issuer: "D7", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "101"
+            )
+            _ = try await coordinator.setServerURL("http://127.0.0.2:9")
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertFalse(try coreKC.hasAccountKey(accountId: "101"))
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
+            XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "101").isEmpty)
+            XCTAssertNotNil(
+                try secKC.loadPasscodeRecord(),
+                "Switching server URL must preserve device-level passcode record while purging server-scoped vault keys"
+            )
+
             await coordinator.shutdown()
         } catch {
             await coordinator.shutdown()
             throw error
         }
+    }
+
+    // MARK: - FIX-5 Regression: Top-Level Overlay UIWindow Covers Child Sheets & Cleans Up on Teardown
+
+    func testFix5SecurityOverlayWindowCoversSheetsAndCleansUpOnTeardown() {
+        #if canImport(UIKit)
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor())
+        let theme = FabushiTheme(locale: .en)
+        let router = ShellNavigationRouter(isPasscodeLockEnabled: true)
+        let registry = FabushiFeatureModuleRegistry()
+        registry.register(security: FabushiSecurityModule())
+
+        let overlayCoordinator = FabushiSecurityOverlayWindowCoordinator(
+            coordinator: coordinator,
+            theme: theme,
+            router: router,
+            registry: registry,
+            launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+            onUnlock: {}
+        )
+        defer { overlayCoordinator.teardown() }
+
+        XCTAssertNil(overlayCoordinator.overlayWindow)
+        XCTAssertFalse(overlayCoordinator.isOverlayWindowVisible)
+
+        let activeScene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard activeScene != nil else {
+            // Skip UIWindowScene presentation assertions only if no UIWindowScene exists in host environment
+            return
+        }
+
+        // 1. Privacy blur active -> top-level overlay UIWindow mounts above UIWindow.Level.alert
+        overlayCoordinator.update(
+            isPasscodeOverlayActive: false,
+            isPrivacyBlurActive: true,
+            hostWindow: nil,
+            coordinator: coordinator,
+            theme: theme,
+            router: router,
+            registry: registry,
+            launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+            onUnlock: {}
+        )
+        XCTAssertTrue(overlayCoordinator.isOverlayWindowVisible)
+        let blurWindow = overlayCoordinator.overlayWindow
+        XCTAssertNotNil(blurWindow)
+        XCTAssertGreaterThan(
+            blurWindow?.windowLevel.rawValue ?? 0,
+            UIWindow.Level.alert.rawValue,
+            "Security overlay UIWindow must render strictly above UIWindow.Level.alert and all presented .sheets"
+        )
+        XCTAssertEqual(blurWindow?.accessibilityViewIsModal, true)
+
+        // 2. Passcode lock active -> overlay window becomes key & modal above all sheets
+        overlayCoordinator.update(
+            isPasscodeOverlayActive: true,
+            isPrivacyBlurActive: false,
+            hostWindow: nil,
+            coordinator: coordinator,
+            theme: theme,
+            router: router,
+            registry: registry,
+            launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+            onUnlock: {}
+        )
+        XCTAssertTrue(overlayCoordinator.isOverlayWindowVisible)
+        XCTAssertEqual(overlayCoordinator.overlayWindow?.isKeyWindow, true)
+        XCTAssertEqual(overlayCoordinator.overlayWindow?.accessibilityViewIsModal, true)
+
+        // 3. Unlock & active -> overlay window hides cleanly
+        overlayCoordinator.update(
+            isPasscodeOverlayActive: false,
+            isPrivacyBlurActive: false,
+            hostWindow: nil,
+            coordinator: coordinator,
+            theme: theme,
+            router: router,
+            registry: registry,
+            launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+            onUnlock: {}
+        )
+        XCTAssertFalse(overlayCoordinator.isOverlayWindowVisible)
+        XCTAssertEqual(overlayCoordinator.overlayWindow?.accessibilityViewIsModal, false)
+
+        // 4. Teardown releases UIWindow completely
+        overlayCoordinator.teardown()
+        XCTAssertNil(overlayCoordinator.overlayWindow)
+        XCTAssertFalse(overlayCoordinator.isOverlayWindowVisible)
+        #endif
     }
 }

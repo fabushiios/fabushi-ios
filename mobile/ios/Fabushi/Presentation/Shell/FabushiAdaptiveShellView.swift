@@ -105,13 +105,9 @@ public struct FabushiAdaptiveShellView: View {
     private var activeModalSheetBinding: Binding<ActiveModalSheet?> {
         Binding(
             get: {
-                // Strictly suppress modal `.sheet` presentations whenever Passcode Lock or
-                // Privacy Blur is active so sheets never render above security overlays, while
-                // preserving live Calls/MiniApp sheets across transient `.inactive` system prompts
-                // when Passcode Lock is disabled.
-                guard !router.isPasscodeLocked, !isPrivacyBlurActive else {
-                    return nil
-                }
+                // Top-level overlay UIWindow (UIWindow.Level.alert + 1) shields ALL presented sheets
+                // during Privacy Blur & Passcode Lock without unmounting sheet @State (e.g. .addAccount
+                // Emergency Kit backup when switching to Notes / 1Password).
                 if router.isAccountSwitcherPresented {
                     return .accountSwitcher
                 }
@@ -131,8 +127,6 @@ public struct FabushiAdaptiveShellView: View {
             },
             set: { newValue in
                 guard newValue == nil else { return }
-                // Do not destroy modal sheet flags when transient Passcode Lock or Privacy Blur
-                // suppresses presentation; unlocked user swipe-dismiss clears modal state cleanly.
                 guard !router.isPasscodeLocked, !isPrivacyBlurActive else { return }
                 router.dismissActiveModalSheet(
                     coordinator: coordinator,
@@ -145,9 +139,7 @@ public struct FabushiAdaptiveShellView: View {
     private var regularInspectorBinding: Binding<Bool> {
         Binding(
             get: {
-                !router.isPasscodeLocked
-                    && !isPrivacyBlurActive
-                    && horizontalSizeClass == .regular
+                horizontalSizeClass == .regular
                     && hasActiveChatWorkspace
                     && router.isInspectorPresented
                     && router.inspectorTarget != nil
@@ -176,6 +168,7 @@ public struct FabushiAdaptiveShellView: View {
                     .zIndex(40)
             }
 
+            #if !canImport(UIKit)
             if isPasscodeOverlayActive {
                 registry.security.makePasscodeLockOverlay(
                     coordinator: coordinator,
@@ -193,7 +186,26 @@ public struct FabushiAdaptiveShellView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .zIndex(100)
             }
+            #endif
         }
+        #if canImport(UIKit)
+        .background(
+            FabushiSecurityOverlayWindowHost(
+                isPasscodeOverlayActive: isPasscodeOverlayActive,
+                isPrivacyBlurActive: isPrivacyBlurActive,
+                coordinator: coordinator,
+                theme: theme,
+                router: router,
+                registry: registry,
+                launchConfiguration: launchConfiguration,
+                onUnlock: {
+                    _ = router.unlockPasscode(coordinator: coordinator)
+                }
+            )
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        )
+        #endif
         .preferredColorScheme(theme.colorScheme)
         .tint(theme.accentColor)
         .environment(\.locale, theme.locale.foundationLocale)
@@ -230,7 +242,7 @@ public struct FabushiAdaptiveShellView: View {
                 router.engagePasscodeLockIfEnabled()
             } else {
                 if oldState == .unauthenticated && !router.isHoldingPrimaryAuthGate {
-                    router.engagePasscodeLockIfEnabled()
+                    _ = router.engagePasscodeLockIfEnabledForGeneration(coordinator.accountScopeGeneration)
                 }
                 router.handleAccountScopeChange(
                     generation: coordinator.accountScopeGeneration,
@@ -860,7 +872,6 @@ public struct FabushiAdaptiveShellView: View {
             Text(emergencyKit)
                 .fabushiFont(.monospacedCaption)
                 .foregroundStyle(theme.textPrimary)
-                .textSelection(.enabled)
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(theme.surfaceInput, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
