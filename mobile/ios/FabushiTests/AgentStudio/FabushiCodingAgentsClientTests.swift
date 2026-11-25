@@ -184,10 +184,13 @@ final class FabushiCodingAgentsClientTests: XCTestCase, @unchecked Sendable {
                         {
                           "node_id": "local:101:mac-studio",
                           "owner_user_id": 101,
-                          "kind": "local_desktop",
+                          "kind": "local_device",
                           "display_name": "Mac Studio M4",
                           "ip_address": "100.64.0.10",
-                          "online": true
+                          "os_name": "macOS",
+                          "resolution": "3840x2160",
+                          "online": true,
+                          "run_policy": "ask_every_time"
                         }
                       ],
                       "pending_approvals": []

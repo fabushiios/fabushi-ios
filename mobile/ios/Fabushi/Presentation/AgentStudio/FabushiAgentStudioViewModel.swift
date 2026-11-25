@@ -1404,7 +1404,7 @@ public final class FabushiAgentStudioViewModel {
             let now_ms: Int64?
         }
         do {
-            let consumed: FabushiStudioValueBoundTokenDTO = try await coordinator.dispatchFenced(
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.fabushi.method("approvalConsumeValueBound"),
                 params: ConsumeParams(
                     approval_id: approvalId,
@@ -1415,10 +1415,34 @@ public final class FabushiAgentStudioViewModel {
                     now_ms: nowMs
                 )
             )
+            let nowTimestampMs = nowMs ?? Int64(Date().timeIntervalSince1970 * 1000)
             if let idx = valueBoundTokens.firstIndex(where: { $0.approvalId == approvalId }) {
-                valueBoundTokens[idx] = consumed
+                let existing = valueBoundTokens[idx]
+                let updated = FabushiStudioValueBoundTokenDTO(
+                    approvalId: existing.approvalId,
+                    action: existing.action,
+                    target: existing.target,
+                    workingDirectory: existing.workingDirectory,
+                    contentSha256: existing.contentSha256,
+                    createdAtMs: existing.createdAtMs,
+                    expiresAtMs: existing.expiresAtMs,
+                    spent: true,
+                    retired: existing.retired
+                )
+                valueBoundTokens[idx] = updated
+                return updated
             }
-            return consumed
+            return FabushiStudioValueBoundTokenDTO(
+                approvalId: approvalId,
+                action: action,
+                target: target,
+                workingDirectory: workingDirectory,
+                contentSha256: contentSha256,
+                createdAtMs: nowTimestampMs,
+                expiresAtMs: nowTimestampMs,
+                spent: true,
+                retired: false
+            )
         } catch {
             handleRPCFailure(error)
             return nil

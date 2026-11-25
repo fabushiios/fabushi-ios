@@ -1595,6 +1595,28 @@ public struct FabushiStudioValueBoundTokenDTO: Codable, Sendable, Equatable, Ide
         case spent
         case retired
     }
+
+    public init(
+        approvalId: String,
+        action: String,
+        target: String,
+        workingDirectory: String?,
+        contentSha256: String?,
+        createdAtMs: Int64,
+        expiresAtMs: Int64,
+        spent: Bool,
+        retired: Bool
+    ) {
+        self.approvalId = approvalId
+        self.action = action
+        self.target = target
+        self.workingDirectory = workingDirectory
+        self.contentSha256 = contentSha256
+        self.createdAtMs = createdAtMs
+        self.expiresAtMs = expiresAtMs
+        self.spent = spent
+        self.retired = retired
+    }
 }
 
 public struct FabushiStudioToolDockResolveResponse: Codable, Sendable, Equatable {

@@ -140,13 +140,15 @@ final class FabushiAgentStudioCoreAndSecurityTests: XCTestCase, @unchecked Senda
         // Stage 6: Key-value secrets (incl. ct0, auth_token, refresh_token, session_id, set-cookie) + benign literals
         let kvInput = """
         "auth_token": "my_secret_cookie_val", "refresh_token": "ref_99887766", "session_id": "sid_11223344"
-        set-cookie: ct0=9988776655443322; Path=/
+        set-cookie: sid=abcdef123456; Path=/
+        ct0=9988776655443322; Path=/
         password=true token=false secret=null pwd=none my_ct0=shouldstay1234
         """
         let kvRes = redactor.redactText(kvInput)
         XCTAssertTrue(kvRes.redactedText.contains("\"auth_token\": \"[REDACTED:SECRET]\""))
         XCTAssertTrue(kvRes.redactedText.contains("\"refresh_token\": \"[REDACTED:SECRET]\""))
         XCTAssertTrue(kvRes.redactedText.contains("\"session_id\": \"[REDACTED:SECRET]\""))
+        XCTAssertTrue(kvRes.redactedText.contains("set-cookie: [REDACTED:SECRET];"))
         XCTAssertTrue(kvRes.redactedText.contains("ct0=[REDACTED:SECRET]"))
         XCTAssertTrue(kvRes.redactedText.contains("password=true"))
         XCTAssertTrue(kvRes.redactedText.contains("token=false"))

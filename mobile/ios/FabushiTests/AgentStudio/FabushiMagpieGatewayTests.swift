@@ -287,11 +287,11 @@ final class FabushiMagpieGatewayTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(FabushiMagpieCircuitBreakerPolicy.classifyRestKind(statusCode: 529, errorText: "overloaded"), .overloadRest)
             XCTAssertEqual(FabushiMagpieCircuitBreakerPolicy.classifyRestKind(statusCode: 429, errorText: "rate_limit"), .rateRest)
 
-            // Routing Group CRUD + `resolveRoute` + `recordFailure` circuit-breaker bypass
+            // Routing Group CRUD + `resolveRoute` + `recordFailure` circuit-breaker bypass (`smart` demotes cooled targets)
             let group = FabushiMagpieRoutingGroupDTO(
                 id: "group/mix",
                 name: "Primary Mix",
-                strategy: .order,
+                strategy: .smart,
                 members: [
                     FabushiMagpieRoutingGroupMemberDTO(target: "openai/gpt-4o", weight: 1, enabled: true),
                     FabushiMagpieRoutingGroupMemberDTO(target: "deepseek/deepseek-chat", weight: 1, enabled: true),

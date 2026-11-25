@@ -72,15 +72,15 @@ final class FabushiMultiAgentProtocolTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(req2.granted, false)
             XCTAssertEqual(req2.queuedCount, 1)
 
-            // UserInterruption preempts active speaker and emits a `trn_` nonce
+            // UserInterruption preempts active speaker (`rust_bot`), emits `trn_` nonce, and promotes queued `qa_bot`
             let preemptRaw = await vm.preemptFloorForUser()
             let preempt = try XCTUnwrap(preemptRaw)
             XCTAssertEqual(preempt.preemptedAgent, "rust_bot")
             XCTAssertTrue(preempt.preemptedNonce?.hasPrefix("trn_") ?? false)
-            XCTAssertNil(preempt.currentSpeaker)
+            XCTAssertEqual(preempt.currentSpeaker, "qa_bot")
+            XCTAssertEqual(preempt.queuedCount, 0)
 
-            // Re-acquire and release cleanly
-            _ = await vm.requestFloor(agentId: "qa_bot", priority: .taskAssignee)
+            // Releasing promoted `qa_bot` clears the floor cleanly
             let releasedRaw = await vm.releaseFloor(agentId: "qa_bot")
             let released = try XCTUnwrap(releasedRaw)
             XCTAssertNil(released.currentSpeaker)
