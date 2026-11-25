@@ -58,7 +58,14 @@ public struct FabushiPasscodeLockOverlayView: View {
                         text: $passcodeInput
                     )
                     .fabushiFont(.body)
-                    .keyboardType(.numberPad)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit {
+                        if !isVerifying {
+                            Task { await submitPasscode() }
+                        }
+                    }
                     .padding(12)
                     .background(theme.surfaceInput, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                     .accessibilityLabel(theme.localized("hig.auth.passcodePlaceholder"))

@@ -37,12 +37,37 @@ public struct FabushiWebAuthnAssertionResult: Sendable, Equatable {
     public let clientDataJsonB64: String
     public let authenticatorDataB64: String
     public let signatureB64: String
+    public let userHandleB64: String?
+
+    public init(
+        credentialIdB64: String,
+        clientDataJsonB64: String,
+        authenticatorDataB64: String,
+        signatureB64: String,
+        userHandleB64: String? = nil
+    ) {
+        self.credentialIdB64 = credentialIdB64
+        self.clientDataJsonB64 = clientDataJsonB64
+        self.authenticatorDataB64 = authenticatorDataB64
+        self.signatureB64 = signatureB64
+        self.userHandleB64 = userHandleB64
+    }
 }
 
 public struct FabushiWebAuthnRegistrationResult: Sendable, Equatable {
     public let credentialIdB64: String
     public let attestationObjectB64: String
     public let clientDataJsonB64: String
+
+    public init(
+        credentialIdB64: String,
+        attestationObjectB64: String,
+        clientDataJsonB64: String
+    ) {
+        self.credentialIdB64 = credentialIdB64
+        self.attestationObjectB64 = attestationObjectB64
+        self.clientDataJsonB64 = clientDataJsonB64
+    }
 }
 
 @MainActor
@@ -63,22 +88,78 @@ public final class FabushiWebAuthnPasskeyController:
         super.init()
     }
 
+    /// W3C WebAuthn unpadded Base64URL encoding (`+` -> `-`, `/` -> `_`, no `=` padding).
+    nonisolated public static func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    nonisolated private static func decodeExactHex64(_ raw: String) -> Data? {
+        let bytes = Array(raw.utf8)
+        guard bytes.count == 64 else { return nil }
+
+        func nibble(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 0x30...0x39: return byte - 0x30       // '0'...'9'
+            case 0x61...0x66: return byte - 0x61 + 10  // 'a'...'f'
+            case 0x41...0x46: return byte - 0x41 + 10  // 'A'...'F'
+            default: return nil
+            }
+        }
+
+        var decoded = Data()
+        decoded.reserveCapacity(32)
+        var idx = 0
+        while idx < 64 {
+            guard let hi = nibble(bytes[idx]), let lo = nibble(bytes[idx + 1]) else {
+                return nil
+            }
+            decoded.append((hi << 4) | lo)
+            idx += 2
+        }
+        return decoded
+    }
+
+    nonisolated private static func isStrictBase64Alphabet(_ raw: String) -> Bool {
+        raw.utf8.allSatisfy { b in
+            (b >= 0x41 && b <= 0x5A) // A-Z
+                || (b >= 0x61 && b <= 0x7A) // a-z
+                || (b >= 0x30 && b <= 0x39) // 0-9
+                || b == 0x2B // +
+                || b == 0x2F // /
+                || b == 0x2D // -
+                || b == 0x5F // _
+                || b == 0x3D // =
+        }
+    }
+
+    /// Decodes a server WebAuthn challenge into raw bytes:
+    /// 1. 64-character ASCII hex SHA-256 string (upstream `PasskeyService::generate_challenge`) -> 32 bytes.
+    /// 2. Strict Base64URL / Standard Base64 string -> decoded bytes.
+    /// 3. Fallback UTF-8 bytes for opaque non-Base64 tokens (e.g. `pkchal_...`).
     nonisolated public static func decodeChallengeData(_ raw: String) -> Data? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        if let standard = Data(base64Encoded: trimmed) {
-            return standard
+
+        if let hex32 = decodeExactHex64(trimmed) {
+            return hex32
         }
-        var base64URL = trimmed
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let remainder = base64URL.count % 4
-        if remainder != 0 {
-            base64URL += String(repeating: "=", count: 4 - remainder)
+
+        if isStrictBase64Alphabet(trimmed) {
+            var normalized = trimmed
+                .replacingOccurrences(of: "-", with: "+")
+                .replacingOccurrences(of: "_", with: "/")
+            let remainder = normalized.count % 4
+            if remainder != 0 {
+                normalized += String(repeating: "=", count: 4 - remainder)
+            }
+            if let decoded = Data(base64Encoded: normalized), !decoded.isEmpty {
+                return decoded
+            }
         }
-        if let decoded = Data(base64Encoded: base64URL) {
-            return decoded
-        }
+
         return Data(trimmed.utf8)
     }
 
@@ -159,12 +240,15 @@ public final class FabushiWebAuthnPasskeyController:
                 continuation.resume(throwing: FabushiWebAuthnError.unexpectedCredential)
                 return
             }
+            let rawUserHandle: Data? = cred.userID
+            let userHandleB64 = rawUserHandle.flatMap { $0.isEmpty ? nil : Self.base64URLEncode($0) }
             continuation.resume(
                 returning: FabushiWebAuthnAssertionResult(
-                    credentialIdB64: cred.credentialID.base64EncodedString(),
-                    clientDataJsonB64: cred.rawClientDataJSON.base64EncodedString(),
-                    authenticatorDataB64: cred.rawAuthenticatorData.base64EncodedString(),
-                    signatureB64: cred.signature.base64EncodedString()
+                    credentialIdB64: Self.base64URLEncode(cred.credentialID),
+                    clientDataJsonB64: Self.base64URLEncode(cred.rawClientDataJSON),
+                    authenticatorDataB64: Self.base64URLEncode(cred.rawAuthenticatorData),
+                    signatureB64: Self.base64URLEncode(cred.signature),
+                    userHandleB64: userHandleB64
                 )
             )
         case .registration(let continuation):
@@ -172,12 +256,15 @@ public final class FabushiWebAuthnPasskeyController:
                 continuation.resume(throwing: FabushiWebAuthnError.unexpectedCredential)
                 return
             }
-            let attestation = cred.rawAttestationObject ?? Data()
+            guard let attestation = cred.rawAttestationObject, !attestation.isEmpty else {
+                continuation.resume(throwing: FabushiWebAuthnError.unexpectedCredential)
+                return
+            }
             continuation.resume(
                 returning: FabushiWebAuthnRegistrationResult(
-                    credentialIdB64: cred.credentialID.base64EncodedString(),
-                    attestationObjectB64: attestation.base64EncodedString(),
-                    clientDataJsonB64: cred.rawClientDataJSON.base64EncodedString()
+                    credentialIdB64: Self.base64URLEncode(cred.credentialID),
+                    attestationObjectB64: Self.base64URLEncode(attestation),
+                    clientDataJsonB64: Self.base64URLEncode(cred.rawClientDataJSON)
                 )
             )
         }

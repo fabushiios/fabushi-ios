@@ -33,12 +33,20 @@ public final class FabushiSecurityModule: SecurityModuleProviding {
         AnyView(FabushiPrivacyBlurOverlayView())
     }
 
+    public func installLogoutSecretsPurger(on coordinator: FabushiCoordinator) {
+        let keychain = securityKeychain
+        coordinator.registerAccountSecretsPurger(id: "fabushi.security.keychain") { accountId in
+            keychain.purgeAccountSecrets(accountId: accountId)
+        }
+    }
+
     public func makeAccountSwitcherSheet(
         coordinator: FabushiCoordinator,
         router: ShellNavigationRouter,
         onDismiss: @escaping () -> Void
     ) -> AnyView {
-        AnyView(
+        installLogoutSecretsPurger(on: coordinator)
+        return AnyView(
             FabushiAccountSwitcherSheet(
                 coordinator: coordinator,
                 router: router,

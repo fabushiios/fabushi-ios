@@ -976,10 +976,18 @@ public struct FabushiVaultUnlockWithKeyBytesRequest: Encodable, Sendable, Equata
 public struct FabushiVaultUnlockStatusResponse: Codable, Sendable, Equatable {
     public let unlocked: Bool
     public let hasEnvelope: Bool?
+    public let rootKeyB64: String?
+
+    public init(unlocked: Bool, hasEnvelope: Bool? = nil, rootKeyB64: String? = nil) {
+        self.unlocked = unlocked
+        self.hasEnvelope = hasEnvelope
+        self.rootKeyB64 = rootKeyB64
+    }
 
     public enum CodingKeys: String, CodingKey {
         case unlocked
         case hasEnvelope = "has_envelope"
+        case rootKeyB64 = "root_key_b64"
     }
 }
 

@@ -221,10 +221,10 @@ private struct FabushiCanonicalSceneHost: View {
     init(launchConfiguration: FabushiLaunchConfiguration) {
         self.launchConfiguration = launchConfiguration
         let passcodeController = FabushiPasscodeLockController.shared
+        let securityModule = FabushiSecurityModule(passcodeController: passcodeController)
+        securityModule.installLogoutSecretsPurger(on: FabushiCoordinator.shared)
         FabushiFeatureModuleRegistry.shared.register(auth: FabushiAuthModule())
-        FabushiFeatureModuleRegistry.shared.register(
-            security: FabushiSecurityModule(passcodeController: passcodeController)
-        )
+        FabushiFeatureModuleRegistry.shared.register(security: securityModule)
         let initialTheme = FabushiTheme()
         initialTheme.applyLaunchConfiguration(launchConfiguration)
         self._theme = State(initialValue: initialTheme)
@@ -246,6 +246,13 @@ private struct FabushiCanonicalSceneHost: View {
             onRetryStartup: {
                 await startCanonicalCoordinator(prepareReset: !didPrepareStateDirectory)
             }
+        )
+        .background(
+            FabushiUserActivityObserverView {
+                FabushiPasscodeLockController.shared.recordUserActivityIfNeeded()
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
         )
         .task {
             await startCanonicalCoordinator(prepareReset: true)

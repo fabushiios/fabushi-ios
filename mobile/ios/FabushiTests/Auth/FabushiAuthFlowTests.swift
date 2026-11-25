@@ -1,6 +1,9 @@
 import Foundation
 import os
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 import XCTest
 @testable import Fabushi
 
@@ -139,14 +142,22 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         )
 
         do {
+            #if canImport(UIKit)
+            defer { UIPasteboard.general.items = [] }
+            #endif
             let router = ShellNavigationRouter()
             let theme = FabushiTheme(locale: .en)
+            var didCompleteCallback = false
             let vm = FabushiAuthViewModel(
                 coordinator: coordinator,
                 router: router,
                 launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
                 mode: .primaryGate,
-                securityKeychain: secKC
+                securityKeychain: secKC,
+                useFastKdfForTests: true,
+                onAuthenticated: {
+                    didCompleteCallback = true
+                }
             )
             vm.serverURLText = server.baseURLString
             vm.authTab = .register
@@ -162,8 +173,33 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             )
             XCTAssertTrue(coordinator.vaultStore.isUnlocked)
             XCTAssertTrue(vm.lastCompletedVaultBootstrap)
-            XCTAssertTrue(vm.generatedEmergencyKit?.hasPrefix("EK-") == true)
+            let emergencyKit = try XCTUnwrap(vm.generatedEmergencyKit)
+            XCTAssertTrue(emergencyKit.hasPrefix("EK-"))
             XCTAssertTrue(secKC.hasVaultRootKey(accountId: "2001"))
+
+            // D4 Option A: Registration holds Auth Gate until user explicitly backs up & acknowledges Emergency Kit
+            XCTAssertTrue(vm.isAwaitingEmergencyKitBackup)
+            XCTAssertTrue(router.isHoldingPrimaryAuthGate)
+            XCTAssertFalse(didCompleteCallback)
+            XCTAssertTrue(vm.passwordText.isEmpty, "Transient password must be scrubbed immediately")
+            XCTAssertFalse(
+                vm.acknowledgeEmergencyKitAndContinue(),
+                "Acknowledge must fail closed while hasAcknowledgedEmergencyKitSaved == false"
+            )
+            XCTAssertTrue(router.isHoldingPrimaryAuthGate)
+
+            XCTAssertTrue(vm.copyGeneratedEmergencyKitToSecurePasteboard())
+            XCTAssertTrue(vm.didCopyEmergencyKit)
+            #if canImport(UIKit)
+            XCTAssertEqual(UIPasteboard.general.string, emergencyKit)
+            #endif
+
+            vm.hasAcknowledgedEmergencyKitSaved = true
+            XCTAssertTrue(vm.acknowledgeEmergencyKitAndContinue())
+            XCTAssertNil(vm.generatedEmergencyKit, "Emergency Kit must be wiped from memory after ack")
+            XCTAssertFalse(vm.isAwaitingEmergencyKitBackup)
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            XCTAssertTrue(didCompleteCallback)
 
             let registerReqs = server.requests(method: "POST", pathPrefix: "/api/v1/auth/register")
             XCTAssertEqual(registerReqs.count, 1)
@@ -300,7 +336,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(loginReqBody.contains("auth_verifier_b64"))
             XCTAssertFalse(loginReqBody.contains("MyV2Password!99"))
 
-            // 3. Legacy V1 fallback + silent Split-Key V2 upgrade
+            // 3. Legacy V1 fallback + silent Split-Key V2 upgrade (D4 Hybrid: non-blocking Shell banner!)
             legacyMode.withLock { $0 = true }
             _ = try await coordinator.clearLocalSession()
             vm.usernameText = "legacy_v1"
@@ -310,7 +346,23 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator.authState,
                 .authenticated(userId: 2003, username: "legacy_v1", accountId: "2003")
             )
-            XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/upgrade-split-key").count, 1)
+            let upgradeReqs = server.requests(method: "POST", pathPrefix: "/api/v1/auth/upgrade-split-key")
+            XCTAssertEqual(upgradeReqs.count, 1)
+            let upgradeBody = try XCTUnwrap(upgradeReqs.first?.bodyString)
+            XCTAssertTrue(upgradeBody.contains("auth_verifier_b64"))
+            XCTAssertTrue(upgradeBody.contains("auth_salt_b64"))
+            XCTAssertEqual(server.requests(method: "PUT", pathPrefix: "/api/v1/user-vault/envelope").count, 1)
+            XCTAssertTrue(secKC.hasVaultRootKey(accountId: "2003"))
+            XCTAssertFalse(
+                router.isHoldingPrimaryAuthGate,
+                "Silent Legacy V1 login upgrade must not block shell entry"
+            )
+            XCTAssertTrue(
+                router.pendingEmergencyKit?.hasPrefix("EK-") == true,
+                "Silent Legacy V1 upgrade must surface one-time Emergency Kit in persistent Shell banner"
+            )
+            router.acknowledgePendingEmergencyKit()
+            XCTAssertNil(router.pendingEmergencyKit)
 
             await coordinator.shutdown()
         } catch {
@@ -377,14 +429,21 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             await vm.sendOTP(theme: theme)
             XCTAssertNotNil(vm.errorMessage)
             XCTAssertFalse(vm.otpCodeSent)
+            XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/phone").count, 0)
 
-            // Valid E.164 phone SMS send -> verify
+            // Valid E.164 phone SMS send -> too-short OTP rejected locally -> valid verify succeeds
             vm.phoneText = "+14155550168"
             await vm.sendOTP(theme: theme)
             XCTAssertNil(vm.errorMessage)
             XCTAssertTrue(vm.otpCodeSent)
             XCTAssertEqual(vm.phoneCodeHash, "hash-99")
             XCTAssertGreaterThan(vm.otpResendRemainingSeconds, 0)
+
+            vm.otpCodeText = "12"
+            await vm.verifyOTP(theme: theme)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/phone/verify").count, 0)
 
             vm.otpCodeText = "123456"
             await vm.verifyOTP(theme: theme)
@@ -394,12 +453,13 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             )
             XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/phone").count, 2)
 
-            // Invalid email fails closed
+            // Invalid email fails closed without hitting server
             _ = try await coordinator.clearLocalSession()
             vm.otpChannel = .email
             vm.emailText = "bad-email"
             await vm.sendOTP(theme: theme)
             XCTAssertNotNil(vm.errorMessage)
+            XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/email").count, 0)
 
             // Valid email send -> verify
             vm.emailText = "alice@example.com"
@@ -412,7 +472,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 .authenticated(userId: 3002, username: "email_user", accountId: "3002")
             )
 
-            // Email Split-Key V2 Registration (zero plaintext password on wire)
+            // Email Split-Key V2 Registration (zero plaintext password on wire + D4 Emergency Kit hold)
             _ = try await coordinator.clearLocalSession()
             vm.authTab = .register
             vm.usernameText = "email_v2"
@@ -424,6 +484,13 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator.authState,
                 .authenticated(userId: 3003, username: "email_v2", accountId: "3003")
             )
+            XCTAssertTrue(vm.isAwaitingEmergencyKitBackup)
+            XCTAssertTrue(router.isHoldingPrimaryAuthGate)
+            vm.hasAcknowledgedEmergencyKitSaved = true
+            XCTAssertTrue(vm.acknowledgeEmergencyKitAndContinue())
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            XCTAssertNil(vm.generatedEmergencyKit)
+
             let emailRegBody = try XCTUnwrap(server.requests(method: "POST", pathPrefix: "/api/v1/auth/email/register").first?.bodyString)
             XCTAssertTrue(emailRegBody.contains("auth_verifier_b64"))
             XCTAssertFalse(emailRegBody.contains("EmailSplitSecret!8"))
@@ -505,6 +572,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             let rejected = await vm.handleAuthCallbackURL(consumedBad, theme: theme)
             XCTAssertFalse(rejected)
             XCTAssertNotNil(vm.errorMessage)
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
 
             // Matching CSRF state callback URL consumes router URL & triggers completion poll!
             let goodCallbackURL = try XCTUnwrap(URL(string: "fabushi://auth/alipay?state=csrf_42&auth_code=ok_code"))
@@ -517,6 +585,13 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator.authState,
                 .authenticated(userId: 4001, username: "alipay_alice", accountId: "4001")
             )
+
+            // Expired Alipay session stops polling cleanly
+            vm.alipayAttemptId = "alipay_expired"
+            vm.alipayExpiresAtMs = 1_000
+            let expiredPoll = await vm.pollAlipayOnce(theme: theme)
+            XCTAssertNil(expiredPoll)
+            XCTAssertEqual(vm.alipayStatusText, theme.localized("hig.auth.alipayExpired"))
 
             vm.cancelActiveTasks()
             await coordinator.shutdown()
@@ -534,7 +609,15 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         let server = try M2bLoopbackHTTPTestServer { req in
             switch (req.method, req.path) {
             case ("POST", "/api/v1/auth/passkey/challenge"):
-                return .json(200, #"{"challenge":"dGVzdC1jaGFsbGVuZ2UtMzJi","rp_id":"fabushi.app","timeout_ms":60000,"user_id":5001}"#)
+                return .json(200, #"{"challenge":"00112233445566778899aabbccddeeff0123456789abcdef0f1e2d3c4b5a6978","rp_id":"fabushi.app","timeout_ms":60000,"user_id":5001}"#)
+            case ("POST", "/api/v1/auth/passkey/verify"):
+                return .json(200, #"{"user_id":5001,"username":"passkey_alice","session_id":"s-5001","token":"tok-5001","first_name":"Passkey"}"#)
+            case ("POST", "/api/v1/auth/passkeys"):
+                return .json(201, #"{"credential_id":"cred_b64url_ok","user_id":5001,"public_key":"att_b64url_ok","sign_count":0,"device_name":"Fabushi iOS","created_at_ms":1700000000000,"last_used_at_ms":1700000000000}"#)
+            case ("GET", "/api/v1/auth/passkeys"):
+                return .json(200, #"{"passkeys":[{"credential_id":"cred_b64url_ok","user_id":5001,"public_key":"att_b64url_ok","sign_count":1,"device_name":"Fabushi iOS","created_at_ms":1700000000000,"last_used_at_ms":1700000005000}],"total":1}"#)
+            case ("DELETE", "/api/v1/auth/passkeys/cred_b64url_ok"):
+                return .json(200, #"{"deleted":true}"#)
             case ("POST", "/api/v1/auth/pair/init"):
                 return .json(200, #"{"pair_token":"pair_tok_777","qr_url":"tg://login?token=pair_tok_777","expires_at_ms":2900000000000}"#)
             case ("POST", "/api/v1/auth/pair/accept"):
@@ -555,6 +638,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         let (coreKC, secKC) = makeIsolatedKeychains()
         defer {
             try? coreKC.deletePassphrase()
+            try? coreKC.deleteAccountKey(accountId: "5001")
             try? coreKC.deleteAccountKey(accountId: "5002")
             try? FileManager.default.removeItem(at: dir)
         }
@@ -568,17 +652,95 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         )
 
         do {
-            // 1. Real Rust auth.passkeyChallenge wire round-trip + base64/base64url decode
+            // 1. Real Rust auth.passkeyChallenge wire round-trip + D8-1 hex64 / Base64URL / Base64 exact byte proof
             let challenge: FabushiPasskeyChallengeDTO = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.auth.method("passkeyChallenge"),
                 params: FabushiPasskeyChallengeRequest(username: "alice")
             )
             XCTAssertEqual(challenge.rpId, "fabushi.app")
             XCTAssertEqual(challenge.userId, 5001)
-            XCTAssertNotNil(FabushiWebAuthnPasskeyController.decodeChallengeData(challenge.challenge))
-            XCTAssertNotNil(FabushiWebAuthnPasskeyController.decodeChallengeData("YWJjLV8"))
+
+            // D8-1: Upstream 64-char SHA-256 hex MUST decode to 32 raw bytes (NOT 48 bogus Base64 bytes!)
+            let hexDecoded = try XCTUnwrap(FabushiWebAuthnPasskeyController.decodeChallengeData(challenge.challenge))
+            XCTAssertEqual(hexDecoded.count, 32)
+            XCTAssertEqual(
+                hexDecoded,
+                Data([
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                    0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
+                ])
+            )
+            // Standard Base64 exact bytes
+            XCTAssertEqual(
+                FabushiWebAuthnPasskeyController.decodeChallengeData("dGVzdC1jaGFsbGVuZ2UtMzJi"),
+                Data("test-challenge-32b".utf8)
+            )
+            // Unpadded Base64URL exact bytes
+            XCTAssertEqual(
+                FabushiWebAuthnPasskeyController.decodeChallengeData("YWJjLV8"),
+                Data([0x61, 0x62, 0x63, 0x2d, 0x5f])
+            )
+            // Opaque non-Base64 UTF-8 token fallback
+            XCTAssertEqual(
+                FabushiWebAuthnPasskeyController.decodeChallengeData("pkchal_1_test"),
+                Data("pkchal_1_test".utf8)
+            )
+            // Empty / whitespace returns nil
+            XCTAssertNil(FabushiWebAuthnPasskeyController.decodeChallengeData("   "))
+
+            // D8-2: Base64URL unpadded encoding strips '+', '/', '=' and round-trips losslessly
+            let binarySample = Data([0xFB, 0xFF, 0xFE, 0x3E, 0x3F])
+            let b64Url = FabushiWebAuthnPasskeyController.base64URLEncode(binarySample)
+            XCTAssertFalse(b64Url.contains("+"))
+            XCTAssertFalse(b64Url.contains("/"))
+            XCTAssertFalse(b64Url.contains("="))
+            XCTAssertEqual(FabushiWebAuthnPasskeyController.decodeChallengeData(b64Url), binarySample)
+
+            // Real Rust passkeyVerify -> passkeyRegister -> passkeyList (upstream credential_id keyed) -> passkeyDelete
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("passkeyVerify"),
+                params: FabushiPasskeyVerifyRequest(
+                    challenge: challenge.challenge,
+                    credentialId: b64Url,
+                    clientDataJson: b64Url,
+                    authenticatorData: b64Url,
+                    signature: b64Url,
+                    userId: 5001
+                ),
+                extractIdentity: { $0.identityTuple }
+            )
+            let verifyBody = try XCTUnwrap(server.requests(method: "POST", pathPrefix: "/api/v1/auth/passkey/verify").first?.bodyString)
+            XCTAssertTrue(verifyBody.contains("\"credential_id\":\"\(b64Url)\""))
+            XCTAssertTrue(verifyBody.contains("\"client_data_json\""))
+            XCTAssertTrue(verifyBody.contains("\"authenticator_data\""))
+            XCTAssertTrue(verifyBody.contains("\"signature\""))
+
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.auth.method("passkeyRegister"),
+                params: FabushiPasskeyRegisterRequest(
+                    credentialId: "cred_b64url_ok",
+                    publicKey: "att_b64url_ok",
+                    deviceName: "Fabushi iOS"
+                )
+            )
+            let rawPasskeys: [FabushiJSONValue] = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.auth.method("passkeyList"),
+                params: FabushiEmptyParams()
+            )
+            let parsedPasskeys = rawPasskeys.compactMap(FabushiPasskeyRecordDTO.fromJSONValue)
+            XCTAssertEqual(parsedPasskeys.count, 1)
+            XCTAssertEqual(parsedPasskeys.first?.id, "cred_b64url_ok")
+            XCTAssertEqual(parsedPasskeys.first?.credentialId, "cred_b64url_ok")
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.auth.method("passkeyDelete"),
+                params: FabushiPasskeyDeleteRequest(passkeyId: "cred_b64url_ok")
+            )
+            XCTAssertEqual(server.requests(method: "DELETE", pathPrefix: "/api/v1/auth/passkeys/cred_b64url_ok").count, 1)
 
             // 2. Real QR Pair Init -> CoreImage QR -> URI token parser -> Accept -> Poll completion
+            _ = try await coordinator.clearLocalSession()
             let router = ShellNavigationRouter()
             let theme = FabushiTheme(locale: .en)
             let vm = FabushiAuthViewModel(
@@ -642,6 +804,9 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             case ("POST", "/api/v1/auth/login"):
                 return .json(401, #"{"code":"two_factor_required","requires_2fa":true,"challenge_token":"tfa_chal_88","hint":"lotus"}"#)
             case ("POST", "/api/v1/auth/2fa/verify"):
+                if req.bodyString.contains("WrongCloud2FA!") {
+                    return .json(401, #"{"error":"invalid_2fa_password"}"#)
+                }
                 return .json(200, #"{"user_id":6001,"username":"t1_f05_2fa","session_id":"s-6001","token":"tok-6001","first_name":"TwoFA"}"#)
             case ("GET", "/api/v1/auth/2fa/status"):
                 let enabled = twoFactorEnabled.withLock { $0 }
@@ -697,6 +862,24 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(coordinator.authState, .unauthenticated)
             XCTAssertEqual(vm.activeTwoFactorChallenge?.challengeToken, "tfa_chal_88")
             XCTAssertEqual(vm.activeTwoFactorChallenge?.hint, "lotus")
+
+            // Negative 2FA checks: plain 401 without challenge_token parses nil; empty & wrong password keep gate open!
+            XCTAssertNil(
+                FabushiTwoFactorChallengeParser.extract(
+                    from: FabushiHostError.rpcError(code: "unauthorized", message: "HTTP 401 invalid credentials", retryable: false)
+                )
+            )
+            vm.twoFactorPasswordText = ""
+            await vm.submitTwoFactorVerification(theme: theme)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertNotNil(vm.activeTwoFactorChallenge)
+            XCTAssertEqual(server.requests(method: "POST", pathPrefix: "/api/v1/auth/2fa/verify").count, 0)
+
+            vm.twoFactorPasswordText = "WrongCloud2FA!"
+            await vm.submitTwoFactorVerification(theme: theme)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertNotNil(vm.activeTwoFactorChallenge)
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
 
             // Verify Cloud 2FA password -> authenticates session
             vm.twoFactorPasswordText = "CloudSecret2FA!"
@@ -767,6 +950,11 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
 
     func testAuthAccessibilityIDsAndModuleRegistrationContract() {
         XCTAssertEqual(FabushiAccessibilityIDs.Auth.allIdentifiers.count, 28)
+        XCTAssertEqual(
+            Set(FabushiAccessibilityIDs.Auth.allIdentifiers).count,
+            28,
+            "All 28 Auth accessibility identifiers must be strictly unique"
+        )
         XCTAssertEqual(FabushiAccessibilityIDs.Auth.root, "fabushi.auth.root")
         XCTAssertEqual(FabushiAccessibilityIDs.Auth.splitKeyBadge, "fabushi.auth.splitKeyBadge")
         XCTAssertEqual(FabushiAccessibilityIDs.Auth.twoFactorPasswordField, "fabushi.auth.twoFactorPasswordField")
@@ -778,11 +966,221 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
 
         let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: FabushiKeychainStore())
         let router = ShellNavigationRouter()
-        let view = registry.auth.makeAuthGateView(
+        let explicitLaunch = FabushiLaunchConfiguration(
+            environment: ["FABUSHI_SERVER_URL": "https://auth-test.example"],
+            arguments: []
+        )
+        let vm = FabushiAuthViewModel(
+            coordinator: coordinator,
+            router: router,
+            launchConfiguration: explicitLaunch
+        )
+        XCTAssertEqual(vm.serverURLText, "https://auth-test.example")
+
+        let fallbackVM = FabushiAuthViewModel(
             coordinator: coordinator,
             router: router,
             launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: [])
         )
-        XCTAssertTrue(type(of: view) == AnyView.self)
+        XCTAssertEqual(fallbackVM.serverURLText, coordinator.settingsStore.activeServerURL)
+    }
+
+    // MARK: - D4 & D3-Auth Regression: Emergency Kit Hold (Primary & AddAccount), Envelope Upload Rollback & Legacy Argon2id Login
+
+    func testD4EmergencyKitBackupGateRequiresAckAndWipesMemoryAcrossRegisterAndAddAccount() async throws {
+        let failRegister = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let failEnvelopePut = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let storedArgonEnvelopeJSON = OSAllocatedUnfairLock<String?>(initialState: nil)
+        let storedSalt = OSAllocatedUnfairLock<String>(initialState: "")
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("POST", "/api/v1/auth/register"):
+                if failRegister.withLock({ $0 }) {
+                    return .json(500, #"{"error":"server_error"}"#)
+                }
+                if req.bodyString.contains("add_acct_user") {
+                    return .json(200, #"{"user_id":9102,"username":"add_acct_user","session_id":"s-9102","token":"tok-9102","first_name":"AddAcct","auth_version":2}"#)
+                }
+                return .json(200, #"{"user_id":9101,"username":"rollback_user","session_id":"s-9101","token":"tok-9101","first_name":"Rollback","auth_version":2}"#)
+            case ("PUT", "/api/v1/user-vault/envelope"):
+                if failEnvelopePut.withLock({ $0 }) {
+                    return .json(500, #"{"error":"vault_storage_down"}"#)
+                }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            case ("GET", "/api/v1/auth/kdf-params"):
+                let salt = storedSalt.withLock { $0 }
+                return .json(
+                    200,
+                    #"{"auth_version":2,"auth_salt_b64":"\#(salt)","kdf_params":{"m_cost_kib":16384,"t_cost":2,"p_cost":1}}"#
+                )
+            case ("POST", "/api/v1/auth/login"):
+                return .json(200, #"{"user_id":9103,"username":"argon_env_user","session_id":"s-9103","token":"tok-9103","first_name":"ArgonEnv","auth_version":2}"#)
+            case ("GET", "/api/v1/user-vault/envelope"):
+                if let env = storedArgonEnvelopeJSON.withLock({ $0 }) {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("d4_emergency_kit")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            for uid in ["9101", "9102", "9103"] {
+                try? coreKC.deleteAccountKey(accountId: uid)
+                secKC.purgeAccountSecrets(accountId: uid)
+            }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let router = ShellNavigationRouter()
+            let theme = FabushiTheme(locale: .en)
+
+            // 1. Failed registration (HTTP 500) MUST release onboarding hold so UI never deadlocks
+            failRegister.withLock { $0 = true }
+            let primaryVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC,
+                useFastKdfForTests: true
+            )
+            primaryVM.serverURLText = server.baseURLString
+            primaryVM.authTab = .register
+            primaryVM.usernameText = "rollback_user"
+            primaryVM.passwordText = "RollbackPass!1"
+            await primaryVM.submitRegistration(theme: theme)
+            XCTAssertNotNil(primaryVM.errorMessage)
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+
+            // 2. D3 Rollback on PUT /envelope HTTP 500: Rust vault MUST be locked via vault.lock rollback!
+            failRegister.withLock { $0 = false }
+            failEnvelopePut.withLock { $0 = true }
+            await primaryVM.submitRegistration(theme: theme)
+            XCTAssertEqual(coordinator.activeAccountId, "9101")
+            XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertFalse(primaryVM.lastCompletedVaultBootstrap)
+            XCTAssertNil(primaryVM.generatedEmergencyKit)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "9101"))
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            let rustStatusAfterFail: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("status"),
+                params: FabushiEmptyParams()
+            )
+            XCTAssertFalse(
+                rustStatusAfterFail.unlocked,
+                "Failed envelopePut during registration MUST roll back Rust vault via vault.lock"
+            )
+
+            // 3. .addAccount registration preserves isAccountSwitcherPresented while holding for Emergency Kit ack
+            failEnvelopePut.withLock { $0 = false }
+            router.isAccountSwitcherPresented = true
+            var addAccountCompleted = false
+            let addVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC,
+                useFastKdfForTests: true,
+                onAuthenticated: {
+                    addAccountCompleted = true
+                }
+            )
+            addVM.serverURLText = server.baseURLString
+            addVM.authTab = .register
+            addVM.usernameText = "add_acct_user"
+            addVM.passwordText = "AddAccountPass!2"
+            await addVM.submitRegistration(theme: theme)
+
+            XCTAssertTrue(addVM.isAwaitingEmergencyKitBackup)
+            XCTAssertTrue(router.isHoldingAddAccountGate)
+            XCTAssertFalse(addAccountCompleted)
+            // handleAccountScopeChange while held MUST NOT dismiss Account Switcher sheet!
+            _ = router.handleAccountScopeChange(
+                generation: coordinator.accountScopeGeneration,
+                coordinator: coordinator
+            )
+            XCTAssertTrue(
+                router.isAccountSwitcherPresented,
+                "Account Switcher sheet must stay mounted while .addAccount Emergency Kit backup is held"
+            )
+            XCTAssertFalse(addVM.acknowledgeEmergencyKitAndContinue())
+            addVM.hasAcknowledgedEmergencyKitSaved = true
+            XCTAssertTrue(addVM.acknowledgeEmergencyKitAndContinue())
+            XCTAssertNil(addVM.generatedEmergencyKit)
+            XCTAssertFalse(router.isHoldingAddAccountGate)
+            XCTAssertTrue(addAccountCompleted)
+
+            // 4. D3-5: bootstrapVaultAfterSplitKeyLogin unlocks legacy `argon2id` envelope via unlockWithPassphrase & saves Keychain key
+            _ = try await coordinator.clearLocalSession()
+            struct InitNewParams: Encodable, Sendable {
+                let userId: UInt64
+                let passphrase: String
+                let fastKdf: Bool
+                enum CodingKeys: String, CodingKey {
+                    case userId = "user_id"
+                    case passphrase
+                    case fastKdf = "fast_kdf"
+                }
+            }
+            struct InitNewResp: Decodable, Sendable {
+                let envelope: FabushiVaultNestedEnvelopeDTO
+                let rootKeyB64: String
+                enum CodingKeys: String, CodingKey {
+                    case envelope
+                    case rootKeyB64 = "root_key_b64"
+                }
+            }
+            let legacyInit: InitNewResp = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("initNew"),
+                params: InitNewParams(userId: 9103, passphrase: "ArgonUserPass!9", fastKdf: true)
+            )
+            let flatArgon = FabushiVaultEnvelopeConverter.toFlat(legacyInit.envelope)
+            let flatArgonData = try JSONEncoder().encode(flatArgon)
+            storedArgonEnvelopeJSON.withLock { $0 = String(decoding: flatArgonData, as: UTF8.self) }
+            storedSalt.withLock { $0 = flatArgon.kdfSaltB64 }
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("lock"),
+                params: FabushiEmptyParams()
+            )
+            coordinator.vaultStore.setUnlocked(false)
+
+            let loginVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC,
+                useFastKdfForTests: true
+            )
+            loginVM.serverURLText = server.baseURLString
+            loginVM.usernameText = "argon_env_user"
+            loginVM.passwordText = "ArgonUserPass!9"
+            await loginVM.submitLogin(theme: theme)
+
+            XCTAssertEqual(coordinator.activeAccountId, "9103")
+            XCTAssertTrue(coordinator.vaultStore.isUnlocked)
+            XCTAssertTrue(loginVM.lastCompletedVaultBootstrap)
+            XCTAssertEqual(try secKC.loadVaultRootKeyBase64(accountId: "9103"), legacyInit.rootKeyB64)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
     }
 }

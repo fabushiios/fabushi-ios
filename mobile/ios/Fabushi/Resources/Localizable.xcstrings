@@ -2302,13 +2302,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Enter 4 to 6 digit passcode"
+            "value" : "Enter passcode (at least 4 characters)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "输入 4 至 6 位密码"
+            "value" : "输入应用锁密码（至少 4 位）"
           }
         }
       }
@@ -2370,7 +2370,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Passcode must be at least 4 digits"
+            "value" : "Passcode must be at least 4 characters"
           }
         },
         "zh-Hans" : {
@@ -3883,13 +3883,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Secret copied"
+            "value" : "Secret copied (this device only, clears in 60s)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "机密内容已复制"
+            "value" : "机密内容已复制（仅本设备，60 秒后自动清除）"
           }
         }
       }
@@ -3934,13 +3934,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "TOTP code copied"
+            "value" : "TOTP code copied (this device only, clears in 60s)"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "动态口令已复制"
+            "value" : "动态口令已复制（仅本设备，60 秒后自动清除）"
           }
         }
       }
@@ -4264,6 +4264,380 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "石墨灰岩"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitAckLabel" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I have saved my Emergency Kit in a safe place"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "我已将紧急恢复套件保存在安全的位置"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitContinueButton" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Continue to Workspace"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "继续进入工作区"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitCopiedNotice" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copied to local clipboard (expires in 60s)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已复制到本机剪贴板（60 秒后自动清除）"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitCopyButton" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy Emergency Kit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制紧急恢复套件"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitSubtitle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This one-time recovery key unlocks your end-to-end encrypted vault if you lose your password or devices. It will not be shown again."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "如果您忘记密码或丢失设备，此一次性恢复密钥可用于解锁端到端加密凭据库。离开后将无法再次查看。"
+          }
+        }
+      }
+    },
+    "hig.auth.emergencyKitTitle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Save Your Emergency Kit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保存紧急恢复套件"
+          }
+        }
+      }
+    },
+    "hig.passcode.biometricChangeReason" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verify your identity to change the local passcode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "验证身份以修改本地应用锁密码"
+          }
+        }
+      }
+    },
+    "hig.passcode.biometricDisableReason" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verify your identity to turn off the local passcode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "验证身份以关闭本地应用锁"
+          }
+        }
+      }
+    },
+    "hig.passcode.currentPlaceholder" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter current passcode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输入当前应用锁密码"
+          }
+        }
+      }
+    },
+    "hig.passcode.currentRequiredError" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Please enter your current passcode to continue"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入当前应用锁密码以继续"
+          }
+        }
+      }
+    },
+    "hig.passcode.disableConfirmHeader" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confirm Current Passcode to Turn Off"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "验证当前密码以关闭应用锁"
+          }
+        }
+      }
+    },
+    "hig.passcode.verifyCurrentHeader" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verify Current Passcode"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "验证当前应用锁密码"
+          }
+        }
+      }
+    },
+    "hig.passcode.verifyWithBiometrics" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verify with Biometrics"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用生物识别验证"
+          }
+        }
+      }
+    },
+    "hig.vault.emergencyKitTitle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Save Your Emergency Kit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请妥善保存应急恢复密钥"
+          }
+        }
+      }
+    },
+    "hig.vault.emergencyKitWarning" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This one-time Emergency Kit is the only way to recover your zero-knowledge vault if you forget your password. The server never stores it."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此一次性应急恢复密钥是忘记密码后找回零知识凭证库的唯一方式，服务器绝不保存该密钥。"
+          }
+        }
+      }
+    },
+    "hig.vault.emergencyKitCopyButton" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy Emergency Kit"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制应急恢复密钥"
+          }
+        }
+      }
+    },
+    "hig.vault.emergencyKitCopiedToast" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Emergency Kit copied (this device only, clears in 60s)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应急恢复密钥已复制（仅本设备，60 秒后自动清除）"
+          }
+        }
+      }
+    },
+    "hig.vault.emergencyKitSavedAck" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "I have saved my Emergency Kit in a safe place"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "我已将应急恢复密钥妥善保存"
+          }
+        }
+      }
+    },
+    "hig.vault.existingEnvelopePrompt" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A cloud vault already exists for this account. Enter your Vault Password, Emergency Kit, or approve via X25519 Device Sync on a trusted device."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此账号已存在云端凭证库。请输入凭证库密码、应急恢复密钥，或在受信任设备上通过 X25519 设备同步批准解锁。"
+          }
+        }
+      }
+    },
+    "hig.vault.initPassphrasePrompt" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No cloud vault exists yet. Enter a Vault Password to initialize a zero-knowledge Split-Key V2 vault and generate your one-time Emergency Kit."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尚未创建云端凭证库。请输入凭证库密码以初始化零知识分密钥 V2 凭证库并生成一次性应急恢复密钥。"
+          }
+        }
+      }
+    },
+    "hig.vault.syncNowButton" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sync Vault Now"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "立即同步凭证库"
+          }
+        }
+      }
+    },
+    "hig.vault.safetyCodeCopiedToast" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Safety code copied (this device only, clears in 60s)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安全校验码已复制（仅本设备，60 秒后自动清除）"
           }
         }
       }

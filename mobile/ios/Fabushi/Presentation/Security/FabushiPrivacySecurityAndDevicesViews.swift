@@ -11,11 +11,15 @@ public struct FabushiPrivacySecuritySettingsView: View {
     @Environment(FabushiTheme.self) private var injectedTheme: FabushiTheme?
     @Environment(FabushiFeatureModuleRegistry.self) private var injectedRegistry: FabushiFeatureModuleRegistry?
 
-    // Passcode setup sheet
+    // Passcode setup & disable confirmation sheets (D5)
     @State private var showingPasscodeSheet = false
+    @State private var currentPasscodeInput = ""
     @State private var newPasscodeInput = ""
     @State private var confirmPasscodeInput = ""
     @State private var passcodeStatusError: String?
+    @State private var showingPasscodeDisableSheet = false
+    @State private var disablePasscodeInput = ""
+    @State private var disablePasscodeError: String?
 
     // Cloud 2FA (F05)
     @State private var twoFactorStatus: FabushiTwoFactorStatusResponse?
@@ -71,6 +75,7 @@ public struct FabushiPrivacySecuritySettingsView: View {
                 .frame(minHeight: FabushiLayoutMetrics.minTouchTarget)
 
                 Button {
+                    currentPasscodeInput = ""
                     newPasscodeInput = ""
                     confirmPasscodeInput = ""
                     passcodeStatusError = nil
@@ -137,7 +142,9 @@ public struct FabushiPrivacySecuritySettingsView: View {
                     .buttonStyle(.plain)
 
                     Button(role: .destructive) {
-                        Task { await removeLocalPasscode() }
+                        disablePasscodeInput = ""
+                        disablePasscodeError = nil
+                        showingPasscodeDisableSheet = true
                     } label: {
                         Label(theme.localized("hig.passcode.disableButton"), systemImage: "lock.slash")
                             .fabushiFont(.body)
@@ -316,6 +323,9 @@ public struct FabushiPrivacySecuritySettingsView: View {
         .sheet(isPresented: $showingPasscodeSheet) {
             passcodeConfigSheet
         }
+        .sheet(isPresented: $showingPasscodeDisableSheet) {
+            passcodeDisableSheet
+        }
         .sheet(isPresented: $showingTwoFactorSetSheet) {
             twoFactorSetSheet
         }
@@ -340,15 +350,46 @@ public struct FabushiPrivacySecuritySettingsView: View {
     // MARK: - Sub-Sheets
 
     private var passcodeConfigSheet: some View {
-        NavigationStack {
+        let biometry = passcodeController.canEvaluateBiometrics()
+        return NavigationStack {
             Form {
+                if passcodeController.isPasscodeEnabled {
+                    Section(header: Text(theme.localized("hig.passcode.verifyCurrentHeader"))) {
+                        SecureField(theme.localized("hig.passcode.currentPlaceholder"), text: $currentPasscodeInput)
+                            .fabushiFont(.body)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        if passcodeController.biometricsEnabled && biometry.available {
+                            Button {
+                                Task { await saveLocalPasscode(useBiometrics: true) }
+                            } label: {
+                                Label(
+                                    theme.localized("hig.passcode.verifyWithBiometrics"),
+                                    systemImage: biometry.kind.systemImage
+                                )
+                                .fabushiFont(.body)
+                            }
+                            .disabled(isWorking)
+                        }
+                    }
+                }
+
                 Section(header: Text(theme.localized("hig.passcode.setupHeader"))) {
                     SecureField(theme.localized("hig.passcode.newPlaceholder"), text: $newPasscodeInput)
                         .fabushiFont(.body)
-                        .keyboardType(.numberPad)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     SecureField(theme.localized("hig.passcode.confirmPlaceholder"), text: $confirmPasscodeInput)
                         .fabushiFont(.body)
-                        .keyboardType(.numberPad)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .onSubmit {
+                            if !isWorking {
+                                Task { await saveLocalPasscode(useBiometrics: false) }
+                            }
+                        }
                 }
 
                 if let passcodeStatusError {
@@ -364,14 +405,75 @@ public struct FabushiPrivacySecuritySettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(theme.localized("hig.common.cancel")) {
+                        currentPasscodeInput = ""
+                        newPasscodeInput = ""
+                        confirmPasscodeInput = ""
                         showingPasscodeSheet = false
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(theme.localized("hig.common.done")) {
-                        Task { await saveLocalPasscode() }
+                        Task { await saveLocalPasscode(useBiometrics: false) }
                     }
                     .disabled(isWorking)
+                }
+            }
+        }
+    }
+
+    private var passcodeDisableSheet: some View {
+        let biometry = passcodeController.canEvaluateBiometrics()
+        return NavigationStack {
+            Form {
+                Section(header: Text(theme.localized("hig.passcode.disableConfirmHeader"))) {
+                    SecureField(theme.localized("hig.passcode.currentPlaceholder"), text: $disablePasscodeInput)
+                        .fabushiFont(.body)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .onSubmit {
+                            if !isWorking && !disablePasscodeInput.isEmpty {
+                                Task { await removeLocalPasscode(useBiometrics: false) }
+                            }
+                        }
+
+                    if passcodeController.biometricsEnabled && biometry.available {
+                        Button(role: .destructive) {
+                            Task { await removeLocalPasscode(useBiometrics: true) }
+                        } label: {
+                            Label(
+                                theme.localized("hig.passcode.verifyWithBiometrics"),
+                                systemImage: biometry.kind.systemImage
+                            )
+                            .fabushiFont(.body)
+                        }
+                        .disabled(isWorking)
+                    }
+                }
+
+                if let disablePasscodeError {
+                    Section {
+                        Text(disablePasscodeError)
+                            .fabushiFont(.footnote)
+                            .foregroundStyle(theme.destructiveColor)
+                    }
+                }
+            }
+            .navigationTitle(theme.localized("hig.passcode.disableButton"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(theme.localized("hig.common.cancel")) {
+                        disablePasscodeInput = ""
+                        disablePasscodeError = nil
+                        showingPasscodeDisableSheet = false
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(theme.localized("hig.common.done"), role: .destructive) {
+                        Task { await removeLocalPasscode(useBiometrics: false) }
+                    }
+                    .disabled(isWorking || disablePasscodeInput.isEmpty)
                 }
             }
         }
@@ -488,7 +590,7 @@ public struct FabushiPrivacySecuritySettingsView: View {
         }
     }
 
-    private func saveLocalPasscode() async {
+    private func saveLocalPasscode(useBiometrics: Bool = false) async {
         passcodeStatusError = nil
         guard newPasscodeInput.count >= FabushiPasscodeLockController.minimumPasscodeLength else {
             passcodeStatusError = theme.localized("hig.passcode.tooShortError")
@@ -499,31 +601,74 @@ public struct FabushiPrivacySecuritySettingsView: View {
             return
         }
 
+        let authorization: FabushiPasscodeReauthAuthorization?
+        if passcodeController.isPasscodeEnabled {
+            if useBiometrics {
+                authorization = .biometrics(
+                    localizedReason: theme.localized("hig.passcode.biometricChangeReason")
+                )
+            } else {
+                guard !currentPasscodeInput.isEmpty else {
+                    passcodeStatusError = theme.localized("hig.passcode.currentRequiredError")
+                    return
+                }
+                authorization = .currentPasscode(currentPasscodeInput)
+            }
+        } else {
+            authorization = nil
+        }
+
         isWorking = true
         defer { isWorking = false }
 
         do {
-            try await passcodeController.setPasscode(newPasscodeInput, coordinator: coordinator)
+            try await passcodeController.setPasscode(
+                newPasscodeInput,
+                currentAuthorization: authorization,
+                coordinator: coordinator
+            )
             router.isPasscodeLockEnabled = true
+            currentPasscodeInput = ""
             newPasscodeInput = ""
             confirmPasscodeInput = ""
             showingPasscodeSheet = false
         } catch {
+            currentPasscodeInput = ""
             passcodeStatusError = error.localizedDescription
         }
     }
 
-    private func removeLocalPasscode() async {
-        passcodeStatusError = nil
+    private func removeLocalPasscode(useBiometrics: Bool = false) async {
+        disablePasscodeError = nil
+        let authorization: FabushiPasscodeReauthAuthorization
+        if useBiometrics {
+            authorization = .biometrics(
+                localizedReason: theme.localized("hig.passcode.biometricDisableReason")
+            )
+        } else {
+            guard !disablePasscodeInput.isEmpty else {
+                disablePasscodeError = theme.localized("hig.passcode.currentRequiredError")
+                return
+            }
+            authorization = .currentPasscode(disablePasscodeInput)
+        }
+
         isWorking = true
         defer { isWorking = false }
 
         do {
-            try await passcodeController.clearPasscode(coordinator: coordinator)
+            try await passcodeController.clearPasscode(
+                authorization: authorization,
+                coordinator: coordinator
+            )
             router.isPasscodeLockEnabled = false
             router.isPasscodeLocked = false
+            disablePasscodeInput = ""
+            disablePasscodeError = nil
+            showingPasscodeDisableSheet = false
         } catch {
-            passcodeStatusError = error.localizedDescription
+            disablePasscodeInput = ""
+            disablePasscodeError = error.localizedDescription
         }
     }
 

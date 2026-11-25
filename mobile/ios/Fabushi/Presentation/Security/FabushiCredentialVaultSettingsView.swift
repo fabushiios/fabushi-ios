@@ -27,6 +27,7 @@ public struct FabushiCredentialVaultSettingsView: View {
     @State private var unlockPassphraseInput = ""
     @State private var unlockEmergencyKitInput = ""
     @State private var showingDeviceSyncSheet = false
+    @State private var hasAcknowledgedEmergencyKit = false
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
@@ -49,8 +50,8 @@ public struct FabushiCredentialVaultSettingsView: View {
             if viewModel.isUnlocked {
                 totpAuthenticatorSection
                 encryptedItemsSection
-                deviceSyncSection
             }
+            deviceSyncSection
             obscuraSandboxNoticeSection
         }
         .listStyle(.insetGrouped)
@@ -61,6 +62,7 @@ public struct FabushiCredentialVaultSettingsView: View {
             await viewModel.refreshVaultStatus()
         }
         .onDisappear {
+            revealedItemIds.removeAll()
             viewModel.stopTotpTicker()
         }
         .sheet(isPresented: $showingAddItemSheet) {
@@ -88,6 +90,14 @@ public struct FabushiCredentialVaultSettingsView: View {
         }
         .sheet(isPresented: $showingDeviceSyncSheet) {
             deviceSyncModalSheet
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { viewModel.pendingEmergencyKit != nil },
+                set: { _ in }
+            )
+        ) {
+            emergencyKitBackupSheet
         }
     }
 
@@ -117,26 +127,54 @@ public struct FabushiCredentialVaultSettingsView: View {
             }
             .padding(.vertical, 4)
 
-            FabushiGlassPillButton(
-                title: viewModel.isUnlocked
-                    ? theme.localized("hig.vault.lockButton")
-                    : theme.localized("hig.vault.unlockButton"),
-                systemImage: viewModel.isUnlocked ? "lock.fill" : "lock.open.fill",
-                accessibilityID: FabushiAccessibilityIDs.Settings.vaultUnlockButton,
-                isProminent: !viewModel.isUnlocked
-            ) {
-                Task {
-                    if viewModel.isUnlocked {
-                        await viewModel.lockVault()
-                    } else {
-                        await viewModel.unlockVault()
+            if viewModel.isUnlocked {
+                FabushiGlassPillButton(
+                    title: theme.localized("hig.vault.syncNowButton"),
+                    systemImage: "arrow.triangle.2.circlepath",
+                    accessibilityID: FabushiAccessibilityIDs.Settings.vaultUnlockButton,
+                    isProminent: false
+                ) {
+                    Task {
+                        await viewModel.loadUnlockedVaultContents()
                     }
                 }
-            }
-            .frame(maxWidth: .infinity)
-            .disabled(viewModel.isBusy)
+                .frame(maxWidth: .infinity)
+                .disabled(viewModel.isBusy)
 
-            if !viewModel.isUnlocked {
+                Button(role: .destructive) {
+                    revealedItemIds.removeAll()
+                    Task {
+                        await viewModel.lockVault()
+                    }
+                } label: {
+                    Label(theme.localized("hig.vault.lockButton"), systemImage: "lock.fill")
+                        .fabushiFont(.body)
+                        .foregroundStyle(theme.destructiveColor)
+                        .frame(maxWidth: .infinity, minHeight: FabushiLayoutMetrics.minTouchTarget, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isBusy)
+                .accessibilityIdentifier("fabushi.internal.vault.lockButton")
+            } else {
+                FabushiGlassPillButton(
+                    title: theme.localized("hig.vault.unlockButton"),
+                    systemImage: "lock.open.fill",
+                    accessibilityID: FabushiAccessibilityIDs.Settings.vaultUnlockButton,
+                    isProminent: true
+                ) {
+                    Task {
+                        await viewModel.unlockVault()
+                        if !viewModel.isUnlocked, viewModel.unlockPromptReason != nil {
+                            unlockPassphraseInput = ""
+                            unlockEmergencyKitInput = ""
+                            showingUnlockOptionsSheet = true
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .disabled(viewModel.isBusy)
+
                 Button {
                     unlockPassphraseInput = ""
                     unlockEmergencyKitInput = ""
@@ -423,7 +461,9 @@ public struct FabushiCredentialVaultSettingsView: View {
         Section(header: Text(theme.localized("hig.vault.deviceSyncHeader"))) {
             Button {
                 showingDeviceSyncSheet = true
-                Task { try? await viewModel.loadPendingDeviceSyncRequests() }
+                if viewModel.isUnlocked {
+                    Task { try? await viewModel.loadPendingDeviceSyncRequests() }
+                }
             } label: {
                 Label(theme.localized("hig.vault.openDeviceSync"), systemImage: "arrow.triangle.2.circlepath.circle.fill")
                     .fabushiFont(.body)
@@ -548,8 +588,35 @@ public struct FabushiCredentialVaultSettingsView: View {
     }
 
     private var advancedUnlockSheet: some View {
-        NavigationStack {
+        let trimmedKit = unlockEmergencyKitInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canSubmit = !unlockPassphraseInput.isEmpty || !trimmedKit.isEmpty
+        return NavigationStack {
             Form {
+                if let promptReason = viewModel.unlockPromptReason {
+                    Section {
+                        Text(
+                            promptReason == .noRemoteEnvelopeRequiresInitialization
+                                ? theme.localized("hig.vault.initPassphrasePrompt")
+                                : theme.localized("hig.vault.existingEnvelopePrompt")
+                        )
+                        .fabushiFont(.footnote)
+                        .foregroundStyle(theme.textSecondary)
+
+                        if promptReason == .existingRemoteEnvelopeRequiresCredentials {
+                            Button {
+                                showingUnlockOptionsSheet = false
+                                showingDeviceSyncSheet = true
+                            } label: {
+                                Label(
+                                    theme.localized("hig.vault.openDeviceSync"),
+                                    systemImage: "arrow.triangle.2.circlepath.circle.fill"
+                                )
+                                .fabushiFont(.body)
+                            }
+                        }
+                    }
+                }
+
                 Section(header: Text(theme.localized("hig.vault.unlockPassphraseHeader"))) {
                     SecureField(theme.localized("hig.auth.passwordPlaceholder"), text: $unlockPassphraseInput)
                         .fabushiFont(.body)
@@ -566,19 +633,77 @@ public struct FabushiCredentialVaultSettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button(theme.localized("hig.common.cancel")) {
+                        unlockPassphraseInput = ""
+                        unlockEmergencyKitInput = ""
                         showingUnlockOptionsSheet = false
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(theme.localized("hig.vault.unlockButton")) {
+                        let pass = unlockPassphraseInput.isEmpty ? nil : unlockPassphraseInput
+                        let kit = trimmedKit.isEmpty ? nil : trimmedKit
+                        unlockPassphraseInput = ""
+                        unlockEmergencyKitInput = ""
                         showingUnlockOptionsSheet = false
                         Task {
                             await viewModel.unlockVault(
-                                passphraseOrPassword: unlockPassphraseInput.isEmpty ? nil : unlockPassphraseInput,
-                                emergencyKit: unlockEmergencyKitInput.isEmpty ? nil : unlockEmergencyKitInput
+                                passphraseOrPassword: pass,
+                                emergencyKit: kit
                             )
                         }
                     }
+                    .disabled(!canSubmit || viewModel.isBusy)
+                }
+            }
+        }
+    }
+
+    private var emergencyKitBackupSheet: some View {
+        NavigationStack {
+            Form {
+                if let kit = viewModel.pendingEmergencyKit {
+                    Section {
+                        Text(theme.localized("hig.vault.emergencyKitWarning"))
+                            .fabushiFont(.footnote)
+                            .foregroundStyle(theme.textSecondary)
+
+                        Text(kit)
+                            .fabushiFont(.monospacedBody)
+                            .foregroundStyle(theme.textPrimary)
+                            .textSelection(.enabled)
+                            .padding(.vertical, 6)
+                            .accessibilityLabel(kit)
+                            .accessibilityIdentifier("fabushi.internal.vault.emergencyKitValue")
+
+                        Button {
+                            copyToClipboard(kit, toastKey: "hig.vault.emergencyKitCopiedToast")
+                        } label: {
+                            Label(theme.localized("hig.vault.emergencyKitCopyButton"), systemImage: "doc.on.doc")
+                                .fabushiFont(.body)
+                        }
+                        .accessibilityIdentifier("fabushi.internal.vault.emergencyKitCopyButton")
+                    }
+
+                    Section {
+                        Toggle(
+                            theme.localized("hig.vault.emergencyKitSavedAck"),
+                            isOn: $hasAcknowledgedEmergencyKit
+                        )
+                        .accessibilityIdentifier("fabushi.internal.vault.emergencyKitAckToggle")
+                    }
+                }
+            }
+            .navigationTitle(theme.localized("hig.vault.emergencyKitTitle"))
+            .navigationBarTitleDisplayMode(.inline)
+            .interactiveDismissDisabled(true)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(theme.localized("hig.common.done")) {
+                        hasAcknowledgedEmergencyKit = false
+                        viewModel.acknowledgeEmergencyKit()
+                    }
+                    .disabled(!hasAcknowledgedEmergencyKit)
+                    .accessibilityIdentifier("fabushi.internal.vault.emergencyKitDoneButton")
                 }
             }
         }
@@ -589,14 +714,27 @@ public struct FabushiCredentialVaultSettingsView: View {
             List {
                 Section(header: Text(theme.localized("hig.vault.deviceSyncRequestHeader"))) {
                     if let code = viewModel.activeSyncVerificationCode {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(theme.localized("hig.vault.safetyFingerprintLabel"))
-                                .fabushiFont(.caption)
-                                .foregroundStyle(theme.textSecondary)
-                            Text(code)
-                                .fabushiFont(.title2)
-                                .fontWeight(.bold)
-                                .foregroundStyle(theme.accentColor)
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(theme.localized("hig.vault.safetyFingerprintLabel"))
+                                    .fabushiFont(.caption)
+                                    .foregroundStyle(theme.textSecondary)
+                                Text(code)
+                                    .fabushiFont(.title2)
+                                    .fontWeight(.bold)
+                                    .foregroundStyle(theme.accentColor)
+                            }
+                            Spacer(minLength: 8)
+                            Button {
+                                copyToClipboard(code, toastKey: "hig.vault.safetyCodeCopiedToast")
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                                    .fabushiFont(.body)
+                                    .foregroundStyle(theme.accentColor)
+                                    .fabushiMinimumTouchTarget()
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(theme.localized("hig.vault.copySecret"))
                         }
                         .padding(.vertical, 4)
 
@@ -610,34 +748,36 @@ public struct FabushiCredentialVaultSettingsView: View {
                     }
                 }
 
-                Section(header: Text(theme.localized("hig.vault.deviceSyncPendingHeader"))) {
-                    if viewModel.pendingDeviceSyncRequests.isEmpty {
-                        Text(theme.localized("hig.vault.deviceSyncNoPending"))
-                            .fabushiFont(.footnote)
-                            .foregroundStyle(theme.textSecondary)
-                    } else {
-                        ForEach(viewModel.pendingDeviceSyncRequests) { pending in
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text(pending.deviceName)
-                                    .fabushiFont(.headline)
-                                    .foregroundStyle(theme.textPrimary)
-                                Text("\(theme.localized("hig.vault.safetyFingerprintLabel")): \(pending.verificationCode)")
-                                    .fabushiFont(.monospacedCaption)
-                                    .foregroundStyle(theme.accentColor)
+                if viewModel.isUnlocked {
+                    Section(header: Text(theme.localized("hig.vault.deviceSyncPendingHeader"))) {
+                        if viewModel.pendingDeviceSyncRequests.isEmpty {
+                            Text(theme.localized("hig.vault.deviceSyncNoPending"))
+                                .fabushiFont(.footnote)
+                                .foregroundStyle(theme.textSecondary)
+                        } else {
+                            ForEach(viewModel.pendingDeviceSyncRequests) { pending in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(pending.deviceName)
+                                        .fabushiFont(.headline)
+                                        .foregroundStyle(theme.textPrimary)
+                                    Text("\(theme.localized("hig.vault.safetyFingerprintLabel")): \(pending.verificationCode)")
+                                        .fabushiFont(.monospacedCaption)
+                                        .foregroundStyle(theme.accentColor)
 
-                                HStack(spacing: 12) {
-                                    Button(theme.localized("hig.vault.deviceSyncApprove")) {
-                                        Task { _ = try? await viewModel.approvePendingDeviceSync(pending) }
-                                    }
-                                    .buttonStyle(.borderedProminent)
+                                    HStack(spacing: 12) {
+                                        Button(theme.localized("hig.vault.deviceSyncApprove")) {
+                                            Task { _ = try? await viewModel.approvePendingDeviceSync(pending) }
+                                        }
+                                        .buttonStyle(.borderedProminent)
 
-                                    Button(theme.localized("hig.vault.deviceSyncDeny"), role: .destructive) {
-                                        Task { _ = try? await viewModel.denyPendingDeviceSync(pending) }
+                                        Button(theme.localized("hig.vault.deviceSyncDeny"), role: .destructive) {
+                                            Task { _ = try? await viewModel.denyPendingDeviceSync(pending) }
+                                        }
+                                        .buttonStyle(.bordered)
                                     }
-                                    .buttonStyle(.bordered)
                                 }
+                                .padding(.vertical, 4)
                             }
-                            .padding(.vertical, 4)
                         }
                     }
                 }
@@ -662,7 +802,7 @@ public struct FabushiCredentialVaultSettingsView: View {
 
     private func copyToClipboard(_ value: String, toastKey: String) {
         #if canImport(UIKit)
-        UIPasteboard.general.string = value
+        FabushiSecureClipboard.copySensitive(value)
         #endif
         injectedRouter?.toastController.showStagePill(theme.localized(toastKey))
     }

@@ -121,11 +121,18 @@ public final class FabushiAuthViewModel {
     public var activeTwoFactorChallenge: FabushiTwoFactorChallenge?
     public var twoFactorPasswordText: String = ""
 
-    // Global Feedback & One-Time Emergency Kit
+    // Global Feedback & One-Time Emergency Kit (D4)
     public var isSubmitting: Bool = false
     public var errorMessage: String?
     public var generatedEmergencyKit: String?
+    public var hasAcknowledgedEmergencyKitSaved: Bool = false
+    public var didCopyEmergencyKit: Bool = false
     public var lastCompletedVaultBootstrap: Bool = false
+
+    public var isAwaitingEmergencyKitBackup: Bool {
+        guard let kit = generatedEmergencyKit else { return false }
+        return !kit.isEmpty
+    }
 
     public init(
         coordinator: FabushiCoordinator,
@@ -292,6 +299,8 @@ public final class FabushiAuthViewModel {
             let trimmedEmail = emailText.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedOtp = otpCodeText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+            router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+
             let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse>
             if !trimmedEmail.isEmpty && !trimmedOtp.isEmpty && FabushiAuthValidation.isValidEmail(trimmedEmail) {
                 envelope = try await coordinator.dispatchAuthTransition(
@@ -335,11 +344,13 @@ public final class FabushiAuthViewModel {
                     userId: identity.userId,
                     password: passwordText,
                     saltB64: derived.authSaltB64,
-                    kdfParams: derived.kdfParams
+                    kdfParams: derived.kdfParams,
+                    presentInShellBanner: false
                 )
             }
-            completeAuthentication()
+            finishAuthenticationOrRequireEmergencyKitBackup()
         } catch {
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             handleAuthError(error, isQrPair: false)
         }
     }
@@ -456,6 +467,7 @@ public final class FabushiAuthViewModel {
                     let resolvedFirst = firstNameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? trimmedUsername
                         : firstNameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
                     let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                         method: FabushiRPCNamespace.auth.method("emailRegisterSplitKey"),
                         params: FabushiSplitKeyEmailRegisterRequest(
@@ -478,10 +490,11 @@ public final class FabushiAuthViewModel {
                             userId: identity.userId,
                             password: passwordText,
                             saltB64: derived.authSaltB64,
-                            kdfParams: derived.kdfParams
+                            kdfParams: derived.kdfParams,
+                            presentInShellBanner: false
                         )
                     }
-                    completeAuthentication()
+                    finishAuthenticationOrRequireEmergencyKitBackup()
                 } else {
                     let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                         method: FabushiRPCNamespace.auth.method("emailVerify"),
@@ -492,6 +505,7 @@ public final class FabushiAuthViewModel {
                 }
             }
         } catch {
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             handleAuthError(error, isQrPair: false)
         }
     }
@@ -825,6 +839,34 @@ public final class FabushiAuthViewModel {
         }
     }
 
+    // MARK: - D4 One-Time Emergency Kit Backup Actions
+
+    @discardableResult
+    public func copyGeneratedEmergencyKitToSecurePasteboard() -> Bool {
+        guard let kit = generatedEmergencyKit, !kit.isEmpty else { return false }
+        FabushiSecureClipboard.copySensitive(
+            kit,
+            expirationSeconds: FabushiSecureClipboard.defaultExpirationSeconds
+        )
+        didCopyEmergencyKit = true
+        return true
+    }
+
+    /// Fail-closed: requires `hasAcknowledgedEmergencyKitSaved == true`, then wipes `generatedEmergencyKit`
+    /// from memory, releases the auth onboarding hold, and completes authentication.
+    @discardableResult
+    public func acknowledgeEmergencyKitAndContinue() -> Bool {
+        guard isAwaitingEmergencyKitBackup, hasAcknowledgedEmergencyKitSaved else {
+            return false
+        }
+        generatedEmergencyKit = nil
+        hasAcknowledgedEmergencyKitSaved = false
+        didCopyEmergencyKit = false
+        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+        completeAuthentication()
+        return true
+    }
+
     private func bootstrapVaultAfterSplitKeyLogin(
         userId: UInt64,
         password: String,
@@ -838,29 +880,52 @@ public final class FabushiAuthViewModel {
                 method: FabushiRPCNamespace.vault.method("envelopeGet"),
                 params: FabushiEmptyParams()
             )
-            if let flatEnv = envelopeResp.envelope,
-               flatEnv.kdfAlg == "split_key_v2" || flatEnv.kdfAlg == "argon2id" {
+            if let flatEnv = envelopeResp.envelope {
                 let nested = FabushiVaultEnvelopeConverter.toNested(flatEnv)
-                let unlocked: FabushiVaultUnlockWithSplitKeyResponse = try await coordinator.dispatchFenced(
-                    method: FabushiRPCNamespace.vault.method("unlockWithSplitKey"),
-                    params: FabushiVaultUnlockWithSplitKeyRequest(
-                        userId: userId,
-                        envelope: nested,
-                        vaultKekB64: vaultKekB64,
-                        password: nil
+                let alg = flatEnv.kdfAlg.trimmingCharacters(in: .whitespacesAndNewlines)
+                if alg == "argon2id" {
+                    let unlocked: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                        method: FabushiRPCNamespace.vault.method("unlockWithPassphrase"),
+                        params: FabushiVaultUnlockPassphraseRequest(
+                            userId: userId,
+                            passphrase: password,
+                            envelope: nested
+                        )
                     )
-                )
-                if unlocked.unlocked {
-                    try? securityKeychain.saveVaultRootKeyBase64(unlocked.rootKeyB64, accountId: accountId)
-                    coordinator.vaultStore.setUnlocked(true)
-                    lastCompletedVaultBootstrap = true
+                    if unlocked.unlocked {
+                        if let rootKeyB64 = unlocked.rootKeyB64, !rootKeyB64.isEmpty {
+                            try? securityKeychain.saveVaultRootKeyBase64(rootKeyB64, accountId: accountId)
+                        }
+                        coordinator.vaultStore.setUnlocked(true)
+                        lastCompletedVaultBootstrap = true
+                    }
+                } else if alg == "split_key_v2" {
+                    let paramsMatch = flatEnv.kdfSaltB64 == saltB64
+                        && flatEnv.kdfMCostKib == kdfParams.mCostKib
+                        && flatEnv.kdfTCost == kdfParams.tCost
+                        && flatEnv.kdfPCost == kdfParams.pCost
+                    let unlocked: FabushiVaultUnlockWithSplitKeyResponse = try await coordinator.dispatchFenced(
+                        method: FabushiRPCNamespace.vault.method("unlockWithSplitKey"),
+                        params: FabushiVaultUnlockWithSplitKeyRequest(
+                            userId: userId,
+                            envelope: nested,
+                            vaultKekB64: paramsMatch ? vaultKekB64 : nil,
+                            password: paramsMatch ? nil : password
+                        )
+                    )
+                    if unlocked.unlocked {
+                        try? securityKeychain.saveVaultRootKeyBase64(unlocked.rootKeyB64, accountId: accountId)
+                        coordinator.vaultStore.setUnlocked(true)
+                        lastCompletedVaultBootstrap = true
+                    }
                 }
-            } else if envelopeResp.envelope == nil {
+            } else {
                 await initializeAndUploadSplitKeyVault(
                     userId: userId,
                     password: password,
                     saltB64: saltB64,
-                    kdfParams: kdfParams
+                    kdfParams: kdfParams,
+                    presentInShellBanner: true
                 )
             }
         } catch {
@@ -873,7 +938,8 @@ public final class FabushiAuthViewModel {
         userId: UInt64,
         password: String,
         saltB64: String,
-        kdfParams: FabushiArgon2KdfParamsDTO
+        kdfParams: FabushiArgon2KdfParamsDTO,
+        presentInShellBanner: Bool
     ) async {
         let accountId = String(userId)
         do {
@@ -888,16 +954,32 @@ public final class FabushiAuthViewModel {
                 )
             )
             let flatEnvelope = FabushiVaultEnvelopeConverter.toFlat(initResp.envelope)
-            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
-                method: FabushiRPCNamespace.vault.method("envelopePut"),
-                params: flatEnvelope
-            )
+            do {
+                let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                    method: FabushiRPCNamespace.vault.method("envelopePut"),
+                    params: flatEnvelope
+                )
+            } catch {
+                // CRITICAL rollback: vault.initSplitKey unlocked Rust in-memory key before upload;
+                // lock immediately so failed cloud upload never leaves an unuploaded key in RAM.
+                let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
+                    method: FabushiRPCNamespace.vault.method("lock"),
+                    params: FabushiEmptyParams()
+                )
+                coordinator.vaultStore.setUnlocked(false)
+                lastCompletedVaultBootstrap = false
+                return
+            }
+
             try? securityKeychain.saveVaultRootKeyBase64(initResp.rootKeyB64, accountId: accountId)
             coordinator.vaultStore.setUnlocked(initResp.unlocked)
-            generatedEmergencyKit = initResp.emergencyKit
             lastCompletedVaultBootstrap = true
+            if presentInShellBanner {
+                router.presentPendingEmergencyKit(initResp.emergencyKit, forAccountId: accountId)
+            } else {
+                generatedEmergencyKit = initResp.emergencyKit
+            }
         } catch {
-            // Non-fatal if remote vault sync is offline; local key may still have been initialized.
             lastCompletedVaultBootstrap = false
         }
     }
@@ -929,10 +1011,26 @@ public final class FabushiAuthViewModel {
                 userId: userId,
                 password: oldPassword,
                 saltB64: derived.authSaltB64,
-                kdfParams: derived.kdfParams
+                kdfParams: derived.kdfParams,
+                presentInShellBanner: true
             )
         } catch {
             // Silent upgrade is intentionally non-fatal for legacy servers.
+        }
+    }
+
+    private func finishAuthenticationOrRequireEmergencyKitBackup() {
+        passwordText = ""
+        otpCodeText = ""
+        twoFactorPasswordText = ""
+        if isAwaitingEmergencyKitBackup {
+            cancelActiveTasks()
+            hasAcknowledgedEmergencyKitSaved = false
+            didCopyEmergencyKit = false
+            router.beginAuthOnboardingHold(isAddAccount: mode == .addAccount)
+        } else {
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            completeAuthentication()
         }
     }
 

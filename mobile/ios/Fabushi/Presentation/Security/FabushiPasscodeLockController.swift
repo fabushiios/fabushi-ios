@@ -47,6 +47,10 @@ public enum FabushiBiometricAuthError: LocalizedError, Sendable, Equatable {
 public enum FabushiPasscodePolicyError: LocalizedError, Sendable, Equatable {
     case tooShort
     case confirmationMismatch
+    case reauthenticationRequired
+    case currentPasscodeIncorrect(failedAttempts: Int)
+    case lockedOut(remainingSeconds: Int, failedAttempts: Int)
+    case biometricVerificationFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -54,8 +58,21 @@ public enum FabushiPasscodePolicyError: LocalizedError, Sendable, Equatable {
             return "Passcode must be at least 4 characters."
         case .confirmationMismatch:
             return "Passcode entries do not match."
+        case .reauthenticationRequired:
+            return "Current passcode or biometric verification is required."
+        case .currentPasscodeIncorrect(let attempts):
+            return "Current passcode is incorrect (\(attempts))."
+        case .lockedOut(let remaining, let attempts):
+            return "Too many failed attempts (\(attempts)). Try again in \(remaining)s."
+        case .biometricVerificationFailed(let reason):
+            return reason
         }
     }
+}
+
+public enum FabushiPasscodeReauthAuthorization: Sendable, Equatable {
+    case currentPasscode(String)
+    case biometrics(localizedReason: String)
 }
 
 public enum FabushiPasscodeVerifyResult: Sendable, Equatable {
@@ -181,12 +198,70 @@ public final class FabushiPasscodeLockController {
 
     // MARK: - Configure / Clear Passcode & Preferences
 
-    public func setPasscode(
-        _ passcode: String,
+    private func hasConfiguredPasscode() -> Bool {
+        if isPasscodeEnabled {
+            return true
+        }
+        if (try? keychainStore.loadPasscodeRecord())?.isEnabled == true {
+            reloadFromKeychain()
+            return true
+        }
+        return false
+    }
+
+    private func enforceReauthentication(
+        _ authorization: FabushiPasscodeReauthAuthorization?,
         coordinator: FabushiCoordinator?
     ) async throws {
+        guard let authorization else {
+            throw FabushiPasscodePolicyError.reauthenticationRequired
+        }
+        switch authorization {
+        case .currentPasscode(let current):
+            let result = await verifyPasscode(current, coordinator: coordinator)
+            switch result {
+            case .unlocked:
+                return
+            case .incorrect(let attempts):
+                throw FabushiPasscodePolicyError.currentPasscodeIncorrect(failedAttempts: attempts)
+            case .lockedOut(let remaining, let attempts):
+                throw FabushiPasscodePolicyError.lockedOut(
+                    remainingSeconds: remaining,
+                    failedAttempts: attempts
+                )
+            }
+        case .biometrics(let reason):
+            guard biometricsEnabled else {
+                throw FabushiPasscodePolicyError.biometricVerificationFailed(
+                    "Biometric authentication is not enabled for passcode."
+                )
+            }
+            let bioResult = await authenticateWithBiometrics(localizedReason: reason)
+            switch bioResult {
+            case .success:
+                return
+            case .failure(let error):
+                throw FabushiPasscodePolicyError.biometricVerificationFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    public func setPasscode(
+        _ passcode: String,
+        currentAuthorization: FabushiPasscodeReauthAuthorization? = nil,
+        coordinator: FabushiCoordinator?
+    ) async throws {
+        let alreadyConfigured = hasConfiguredPasscode()
+        if alreadyConfigured {
+            guard currentAuthorization != nil else {
+                throw FabushiPasscodePolicyError.reauthenticationRequired
+            }
+        }
         guard passcode.count >= Self.minimumPasscodeLength else {
             throw FabushiPasscodePolicyError.tooShort
+        }
+        if alreadyConfigured {
+            try await enforceReauthentication(currentAuthorization, coordinator: coordinator)
         }
 
         let salt = try FabushiPasscodeCrypto.generateRandomBytes(count: FabushiPasscodeCrypto.saltByteLength)
@@ -214,6 +289,7 @@ public final class FabushiPasscodeLockController {
         isPasscodeEnabled = true
         failedAttempts = 0
         lockoutUntilEpochMs = nil
+        backgroundedAtDate = nil
         lastActivityDate = nowProvider()
 
         if let coordinator, coordinator.isStarted {
@@ -224,12 +300,19 @@ public final class FabushiPasscodeLockController {
         }
     }
 
-    public func clearPasscode(coordinator: FabushiCoordinator?) async throws {
+    public func clearPasscode(
+        authorization: FabushiPasscodeReauthAuthorization? = nil,
+        coordinator: FabushiCoordinator?
+    ) async throws {
+        if hasConfiguredPasscode() {
+            try await enforceReauthentication(authorization, coordinator: coordinator)
+        }
         try keychainStore.deletePasscodeRecord()
         isPasscodeEnabled = false
         biometricsEnabled = false
         failedAttempts = 0
         lockoutUntilEpochMs = nil
+        backgroundedAtDate = nil
 
         if let coordinator, coordinator.isStarted {
             let _: FabushiJSONValue = try await coordinator.dispatchFenced(
@@ -419,6 +502,17 @@ public final class FabushiPasscodeLockController {
         lastActivityDate = nowProvider()
     }
 
+    @discardableResult
+    public func recordUserActivityIfNeeded(minimumInterval: TimeInterval = 1.0) -> Bool {
+        let now = nowProvider()
+        let elapsed = now.timeIntervalSince(lastActivityDate)
+        guard elapsed < 0 || elapsed >= max(0, minimumInterval) else {
+            return false
+        }
+        lastActivityDate = now
+        return true
+    }
+
     public func shouldEngageIdleAutoLock() -> Bool {
         guard isPasscodeEnabled, autoLockTimeoutSeconds > 0 else { return false }
         let elapsed = nowProvider().timeIntervalSince(lastActivityDate)
@@ -436,23 +530,32 @@ public final class FabushiPasscodeLockController {
     public func handleScenePhaseChange(_ phase: ScenePhase, router: ShellNavigationRouter) {
         switch phase {
         case .background:
-            backgroundedAtDate = nowProvider()
-            if isPasscodeEnabled {
-                router.isPasscodeLockEnabled = true
-                router.engagePasscodeLockIfEnabled()
+            if backgroundedAtDate == nil {
+                backgroundedAtDate = nowProvider()
             }
+            // Do NOT unconditionally engage passcode lock here.
+            // Privacy blur shields the snapshot immediately via FabushiAdaptiveShellView.isPrivacyBlurActive,
+            // while passcode locking strictly respects autoLockTimeoutSeconds (0 == Disabled / Never auto-lock).
         case .inactive:
             break
         case .active:
-            if let backgrounded = backgroundedAtDate,
-               isPasscodeEnabled,
-               autoLockTimeoutSeconds > 0,
-               nowProvider().timeIntervalSince(backgrounded) >= TimeInterval(autoLockTimeoutSeconds) {
-                router.isPasscodeLockEnabled = true
-                router.engagePasscodeLockIfEnabled()
+            if let backgrounded = backgroundedAtDate {
+                backgroundedAtDate = nil
+                let elapsed = nowProvider().timeIntervalSince(backgrounded)
+                if isPasscodeEnabled,
+                   autoLockTimeoutSeconds > 0,
+                   elapsed >= TimeInterval(autoLockTimeoutSeconds) {
+                    router.isPasscodeLockEnabled = true
+                    router.engagePasscodeLockIfEnabled()
+                } else if !router.isPasscodeLocked {
+                    // Returning from a brief app switch (e.g. Alipay OAuth / SMS / 2FA code)
+                    // within autoLockTimeoutSeconds (or when auto-lock is disabled) refreshes
+                    // activity without locking out the user. Already-locked sessions stay locked.
+                    recordUserActivity()
+                }
+            } else {
+                _ = evaluateIdleAutoLock(router: router)
             }
-            backgroundedAtDate = nil
-            _ = evaluateIdleAutoLock(router: router)
         @unknown default:
             break
         }

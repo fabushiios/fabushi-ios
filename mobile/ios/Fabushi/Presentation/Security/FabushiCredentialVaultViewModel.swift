@@ -27,11 +27,22 @@ public enum FabushiVaultCategory: String, CaseIterable, Codable, Sendable, Ident
     }
 }
 
+public enum FabushiVaultUnlockPromptReason: Sendable, Equatable {
+    case existingRemoteEnvelopeRequiresCredentials
+    case noRemoteEnvelopeRequiresInitialization
+}
+
 public enum FabushiVaultValidationError: LocalizedError, Sendable, Equatable {
     case payloadExceedsLimit(actualBytes: Int, maxBytes: Int)
     case invalidItemKey(String)
     case vaultLocked
     case unauthenticated
+    case remoteEnvelopeRequiresCredentials
+    case remoteEnvelopeMissingForInitialization
+    case remoteEnvelopeMissingForRecovery
+    case envelopeUploadFailed(String)
+    case unsupportedEnvelopeKdf(String)
+    case unlockRejected
 
     public var errorDescription: String? {
         switch self {
@@ -43,6 +54,21 @@ public enum FabushiVaultValidationError: LocalizedError, Sendable, Equatable {
             return "Credential vault is locked."
         case .unauthenticated:
             return "Sign in before accessing the credential vault."
+        case .remoteEnvelopeRequiresCredentials:
+            return "A cloud vault already exists for this account. Enter your Vault Password, Emergency Kit, or approve via X25519 Device Sync."
+        case .remoteEnvelopeMissingForInitialization:
+            return "No cloud vault exists yet. Enter a Vault Password to initialize a zero-knowledge Split-Key V2 vault and generate your Emergency Kit."
+        case .remoteEnvelopeMissingForRecovery:
+            return "No cloud vault envelope was found on the server to recover with an Emergency Kit."
+        case .envelopeUploadFailed(let detail):
+            return "Failed to upload encrypted vault envelope to server; vault remains locked (\(detail))."
+        case .unsupportedEnvelopeKdf(let alg):
+            if alg == "device_keychain_v2" {
+                return "This vault uses device keychain encryption and cannot be unlocked with a password. Use your Emergency Kit or X25519 Device Sync."
+            }
+            return "Unsupported cloud vault encryption format: \(alg)."
+        case .unlockRejected:
+            return "Credential vault unlock was rejected."
         }
     }
 }
@@ -542,6 +568,8 @@ public struct FabushiTotpURIInfo: Sendable, Equatable {
 @MainActor
 @Observable
 public final class FabushiCredentialVaultViewModel {
+    public let useFastKdfForTests: Bool
+
     @ObservationIgnored private let coordinator: FabushiCoordinator
     @ObservationIgnored private let securityKeychain: FabushiSecurityKeychainStore
     @ObservationIgnored private let nowProvider: @Sendable () -> Date
@@ -554,6 +582,8 @@ public final class FabushiCredentialVaultViewModel {
     public var liveTotpCodes: [String: String] = [:]
     public var totpRemainingSeconds: Int = 30
     public var remoteEncryptedTotpCount: Int = 0
+    public var unlockPromptReason: FabushiVaultUnlockPromptReason?
+    public var pendingEmergencyKit: String?
 
     // X25519 Device Sync state
     public var activeSyncPairId: String?
@@ -570,10 +600,12 @@ public final class FabushiCredentialVaultViewModel {
     public init(
         coordinator: FabushiCoordinator,
         securityKeychain: FabushiSecurityKeychainStore = .shared,
+        useFastKdfForTests: Bool = false,
         nowProvider: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.coordinator = coordinator
         self.securityKeychain = securityKeychain
+        self.useFastKdfForTests = useFastKdfForTests
         self.nowProvider = nowProvider
         self.isUnlocked = coordinator.vaultStore.isUnlocked
     }
@@ -584,6 +616,10 @@ public final class FabushiCredentialVaultViewModel {
 
     public func stopTotpTicker() {
         taskBag.cancel(key: "totpTicker")
+    }
+
+    public func acknowledgeEmergencyKit() {
+        pendingEmergencyKit = nil
     }
 
     public var currentUserId: UInt64? {
@@ -604,7 +640,7 @@ public final class FabushiCredentialVaultViewModel {
         items.filter { $0.category == selectedCategory.rawValue }
     }
 
-    // MARK: - Vault Lock & Unlock (Real Rust Crypto + Keychain VaultRootKey)
+    // MARK: - Vault Lock & Unlock (Fail-Closed 4-Case State Machine — Zero Random-Key Fallback)
 
     public func refreshVaultStatus() async {
         guard coordinator.isStarted else { return }
@@ -620,16 +656,25 @@ public final class FabushiCredentialVaultViewModel {
         }
     }
 
-    /// Unlocks the zero-knowledge vault using the account's Keychain-stored 32-byte `VaultRootKey`,
-    /// an explicit Split-Key password / passphrase / Emergency Kit, or provisions a fresh 32-byte
-    /// CSPRNG device-bound `VaultRootKey` into Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`)
-    /// and unlocks real Rust `bot-browser` vault crypto via `vault.unlockWithKeyBytes`.
+    /// Fail-closed 4-case zero-knowledge vault unlock:
+    /// - Case D (`emergencyKit` supplied): queries `vault.envelopeGet` (fails closed if `nil`),
+    ///   unlocks via `vault.unlockWithRecoveryKey`, and persists returned `rootKeyB64` in Keychain.
+    /// - Case C (`passphraseOrPassword` supplied): queries `vault.envelopeGet`; if remote envelope
+    ///   exists, dispatches by `kdf_alg` (`split_key_v2`, `argon2id`, or rejects `device_keychain_v2`);
+    ///   if remote envelope is `nil`, initializes Split-Key V2, uploads via `vault.envelopePut` with
+    ///   fail-closed `vault.lock` rollback on upload error, persists `rootKeyB64`, and exposes
+    ///   one-time `pendingEmergencyKit`.
+    /// - Case A (no credentials supplied & local Keychain has `VaultRootKey`): unlocks via
+    ///   `vault.unlockWithKeyBytes`.
+    /// - Case B (no credentials supplied & local Keychain empty): queries `vault.envelopeGet` FIRST
+    ///   and ALWAYS fails closed with typed `unlockPromptReason` (NEVER mints an unbacked random key!).
     public func unlockVault(
         passphraseOrPassword: String? = nil,
         emergencyKit: String? = nil
     ) async {
         errorMessage = nil
         statusMessage = nil
+        unlockPromptReason = nil
         guard coordinator.isStarted else {
             errorMessage = FabushiCoordinatorError.notStarted.localizedDescription
             return
@@ -654,13 +699,21 @@ public final class FabushiCredentialVaultViewModel {
                 return
             }
 
-            if let kit = emergencyKit?.trimmingCharacters(in: .whitespacesAndNewlines), !kit.isEmpty {
+            let trimmedKit = emergencyKit?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasKit = (trimmedKit?.isEmpty == false)
+            let hasSecret = (passphraseOrPassword?.isEmpty == false)
+
+            if hasKit, let kit = trimmedKit {
+                // Case D: Emergency Kit recovery
                 let envResp: FabushiVaultEnvelopeResponseDTO = try await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.vault.method("envelopeGet"),
                     params: FabushiEmptyParams()
                 )
-                let nested = envResp.envelope.map(FabushiVaultEnvelopeConverter.toNested)
-                let _: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                guard let flatEnv = envResp.envelope else {
+                    throw FabushiVaultValidationError.remoteEnvelopeMissingForRecovery
+                }
+                let nested = FabushiVaultEnvelopeConverter.toNested(flatEnv)
+                let unlockRes: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.vault.method("unlockWithRecoveryKey"),
                     params: FabushiVaultUnlockRecoveryRequest(
                         userId: userId,
@@ -668,14 +721,24 @@ public final class FabushiCredentialVaultViewModel {
                         envelope: nested
                     )
                 )
-            } else if let secret = passphraseOrPassword, !secret.isEmpty {
+                guard unlockRes.unlocked else {
+                    throw FabushiVaultValidationError.unlockRejected
+                }
+                if let rootKeyB64 = unlockRes.rootKeyB64, !rootKeyB64.isEmpty {
+                    try securityKeychain.saveVaultRootKeyBase64(rootKeyB64, accountId: accountId)
+                }
+            } else if hasSecret, let secret = passphraseOrPassword {
+                // Case C: Passphrase / Split-Key Password unlock or first-time Split-Key V2 initialization
                 let envResp: FabushiVaultEnvelopeResponseDTO = try await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.vault.method("envelopeGet"),
                     params: FabushiEmptyParams()
                 )
                 if let flatEnv = envResp.envelope {
+                    // Subcase C1: Existing remote envelope -> dispatch strictly by kdf_alg
                     let nested = FabushiVaultEnvelopeConverter.toNested(flatEnv)
-                    if flatEnv.kdfAlg == "split_key_v2" {
+                    let alg = flatEnv.kdfAlg.trimmingCharacters(in: .whitespacesAndNewlines)
+                    switch alg {
+                    case "split_key_v2":
                         let res: FabushiVaultUnlockWithSplitKeyResponse = try await coordinator.dispatchFenced(
                             method: FabushiRPCNamespace.vault.method("unlockWithSplitKey"),
                             params: FabushiVaultUnlockWithSplitKeyRequest(
@@ -685,9 +748,12 @@ public final class FabushiCredentialVaultViewModel {
                                 password: secret
                             )
                         )
+                        guard res.unlocked else {
+                            throw FabushiVaultValidationError.unlockRejected
+                        }
                         try securityKeychain.saveVaultRootKeyBase64(res.rootKeyB64, accountId: accountId)
-                    } else {
-                        let _: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                    case "argon2id":
+                        let res: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
                             method: FabushiRPCNamespace.vault.method("unlockWithPassphrase"),
                             params: FabushiVaultUnlockPassphraseRequest(
                                 userId: userId,
@@ -695,8 +761,20 @@ public final class FabushiCredentialVaultViewModel {
                                 envelope: nested
                             )
                         )
+                        guard res.unlocked else {
+                            throw FabushiVaultValidationError.unlockRejected
+                        }
+                        if let rootKeyB64 = res.rootKeyB64, !rootKeyB64.isEmpty {
+                            try securityKeychain.saveVaultRootKeyBase64(rootKeyB64, accountId: accountId)
+                        }
+                    case "device_keychain_v2":
+                        unlockPromptReason = .existingRemoteEnvelopeRequiresCredentials
+                        throw FabushiVaultValidationError.unsupportedEnvelopeKdf("device_keychain_v2")
+                    default:
+                        throw FabushiVaultValidationError.unsupportedEnvelopeKdf(alg)
                     }
                 } else {
+                    // Subcase C2: Confirmed nil remote envelope -> initSplitKey + envelopePut + rollback guard
                     let initRes: FabushiVaultInitSplitKeyResponse = try await coordinator.dispatchFenced(
                         method: FabushiRPCNamespace.vault.method("initSplitKey"),
                         params: FabushiVaultInitSplitKeyRequest(
@@ -704,25 +782,52 @@ public final class FabushiCredentialVaultViewModel {
                             password: secret,
                             saltB64: nil,
                             kdfParams: nil,
-                            fastKdf: nil
+                            fastKdf: useFastKdfForTests ? true : nil
                         )
                     )
+                    let flatEnvelope = FabushiVaultEnvelopeConverter.toFlat(initRes.envelope)
+                    do {
+                        let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                            method: FabushiRPCNamespace.vault.method("envelopePut"),
+                            params: flatEnvelope
+                        )
+                    } catch {
+                        // CRITICAL: vault.initSplitKey already unlocked Rust's in-memory key!
+                        // Roll back immediately so vault remains fail-closed locked on upload failure.
+                        let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
+                            method: FabushiRPCNamespace.vault.method("lock"),
+                            params: FabushiEmptyParams()
+                        )
+                        coordinator.vaultStore.setUnlocked(false)
+                        isUnlocked = false
+                        throw FabushiVaultValidationError.envelopeUploadFailed(error.localizedDescription)
+                    }
                     try securityKeychain.saveVaultRootKeyBase64(initRes.rootKeyB64, accountId: accountId)
+                    pendingEmergencyKit = initRes.emergencyKit
                 }
             } else if let storedRootKeyB64 = try securityKeychain.loadVaultRootKeyBase64(accountId: accountId) {
-                let _: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                // Case A: Local Keychain already stores this account's 32-byte VaultRootKey
+                let unlockRes: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
                     method: FabushiRPCNamespace.vault.method("unlockWithKeyBytes"),
                     params: FabushiVaultUnlockWithKeyBytesRequest(rootKeyB64: storedRootKeyB64)
                 )
+                guard unlockRes.unlocked else {
+                    throw FabushiVaultValidationError.unlockRejected
+                }
             } else {
-                // First-time device-bound Keychain VaultRootKey provisioning (real 32-byte CSPRNG -> Keychain -> Rust).
-                let freshKeyData = try FabushiPasscodeCrypto.generateRandomBytes(count: 32)
-                let freshKeyB64 = freshKeyData.base64EncodedString()
-                try securityKeychain.saveVaultRootKeyBase64(freshKeyB64, accountId: accountId)
-                let _: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
-                    method: FabushiRPCNamespace.vault.method("unlockWithKeyBytes"),
-                    params: FabushiVaultUnlockWithKeyBytesRequest(rootKeyB64: freshKeyB64)
+                // Case B: Empty local Keychain and no credentials -> query server FIRST, ALWAYS fail closed!
+                let envResp: FabushiVaultEnvelopeResponseDTO = try await coordinator.dispatchFenced(
+                    method: FabushiRPCNamespace.vault.method("envelopeGet"),
+                    params: FabushiEmptyParams()
                 )
+                if envResp.envelope != nil {
+                    unlockPromptReason = .existingRemoteEnvelopeRequiresCredentials
+                    errorMessage = FabushiVaultValidationError.remoteEnvelopeRequiresCredentials.localizedDescription
+                } else {
+                    unlockPromptReason = .noRemoteEnvelopeRequiresInitialization
+                    errorMessage = FabushiVaultValidationError.remoteEnvelopeMissingForInitialization.localizedDescription
+                }
+                return
             }
 
             isUnlocked = true
@@ -736,8 +841,10 @@ public final class FabushiCredentialVaultViewModel {
     public func lockVault() async {
         stopTotpTicker()
         items = []
+        totpAccounts = []
         liveTotpCodes = [:]
         remoteEncryptedTotpCount = 0
+        unlockPromptReason = nil
         isUnlocked = false
         coordinator.vaultStore.setUnlocked(false)
 

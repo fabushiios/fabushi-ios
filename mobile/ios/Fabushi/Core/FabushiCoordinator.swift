@@ -129,6 +129,8 @@ public final class FabushiCoordinator {
     @ObservationIgnored
     private var inFlightStartId: UInt64 = 0
     @ObservationIgnored
+    private var accountSecretsPurgers: [String: @MainActor (String) -> Void] = [:]
+    @ObservationIgnored
     private var inFlightStartTask: Task<Void, Error>? = nil
     @ObservationIgnored
     private var shutdownTaskCounter: UInt64 = 0
@@ -586,10 +588,32 @@ public final class FabushiCoordinator {
         return res.generation
     }
 
+    // MARK: - Account-Scoped Secrets Purge Hook (D7)
+
+    public func registerAccountSecretsPurger(
+        id: String = "default",
+        _ purger: @escaping @MainActor (String) -> Void
+    ) {
+        accountSecretsPurgers[id] = purger
+    }
+
+    public func unregisterAccountSecretsPurger(id: String) {
+        accountSecretsPurgers.removeValue(forKey: id)
+    }
+
+    private func purgeDepartingAccountSecrets(accountId: String?) {
+        guard let accountId, !accountId.isEmpty else { return }
+        try? keychain.deleteAccountKey(accountId: accountId)
+        for purger in accountSecretsPurgers.values {
+            purger(accountId)
+        }
+    }
+
     @discardableResult
     public func clearLocalSession() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
         let capturedEpoch = coordinatorLifecycleEpoch
+        let departingAccountId = activeAccountId
         let res = try await host.clearSession(generation: accountScopeGeneration)
         guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
             throw FabushiCoordinatorError.notStarted
@@ -603,6 +627,7 @@ public final class FabushiCoordinator {
         applyGenerationAdvance(res.generation)
         activeAccountId = nil
         authState = .unauthenticated
+        purgeDepartingAccountSecrets(accountId: departingAccountId)
         return res.generation
     }
 
@@ -610,6 +635,7 @@ public final class FabushiCoordinator {
     public func logout() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
         let capturedEpoch = coordinatorLifecycleEpoch
+        let departingAccountId = activeAccountId
         do {
             let res = try await host.logout(generation: accountScopeGeneration)
             guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
@@ -624,6 +650,7 @@ public final class FabushiCoordinator {
             applyGenerationAdvance(res.generation)
             activeAccountId = nil
             authState = .unauthenticated
+            purgeDepartingAccountSecrets(accountId: departingAccountId)
             return res.generation
         } catch let coordinatorError as FabushiCoordinatorError {
             throw coordinatorError
@@ -632,7 +659,7 @@ public final class FabushiCoordinator {
                 throw FabushiCoordinatorError.notStarted
             }
             // Rust rejected auth.logout pre-dispatch because another transition already
-            // advanced generation; NEVER blindly wipe the newer active session.
+            // advanced generation; NEVER blindly wipe the newer active session or purge its secrets.
             await reconcileAuthoritativeSessionState(expectedEpoch: capturedEpoch)
             guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
                 throw FabushiCoordinatorError.notStarted
@@ -647,6 +674,9 @@ public final class FabushiCoordinator {
             await reconcileAuthoritativeSessionState(expectedEpoch: capturedEpoch)
             guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
                 throw FabushiCoordinatorError.notStarted
+            }
+            if authState == .unauthenticated {
+                purgeDepartingAccountSecrets(accountId: departingAccountId)
             }
             throw error
         }

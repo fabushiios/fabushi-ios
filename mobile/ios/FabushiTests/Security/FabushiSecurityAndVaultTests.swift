@@ -1,6 +1,10 @@
 import Foundation
 import os
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+import UniformTypeIdentifiers
 import XCTest
 @testable import Fabushi
 
@@ -67,8 +71,9 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
         do {
             let router = ShellNavigationRouter()
+            FabushiSecurityModule(securityKeychain: secKC).installLogoutSecretsPurger(on: coordinator)
 
-            // 1. Sign in Account A (101)
+            // 1. Sign in Account A (101) & seed VaultRootKey + TOTP + unlock Rust vault
             let envA: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                 method: FabushiRPCNamespace.auth.method("login"),
                 params: FabushiLegacyLoginRequest(username: "alice_acct", password: "PasswordA!1"),
@@ -77,6 +82,10 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(coordinator.activeAccountId, "101")
             let keyA = try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString()
             try secKC.saveVaultRootKeyBase64(keyA, accountId: "101")
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "alice@ex", issuer: "Fabushi", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "101"
+            )
             XCTAssertTrue(secKC.hasVaultRootKey(accountId: "101"))
 
             // 2. Add Account B (202) WITHOUT logging out Account A!
@@ -87,6 +96,16 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             )
             XCTAssertGreaterThan(envB.generation, envA.generation)
             XCTAssertEqual(coordinator.activeAccountId, "202")
+            let keyB = try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString()
+            try secKC.saveVaultRootKeyBase64(keyB, accountId: "202")
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "bob@ex", issuer: "Fabushi", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "202"
+            )
+            let _: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("unlockWithKeyBytes"),
+                params: FabushiVaultUnlockWithKeyBytesRequest(rootKeyB64: keyB)
+            )
             XCTAssertEqual(
                 server.requests(method: "POST", pathPrefix: "/api/v1/auth/logout").count,
                 0,
@@ -97,13 +116,21 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(accountsList.accounts.count, 2)
             XCTAssertEqual(accountsList.activeAccountId, "202")
 
-            // 3. Atomic switch back to Account A -> advances generation & resets router scope
+            // 3. Atomic switch back to Account A -> advances generation, locks Rust vault & resets router scope
             router.isAccountSwitcherPresented = true
             let genAfterSwitch = try await coordinator.switchAccount(accountId: "101")
             XCTAssertGreaterThan(genAfterSwitch, envB.generation)
             XCTAssertEqual(
                 coordinator.authState,
                 .authenticated(userId: 101, username: "alice_acct", accountId: "101")
+            )
+            let rustStatusAfterSwitch: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("status"),
+                params: FabushiEmptyParams()
+            )
+            XCTAssertFalse(
+                rustStatusAfterSwitch.unlocked,
+                "Switching from Account B to Account A must lock Rust vault in-memory key"
             )
             XCTAssertTrue(router.handleAccountScopeChange(generation: genAfterSwitch, coordinator: coordinator))
             XCTAssertFalse(router.isAccountSwitcherPresented)
@@ -116,14 +143,17 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(FabushiAccountQuotaPolicy.canAddAccount(currentCount: 3, isPremium: true))
             XCTAssertFalse(FabushiAccountQuotaPolicy.canAddAccount(currentCount: 6, isPremium: true))
 
-            // 5. Logout Account A & scrub isolated Keychain secrets
+            // 5. D7: coordinator.logout() ITSELF scrubs Account A's Keychain secrets while preserving Account B!
             let genAfterLogout = try await coordinator.logout()
-            try? coreKC.deleteAccountKey(accountId: "101")
-            secKC.purgeAccountSecrets(accountId: "101")
             XCTAssertGreaterThan(genAfterLogout, genAfterSwitch)
             XCTAssertEqual(coordinator.authState, .unauthenticated)
             XCTAssertFalse(try coreKC.hasAccountKey(accountId: "101"))
             XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
+            XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "101").isEmpty)
+            // Account B remains untouched
+            XCTAssertTrue(try coreKC.hasAccountKey(accountId: "202"))
+            XCTAssertTrue(secKC.hasVaultRootKey(accountId: "202"))
+            XCTAssertEqual(try secKC.loadTotpAccounts(accountId: "202").count, 1)
 
             await coordinator.shutdown()
         } catch {
@@ -223,8 +253,19 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(controller.evaluateIdleAutoLock(router: router))
             XCTAssertTrue(router.isPasscodeLocked)
 
-            // 6. Clear passcode wipes Keychain & Rust
-            try await controller.clearPasscode(coordinator: coordinator)
+            // 6. D5: Clear passcode rejects missing re-auth, then authorized clear wipes Keychain & Rust
+            do {
+                try await controller.clearPasscode(coordinator: coordinator)
+                XCTFail("Expected FabushiPasscodePolicyError.reauthenticationRequired")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            XCTAssertTrue(controller.isPasscodeEnabled)
+
+            try await controller.clearPasscode(
+                authorization: .currentPasscode("246810"),
+                coordinator: coordinator
+            )
             XCTAssertFalse(controller.isPasscodeEnabled)
             XCTAssertNil(try secKC.loadPasscodeRecord())
 
@@ -239,10 +280,21 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
     func testF23VaultEnvelopeConversionSealOpenSync24MiBBoundAndOriginCRUD() async throws {
         let serverItems = OSAllocatedUnfairLock<[String: FabushiEncryptedVaultBlobDTO]>(initialState: [:])
+        let storedEnvelopeJSON = OSAllocatedUnfairLock<String?>(initialState: nil)
 
         let server = try M2bLoopbackHTTPTestServer { req in
             if req.method == "POST", req.path == "/api/v1/auth/login" {
                 return .json(200, #"{"user_id":7001,"username":"vault_alice","session_id":"s-7001","token":"tok-7001","first_name":"Vault"}"#)
+            }
+            if req.method == "GET", req.path == "/api/v1/user-vault/envelope" {
+                if let env = storedEnvelopeJSON.withLock({ $0 }) {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            }
+            if req.method == "PUT", req.path == "/api/v1/user-vault/envelope" {
+                storedEnvelopeJSON.withLock { $0 = req.bodyString }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
             }
             if req.method == "GET", req.path == "/api/v1/user-vault/items" {
                 let items = serverItems.withLock { Array($0.values) }
@@ -345,11 +397,19 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
             )
 
-            let vm = FabushiCredentialVaultViewModel(coordinator: coordinator, securityKeychain: secKC)
-            await vm.unlockVault()
+            let vm = FabushiCredentialVaultViewModel(
+                coordinator: coordinator,
+                securityKeychain: secKC,
+                useFastKdfForTests: true
+            )
+            await vm.unlockVault(passphraseOrPassword: "VaultMasterPass!7")
             XCTAssertTrue(vm.isUnlocked)
             XCTAssertTrue(coordinator.vaultStore.isUnlocked)
             XCTAssertTrue(secKC.hasVaultRootKey(accountId: "7001"))
+            XCTAssertTrue(vm.pendingEmergencyKit?.hasPrefix("EK-") == true)
+            vm.acknowledgeEmergencyKit()
+            XCTAssertNil(vm.pendingEmergencyKit)
+            XCTAssertEqual(server.requests(method: "PUT", pathPrefix: "/api/v1/user-vault/envelope").count, 1)
 
             // 3. Save & round-trip across ALL 3 canonical categories: password, browser_cookie, ai_oauth
             for (category, key, secret) in [
@@ -423,12 +483,29 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(decrypted.username, "alice@example.com")
             XCTAssertEqual(decrypted.password, "LocalOriginPassword!7")
             XCTAssertEqual(decrypted.totpCode?.count, 6)
+            // Origin mismatch MUST fail closed on decryptLocalOriginCredential
+            do {
+                _ = try await vm.decryptLocalOriginCredential(
+                    credentialId: meta.credentialId,
+                    origin: "https://evil.example"
+                )
+                XCTFail("Expected origin mismatch failure")
+            } catch {
+                // Expected fail-closed rejection
+            }
+
             let deletedOriginCredential = try await vm.deleteLocalOriginCredential(credentialId: meta.credentialId)
             XCTAssertTrue(deletedOriginCredential)
 
             await vm.lockVault()
             XCTAssertFalse(vm.isUnlocked)
             XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertTrue(vm.totpAccounts.isEmpty)
+            let rustLockedStatus: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("status"),
+                params: FabushiEmptyParams()
+            )
+            XCTAssertFalse(rustLockedStatus.unlocked)
 
             await coordinator.shutdown()
         } catch {
@@ -452,10 +529,21 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         }
 
         let syncStore = OSAllocatedUnfairLock<SyncRecord?>(initialState: nil)
+        let storedEnvelopeJSON = OSAllocatedUnfairLock<String?>(initialState: nil)
 
         let server = try M2bLoopbackHTTPTestServer { req in
             if req.method == "POST", req.path == "/api/v1/auth/login" {
                 return .json(200, #"{"user_id":8001,"username":"sync_alice","session_id":"s-8001","token":"tok-8001","first_name":"Sync"}"#)
+            }
+            if req.method == "GET", req.path == "/api/v1/user-vault/envelope" {
+                if let env = storedEnvelopeJSON.withLock({ $0 }) {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            }
+            if req.method == "PUT", req.path == "/api/v1/user-vault/envelope" {
+                storedEnvelopeJSON.withLock { $0 = req.bodyString }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
             }
             if req.method == "POST", req.path == "/api/v1/user-vault/device-sync/request" {
                 let json = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
@@ -539,8 +627,14 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
             )
 
-            let vm = FabushiCredentialVaultViewModel(coordinator: coordinator, securityKeychain: secKC)
-            await vm.unlockVault()
+            let vm = FabushiCredentialVaultViewModel(
+                coordinator: coordinator,
+                securityKeychain: secKC,
+                useFastKdfForTests: true
+            )
+            await vm.unlockVault(passphraseOrPassword: "SyncVaultPass!1")
+            XCTAssertTrue(vm.isUnlocked)
+            vm.acknowledgeEmergencyKit()
             let originalRootKeyB64 = try XCTUnwrap(try secKC.loadVaultRootKeyBase64(accountId: "8001"))
 
             // 1. New device requests key (X25519 keygen -> 6-digit NNN-NNN safety fingerprint)
@@ -558,9 +652,23 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(approved.ok)
             XCTAssertEqual(approved.status, "approved")
 
-            // 3. Requester locks vault, removes Keychain root key, polls status, opens X25519 transfer & recovers exact same 32-byte key!
+            // 3. Requester locks vault & removes Keychain root key:
+            //    (a) Locked approver MUST fail closed with .vaultLocked
+            //    (b) Bare unlockVault() MUST fail closed with .existingRemoteEnvelopeRequiresCredentials (ZERO random key!)
+            //    (c) X25519 device sync open recovers the exact same 32-byte key!
             await vm.lockVault()
             try secKC.deleteVaultRootKey(accountId: "8001")
+            do {
+                _ = try await vm.approvePendingDeviceSync(pending)
+                XCTFail("Expected FabushiVaultValidationError.vaultLocked on locked approver")
+            } catch let err as FabushiVaultValidationError {
+                XCTAssertEqual(err, .vaultLocked)
+            }
+            await vm.unlockVault()
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertEqual(vm.unlockPromptReason, .existingRemoteEnvelopeRequiresCredentials)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "8001"))
+
             let finalStatus = try await vm.checkDeviceSyncStatusAndOpenIfApproved()
             XCTAssertEqual(finalStatus, "approved")
             XCTAssertTrue(vm.isUnlocked)
@@ -650,6 +758,17 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(vm.totpAccounts.isEmpty)
             XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "9001").isEmpty)
 
+            // Negative TOTP URI & invalid Base32 checks leave Keychain clean
+            XCTAssertNil(FabushiTotpURIInfo.parse("otpauth://hotp/Fabushi:alice?secret=\(secret)"))
+            XCTAssertNil(FabushiTotpURIInfo.parse("otpauth://totp/Fabushi:alice?issuer=Fabushi"))
+            XCTAssertNil(FabushiTotpURIInfo.parse("   "))
+            do {
+                try await vm.addTotpAccount(label: "bad", issuer: "Test", secretOrURI: "!!!INVALID_BASE32!!!")
+                XCTFail("Expected invalid Base32 secret to fail closed")
+            } catch {
+                XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "9001").isEmpty)
+            }
+
             // 3. Honest Remote Obscura iOS sandbox disclosure in both en & zh-Hans
             let enNotice = FabushiLocale.en.localized("hig.vault.obscuraIosSandboxNotice", bundle: .main)
             let zhNotice = FabushiLocale.zhHans.localized("hig.vault.obscuraIosSandboxNotice", bundle: .main)
@@ -658,7 +777,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(zhNotice.contains("沙盒"))
             XCTAssertTrue(zhNotice.contains("桌面"))
 
-            // 4. FabushiSecurityModule implements all 6 SecurityModuleProviding factories cleanly
+            // 4. FabushiSecurityModule registration & logout purger wiring contract
             let registry = FabushiFeatureModuleRegistry()
             let secModule = FabushiSecurityModule(
                 passcodeController: FabushiPasscodeLockController(keychainStore: secKC),
@@ -666,21 +785,636 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
             )
             registry.register(security: secModule)
             XCTAssertTrue(registry.security === secModule)
-
             let router = ShellNavigationRouter()
-            let launchConfig = FabushiLaunchConfiguration(environment: [:], arguments: [])
-            let factories: [AnyView] = [
-                registry.security.makePasscodeLockOverlay(coordinator: coordinator, launchConfiguration: launchConfig) {},
-                registry.security.makePrivacyBlurOverlay(),
-                registry.security.makeAccountSwitcherSheet(coordinator: coordinator, router: router) {},
-                registry.security.makeVaultSettingsView(coordinator: coordinator),
-                registry.security.makeDevicesSettingsView(coordinator: coordinator),
-                registry.security.makePrivacySecuritySettingsView(coordinator: coordinator, router: router),
-            ]
-            XCTAssertEqual(factories.count, 6)
-            for view in factories {
-                XCTAssertTrue(type(of: view) == AnyView.self)
+            _ = registry.security.makeAccountSwitcherSheet(coordinator: coordinator, router: router) {}
+            XCTAssertEqual(FabushiAccessibilityIDs.Settings.vaultUnlockButton, "fabushi.settings.vaultUnlockButton")
+            XCTAssertEqual(FabushiAccessibilityIDs.Settings.vaultTotpCodeLabel, "fabushi.settings.vaultTotpCodeLabel")
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - D1 Regression: Passive UIWindow Recognizer, Throttling & Typing Activity Idle Prevention
+
+    func testD1UserActivityObserverWindowRecognizerThrottlingAndIdlePrevention() async throws {
+        let (_, secKC) = makeIsolatedKeychains()
+        defer { try? secKC.deletePasscodeRecord() }
+
+        let clock = OSAllocatedUnfairLock<Date>(initialState: Date(timeIntervalSince1970: 1_700_000_000))
+        let controller = FabushiPasscodeLockController(
+            keychainStore: secKC,
+            useFastIterationsForTests: true,
+            nowProvider: { clock.withLock { $0 } }
+        )
+        try await controller.setPasscode("246810", coordinator: nil)
+        try controller.setAutoLockTimeoutSeconds(60)
+
+        let router = ShellNavigationRouter(isPasscodeLockEnabled: true)
+        router.isPasscodeLocked = false
+
+        // Throttling verification
+        clock.withLock { $0 = $0.addingTimeInterval(0.2) }
+        XCTAssertFalse(controller.recordUserActivityIfNeeded(minimumInterval: 1.0))
+        clock.withLock { $0 = $0.addingTimeInterval(1.0) }
+        XCTAssertTrue(controller.recordUserActivityIfNeeded(minimumInterval: 1.0))
+        let baselineActivity = controller.lastActivityDate
+
+        #if canImport(UIKit)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let observerCoord = FabushiUserActivityObserverView.Coordinator {
+            _ = controller.recordUserActivityIfNeeded(minimumInterval: 1.0)
+        }
+        let anchor = FabushiUserActivityObserverView.AnchorView(frame: .zero)
+        anchor.onWindowChange = { attachedWin in
+            observerCoord.attach(to: attachedWin)
+        }
+        window.addSubview(anchor)
+        defer { observerCoord.detach() }
+
+        let recognizers = window.gestureRecognizers ?? []
+        let attached = try XCTUnwrap(
+            recognizers.first(where: { $0 is FabushiActivityObservationGestureRecognizer })
+                as? FabushiActivityObservationGestureRecognizer,
+            "FabushiActivityObservationGestureRecognizer must attach to hosting UIWindow"
+        )
+        XCTAssertFalse(attached.cancelsTouchesInView)
+        XCTAssertFalse(attached.delaysTouchesBegan)
+        XCTAssertFalse(attached.delaysTouchesEnded)
+        XCTAssertFalse(attached.canPrevent(UITapGestureRecognizer()))
+        XCTAssertFalse(attached.canBePrevented(by: UITapGestureRecognizer()))
+
+        // Advance +45s and simulate software keyboard typing notification -> resets idle timer!
+        clock.withLock { $0 = $0.addingTimeInterval(45) }
+        NotificationCenter.default.post(name: UITextField.textDidChangeNotification, object: nil)
+        await Task.yield()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertGreaterThan(controller.lastActivityDate, baselineActivity)
+
+        // Advance another +45s (90s total, 45s since typing) -> MUST NOT lock yet!
+        clock.withLock { $0 = $0.addingTimeInterval(45) }
+        XCTAssertFalse(controller.evaluateIdleAutoLock(router: router))
+        XCTAssertFalse(router.isPasscodeLocked)
+
+        // Advance +16s with no activity (61s since typing) -> MUST lock!
+        clock.withLock { $0 = $0.addingTimeInterval(16) }
+        XCTAssertTrue(controller.evaluateIdleAutoLock(router: router))
+        XCTAssertTrue(router.isPasscodeLocked)
+
+        // Detach cleans up gesture recognizer from window (zero leaks)
+        observerCoord.detach()
+        XCTAssertFalse(
+            (window.gestureRecognizers ?? []).contains(where: { $0 is FabushiActivityObservationGestureRecognizer })
+        )
+        #endif
+    }
+
+    // MARK: - D2 Regression: Background ScenePhase Respects autoLockTimeoutSeconds & Preserves Locked Sessions
+
+    func testD2BackgroundScenePhaseRespectsAutoLockTimeoutAndNeverUnlocksLockedSession() async throws {
+        let (_, secKC) = makeIsolatedKeychains()
+        defer { try? secKC.deletePasscodeRecord() }
+
+        let clock = OSAllocatedUnfairLock<Date>(initialState: Date(timeIntervalSince1970: 1_700_010_000))
+        let controller = FabushiPasscodeLockController(
+            keychainStore: secKC,
+            useFastIterationsForTests: true,
+            nowProvider: { clock.withLock { $0 } }
+        )
+        try await controller.setPasscode("246810", coordinator: nil)
+        try controller.setAutoLockTimeoutSeconds(60)
+
+        let router = ShellNavigationRouter(isPasscodeLockEnabled: true)
+        router.isPasscodeLocked = false
+
+        // 1. Brief switch (< 60s): .background MUST NOT lock immediately; returning at +15s stays unlocked & refreshes activity
+        controller.handleScenePhaseChange(.background, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        XCTAssertNotNil(controller.backgroundedAtDate)
+
+        clock.withLock { $0 = $0.addingTimeInterval(15) }
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        XCTAssertNil(controller.backgroundedAtDate)
+        XCTAssertEqual(controller.lastActivityDate, clock.withLock { $0 })
+        XCTAssertFalse(controller.evaluateIdleAutoLock(router: router))
+
+        // 2. Long background (>= 60s): locks immediately upon returning to .active
+        controller.handleScenePhaseChange(.background, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        clock.withLock { $0 = $0.addingTimeInterval(60) }
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertTrue(router.isPasscodeLocked)
+
+        // 3. Disabled (autoLockTimeoutSeconds == 0): never auto-locks even after 24h in background
+        router.isPasscodeLocked = false
+        try controller.setAutoLockTimeoutSeconds(0)
+        controller.handleScenePhaseChange(.background, router: router)
+        clock.withLock { $0 = $0.addingTimeInterval(86_400) }
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertFalse(router.isPasscodeLocked)
+        XCTAssertFalse(controller.shouldEngageIdleAutoLock())
+
+        // 4. Already locked session stays locked across .background -> .active (T2_11 invariant)
+        router.isPasscodeLocked = true
+        try controller.setAutoLockTimeoutSeconds(300)
+        controller.handleScenePhaseChange(.background, router: router)
+        clock.withLock { $0 = $0.addingTimeInterval(5) }
+        controller.handleScenePhaseChange(.active, router: router)
+        XCTAssertTrue(router.isPasscodeLocked)
+    }
+
+    // MARK: - D3 Regression: Fail-Closed 4-Case Vault Unlock State Machine, Envelope Upload Rollback & Recovery
+
+    func testD3VaultUnlockFailClosedStateMachineEnvelopeUploadAndRecovery() async throws {
+        let serverEnvelopeJSON = OSAllocatedUnfairLock<String?>(initialState: nil)
+        let failEnvelopePut = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let serverItems = OSAllocatedUnfairLock<[String: FabushiEncryptedVaultBlobDTO]>(initialState: [:])
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            if req.method == "POST", req.path == "/api/v1/auth/login" {
+                return .json(200, #"{"user_id":7101,"username":"d3_vault_user","session_id":"s-7101","token":"tok-7101","first_name":"D3User"}"#)
             }
+            if req.method == "GET", req.path == "/api/v1/user-vault/envelope" {
+                if let env = serverEnvelopeJSON.withLock({ $0 }) {
+                    return .json(200, "{\"envelope\":\(env)}")
+                }
+                return .json(200, #"{"envelope":null}"#)
+            }
+            if req.method == "PUT", req.path == "/api/v1/user-vault/envelope" {
+                if failEnvelopePut.withLock({ $0 }) {
+                    return .json(500, #"{"error":"storage_unavailable"}"#)
+                }
+                serverEnvelopeJSON.withLock { $0 = req.bodyString }
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            }
+            if req.method == "GET", req.path == "/api/v1/user-vault/items" {
+                let items = serverItems.withLock { Array($0.values) }
+                let resp = FabushiVaultSyncPullResponse(latestRevision: 1, items: items)
+                let data = (try? JSONEncoder().encode(resp)) ?? Data("{\"latest_revision\":0,\"items\":[]}".utf8)
+                return .json(200, String(decoding: data, as: UTF8.self))
+            }
+            if req.method == "PUT", req.path.hasPrefix("/api/v1/user-vault/items/") {
+                let tail = String(req.path.dropFirst("/api/v1/user-vault/items/".count))
+                let parts = tail.split(separator: "/", maxSplits: 1).map(String.init)
+                let category = (parts.first ?? "password").removingPercentEncoding ?? "password"
+                let itemKey = (parts.count > 1 ? parts[1] : "item").removingPercentEncoding ?? "item"
+                let json = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
+                let blob = FabushiEncryptedVaultBlobDTO(
+                    category: category,
+                    itemKey: itemKey,
+                    revision: 1,
+                    nonceB64: (json["nonce_b64"] as? String) ?? "",
+                    ciphertextB64: (json["ciphertext_b64"] as? String) ?? "",
+                    deleted: false,
+                    updatedAtMs: 1_700_000_000_000
+                )
+                serverItems.withLock { $0["\(category):\(itemKey)"] = blob }
+                return .json(200, #"{"ok":true,"category":"\#(category)","item_key":"\#(itemKey)","revision":1,"updated_at_ms":1700000000000}"#)
+            }
+            return .json(404, #"{"error":"not_found"}"#)
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("d3_vault_state_machine")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            try? coreKC.deleteAccountKey(accountId: "7101")
+            secKC.purgeAccountSecrets(accountId: "7101")
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("login"),
+                params: FabushiLegacyLoginRequest(username: "d3_vault_user", password: "Pass!1"),
+                extractIdentity: { $0.identityTuple }
+            )
+
+            let vm = FabushiCredentialVaultViewModel(
+                coordinator: coordinator,
+                securityKeychain: secKC,
+                useFastKdfForTests: true
+            )
+
+            // Case B2: No remote envelope, empty Keychain, bare unlockVault() -> MUST fail closed (ZERO random key!)
+            await vm.unlockVault()
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertEqual(vm.unlockPromptReason, .noRemoteEnvelopeRequiresInitialization)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "7101"))
+            let statusB2: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("status"),
+                params: FabushiEmptyParams()
+            )
+            XCTAssertFalse(statusB2.unlocked)
+
+            // Case C2-Negative: envelopePut HTTP 500 MUST roll back Rust vault via vault.lock!
+            failEnvelopePut.withLock { $0 = true }
+            await vm.unlockVault(passphraseOrPassword: "NewVaultPass!9")
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertNil(vm.pendingEmergencyKit)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "7101"))
+            let statusRollback: FabushiVaultUnlockStatusResponse = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.vault.method("status"),
+                params: FabushiEmptyParams()
+            )
+            XCTAssertFalse(
+                statusRollback.unlocked,
+                "Failed envelopePut MUST roll back Rust vault_unlocked_key via vault.lock"
+            )
+
+            // Case C2-Positive: initSplitKey + envelopePut + Emergency Kit + Keychain + seal item
+            failEnvelopePut.withLock { $0 = false }
+            await vm.unlockVault(passphraseOrPassword: "NewVaultPass!9")
+            XCTAssertTrue(vm.isUnlocked)
+            let originalRootKey = try XCTUnwrap(try secKC.loadVaultRootKeyBase64(accountId: "7101"))
+            let kit = try XCTUnwrap(vm.pendingEmergencyKit)
+            XCTAssertTrue(kit.hasPrefix("EK-"))
+            vm.acknowledgeEmergencyKit()
+            XCTAssertNil(vm.pendingEmergencyKit)
+            let uploadedEnv = try XCTUnwrap(serverEnvelopeJSON.withLock { $0 })
+            XCTAssertTrue(uploadedEnv.contains("split_key_v2"))
+            XCTAssertTrue(uploadedEnv.contains("kdf_m_cost_kib"))
+            XCTAssertTrue(uploadedEnv.contains("recovery_wrapped_root_key_b64"))
+
+            _ = try await vm.saveEncryptedItem(category: .password, itemKey: "proof_item", plaintext: "secret-proof-1")
+
+            // Case A: Lock -> unlock from local Keychain without passphrase -> decrypts item
+            await vm.lockVault()
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertTrue(vm.totpAccounts.isEmpty)
+            await vm.unlockVault()
+            XCTAssertTrue(vm.isUnlocked)
+            XCTAssertEqual(vm.items.first(where: { $0.itemKey == "proof_item" })?.plaintext, "secret-proof-1")
+
+            // Case B1: Existing remote envelope + empty local Keychain + bare unlockVault() -> MUST fail closed!
+            await vm.lockVault()
+            try secKC.deleteVaultRootKey(accountId: "7101")
+            await vm.unlockVault()
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertEqual(vm.unlockPromptReason, .existingRemoteEnvelopeRequiresCredentials)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "7101"))
+
+            // Case C1: Wrong password fails closed; right password unlocks & persists Keychain key
+            await vm.unlockVault(passphraseOrPassword: "WrongPass!")
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "7101"))
+
+            await vm.unlockVault(passphraseOrPassword: "NewVaultPass!9")
+            XCTAssertTrue(vm.isUnlocked)
+            XCTAssertEqual(try secKC.loadVaultRootKeyBase64(accountId: "7101"), originalRootKey)
+            XCTAssertEqual(vm.items.first(where: { $0.itemKey == "proof_item" })?.plaintext, "secret-proof-1")
+
+            // Case D: Emergency Kit recovery -> fails closed if remote envelope is nil; recovers & persists exact rootKeyB64 when present!
+            await vm.lockVault()
+            try secKC.deleteVaultRootKey(accountId: "7101")
+            let savedEnv = serverEnvelopeJSON.withLock { $0 }
+            serverEnvelopeJSON.withLock { $0 = nil }
+            await vm.unlockVault(emergencyKit: kit)
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertNotNil(vm.errorMessage)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "7101"))
+
+            serverEnvelopeJSON.withLock { $0 = savedEnv }
+            await vm.unlockVault(emergencyKit: kit)
+            XCTAssertTrue(vm.isUnlocked)
+            XCTAssertEqual(try secKC.loadVaultRootKeyBase64(accountId: "7101"), originalRootKey)
+            XCTAssertEqual(vm.items.first(where: { $0.itemKey == "proof_item" })?.plaintext, "secret-proof-1")
+
+            // Device-keychain-only cloud envelope rejects password unlock with clear guidance
+            await vm.lockVault()
+            try secKC.deleteVaultRootKey(accountId: "7101")
+            serverEnvelopeJSON.withLock {
+                $0 = #"{"key_version":2,"kdf_alg":"device_keychain_v2","kdf_salt_b64":"","kdf_m_cost_kib":65536,"kdf_t_cost":3,"kdf_p_cost":1,"wrapped_root_key_b64":"","recovery_wrapped_root_key_b64":"cmVjb3Zlcnk=","updated_at_ms":1700000000000}"#
+            }
+            await vm.unlockVault(passphraseOrPassword: "AnyPassword!1")
+            XCTAssertFalse(vm.isUnlocked)
+            XCTAssertEqual(vm.unlockPromptReason, .existingRemoteEnvelopeRequiresCredentials)
+            XCTAssertTrue(vm.errorMessage?.localizedCaseInsensitiveContains("Emergency Kit") == true)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - D5 & D9 Regression: Mandatory Re-Auth on Passcode Change/Clear, Progressive Lockout & Alphanumeric Support
+
+    func testD5AndD9PasscodeReauthEnforcementLockoutAndAlphanumericSupport() async throws {
+        let dir = try makeTempDir("d5_d9_passcode")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            try? secKC.deletePasscodeRecord()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: "http://127.0.0.1:9",
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let clock = OSAllocatedUnfairLock<Date>(initialState: Date(timeIntervalSince1970: 1_700_020_000))
+            let controller = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true,
+                nowProvider: { clock.withLock { $0 } }
+            )
+
+            // D9: Initial setup with alphanumeric passcode works in both Swift PBKDF2 & Rust Argon2id
+            try await controller.setPasscode("Abc!9x", coordinator: coordinator)
+            XCTAssertTrue(controller.isPasscodeEnabled)
+
+            struct VerifyParams: Encodable, Sendable { let passcode: String }
+            struct VerifyResp: Decodable, Sendable { let valid: Bool; let configured: Bool }
+            let rustVerifyAlpha: VerifyResp = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeVerify"),
+                params: VerifyParams(passcode: "Abc!9x")
+            )
+            XCTAssertTrue(rustVerifyAlpha.configured && rustVerifyAlpha.valid)
+
+            // D5: Unauthorized overwrite & clear MUST throw .reauthenticationRequired
+            do {
+                try await controller.setPasscode("New!23", coordinator: coordinator)
+                XCTFail("Expected .reauthenticationRequired on unauthorized overwrite")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+            do {
+                try await controller.clearPasscode(coordinator: coordinator)
+                XCTFail("Expected .reauthenticationRequired on unauthorized clear")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .reauthenticationRequired)
+            }
+
+            // Wrong current passcode triggers progressive lockout (1 -> 2 -> 3 locks out for 5s)
+            for expectedAttempt in 1...2 {
+                do {
+                    try await controller.clearPasscode(
+                        authorization: .currentPasscode("WrongPass"),
+                        coordinator: coordinator
+                    )
+                    XCTFail("Expected .currentPasscodeIncorrect")
+                } catch let err as FabushiPasscodePolicyError {
+                    XCTAssertEqual(err, .currentPasscodeIncorrect(failedAttempts: expectedAttempt))
+                }
+            }
+            do {
+                try await controller.setPasscode(
+                    "ZyX#42",
+                    currentAuthorization: .currentPasscode("WrongPass"),
+                    coordinator: coordinator
+                )
+                XCTFail("Expected .lockedOut on 3rd failed re-auth")
+            } catch let err as FabushiPasscodePolicyError {
+                XCTAssertEqual(err, .lockedOut(remainingSeconds: 5, failedAttempts: 3))
+            }
+
+            // Even right current passcode is rejected while lockout timer is active
+            do {
+                try await controller.clearPasscode(
+                    authorization: .currentPasscode("Abc!9x"),
+                    coordinator: coordinator
+                )
+                XCTFail("Expected .lockedOut during active lockout window")
+            } catch let err as FabushiPasscodePolicyError {
+                if case .lockedOut(let remaining, let attempts) = err {
+                    XCTAssertGreaterThan(remaining, 0)
+                    XCTAssertEqual(attempts, 3)
+                } else {
+                    XCTFail("Expected .lockedOut, got \(err)")
+                }
+            }
+
+            // Biometric re-auth when biometricsEnabled == false fails closed without modifying passcode
+            do {
+                try await controller.clearPasscode(
+                    authorization: .biometrics(localizedReason: "Disable passcode"),
+                    coordinator: coordinator
+                )
+                XCTFail("Expected .biometricVerificationFailed")
+            } catch let err as FabushiPasscodePolicyError {
+                if case .biometricVerificationFailed = err {
+                    // Expected
+                } else {
+                    XCTFail("Expected .biometricVerificationFailed, got \(err)")
+                }
+            }
+            XCTAssertTrue(controller.isPasscodeEnabled)
+
+            // Advance clock +6s -> authorized overwrite to alphanumeric "ZyX#42" succeeds!
+            clock.withLock { $0 = $0.addingTimeInterval(6) }
+            try await controller.setPasscode(
+                "ZyX#42",
+                currentAuthorization: .currentPasscode("Abc!9x"),
+                coordinator: coordinator
+            )
+            let oldRejected = await controller.verifyPasscode("Abc!9x", coordinator: coordinator)
+            XCTAssertEqual(oldRejected, .incorrect(failedAttempts: 1))
+            let newAccepted = await controller.verifyPasscode("ZyX#42", coordinator: coordinator)
+            XCTAssertEqual(newAccepted, .unlocked)
+
+            // Authorized clear wipes Keychain & Rust
+            try await controller.clearPasscode(
+                authorization: .currentPasscode("ZyX#42"),
+                coordinator: coordinator
+            )
+            XCTAssertFalse(controller.isPasscodeEnabled)
+            XCTAssertNil(try secKC.loadPasscodeRecord())
+            let rustCleared: VerifyResp = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeVerify"),
+                params: VerifyParams(passcode: "ZyX#42")
+            )
+            XCTAssertFalse(rustCleared.configured)
+            XCTAssertFalse(rustCleared.valid)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - D6 Regression: Local-Only Auto-Expiring Secure Clipboard Enforcement
+
+    func testD6SecureClipboardLocalOnlyAndExpirationEnforcement() async throws {
+        let t0 = Date(timeIntervalSince1970: 1_700_050_000)
+        let payload = FabushiSecureClipboard.makeSensitivePayload(
+            "EK-TEST-1234",
+            expirationSeconds: 60,
+            now: t0
+        )
+        XCTAssertTrue(payload.localOnly)
+        XCTAssertEqual(payload.typeIdentifier, UTType.plainText.identifier)
+        XCTAssertEqual(payload.value, "EK-TEST-1234")
+        XCTAssertEqual(payload.expirationDate, t0.addingTimeInterval(60))
+
+        // Clamping non-positive expiration to >= 1s
+        let clamped = FabushiSecureClipboard.makeSensitivePayload(
+            "EK-CLAMP",
+            expirationSeconds: 0,
+            now: t0
+        )
+        XCTAssertEqual(clamped.expirationDate, t0.addingTimeInterval(1))
+
+        #if canImport(UIKit)
+        defer { UIPasteboard.general.items = [] }
+
+        let copied = FabushiSecureClipboard.copySensitive("S3cr3t-TOTP-287082", expirationSeconds: 60)
+        XCTAssertTrue(copied.localOnly)
+        XCTAssertEqual(UIPasteboard.general.string, "S3cr3t-TOTP-287082")
+        XCTAssertTrue(UIPasteboard.general.contains(pasteboardTypes: [UTType.plainText.identifier]))
+
+        // Verify UIPasteboard actually honors `.expirationDate` (1s TTL clears automatically)
+        FabushiSecureClipboard.copySensitive("ephemeral-secret", expirationSeconds: 1)
+        XCTAssertEqual(UIPasteboard.general.string, "ephemeral-secret")
+
+        var expired = false
+        for _ in 0..<24 {
+            try await Task.sleep(nanoseconds: 250_000_000)
+            if UIPasteboard.general.string == nil {
+                expired = true
+                break
+            }
+        }
+        XCTAssertTrue(
+            expired,
+            "UIPasteboard.general must clear expired sensitive items set via FabushiSecureClipboard"
+        )
+        #endif
+    }
+
+    // MARK: - D7-Swift Regression: Coordinator Logout Purger Hook, Idempotency, Offline Wipe & Stale-Generation Preservation
+
+    func testD7CoordinatorLogoutHookPurgesKeychainSecretsAndRespectsStaleGeneration() async throws {
+        let failLogout = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("POST", "/api/v1/auth/login"):
+                if req.bodyString.contains("bob_d7") {
+                    return .json(200, #"{"user_id":202,"username":"bob_d7","session_id":"s-202","token":"tok-202","first_name":"Bob"}"#)
+                }
+                return .json(200, #"{"user_id":101,"username":"alice_d7","session_id":"s-101","token":"tok-101","first_name":"Alice"}"#)
+            case ("POST", "/api/v1/auth/logout"):
+                if failLogout.withLock({ $0 }) {
+                    return .json(500, #"{"error":"offline_logout_error"}"#)
+                }
+                return .json(200, #"{"ok":true}"#)
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("d7_logout_hook")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            for uid in ["101", "202"] {
+                try? coreKC.deleteAccountKey(accountId: uid)
+                secKC.purgeAccountSecrets(accountId: uid)
+            }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            // Register twice to prove keyed idempotency
+            let secModule = FabushiSecurityModule(securityKeychain: secKC)
+            secModule.installLogoutSecretsPurger(on: coordinator)
+            secModule.installLogoutSecretsPurger(on: coordinator)
+
+            // Sign in Account A (101) & Account B (202), seed Keychain secrets for BOTH
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("login"),
+                params: FabushiLegacyLoginRequest(username: "alice_d7", password: "pwA"),
+                extractIdentity: { $0.identityTuple }
+            )
+            try secKC.saveVaultRootKeyBase64(
+                try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString(),
+                accountId: "101"
+            )
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "alice@d7", issuer: "D7", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "101"
+            )
+
+            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                method: FabushiRPCNamespace.auth.method("login"),
+                params: FabushiLegacyLoginRequest(username: "bob_d7", password: "pwB"),
+                extractIdentity: { $0.identityTuple }
+            )
+            try secKC.saveVaultRootKeyBase64(
+                try FabushiPasscodeCrypto.generateRandomBytes(count: 32).base64EncodedString(),
+                accountId: "202"
+            )
+            try secKC.saveTotpAccounts(
+                [FabushiStoredTotpAccount(label: "bob@d7", issuer: "D7", secret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
+                accountId: "202"
+            )
+
+            // 1. Stale generation guard: MUST preserve active account "202" secrets when logout throws stale_generation!
+            _ = try await coordinator.host.bumpGeneration()
+            do {
+                _ = try await coordinator.logout()
+                XCTFail("Expected stale_generation on bumped host generation")
+            } catch let hostErr as FabushiHostError {
+                XCTAssertEqual(hostErr.code, "stale_generation")
+            }
+            XCTAssertTrue(try coreKC.hasAccountKey(accountId: "202"))
+            XCTAssertTrue(secKC.hasVaultRootKey(accountId: "202"))
+            XCTAssertEqual(try secKC.loadTotpAccounts(accountId: "202").count, 1)
+
+            // 2. Normal direct coordinator.logout() (no AccountSwitcher): scrubs "202", preserves "101"!
+            _ = try await coordinator.logout()
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertFalse(try coreKC.hasAccountKey(accountId: "202"))
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "202"))
+            XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "202").isEmpty)
+            XCTAssertTrue(try coreKC.hasAccountKey(accountId: "101"))
+            XCTAssertTrue(secKC.hasVaultRootKey(accountId: "101"))
+            XCTAssertEqual(try secKC.loadTotpAccounts(accountId: "101").count, 1)
+
+            // 3. Offline logout (HTTP 500 -> Rust wipes local session): reconciles unauthenticated & purges "101"!
+            _ = try await coordinator.switchAccount(accountId: "101")
+            failLogout.withLock { $0 = true }
+            do {
+                _ = try await coordinator.logout()
+                XCTFail("Expected offline HTTP 500 error to propagate")
+            } catch {
+                // Expected server error after Rust local wipe
+            }
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertFalse(try coreKC.hasAccountKey(accountId: "101"))
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "101"))
+            XCTAssertTrue(try secKC.loadTotpAccounts(accountId: "101").isEmpty)
 
             await coordinator.shutdown()
         } catch {

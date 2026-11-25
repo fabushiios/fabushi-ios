@@ -11,6 +11,7 @@ use bot_browser::vault::CredentialVault;
 use fabushi_miniapp::state::UiCommand;
 use fabushi_remote_engine::input::NativeInputEngine;
 use fabushi_remote_engine::power::PowerManager;
+use gpui_telegram_client::client::TelegramClient;
 use gpui_telegram_client::net::api_miniapps::verify_telegram_init_data_hmac;
 use gpui_telegram_client::net::{
     ApproveDeviceSyncRequest, AssistStartRequest, CallInviteRequest, CallSignalRequest,
@@ -116,6 +117,17 @@ fn open_unlocked_vault(host: &FabushiAppHost) -> HostResult<CredentialVault> {
     CredentialVault::open(&vault_path, &key).map_err(|e| HostError::crypto(e.to_string()))
 }
 
+fn verify_vault_user_scope(client: &TelegramClient, requested_user_id: u64) -> HostResult<()> {
+    if let Some(active_uid) = client.current_user_id() {
+        if active_uid != requested_user_id {
+            return Err(HostError::unauthorized(format!(
+                "Vault user_id {requested_user_id} does not match active session user_id {active_uid}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_vault(
     host: &FabushiAppHost,
     req_id: &str,
@@ -146,12 +158,18 @@ pub fn handle_vault(
             let user_id = req_u64(params, "user_id")?;
             let passphrase = req_raw_str(params, "passphrase")?;
             let kdf = parse_kdf_params(host, params)?;
+            host.with_fenced_session_read(&client, || verify_vault_user_scope(&client, user_id))?;
             let (unlocked, envelope, recovery_key) =
                 UserVaultCrypto::initialize_new(user_id, passphrase, kdf)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
             let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
-            *host.vault_unlocked_key.lock() = Some(unlocked);
-            *host.vault_envelope.lock() = Some(envelope.clone());
+            let envelope_for_store = envelope.clone();
+            host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                *host.vault_envelope.lock() = Some(envelope_for_store);
+                Ok(())
+            })?;
             Ok(json!({
                 "unlocked": true,
                 "envelope": envelope,
@@ -169,6 +187,7 @@ pub fn handle_vault(
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(generate_split_key_salt_b64);
             let kdf = parse_kdf_params(host, params)?;
+            host.with_fenced_session_read(&client, || verify_vault_user_scope(&client, user_id))?;
             let bundle = derive_split_key(password, &salt_b64, &kdf)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             let (envelope, unlocked, emergency_kit) = UserVaultCrypto::initialize_with_split_key(
@@ -179,8 +198,13 @@ pub fn handle_vault(
             )
             .map_err(|e| HostError::crypto(e.to_string()))?;
             let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
-            *host.vault_unlocked_key.lock() = Some(unlocked);
-            *host.vault_envelope.lock() = Some(envelope.clone());
+            let envelope_for_store = envelope.clone();
+            host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                *host.vault_envelope.lock() = Some(envelope_for_store);
+                Ok(())
+            })?;
             Ok(json!({
                 "unlocked": true,
                 "auth_salt_b64": bundle.auth_salt_b64,
@@ -193,14 +217,17 @@ pub fn handle_vault(
         "unlockWithPassphrase" => {
             let user_id = req_u64(params, "user_id")?;
             let passphrase = req_raw_str(params, "passphrase")?;
-            let envelope: UserVaultKeyEnvelope = if let Some(env_val) = params.get("envelope") {
-                parse_req(env_val)?
-            } else {
-                host.vault_envelope
-                    .lock()
-                    .clone()
-                    .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))?
-            };
+            let envelope: UserVaultKeyEnvelope = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                if let Some(env_val) = params.get("envelope") {
+                    parse_req(env_val)
+                } else {
+                    host.vault_envelope
+                        .lock()
+                        .clone()
+                        .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))
+                }
+            })?;
             validate_argon2_ios_ceiling(
                 envelope.kdf_params.m_cost_kib,
                 envelope.kdf_params.t_cost,
@@ -208,20 +235,28 @@ pub fn handle_vault(
             )?;
             let unlocked = UserVaultCrypto::unlock_with_passphrase(user_id, passphrase, &envelope)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
-            *host.vault_unlocked_key.lock() = Some(unlocked);
-            *host.vault_envelope.lock() = Some(envelope);
-            Ok(json!({ "unlocked": true }))
+            let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
+            host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                *host.vault_envelope.lock() = Some(envelope);
+                Ok(())
+            })?;
+            Ok(json!({ "unlocked": true, "root_key_b64": root_key_b64 }))
         }
         "unlockWithSplitKey" => {
             let user_id = req_u64(params, "user_id")?;
-            let envelope: UserVaultKeyEnvelope = if let Some(env_val) = params.get("envelope") {
-                parse_req(env_val)?
-            } else {
-                host.vault_envelope
-                    .lock()
-                    .clone()
-                    .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))?
-            };
+            let envelope: UserVaultKeyEnvelope = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                if let Some(env_val) = params.get("envelope") {
+                    parse_req(env_val)
+                } else {
+                    host.vault_envelope
+                        .lock()
+                        .clone()
+                        .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))
+                }
+            })?;
             let kek = if let Some(kek_b64) = params.get("vault_kek_b64").and_then(|v| v.as_str()) {
                 let raw = Zeroizing::new(
                     BASE64_STANDARD
@@ -247,27 +282,39 @@ pub fn handle_vault(
             let unlocked = UserVaultCrypto::unlock_with_split_key(user_id, &envelope, &kek)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
-            *host.vault_unlocked_key.lock() = Some(unlocked);
-            *host.vault_envelope.lock() = Some(envelope);
+            host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                *host.vault_envelope.lock() = Some(envelope);
+                Ok(())
+            })?;
             Ok(json!({ "unlocked": true, "root_key_b64": root_key_b64 }))
         }
         "unlockWithRecoveryKey" => {
             let user_id = req_u64(params, "user_id")?;
             let recovery_key = req_raw_str(params, "recovery_key")?;
-            let envelope: UserVaultKeyEnvelope = if let Some(env_val) = params.get("envelope") {
-                parse_req(env_val)?
-            } else {
-                host.vault_envelope
-                    .lock()
-                    .clone()
-                    .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))?
-            };
+            let envelope: UserVaultKeyEnvelope = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                if let Some(env_val) = params.get("envelope") {
+                    parse_req(env_val)
+                } else {
+                    host.vault_envelope
+                        .lock()
+                        .clone()
+                        .ok_or_else(|| HostError::invalid_arguments("Missing 'envelope'"))
+                }
+            })?;
             let unlocked =
                 UserVaultCrypto::unlock_with_recovery_key(user_id, recovery_key, &envelope)
                     .map_err(|e| HostError::crypto(e.to_string()))?;
-            *host.vault_unlocked_key.lock() = Some(unlocked);
-            *host.vault_envelope.lock() = Some(envelope);
-            Ok(json!({ "unlocked": true }))
+            let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
+            host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                *host.vault_envelope.lock() = Some(envelope);
+                Ok(())
+            })?;
+            Ok(json!({ "unlocked": true, "root_key_b64": root_key_b64 }))
         }
         "unlockWithKeyBytes" => {
             let raw = Zeroizing::new(
@@ -279,17 +326,31 @@ pub fn handle_vault(
                 <[u8; 32]>::try_from(raw.as_slice())
                     .map_err(|_| HostError::invalid_arguments("root_key_b64 must be exactly 32 bytes"))?,
             );
-            *host.vault_unlocked_key.lock() = Some(UnlockedUserVaultKey::from_bytes(*arr));
+            host.with_fenced_session_read(&client, || {
+                *host.vault_unlocked_key.lock() = Some(UnlockedUserVaultKey::from_bytes(*arr));
+                Ok(())
+            })?;
             Ok(json!({ "unlocked": true }))
         }
         "lock" => {
-            *host.vault_unlocked_key.lock() = None;
+            host.with_fenced_session_read(&client, || {
+                *host.vault_unlocked_key.lock() = None;
+                Ok(())
+            })?;
             Ok(json!({ "unlocked": false }))
         }
-        "status" => Ok(json!({
-            "unlocked": host.vault_unlocked_key.lock().is_some(),
-            "has_envelope": host.vault_envelope.lock().is_some(),
-        })),
+        "status" => {
+            let (unlocked, has_envelope) = host.with_fenced_session_read(&client, || {
+                Ok((
+                    host.vault_unlocked_key.lock().is_some(),
+                    host.vault_envelope.lock().is_some(),
+                ))
+            })?;
+            Ok(json!({
+                "unlocked": unlocked,
+                "has_envelope": has_envelope,
+            }))
+        }
         "storeCredential" => {
             let origin = req_str(params, "origin")?;
             let username = req_str(params, "username")?;
@@ -316,29 +377,35 @@ pub fn handle_vault(
             to_val(meta)
         }
         "listForOrigin" => {
-            let vault = open_unlocked_vault(host)?;
             let origin = req_str(params, "origin")?;
-            let list = vault
-                .list_for_origin(origin)
-                .map_err(|e| HostError::storage(e.to_string()))?;
+            let list = host.with_fenced_session_read(&client, || {
+                let vault = open_unlocked_vault(host)?;
+                vault
+                    .list_for_origin(origin)
+                    .map_err(|e| HostError::storage(e.to_string()))
+            })?;
             to_val(list)
         }
         "getMeta" => {
-            let vault = open_unlocked_vault(host)?;
             let cred_id = req_str(params, "credential_id")?;
-            let meta = vault
-                .get_meta(cred_id)
-                .map_err(|e| HostError::not_found(e.to_string()))?;
+            let meta = host.with_fenced_session_read(&client, || {
+                let vault = open_unlocked_vault(host)?;
+                vault
+                    .get_meta(cred_id)
+                    .map_err(|e| HostError::not_found(e.to_string()))
+            })?;
             to_val(meta)
         }
         "decryptForOrigin" => {
-            let vault = open_unlocked_vault(host)?;
             let cred_id = req_str(params, "credential_id")?;
             let origin = req_str(params, "origin")?;
             let frame_origin = params.get("frame_origin").and_then(|v| v.as_str());
-            let secret = vault
-                .decrypt_for_origin(cred_id, origin, frame_origin)
-                .map_err(|e| HostError::crypto(e.to_string()))?;
+            let secret = host.with_fenced_session_read(&client, || {
+                let vault = open_unlocked_vault(host)?;
+                vault
+                    .decrypt_for_origin(cred_id, origin, frame_origin)
+                    .map_err(|e| HostError::crypto(e.to_string()))
+            })?;
             let totp_code = secret
                 .totp_secret
                 .as_deref()
@@ -364,34 +431,38 @@ pub fn handle_vault(
             Ok(json!({ "deleted": true, "credential_id": cred_id }))
         }
         "sealItem" => {
-            let key = host
-                .vault_unlocked_key
-                .lock()
-                .clone()
-                .ok_or_else(|| HostError::unauthorized("Vault is locked"))?;
             let user_id = req_u64(params, "user_id")?;
             let cat = UserVaultCategory::from_str(req_str(params, "category")?)
                 .map_err(|e| HostError::invalid_arguments(e.to_string()))?;
             let item_key = req_str(params, "item_key")?;
             let revision = params.get("revision").and_then(|v| v.as_i64()).unwrap_or(1);
             let plaintext = req_raw_str(params, "plaintext")?.as_bytes();
+            let key = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                host.vault_unlocked_key
+                    .lock()
+                    .clone()
+                    .ok_or_else(|| HostError::unauthorized("Vault is locked"))
+            })?;
             let blob = key
                 .seal_item(user_id, cat, item_key, revision, plaintext)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             to_val(blob)
         }
         "openItem" => {
-            let key = host
-                .vault_unlocked_key
-                .lock()
-                .clone()
-                .ok_or_else(|| HostError::unauthorized("Vault is locked"))?;
             let user_id = req_u64(params, "user_id")?;
             let blob: EncryptedVaultBlob = parse_req(
                 params
                     .get("blob")
                     .ok_or_else(|| HostError::invalid_arguments("Missing 'blob'"))?,
             )?;
+            let key = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                host.vault_unlocked_key
+                    .lock()
+                    .clone()
+                    .ok_or_else(|| HostError::unauthorized("Vault is locked"))
+            })?;
             let plain = key
                 .open_item(user_id, &blob)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
@@ -411,7 +482,11 @@ pub fn handle_vault(
             let pub_b64 = kp.public_key_b64();
             let code = DeviceSyncKeypair::verification_code(&pub_b64)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
-            host.vault_device_keypairs.lock().insert(pair_id.clone(), kp);
+            let pair_id_for_store = pair_id.clone();
+            host.with_fenced_session_read(&client, || {
+                host.vault_device_keypairs.lock().insert(pair_id_for_store, kp);
+                Ok(())
+            })?;
             Ok(json!({
                 "pair_id": pair_id,
                 "public_key_b64": pub_b64,
@@ -419,14 +494,16 @@ pub fn handle_vault(
             }))
         }
         "deviceSyncSeal" => {
-            let key = host
-                .vault_unlocked_key
-                .lock()
-                .clone()
-                .ok_or_else(|| HostError::unauthorized("Vault is locked"))?;
             let request_id = req_str(params, "request_id")?;
             let user_id = req_u64(params, "user_id")?;
             let target_pub = req_str(params, "target_device_pub_b64")?;
+            let key = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                host.vault_unlocked_key
+                    .lock()
+                    .clone()
+                    .ok_or_else(|| HostError::unauthorized("Vault is locked"))
+            })?;
             let code = DeviceSyncKeypair::verification_code(target_pub)
                 .map_err(|e| HostError::crypto(e.to_string()))?;
             let transfer = DeviceSyncKeypair::seal_root_key_for_device(
@@ -444,16 +521,20 @@ pub fn handle_vault(
                     .get("transfer")
                     .ok_or_else(|| HostError::invalid_arguments("Missing 'transfer'"))?,
             )?;
-            let kp = host
-                .vault_device_keypairs
-                .lock()
-                .remove(pair_id)
-                .ok_or_else(|| HostError::not_found(format!("Sync keypair '{pair_id}' not found")))?;
-            let unlocked = kp
-                .open_root_key_transfer(request_id, user_id, &transfer)
-                .map_err(|e| HostError::crypto(e.to_string()))?;
-            let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
-            *host.vault_unlocked_key.lock() = Some(unlocked);
+            let root_key_b64 = host.with_fenced_session_read(&client, || {
+                verify_vault_user_scope(&client, user_id)?;
+                let kp = host
+                    .vault_device_keypairs
+                    .lock()
+                    .remove(pair_id)
+                    .ok_or_else(|| HostError::not_found(format!("Sync keypair '{pair_id}' not found")))?;
+                let unlocked = kp
+                    .open_root_key_transfer(request_id, user_id, &transfer)
+                    .map_err(|e| HostError::crypto(e.to_string()))?;
+                let root_key_b64 = BASE64_STANDARD.encode(unlocked.as_bytes());
+                *host.vault_unlocked_key.lock() = Some(unlocked);
+                Ok(root_key_b64)
+            })?;
             Ok(json!({ "unlocked": true, "root_key_b64": root_key_b64 }))
         }
         "totpGenerate" => {

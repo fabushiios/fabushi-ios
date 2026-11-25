@@ -142,6 +142,8 @@ targets:
         NSCameraUsageDescription: 用于你主动发起或接听视频通话时采集相机画面。
         NSFaceIDUsageDescription: 用于通过面容 ID 解锁法布施应用锁与零知识凭证库。
         NSSpeechRecognitionUsageDescription: 用于在设备本地把你的语音输入转成可编辑文字，不使用网络转写回退。
+        NSPhotoLibraryUsageDescription: 用于在聊天和动态中选择并发送你指定的照片或视频。
+        NSPhotoLibraryAddUsageDescription: 用于按你的操作将聊天中的照片或视频保存到系统相册。
         CFBundleIconName: AppIcon
         UIBackgroundModes:
           - audio

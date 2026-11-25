@@ -213,6 +213,22 @@ public final class ShellNavigationRouter {
     public private(set) var lastAuthCallbackURL: URL?
     public var activeProviderErrorMessage: String?
 
+    /// Onboarding hold flags preventing Shell/AccountSwitcher from tearing down `FabushiAuthWizardView`
+    /// while Split-Key V2 vault initialization and one-time Emergency Kit backup are active (D4).
+    public private(set) var isHoldingPrimaryAuthGate: Bool = false
+    public private(set) var isHoldingAddAccountGate: Bool = false
+
+    /// Persistent one-time Emergency Kit surfaced non-blockingly in the authenticated Shell banner
+    /// after silent login vault bootstrap or Legacy V1 -> Split-Key V2 upgrade (D4).
+    public var pendingEmergencyKit: String? {
+        didSet {
+            if pendingEmergencyKit == nil {
+                pendingEmergencyKitAccountId = nil
+            }
+        }
+    }
+    @ObservationIgnored private var pendingEmergencyKitAccountId: String?
+
     public let toastController: FabushiToastController
     public private(set) var observedGeneration: UInt64 = 1
     public private(set) var lastScenePhase: ScenePhase = .active
@@ -352,6 +368,36 @@ public final class ShellNavigationRouter {
         activeProviderErrorMessage = nil
     }
 
+    // MARK: - Auth Onboarding Hold & Persistent Emergency Kit Banner (D4)
+
+    public func beginAuthOnboardingHold(isAddAccount: Bool) {
+        if isAddAccount {
+            isHoldingAddAccountGate = true
+        } else {
+            isHoldingPrimaryAuthGate = true
+        }
+    }
+
+    public func endAuthOnboardingHold(isAddAccount: Bool) {
+        if isAddAccount {
+            isHoldingAddAccountGate = false
+        } else {
+            isHoldingPrimaryAuthGate = false
+        }
+    }
+
+    public func presentPendingEmergencyKit(_ emergencyKit: String, forAccountId accountId: String?) {
+        let trimmed = emergencyKit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        pendingEmergencyKit = trimmed
+        pendingEmergencyKitAccountId = accountId
+    }
+
+    public func acknowledgePendingEmergencyKit() {
+        pendingEmergencyKit = nil
+        pendingEmergencyKitAccountId = nil
+    }
+
     // MARK: - Runtime Passcode Lock Hooks (M2b Security Integration)
 
     public func engagePasscodeLockIfEnabled() {
@@ -390,6 +436,7 @@ public final class ShellNavigationRouter {
 
         let isReadyForShellNavigation = coordinator.isStarted
             && coordinator.authState != .unauthenticated
+            && !isHoldingPrimaryAuthGate
             && !isPasscodeLocked
         guard isReadyForShellNavigation else {
             pendingDeepLinkURL = url
@@ -421,7 +468,7 @@ public final class ShellNavigationRouter {
         return true
     }
 
-    /// Replays a deferred deep link ONLY when started, authenticated, and NOT passcode-locked.
+    /// Replays a deferred deep link ONLY when started, authenticated, not holding onboarding, and NOT passcode-locked.
     /// Reconciles `coordinator.accountScopeGeneration` strictly BEFORE replaying so a delayed
     /// SwiftUI `.onChange(of: coordinator.accountScopeGeneration)` tick can never wipe the
     /// newly replayed route or deep-link banner.
@@ -429,6 +476,7 @@ public final class ShellNavigationRouter {
     public func replayPendingDeepLinkIfReady(coordinator: FabushiCoordinator) -> Bool {
         guard coordinator.isStarted,
               coordinator.authState != .unauthenticated,
+              !isHoldingPrimaryAuthGate,
               !isPasscodeLocked
         else {
             return false
@@ -452,7 +500,9 @@ public final class ShellNavigationRouter {
 
     /// Resets transient navigation, inspector, overlay, and toast state when `generation` advances.
     /// Rejects stale generations (`generation <= observedGeneration`) without mutating state.
-    /// Preserves `pendingDeepLinkURL` so pre-auth / cold-start deep links can replay immediately after.
+    /// Preserves `pendingDeepLinkURL` so pre-auth / cold-start deep links can replay immediately after,
+    /// preserves `isAccountSwitcherPresented` while `.addAccount` Emergency Kit onboarding is held, and
+    /// preserves `pendingEmergencyKit` for the same authenticated account until explicitly acknowledged.
     @discardableResult
     public func handleAccountScopeChange(
         generation: UInt64,
@@ -466,7 +516,9 @@ public final class ShellNavigationRouter {
         toastController.clearAll()
         inspectorTarget = nil
         isInspectorPresented = false
-        isAccountSwitcherPresented = false
+        if !isHoldingAddAccountGate {
+            isAccountSwitcherPresented = false
+        }
         isCallsSheetPresented = false
         presentedMiniAppId = nil
         activeMiniAppPip = nil
@@ -474,6 +526,13 @@ public final class ShellNavigationRouter {
         activeRemoteControlStatus = nil
         activeDeepLinkBannerText = nil
         activeProviderErrorMessage = nil
+
+        if coordinator.authState == .unauthenticated {
+            acknowledgePendingEmergencyKit()
+        } else if let kitAccount = pendingEmergencyKitAccountId,
+                  coordinator.activeAccountId != kitAccount {
+            acknowledgePendingEmergencyKit()
+        }
 
         activeTab = .chats
         let defaultRoute: ShellRoute = .chats(chatId: nil, messageId: nil)

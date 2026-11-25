@@ -454,6 +454,10 @@ impl FabushiAppHost {
                 }
             }
             let _ = crate::storage::purge_media_cas_dir(&storage_dir);
+            // Wipe on-disk CredentialVault (vault.db stores origin/account_hint metadata in plaintext columns)
+            for fname in ["vault.db", "vault.db-wal", "vault.db-shm"] {
+                let _ = std::fs::remove_file(storage_dir.join(fname));
+            }
             let _ = host_db.clear_account_scoped_data();
             let _ = host_db.delete_meta("active_account_id");
             let _ = host_db.delete_meta("local_store_owner_scope");
@@ -991,6 +995,10 @@ impl FabushiAppHost {
             }
         }
         let _ = crate::storage::purge_media_cas_dir(&self.storage_dir);
+        // 4b. Wipe on-disk CredentialVault (vault.db stores origin/account_hint metadata in plaintext columns)
+        for fname in ["vault.db", "vault.db-wal", "vault.db-shm"] {
+            let _ = std::fs::remove_file(self.storage_dir.join(fname));
+        }
         // 5. Wipe account-scoped tables in host_state.db (preserving accounts/settings/passcode/proxies/server_url)
         let _ = self.host_db.clear_account_scoped_data();
         // 6. Wipe RAM dedup store (aborting waiting in-flight followers), workspaces, and Tantivy index

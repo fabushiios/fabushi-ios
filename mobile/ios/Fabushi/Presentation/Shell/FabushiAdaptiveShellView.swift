@@ -62,7 +62,9 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     private var isAuthenticatedShellActive: Bool {
-        coordinator.isStarted && coordinator.authState != .unauthenticated
+        coordinator.isStarted
+            && coordinator.authState != .unauthenticated
+            && !router.isHoldingPrimaryAuthGate
     }
 
     private var hasActiveChatWorkspace: Bool {
@@ -73,7 +75,9 @@ public struct FabushiAdaptiveShellView: View {
     }
 
     private var isPasscodeOverlayActive: Bool {
-        coordinator.authState != .unauthenticated && router.isPasscodeLocked
+        coordinator.authState != .unauthenticated
+            && !router.isHoldingPrimaryAuthGate
+            && router.isPasscodeLocked
     }
 
     private var isPrivacyBlurActive: Bool {
@@ -82,7 +86,9 @@ public struct FabushiAdaptiveShellView: View {
 
     private var hasPersistentTopBanner: Bool {
         coordinator.authState != .unauthenticated
-            && (router.activeDeepLinkBannerText != nil || router.activeProviderErrorMessage != nil)
+            && (router.pendingEmergencyKit != nil
+                || router.activeDeepLinkBannerText != nil
+                || router.activeProviderErrorMessage != nil)
     }
 
     private var baseNavToastInset: CGFloat {
@@ -223,23 +229,20 @@ public struct FabushiAdaptiveShellView: View {
             if newState == .unauthenticated {
                 router.engagePasscodeLockIfEnabled()
             } else {
-                if oldState == .unauthenticated {
+                if oldState == .unauthenticated && !router.isHoldingPrimaryAuthGate {
                     router.engagePasscodeLockIfEnabled()
                 }
                 router.handleAccountScopeChange(
                     generation: coordinator.accountScopeGeneration,
                     coordinator: coordinator
                 )
-                if !router.isPasscodeLocked {
+                if !router.isPasscodeLocked && !router.isHoldingPrimaryAuthGate {
                     router.replayPendingDeepLinkIfReady(coordinator: coordinator)
                 }
             }
         }
         .onChange(of: scenePhase) { _, phase in
             router.handleScenePhaseChange(phase)
-            if phase == .background {
-                router.engagePasscodeLockIfEnabled()
-            }
         }
     }
 
@@ -272,7 +275,7 @@ public struct FabushiAdaptiveShellView: View {
             .background(theme.surfacePrimary)
             .accessibilityElement(children: .combine)
             .accessibilityLabel(theme.localized("hig.status.starting"))
-        } else if coordinator.authState == .unauthenticated {
+        } else if coordinator.authState == .unauthenticated || router.isHoldingPrimaryAuthGate {
             registry.auth.makeAuthGateView(
                 coordinator: coordinator,
                 router: router,
@@ -780,6 +783,10 @@ public struct FabushiAdaptiveShellView: View {
     @ViewBuilder
     private var topPersistentBannersContent: some View {
         VStack(spacing: 8) {
+            if let emergencyKit = router.pendingEmergencyKit, !emergencyKit.isEmpty {
+                emergencyKitPersistentBanner(emergencyKit: emergencyKit)
+            }
+
             if let deepLinkText = router.activeDeepLinkBannerText {
                 let bannerText = "\(theme.localized("hig.deeplink.banner")): \(deepLinkText)"
                 HStack(spacing: 8) {
@@ -830,6 +837,75 @@ public struct FabushiAdaptiveShellView: View {
         }
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
+    }
+
+    private func emergencyKitPersistentBanner(emergencyKit: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "key.viewfinder")
+                    .fabushiFont(.headline)
+                    .foregroundStyle(theme.warningColor)
+                    .accessibilityHidden(true)
+                Text(theme.localized("hig.auth.emergencyKitTitle"))
+                    .fabushiFont(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(theme.textPrimary)
+                Spacer(minLength: 4)
+            }
+
+            Text(theme.localized("hig.auth.emergencyKitSubtitle"))
+                .fabushiFont(.caption)
+                .foregroundStyle(theme.textSecondary)
+
+            Text(emergencyKit)
+                .fabushiFont(.monospacedCaption)
+                .foregroundStyle(theme.textPrimary)
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.surfaceInput, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityLabel(emergencyKit)
+                .accessibilityIdentifier("fabushi.internal.shell.emergencyKitValue")
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    emergencyKitBannerCopyButton(emergencyKit: emergencyKit)
+                    emergencyKitBannerAckButton
+                }
+                VStack(spacing: 6) {
+                    emergencyKitBannerCopyButton(emergencyKit: emergencyKit)
+                    emergencyKitBannerAckButton
+                }
+            }
+        }
+        .padding(12)
+        .fabushiLiquidGlass(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, isInteractive: false)
+        .padding(.horizontal, 16)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("fabushi.internal.shell.emergencyKitBanner")
+    }
+
+    private func emergencyKitBannerCopyButton(emergencyKit: String) -> some View {
+        FabushiGlassPillButton(
+            title: theme.localized("hig.auth.emergencyKitCopyButton"),
+            systemImage: "doc.on.doc",
+            accessibilityID: "fabushi.internal.shell.emergencyKitCopyButton",
+            isProminent: false
+        ) {
+            FabushiSecureClipboard.copySensitive(emergencyKit)
+            router.toastController.showStagePill(theme.localized("hig.auth.emergencyKitCopiedNotice"))
+        }
+    }
+
+    private var emergencyKitBannerAckButton: some View {
+        FabushiGlassPillButton(
+            title: theme.localized("hig.auth.emergencyKitAckLabel"),
+            systemImage: "checkmark.shield.fill",
+            accessibilityID: "fabushi.internal.shell.emergencyKitAckButton",
+            isProminent: true
+        ) {
+            router.acknowledgePendingEmergencyKit()
+        }
     }
 
     @ViewBuilder

@@ -299,19 +299,12 @@ public struct FabushiAccountSwitcherSheet: View {
         isMutating = true
         defer { isMutating = false }
 
-        let departingAccountId = coordinator.activeAccountId
         do {
             let newGen = try await coordinator.logout()
-            if let departingAccountId {
-                try? coordinator.keychain.deleteAccountKey(accountId: departingAccountId)
-                securityKeychain.purgeAccountSecrets(accountId: departingAccountId)
-            }
             router.handleAccountScopeChange(generation: newGen, coordinator: coordinator)
             onDismiss()
         } catch {
-            if let departingAccountId, coordinator.authState == .unauthenticated {
-                try? coordinator.keychain.deleteAccountKey(accountId: departingAccountId)
-                securityKeychain.purgeAccountSecrets(accountId: departingAccountId)
+            if coordinator.authState == .unauthenticated {
                 router.handleAccountScopeChange(
                     generation: coordinator.accountScopeGeneration,
                     coordinator: coordinator

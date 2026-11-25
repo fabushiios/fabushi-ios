@@ -56,7 +56,7 @@ public struct FabushiAuthWizardView: View {
                     .navigationTitle(theme.localized("hig.accountSwitcher.addAccount"))
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
-                        if let onCancelAddAccount {
+                        if let onCancelAddAccount, !viewModel.isAwaitingEmergencyKitBackup {
                             ToolbarItem(placement: .topBarLeading) {
                                 Button(theme.localized("hig.common.cancel")) {
                                     viewModel.cancelActiveTasks()
@@ -69,6 +69,7 @@ public struct FabushiAuthWizardView: View {
                     }
             }
         }
+        .interactiveDismissDisabled(viewModel.isAwaitingEmergencyKitBackup)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(FabushiAccessibilityIDs.Auth.root)
         .onChange(of: router.lastAuthCallbackURL) { _, newURL in
@@ -93,8 +94,12 @@ public struct FabushiAuthWizardView: View {
         ScrollView {
             VStack(spacing: 18) {
                 headerSection
-                serverConfigurationCard
-                if let challenge = viewModel.activeTwoFactorChallenge {
+                if !viewModel.isAwaitingEmergencyKitBackup {
+                    serverConfigurationCard
+                }
+                if let emergencyKit = viewModel.generatedEmergencyKit, !emergencyKit.isEmpty {
+                    emergencyKitBackupCard(emergencyKit: emergencyKit)
+                } else if let challenge = viewModel.activeTwoFactorChallenge {
                     twoFactorGateCard(challenge: challenge)
                 } else {
                     primaryCredentialsCard
@@ -664,5 +669,74 @@ public struct FabushiAuthWizardView: View {
         }
         .padding(16)
         .fabushiLiquidGlass(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, isInteractive: false)
+    }
+
+    // MARK: - D4: One-Time Emergency Kit Backup Card (Split-Key V2 Registration)
+
+    private func emergencyKitBackupCard(emergencyKit: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "key.viewfinder")
+                    .fabushiFont(.title3)
+                    .foregroundStyle(theme.warningColor)
+                    .accessibilityHidden(true)
+                Text(theme.localized("hig.auth.emergencyKitTitle"))
+                    .fabushiFont(.headline)
+                    .foregroundStyle(theme.textPrimary)
+            }
+
+            Text(theme.localized("hig.auth.emergencyKitSubtitle"))
+                .fabushiFont(.footnote)
+                .foregroundStyle(theme.textSecondary)
+
+            Text(emergencyKit)
+                .fabushiFont(.monospacedBody)
+                .foregroundStyle(theme.textPrimary)
+                .textSelection(.enabled)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(theme.surfaceInput, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .accessibilityLabel(emergencyKit)
+                .accessibilityIdentifier("fabushi.internal.auth.emergencyKitValue")
+
+            FabushiGlassPillButton(
+                title: theme.localized("hig.auth.emergencyKitCopyButton"),
+                systemImage: "doc.on.doc",
+                accessibilityID: "fabushi.internal.auth.emergencyKitCopyButton",
+                isProminent: false
+            ) {
+                _ = viewModel.copyGeneratedEmergencyKitToSecurePasteboard()
+            }
+            .frame(maxWidth: .infinity)
+
+            if viewModel.didCopyEmergencyKit {
+                Text(theme.localized("hig.auth.emergencyKitCopiedNotice"))
+                    .fabushiFont(.footnote)
+                    .foregroundStyle(theme.successColor)
+            }
+
+            Toggle(isOn: $viewModel.hasAcknowledgedEmergencyKitSaved) {
+                Text(theme.localized("hig.auth.emergencyKitAckLabel"))
+                    .fabushiFont(.footnote)
+                    .foregroundStyle(theme.textPrimary)
+            }
+            .frame(minHeight: FabushiLayoutMetrics.minTouchTarget)
+            .accessibilityIdentifier("fabushi.internal.auth.emergencyKitAckToggle")
+
+            FabushiGlassPillButton(
+                title: theme.localized("hig.auth.emergencyKitContinueButton"),
+                systemImage: "checkmark.shield.fill",
+                accessibilityID: "fabushi.internal.auth.emergencyKitContinueButton",
+                isProminent: true
+            ) {
+                _ = viewModel.acknowledgeEmergencyKitAndContinue()
+            }
+            .frame(maxWidth: .infinity)
+            .disabled(!viewModel.hasAcknowledgedEmergencyKitSaved)
+        }
+        .padding(16)
+        .fabushiLiquidGlass(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, isInteractive: false)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("fabushi.internal.auth.emergencyKitCard")
     }
 }

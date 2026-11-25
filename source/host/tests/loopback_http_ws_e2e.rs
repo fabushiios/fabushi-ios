@@ -4965,5 +4965,342 @@ fn test_b6_02_outbox_worker_fenced_against_account_switch_and_shutdown_wal_write
     drop(host_arc);
 }
 
+#[test]
+fn test_vault_cross_account_isolation_concurrent_argon2_and_vault_db_wipe() {
+    let dir = tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let addr = rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/api/v1/auth/login",
+                post(|Json(body): Json<Value>| async move {
+                    let user = body.get("username").and_then(|v| v.as_str()).unwrap_or("alice");
+                    if user == "bob_vault" {
+                        Json(json!({
+                            "user_id": 202,
+                            "username": "bob_vault",
+                            "session_id": "sess-bob-vault",
+                            "token": "TOKEN_BOB_VAULT_202",
+                            "first_name": "Bob"
+                        }))
+                    } else {
+                        Json(json!({
+                            "user_id": 101,
+                            "username": "alice_vault",
+                            "session_id": "sess-alice-vault",
+                            "token": "TOKEN_ALICE_VAULT_101",
+                            "first_name": "Alice"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/logout",
+                post(|| async { Json(json!({ "ok": true })) }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        local_addr
+    });
+
+    let cfg = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "server_url": format!("http://{addr}"),
+            "storage_passphrase": "vault-isolation-test-keychain-key",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    unsafe {
+        let host = fabushi_host_create(cfg.as_ptr());
+        assert!(!host.is_null());
+
+        // 1. Login Account A (101) and Account B (202), then switch to Account A (101)
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "alice_vault", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "auth.login", "params": {"username": "bob_vault", "password": "pw"}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "session.switchAccount", "params": {"account_id": "101"}})
+            )["ok"],
+            true
+        );
+
+        // 2. Unlock Account A's vault and store a local origin credential in vault.db
+        let alice_init = dispatch(
+            host,
+            &json!({"method": "vault.initSplitKey", "params": {"user_id": 101, "password": "alice-pw", "fast_kdf": true}}),
+        );
+        assert_eq!(alice_init["ok"], true, "Alice initSplitKey failed: {alice_init}");
+
+        let stored = dispatch(
+            host,
+            &json!({
+                "method": "vault.storeCredential",
+                "params": {
+                    "origin": "https://secret-alice.example",
+                    "username": "alice@secret.example",
+                    "password": "AliceSecretPassword!1",
+                    "account_hint": "AlicePrivate"
+                }
+            }),
+        );
+        assert_eq!(stored["ok"], true, "Alice storeCredential failed: {stored}");
+        let alice_list = dispatch(
+            host,
+            &json!({"method": "vault.listForOrigin", "params": {"origin": "https://secret-alice.example"}}),
+        );
+        assert_eq!(alice_list["ok"], true);
+        assert_eq!(alice_list["result"].as_array().unwrap().len(), 1);
+        assert!(dir.path().join("vault.db").exists());
+
+        // 3. D7-R2: Switch to Account B (202) -> vault locked & on-disk vault.db wiped so Bob sees ZERO Alice rows!
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "session.switchAccount", "params": {"account_id": "202"}})
+            )["ok"],
+            true
+        );
+        let status_after_switch = dispatch(host, &json!({"method": "vault.status"}));
+        assert_eq!(status_after_switch["result"]["unlocked"], false);
+        assert_eq!(status_after_switch["result"]["has_envelope"], false);
+
+        let bob_init = dispatch(
+            host,
+            &json!({"method": "vault.initSplitKey", "params": {"user_id": 202, "password": "bob-pw", "fast_kdf": true}}),
+        );
+        assert_eq!(bob_init["ok"], true, "Bob initSplitKey failed: {bob_init}");
+        let bob_root_key = bob_init["result"]["root_key_b64"].as_str().unwrap().to_string();
+        let bob_ek = bob_init["result"]["emergency_kit"].as_str().unwrap().to_string();
+        let bob_env = bob_init["result"]["envelope"].clone();
+
+        let bob_list_alice_origin = dispatch(
+            host,
+            &json!({"method": "vault.listForOrigin", "params": {"origin": "https://secret-alice.example"}}),
+        );
+        assert_eq!(bob_list_alice_origin["ok"], true, "Bob listForOrigin failed: {bob_list_alice_origin}");
+        assert_eq!(
+            bob_list_alice_origin["result"].as_array().unwrap().len(),
+            0,
+            "On-disk vault.db must be wiped on account switch so Account B sees zero Account A metadata (D7-R2)"
+        );
+
+        // 4. D7-R3: Cross-user user_id ownership fence rejects user_id=101 while active session is 202
+        let cross_seal = dispatch(
+            host,
+            &json!({
+                "method": "vault.sealItem",
+                "params": {
+                    "user_id": 101,
+                    "category": "password",
+                    "item_key": "cross_user_attempt",
+                    "revision": 1,
+                    "plaintext": "secret"
+                }
+            }),
+        );
+        assert_eq!(cross_seal["ok"], false, "Cross-user sealItem must fail closed");
+        assert_eq!(cross_seal["error"]["code"], "unauthorized");
+
+        let cross_init = dispatch(
+            host,
+            &json!({
+                "method": "vault.initSplitKey",
+                "params": { "user_id": 101, "password": "pw", "fast_kdf": true }
+            }),
+        );
+        assert_eq!(cross_init["ok"], false, "Cross-user initSplitKey must fail closed");
+        assert_eq!(cross_init["error"]["code"], "unauthorized");
+
+        // 5. D3-Rust: unlockWithRecoveryKey & unlockWithPassphrase both return exact 32-byte root_key_b64
+        assert_eq!(dispatch(host, &json!({"method": "vault.lock"}))["result"]["unlocked"], false);
+        let recovered = dispatch(
+            host,
+            &json!({
+                "method": "vault.unlockWithRecoveryKey",
+                "params": {
+                    "user_id": 202,
+                    "recovery_key": bob_ek,
+                    "envelope": bob_env
+                }
+            }),
+        );
+        assert_eq!(recovered["ok"], true, "unlockWithRecoveryKey failed: {recovered}");
+        assert_eq!(recovered["result"]["unlocked"], true);
+        assert_eq!(
+            recovered["result"]["root_key_b64"].as_str(),
+            Some(bob_root_key.as_str()),
+            "unlockWithRecoveryKey must return exact root_key_b64 for Keychain persistence"
+        );
+
+        let legacy_init = dispatch(
+            host,
+            &json!({
+                "method": "vault.initNew",
+                "params": { "user_id": 202, "passphrase": "legacy-vault-pass-202", "fast_kdf": true }
+            }),
+        );
+        assert_eq!(legacy_init["ok"], true, "initNew failed: {legacy_init}");
+        let legacy_root_key = legacy_init["result"]["root_key_b64"].as_str().unwrap().to_string();
+        let legacy_env = legacy_init["result"]["envelope"].clone();
+        assert_eq!(dispatch(host, &json!({"method": "vault.lock"}))["result"]["unlocked"], false);
+
+        let pass_unlock = dispatch(
+            host,
+            &json!({
+                "method": "vault.unlockWithPassphrase",
+                "params": {
+                    "user_id": 202,
+                    "passphrase": "legacy-vault-pass-202",
+                    "envelope": legacy_env
+                }
+            }),
+        );
+        assert_eq!(pass_unlock["ok"], true, "unlockWithPassphrase failed: {pass_unlock}");
+        assert_eq!(pass_unlock["result"]["unlocked"], true);
+        assert_eq!(
+            pass_unlock["result"]["root_key_b64"].as_str(),
+            Some(legacy_root_key.as_str()),
+            "unlockWithPassphrase must return exact root_key_b64 for Keychain persistence"
+        );
+
+        // 6. D7-R1 Subcase A: Concurrent slow Argon2id during session.switchAccount MUST NOT pollute Account B!
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "session.switchAccount", "params": {"account_id": "101"}})
+            )["ok"],
+            true
+        );
+        let gen_a = dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"]
+            .as_u64()
+            .unwrap();
+        let host_addr = host as usize;
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let worker_started_clone = Arc::clone(&worker_started);
+        let worker_switch = thread::spawn(move || {
+            worker_started_clone.store(true, Ordering::SeqCst);
+            unsafe {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": "slow-argon-switch",
+                        "method": "vault.initSplitKey",
+                        "generation": gen_a,
+                        "params": {
+                            "user_id": 101,
+                            "password": "slow-argon-switch-pw",
+                            "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
+                        }
+                    }),
+                )
+            }
+        });
+        while !worker_started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(40));
+
+        let switch_to_b = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "202"}}),
+        );
+        assert_eq!(switch_to_b["ok"], true, "switchAccount to 202 failed: {switch_to_b}");
+
+        let worker_switch_res = worker_switch.join().unwrap();
+        assert_eq!(
+            worker_switch_res["ok"], false,
+            "Stale Account A Argon2id worker must fail closed after switchAccount: {worker_switch_res}"
+        );
+        assert_eq!(worker_switch_res["error"]["code"], "stale_generation");
+
+        let status_bob = dispatch(host, &json!({"method": "vault.status"}));
+        assert_eq!(
+            status_bob["result"]["unlocked"], false,
+            "Late-finishing Account A Argon2id MUST NOT unlock Account B's vault (D7-R1)"
+        );
+        assert_eq!(
+            status_bob["result"]["has_envelope"], false,
+            "Late-finishing Account A Argon2id MUST NOT install envelope into Account B (D7-R1)"
+        );
+
+        // 7. D7-R1 Subcase B: Concurrent slow Argon2id during auth.logout MUST NOT pollute logged-out host!
+        let gen_b = dispatch(host, &json!({"method": "generation.current"}))["result"]["generation"]
+            .as_u64()
+            .unwrap();
+        let logout_started = Arc::new(AtomicBool::new(false));
+        let logout_started_clone = Arc::clone(&logout_started);
+        let worker_logout = thread::spawn(move || {
+            logout_started_clone.store(true, Ordering::SeqCst);
+            unsafe {
+                dispatch(
+                    host_addr as *mut c_void,
+                    &json!({
+                        "id": "slow-argon-logout",
+                        "method": "vault.initSplitKey",
+                        "generation": gen_b,
+                        "params": {
+                            "user_id": 202,
+                            "password": "slow-argon-logout-pw",
+                            "kdf_params": { "m_cost_kib": 131072, "t_cost": 6, "p_cost": 1 }
+                        }
+                    }),
+                )
+            }
+        });
+        while !logout_started.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(40));
+
+        let logout_res = dispatch(host, &json!({"method": "auth.logout"}));
+        assert_eq!(logout_res["ok"], true, "auth.logout failed: {logout_res}");
+
+        let worker_logout_res = worker_logout.join().unwrap();
+        assert_eq!(
+            worker_logout_res["ok"], false,
+            "Stale Account B Argon2id worker must fail closed after auth.logout: {worker_logout_res}"
+        );
+        assert_eq!(worker_logout_res["error"]["code"], "stale_generation");
+
+        let status_logged_out = dispatch(host, &json!({"method": "vault.status"}));
+        assert_eq!(
+            status_logged_out["result"]["unlocked"], false,
+            "Late-finishing Argon2id MUST NOT unlock logged-out host vault (D7-R1)"
+        );
+        assert_eq!(
+            status_logged_out["result"]["has_envelope"], false,
+            "Late-finishing Argon2id MUST NOT install envelope on logged-out host (D7-R1)"
+        );
+
+        fabushi_host_destroy(host);
+    }
+}
+
+
 
 
