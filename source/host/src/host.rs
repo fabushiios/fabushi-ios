@@ -1422,14 +1422,17 @@ impl FabushiAppHost {
             let is_token_only = client.current_user_id().is_none() && client.token().is_some();
             self.reset_account_scope();
             self.account_tokens.lock().clear();
-            client.clear_session();
-            let _ = client.poll_events();
             // Token-only sessions have no verified user_id ownership; wipe account-scoped local
-            // caches on shutdown so they can never be adopted on cold restart while preserving
-            // authenticated same-account and unauthenticated offline restart persistence (B6-01).
+            // caches and stores on shutdown so they can never be adopted on cold restart while
+            // preserving authenticated same-account and unauthenticated offline restart persistence (B6-01).
             if is_token_only {
+                client.clear_session();
+                let _ = client.poll_events();
                 let _ = self.host_db.delete_meta("local_store_owner_scope");
                 self.clear_account_local_data(&client);
+            } else {
+                client.suspend_session_preserving_stores();
+                let _ = client.poll_events();
             }
             let _ = self.checkpoint_all_wals();
         }

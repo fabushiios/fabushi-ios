@@ -13,6 +13,7 @@ use gpui_telegram_proto::e2ee::{
 };
 use gpui_telegram_proto::message::{MessageContent, MessageItem};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub type DeviceIdProvider = Arc<dyn Fn() -> String + Send + Sync>;
@@ -25,6 +26,7 @@ pub struct E2eeManager {
     token_provider: TokenProvider,
     device_id_provider: DeviceIdProvider,
     user_id_provider: UserIdProvider,
+    session_epoch: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for E2eeManager {
@@ -43,13 +45,41 @@ impl E2eeManager {
         device_id_provider: DeviceIdProvider,
         user_id_provider: UserIdProvider,
     ) -> Arc<Self> {
+        Self::new_with_session_epoch(
+            store,
+            http_client,
+            token_provider,
+            device_id_provider,
+            user_id_provider,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_session_epoch(
+        store: E2eeStore,
+        http_client: HttpClient,
+        token_provider: TokenProvider,
+        device_id_provider: DeviceIdProvider,
+        user_id_provider: UserIdProvider,
+        session_epoch: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             http_client,
             token_provider,
             device_id_provider,
             user_id_provider,
+            session_epoch,
         })
+    }
+
+    fn ensure_same_epoch(&self, start_epoch: u64) -> Result<(), E2eeError> {
+        if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+            return Err(E2eeError::Network(
+                "Session changed during E2EE operation".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn store(&self) -> &E2eeStore {
@@ -60,48 +90,89 @@ impl E2eeManager {
         self.store.get_or_create_identity()
     }
 
-    pub async fn init_and_publish_prekeys(
+    async fn init_and_publish_prekeys_pinned(
         &self,
+        start_epoch: u64,
+        token: &str,
         otpk_batch_size: usize,
     ) -> Result<PublishPreKeysResponse, E2eeError> {
-        let token = (self.token_provider)()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| E2eeError::Network("Missing session token for E2EE prekeys".into()))?;
+        self.ensure_same_epoch(start_epoch)?;
         let device_id = (self.device_id_provider)();
         let req = self
             .store
             .build_publish_request(&device_id, Some("GPUI Desktop".into()), otpk_batch_size)?;
-        self.http_client
-            .publish_e2ee_prekeys(&token, &req)
-            .await
-            .map_err(|e| E2eeError::Network(e.to_string()))
-    }
-
-    pub async fn replenish_prekeys_if_low(
-        &self,
-        min_threshold: usize,
-        target_batch: usize,
-    ) -> Result<Option<PublishPreKeysResponse>, E2eeError> {
-        let token = (self.token_provider)()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| E2eeError::Network("Missing session token".into()))?;
-        let device_id = (self.device_id_provider)();
-        let count = self
+        let resp = self
             .http_client
-            .get_e2ee_prekey_count(&token, Some(&device_id))
+            .publish_e2ee_prekeys(token, &req)
             .await
             .map_err(|e| E2eeError::Network(e.to_string()))?;
-        if !count.has_signed_prekey || count.remaining_one_time_prekeys < min_threshold {
-            let resp = self.init_and_publish_prekeys(target_batch).await?;
-            return Ok(Some(resp));
+        self.ensure_same_epoch(start_epoch)?;
+        Ok(resp)
+    }
+
+    pub fn init_and_publish_prekeys<'a>(
+        &'a self,
+        otpk_batch_size: usize,
+    ) -> impl std::future::Future<Output = Result<PublishPreKeysResponse, E2eeError>> + Send + 'a {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            let token = start_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    E2eeError::Network("Missing session token for E2EE prekeys".into())
+                })?;
+            self.init_and_publish_prekeys_pinned(start_epoch, &token, otpk_batch_size)
+                .await
         }
-        Ok(None)
+    }
+
+    pub fn replenish_prekeys_if_low<'a>(
+        &'a self,
+        min_threshold: usize,
+        target_batch: usize,
+    ) -> impl std::future::Future<Output = Result<Option<PublishPreKeysResponse>, E2eeError>> + Send + 'a
+    {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            let token = start_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| E2eeError::Network("Missing session token".into()))?;
+            self.ensure_same_epoch(start_epoch)?;
+            let device_id = (self.device_id_provider)();
+            let count = self
+                .http_client
+                .get_e2ee_prekey_count(&token, Some(&device_id))
+                .await
+                .map_err(|e| E2eeError::Network(e.to_string()))?;
+            self.ensure_same_epoch(start_epoch)?;
+            if !count.has_signed_prekey || count.remaining_one_time_prekeys < min_threshold {
+                let resp = self
+                    .init_and_publish_prekeys_pinned(start_epoch, &token, target_batch)
+                    .await?;
+                self.ensure_same_epoch(start_epoch)?;
+                return Ok(Some(resp));
+            }
+            Ok(None)
+        }
     }
 
     pub fn establish_session_from_bundle(
         &self,
         bundle: &DevicePreKeyBundle,
     ) -> Result<DoubleRatchetSession, E2eeError> {
+        self.establish_session_from_bundle_fenced(None, bundle)
+    }
+
+    fn establish_session_from_bundle_fenced(
+        &self,
+        expected_epoch: Option<u64>,
+        bundle: &DevicePreKeyBundle,
+    ) -> Result<DoubleRatchetSession, E2eeError> {
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         let identity = self.store.get_or_create_identity()?;
         let ek_sec = random_32()?;
         let ek_pub = x25519_pub_from_secret(&ek_sec);
@@ -114,6 +185,9 @@ impl E2eeManager {
             bundle.signed_prekey.key_id,
             bundle.one_time_prekey.as_ref().map(|k| k.key_id),
         );
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         self.store
             .save_session(bundle.user_id, &bundle.device_id, &session)?;
         Ok(session)
@@ -121,13 +195,14 @@ impl E2eeManager {
 
     async fn fetch_target_bundles(
         &self,
+        start_epoch: u64,
+        token: &str,
         user_ids: &[u64],
     ) -> Result<Vec<DevicePreKeyBundle>, E2eeError> {
-        let token = (self.token_provider)()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| E2eeError::Network("Missing session token".into()))?;
+        self.ensure_same_epoch(start_epoch)?;
         let self_uid = (self.user_id_provider)().unwrap_or(0);
         let self_dev = (self.device_id_provider)();
+        self.ensure_same_epoch(start_epoch)?;
 
         let mut seen_uid = HashSet::new();
         let mut all_bundles = Vec::new();
@@ -135,11 +210,13 @@ impl E2eeManager {
             if uid == 0 || !seen_uid.insert(uid) {
                 continue;
             }
-            match self
+            self.ensure_same_epoch(start_epoch)?;
+            let res = self
                 .http_client
-                .fetch_user_prekey_bundles(&token, uid, None)
-                .await
-            {
+                .fetch_user_prekey_bundles(token, uid, None)
+                .await;
+            self.ensure_same_epoch(start_epoch)?;
+            match res {
                 Ok(resp) => {
                     for b in resp.devices {
                         if b.user_id == self_uid && b.device_id == self_dev {
@@ -163,21 +240,29 @@ impl E2eeManager {
 
     async fn ensure_pairwise_targets_for_users(
         &self,
+        start_epoch: u64,
+        token: &str,
         user_ids: &[u64],
     ) -> Result<Vec<(u64, String)>, E2eeError> {
+        self.ensure_same_epoch(start_epoch)?;
         let self_uid = (self.user_id_provider)().unwrap_or(0);
         let self_dev = (self.device_id_provider)();
+        self.ensure_same_epoch(start_epoch)?;
 
         // Always fetch active devices/bundles from server for users lacking sessions or to discover newly added devices
-        let bundles = self.fetch_target_bundles(user_ids).await?;
+        let bundles = self
+            .fetch_target_bundles(start_epoch, token, user_ids)
+            .await?;
+        self.ensure_same_epoch(start_epoch)?;
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
         for b in bundles {
+            self.ensure_same_epoch(start_epoch)?;
             if b.user_id == self_uid && b.device_id == self_dev {
                 continue;
             }
             if self.store.get_session(b.user_id, &b.device_id)?.is_none() {
-                self.establish_session_from_bundle(&b)?;
+                self.establish_session_from_bundle_fenced(Some(start_epoch), &b)?;
             }
             if seen.insert((b.user_id, b.device_id.clone())) {
                 targets.push((b.user_id, b.device_id));
@@ -185,6 +270,7 @@ impl E2eeManager {
         }
         // Also include any locally cached sessions for those users
         for &uid in user_ids {
+            self.ensure_same_epoch(start_epoch)?;
             for (dev, _) in self.store.list_peer_sessions(uid)? {
                 if uid == self_uid && dev == self_dev {
                     continue;
@@ -203,12 +289,31 @@ impl E2eeManager {
         plaintext: &[u8],
         is_sender_key_dist: bool,
     ) -> Result<EncryptedEnvelope, E2eeError> {
+        self.encrypt_pairwise_for_targets_fenced(None, targets, plaintext, is_sender_key_dist)
+    }
+
+    fn encrypt_pairwise_for_targets_fenced(
+        &self,
+        expected_epoch: Option<u64>,
+        targets: &[(u64, String)],
+        plaintext: &[u8],
+        is_sender_key_dist: bool,
+    ) -> Result<EncryptedEnvelope, E2eeError> {
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         let self_uid = (self.user_id_provider)().unwrap_or(0);
         let self_dev = (self.device_id_provider)();
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         let identity = self.store.get_or_create_identity()?;
 
         let mut recipients = Vec::with_capacity(targets.len());
         for (uid, dev_id) in targets {
+            if let Some(ep) = expected_epoch {
+                self.ensure_same_epoch(ep)?;
+            }
             if *uid == self_uid && *dev_id == self_dev {
                 continue;
             }
@@ -220,6 +325,9 @@ impl E2eeManager {
             let ek = session.pending_x3dh_ek_pub.map(|b| b64_encode(&b));
             let spk_id = session.pending_x3dh_spk_id;
             let otpk_id = session.pending_x3dh_otpk_id;
+            if let Some(ep) = expected_epoch {
+                self.ensure_same_epoch(ep)?;
+            }
             self.store.save_session(*uid, dev_id, &session)?;
 
             recipients.push(PerDeviceCiphertext {
@@ -245,6 +353,10 @@ impl E2eeManager {
             EncryptedPayloadKind::PairwiseFanout { recipients }
         };
 
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
+
         Ok(EncryptedEnvelope {
             version: 1,
             sender_user_id: self_uid,
@@ -255,18 +367,30 @@ impl E2eeManager {
         })
     }
 
-    pub async fn encrypt_dm(
-        &self,
+    pub fn encrypt_dm<'a>(
+        &'a self,
         recipient_user_id: u64,
-        plaintext: &[u8],
-    ) -> Result<EncryptedEnvelope, E2eeError> {
-        let self_uid = (self.user_id_provider)().unwrap_or(0);
-        let mut users = vec![recipient_user_id];
-        if self_uid > 0 && self_uid != recipient_user_id {
-            users.push(self_uid);
+        plaintext: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<EncryptedEnvelope, E2eeError>> + Send + 'a {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            let token = start_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| E2eeError::Network("Missing session token".into()))?;
+            self.ensure_same_epoch(start_epoch)?;
+            let self_uid = (self.user_id_provider)().unwrap_or(0);
+            self.ensure_same_epoch(start_epoch)?;
+            let mut users = vec![recipient_user_id];
+            if self_uid > 0 && self_uid != recipient_user_id {
+                users.push(self_uid);
+            }
+            let targets = self
+                .ensure_pairwise_targets_for_users(start_epoch, &token, &users)
+                .await?;
+            self.ensure_same_epoch(start_epoch)?;
+            self.encrypt_pairwise_for_targets_fenced(Some(start_epoch), &targets, plaintext, false)
         }
-        let targets = self.ensure_pairwise_targets_for_users(&users).await?;
-        self.encrypt_pairwise_for_targets(&targets, plaintext, false)
     }
 
     pub fn rotate_group_sender_key(&self, chat_id: i64) -> Result<(), E2eeError> {
@@ -276,19 +400,34 @@ impl E2eeManager {
             .delete_own_sender_key(chat_id, self_uid, &self_dev)
     }
 
-    pub async fn encrypt_group(
-        &self,
+    pub fn encrypt_group<'a>(
+        &'a self,
         chat_id: i64,
-        member_user_ids: &[u64],
-        plaintext: &[u8],
-    ) -> Result<(Option<EncryptedEnvelope>, EncryptedEnvelope), E2eeError> {
-        let self_uid = (self.user_id_provider)().unwrap_or(0);
-        let mut all_members = member_user_ids.to_vec();
-        if self_uid > 0 && !all_members.contains(&self_uid) {
-            all_members.push(self_uid);
+        member_user_ids: &'a [u64],
+        plaintext: &'a [u8],
+    ) -> impl std::future::Future<
+        Output = Result<(Option<EncryptedEnvelope>, EncryptedEnvelope), E2eeError>,
+    > + Send
+           + 'a {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            let token = start_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| E2eeError::Network("Missing session token".into()))?;
+            self.ensure_same_epoch(start_epoch)?;
+            let self_uid = (self.user_id_provider)().unwrap_or(0);
+            self.ensure_same_epoch(start_epoch)?;
+            let mut all_members = member_user_ids.to_vec();
+            if self_uid > 0 && !all_members.contains(&self_uid) {
+                all_members.push(self_uid);
+            }
+            let targets = self
+                .ensure_pairwise_targets_for_users(start_epoch, &token, &all_members)
+                .await?;
+            self.ensure_same_epoch(start_epoch)?;
+            self.encrypt_group_for_targets_fenced(Some(start_epoch), chat_id, &targets, plaintext)
         }
-        let targets = self.ensure_pairwise_targets_for_users(&all_members).await?;
-        self.encrypt_group_for_targets(chat_id, &targets, plaintext)
     }
 
     pub fn encrypt_group_for_targets(
@@ -297,14 +436,33 @@ impl E2eeManager {
         targets: &[(u64, String)],
         plaintext: &[u8],
     ) -> Result<(Option<EncryptedEnvelope>, EncryptedEnvelope), E2eeError> {
+        self.encrypt_group_for_targets_fenced(None, chat_id, targets, plaintext)
+    }
+
+    fn encrypt_group_for_targets_fenced(
+        &self,
+        expected_epoch: Option<u64>,
+        chat_id: i64,
+        targets: &[(u64, String)],
+        plaintext: &[u8],
+    ) -> Result<(Option<EncryptedEnvelope>, EncryptedEnvelope), E2eeError> {
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         let self_uid = (self.user_id_provider)().unwrap_or(0);
         let self_dev = (self.device_id_provider)();
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         let identity = self.store.get_or_create_identity()?;
 
         let mut own_sk = match self.store.get_sender_key(chat_id, self_uid, &self_dev)? {
             Some(sk) => sk,
             None => {
                 let (sk, _) = SenderKeyState::create_own(chat_id, self_uid, self_dev.clone())?;
+                if let Some(ep) = expected_epoch {
+                    self.ensure_same_epoch(ep)?;
+                }
                 self.store.save_sender_key(&sk)?;
                 sk
             }
@@ -327,7 +485,15 @@ impl E2eeManager {
             let dist_msg = own_sk.distribution_message();
             let dist_bytes = serde_json::to_vec(&dist_msg)
                 .map_err(|e| E2eeError::Serialization(e.to_string()))?;
-            let env = self.encrypt_pairwise_for_targets(&need_dist, &dist_bytes, true)?;
+            let env = self.encrypt_pairwise_for_targets_fenced(
+                expected_epoch,
+                &need_dist,
+                &dist_bytes,
+                true,
+            )?;
+            if let Some(ep) = expected_epoch {
+                self.ensure_same_epoch(ep)?;
+            }
             for (uid, dev) in &need_dist {
                 self.store.mark_sender_key_distributed_to(
                     chat_id,
@@ -342,6 +508,9 @@ impl E2eeManager {
         };
 
         let group_ct = own_sk.encrypt_group_message(plaintext)?;
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         self.store.save_sender_key(&own_sk)?;
 
         let payload_env = EncryptedEnvelope {
@@ -352,6 +521,9 @@ impl E2eeManager {
             sender_signing_key: b64_encode(&identity.ed25519_pub),
             kind: EncryptedPayloadKind::GroupSenderKey(group_ct),
         };
+        if let Some(ep) = expected_epoch {
+            self.ensure_same_epoch(ep)?;
+        }
         Ok((dist_envelope, payload_env))
     }
 

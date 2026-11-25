@@ -237,8 +237,12 @@ fn finalize_authenticated_session(
         .flatten();
     let needs_local_wipe = prev_owner.as_deref() != Some(target_owner.as_str());
 
-    // Step 1: Clear live client session (stops & drains OutboxWorker/WsTransport/Tailnet; token == None)
-    live_client.clear_session();
+    // Step 1: Clear or suspend live client session (stops & drains OutboxWorker/WsTransport/Tailnet; token == None)
+    if needs_local_wipe {
+        live_client.clear_session();
+    } else {
+        live_client.suspend_session_preserving_stores();
+    }
     // Step 2: Drain stale WS frames, wipe runtime account scope, and if local_store_owner_scope
     // does not match "{server_url}|{user_id}" (covering cross-user switch, token-only cold restart,
     // iOS Jetsam crash, and unauthenticated staging), wipe all account-scoped local data BEFORE
@@ -1027,8 +1031,12 @@ pub fn handle_session(
                 .flatten();
             let needs_local_wipe = prev_owner.as_deref() != Some(target_owner.as_str());
             // Strict 5-step commit order (B4-02, B5-02, B6-01, NB6-01, NB6-02):
-            // Step 1: Clear live client session (stops & drains OutboxWorker/WsTransport/Tailnet)
-            live_client.clear_session();
+            // Step 1: Clear or suspend live client session (stops & drains OutboxWorker/WsTransport/Tailnet)
+            if needs_local_wipe {
+                live_client.clear_session();
+            } else {
+                live_client.suspend_session_preserving_stores();
+            }
             // Step 2: Drain stale WS frames, wipe runtime account scope & cross-account local data
             let _ = live_client.poll_events();
             host.reset_account_scope();
@@ -1447,6 +1455,9 @@ pub fn handle_proxy(
                             .ok_or_else(|| HostError::not_found(format!("Proxy '{id}' not found")))?;
                         let parsed: ClientProxyConfig = serde_json::from_str(&raw)
                             .map_err(|e| HostError::storage(format!("Corrupt proxy record: {e}")))?;
+                        parsed
+                            .validate()
+                            .map_err(|e| HostError::invalid_arguments(format!("Invalid proxy config: {e}")))?;
                         client.apply_proxy(Some(parsed.clone()))?;
                         host.host_db.set_meta("active_proxy_id", id)?;
                         Ok(parsed)

@@ -870,6 +870,141 @@ final class FabushiShellNavigationTests: XCTestCase, @unchecked Sendable {
             throw error
         }
     }
+
+    func testM2D1AndM2D3BlockingOverlaysAndPasscodeLockReconcileChatScopedToastsPreservingNonChatToasts() async throws {
+        let dir = try makeTempDir("m2d1_toast_reconcile")
+        let keychain = FabushiKeychainStore(
+            service: "com.ombhrum.fabushi.tests.shell.m2d1.\(UUID().uuidString)",
+            account: "shell-m2d1"
+        )
+        defer {
+            try? keychain.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: keychain)
+        try await coordinator.start(appDataDirectory: dir, testMode: true, startNetworkMonitor: false)
+
+        do {
+            _ = try await coordinator.setAuthSession(FabushiSessionAuthParams(
+                userId: 901,
+                username: "toast_reconcile_user",
+                sessionId: "sess-tr-901",
+                token: "tok-tr-901"
+            ))
+
+            let controller = FabushiToastController(autoDismissEnabled: false)
+            let router = ShellNavigationRouter(toastController: controller, isPasscodeLockEnabled: true)
+            _ = router.unlockPasscode(coordinator: coordinator)
+            router.navigate(to: .chats(chatId: 100, messageId: nil), coordinator: coordinator)
+
+            // 1. Visible chat 100 accepts chat-scoped toast; M2-D3 explicit showNonChatToast has scopeChatId == nil
+            XCTAssertFalse(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertFalse(router.hasBlockingOverlay(isCompact: true))
+            XCTAssertTrue(router.isChatVisibleForToast(100, coordinator: coordinator, isCompact: false))
+            XCTAssertFalse(router.isChatVisibleForToast(200, coordinator: coordinator, isCompact: false))
+
+            controller.showStagePill("Chat 100 stage pill", chatId: 100)
+            XCTAssertTrue(
+                router.showChatToastIfVisible(
+                    "Chat 100 error banner",
+                    chatId: 100,
+                    coordinator: coordinator,
+                    isCompact: false
+                )
+            )
+            controller.showChatToast("Chat 100 queued toast", chatId: 100)
+            controller.showNonChatToast("Vault unlocked globally")
+
+            XCTAssertEqual(controller.windowBanner?.scopeChatId, 100)
+            XCTAssertEqual(controller.windowQueue.count, 2)
+            XCTAssertEqual(controller.windowQueue.last?.scopeChatId, nil)
+
+            // 2. Engaging passcode lock clears ALL chat-scoped toasts (active + queued + stage)
+            //    while preserving & promoting unscoped non-chat toast (M2-D1 / M2-D3)
+            router.engagePasscodeLockIfEnabled()
+            XCTAssertTrue(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertFalse(router.isChatVisibleForToast(100, coordinator: coordinator, isCompact: false))
+            XCTAssertNil(controller.stagePill, "Passcode lock must purge chat-scoped stage pill")
+            XCTAssertEqual(
+                controller.windowBanner?.message,
+                "Vault unlocked globally",
+                "Passcode lock must preserve and promote unscoped non-chat toast"
+            )
+            XCTAssertNil(controller.windowBanner?.scopeChatId)
+            XCTAssertTrue(controller.windowQueue.isEmpty, "Passcode lock must purge queued chat-scoped toasts")
+            XCTAssertFalse(
+                router.showChatToastIfVisible("Blocked while locked", chatId: 100, coordinator: coordinator, isCompact: false),
+                "Chat-scoped toast must drop while passcode locked"
+            )
+
+            // 3. Per-generation passcode lock engagement also purges chat-scoped toasts
+            _ = router.unlockPasscode(coordinator: coordinator)
+            controller.dismissWindowToast(id: controller.windowBanner?.id)
+            controller.showStagePill("Gen lock pill", chatId: 100)
+            controller.showChatToast("Gen lock banner", chatId: 100)
+            controller.showNonChatToast("Settings saved")
+            XCTAssertTrue(router.engagePasscodeLockIfEnabledForGeneration(coordinator.accountScopeGeneration + 1))
+            XCTAssertNil(controller.stagePill)
+            XCTAssertEqual(controller.windowBanner?.message, "Settings saved")
+            XCTAssertTrue(controller.windowQueue.isEmpty)
+
+            // 4. Blocking modal sheets (Account Switcher, Calls, Mini App) immediately purge chat-scoped toasts
+            _ = router.unlockPasscode(coordinator: coordinator)
+            controller.dismissWindowToast(id: controller.windowBanner?.id)
+            controller.showStagePill("Before switcher", chatId: 100)
+            controller.showChatToast("Before switcher banner", chatId: 100)
+            controller.showNonChatToast("Global proxy status")
+            router.isAccountSwitcherPresented = true
+            XCTAssertTrue(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertNil(controller.stagePill)
+            XCTAssertEqual(controller.windowBanner?.message, "Global proxy status")
+            router.isAccountSwitcherPresented = false
+
+            controller.dismissWindowToast(id: controller.windowBanner?.id)
+            controller.showChatToast("Before calls", chatId: 100)
+            router.isCallsSheetPresented = true
+            XCTAssertTrue(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertNil(controller.windowBanner)
+            router.isCallsSheetPresented = false
+
+            controller.showChatToast("Before miniapp", chatId: 100)
+            router.presentedMiniAppId = "global_dharma"
+            XCTAssertTrue(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertNil(controller.windowBanner)
+            router.presentedMiniAppId = nil
+
+            // 5. Compact vs Regular Inspector reconciliation:
+            //    Regular iPad keeps chat 100 visible (purges stale chat 200);
+            //    Compact iPhone treats Inspector sheet as blocking overlay (purges chat 100, preserves non-chat).
+            router.openInspector(for: .chat(chatId: 100))
+            XCTAssertFalse(router.hasBlockingOverlay(isCompact: false))
+            XCTAssertTrue(router.hasBlockingOverlay(isCompact: true))
+            XCTAssertTrue(router.isChatVisibleForToast(100, coordinator: coordinator, isCompact: false))
+            XCTAssertFalse(router.isChatVisibleForToast(100, coordinator: coordinator, isCompact: true))
+
+            controller.showChatToast("Visible chat 100 on iPad", chatId: 100)
+            controller.showChatToast("Stale chat 200 toast", chatId: 200)
+            controller.showNonChatToast("Global alert")
+
+            router.reconcileChatScopedToasts(coordinator: coordinator, isCompact: false)
+            XCTAssertEqual(controller.windowBanner?.message, "Visible chat 100 on iPad")
+            XCTAssertEqual(controller.windowQueue.map(\.message), ["Global alert"])
+
+            router.reconcileChatScopedToasts(coordinator: coordinator, isCompact: true)
+            XCTAssertEqual(
+                controller.windowBanner?.message,
+                "Global alert",
+                "Compact inspector sheet must purge chat-100 toast and promote non-chat toast"
+            )
+            XCTAssertTrue(controller.windowQueue.isEmpty)
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
+    }
 }
 
 // MARK: - Protocol Conformance Test Spies

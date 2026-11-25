@@ -238,25 +238,68 @@ impl DeepLinksRouterDeepLinks {
     }
 }
 
-fn percent_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            let h1 = chars.next();
-            let h2 = chars.next();
-            if let (Some(c1), Some(c2)) = (h1, h2) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", c1, c2), 16) {
-                    result.push(byte as char);
-                    continue;
-                }
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
             }
-        } else if ch == '+' {
-            result.push(' ');
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
             continue;
         }
-        result.push(ch);
+        out.push(bytes[i]);
+        i += 1;
     }
-    result
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_percent_decode_utf8_and_malformed_sequences() {
+        assert_eq!(percent_decode("%E5%AF%86%E7%A0%81%C3%BC"), "密码ü");
+        assert_eq!(percent_decode("%F0%9F%94%90"), "🔐");
+        assert_eq!(
+            percent_decode("hello+world%20%2B%E5%AF%86%E7%A0%81%C3%BC"),
+            "hello world +密码ü"
+        );
+        assert_eq!(percent_decode("密码%20ü"), "密码 ü");
+
+        // Malformed % sequences must not panic or misparse "+1" as 0x01
+        assert_eq!(percent_decode("foo%"), "foo%");
+        assert_eq!(percent_decode("foo%%"), "foo%%");
+        assert_eq!(percent_decode("foo%ZZ"), "foo%ZZ");
+        assert_eq!(percent_decode("foo%0"), "foo%0");
+        assert_eq!(percent_decode("foo%+1"), "foo% 1");
+        assert_eq!(percent_decode("foo%%41"), "foo%A");
+
+        // Invalid UTF-8 bytes are safely lossy-decoded without panic
+        assert_eq!(percent_decode("%FF%FE"), "\u{FFFD}\u{FFFD}");
+
+        let ctx = DeepLinksRouterDeepLinks::parse_command(
+            "tg://socks?server=127.0.0.1&port=1080&user=alice&pass=%E5%AF%86%E7%A0%81%C3%BC",
+            true,
+        );
+        assert_eq!(ctx.param("pass"), Some("密码ü"));
+    }
 }

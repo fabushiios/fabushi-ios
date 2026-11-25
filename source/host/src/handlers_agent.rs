@@ -1271,7 +1271,13 @@ pub fn handle_coding(
             Ok(json!({ "sent": true }))
         }
         "upsertThread" => {
+            let owner_user_id = client
+                .current_user_id()
+                .filter(|&id| id > 0)
+                .or_else(|| params.get("owner_user_id").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
             let rec = ThreadRecord {
+                owner_user_id,
                 bot_user_id: req_i64(params, "bot_user_id")?,
                 chat_id: req_i64(params, "chat_id")?,
                 topic_id: params.get("topic_id").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -1312,6 +1318,7 @@ pub fn handle_coding(
                     .map_err(HostError::storage)
             })?;
             Ok(json!({
+                "owner_user_id": rec.owner_user_id,
                 "thread_id": rec.thread_id,
                 "bot_user_id": rec.bot_user_id,
                 "chat_id": rec.chat_id,
@@ -1321,10 +1328,15 @@ pub fn handle_coding(
             }))
         }
         "getThread" => {
+            let owner_user_id = client
+                .current_user_id()
+                .filter(|&id| id > 0)
+                .or_else(|| params.get("owner_user_id").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
             let bot_user_id = req_i64(params, "bot_user_id")?;
             let chat_id = req_i64(params, "chat_id")?;
             let topic_id = params.get("topic_id").and_then(|v| v.as_i64());
-            let key = ThreadKey::new(bot_user_id, chat_id, topic_id);
+            let key = ThreadKey::for_owner(owner_user_id, bot_user_id, chat_id, topic_id);
             let rec = host
                 .coding_store
                 .lock()
@@ -1332,6 +1344,7 @@ pub fn handle_coding(
                 .map_err(HostError::storage)?;
             Ok(match rec {
                 Some(r) => json!({
+                    "owner_user_id": r.owner_user_id,
                     "bot_user_id": r.bot_user_id,
                     "chat_id": r.chat_id,
                     "topic_id": r.topic_id,
@@ -1351,7 +1364,13 @@ pub fn handle_coding(
             })
         }
         "saveCheckpoint" => {
+            let owner_user_id = client
+                .current_user_id()
+                .filter(|&id| id > 0)
+                .or_else(|| params.get("owner_user_id").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
             let cp = CheckpointRecord {
+                owner_user_id,
                 thread_id: req_str(params, "thread_id")?.to_string(),
                 turn_idx: params.get("turn_idx").and_then(|v| v.as_u64()).unwrap_or(0),
                 before_ref: params.get("before_ref").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1375,6 +1394,7 @@ pub fn handle_coding(
                     .map_err(HostError::storage)
             })?;
             Ok(json!({
+                "owner_user_id": cp.owner_user_id,
                 "thread_id": cp.thread_id,
                 "turn_idx": cp.turn_idx,
                 "before_ref": cp.before_ref,
@@ -1383,17 +1403,23 @@ pub fn handle_coding(
             }))
         }
         "getCheckpoints" => {
+            let owner_user_id = client
+                .current_user_id()
+                .filter(|&id| id > 0)
+                .or_else(|| params.get("owner_user_id").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
             let thread_id = req_str(params, "thread_id")?;
             let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
             let cps = host
                 .coding_store
                 .lock()
-                .list_recent_checkpoints(thread_id, limit)
+                .list_recent_checkpoints(owner_user_id, thread_id, limit)
                 .map_err(HostError::storage)?;
             let out: Vec<Value> = cps
                 .into_iter()
                 .map(|c| {
                     json!({
+                        "owner_user_id": c.owner_user_id,
                         "thread_id": c.thread_id,
                         "turn_idx": c.turn_idx,
                         "before_ref": c.before_ref,

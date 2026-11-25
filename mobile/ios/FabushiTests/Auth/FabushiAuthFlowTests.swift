@@ -1784,4 +1784,159 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             throw error
         }
     }
+
+    // MARK: - v1.6.10 M2-D2: Auth Wizard Server-URL Switch Cancellation & Mid-Flight Race Fence
+
+    func testM2D2ServerURLSwitchCancelsActivePollsScrubsStaleOtpAnd2FAAndFencesInFlightAuth() async throws {
+        let holdPhoneSend = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let phoneSendArrived = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+        let serverA = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("POST", "/api/v1/auth/phone/send-code"):
+                phoneSendArrived.withLock { $0 = true }
+                while holdPhoneSend.withLock({ $0 }) {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                return .json(200, #"{"ok":true,"sent":true,"phone_code_hash":"server-a-hash-77","expires_at_ms":2900000000000,"resend_after_ms":60000,"debug_code":"654321"}"#)
+            case ("POST", "/api/v1/auth/alipay/start"):
+                return .json(200, #"{"attempt_id":"alipay_srv_a","login_url":"https://auth.alipay.example/oauth?state=srv_a","expires_at_ms":2900000000000}"#)
+            case ("GET", "/api/v1/auth/alipay/poll/alipay_srv_a"):
+                return .json(200, #"{"status":"pending"}"#)
+            case ("POST", "/api/v1/auth/pair/init"):
+                return .json(200, #"{"pair_token":"pair_srv_a","qr_url":"tg://login?token=pair_srv_a","expires_at_ms":2900000000000}"#)
+            case ("GET", "/api/v1/auth/pair/poll/pair_srv_a"):
+                return .json(200, #"{"status":"pending","pair_token":"pair_srv_a"}"#)
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        let serverB = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("POST", "/api/v1/auth/phone/send-code"):
+                return .json(200, #"{"ok":true,"sent":true,"phone_code_hash":"server-b-hash-88","expires_at_ms":2900000000000,"resend_after_ms":45000,"debug_code":"111222"}"#)
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer {
+            holdPhoneSend.withLock { $0 = false }
+            serverA.stop()
+            serverB.stop()
+        }
+
+        let dir = try makeTempDir("m2d2_server_switch")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: serverA.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let router = ShellNavigationRouter()
+            let theme = FabushiTheme(locale: .en)
+            let vm = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC,
+                pollIntervalNanoseconds: 5_000_000_000
+            )
+            vm.serverURLText = serverA.baseURLString
+            vm.otpChannel = .phone
+            vm.phoneText = "+14155550199"
+
+            // 1. Populate active OTP, Alipay poll, QR Pair poll, and 2FA challenge against Server A
+            await vm.sendOTP(theme: theme)
+            XCTAssertEqual(vm.phoneCodeHash, "server-a-hash-77")
+            XCTAssertTrue(vm.otpCodeSent)
+            XCTAssertGreaterThan(vm.otpResendRemainingSeconds, 0)
+
+            await vm.startAlipayLogin(theme: theme)
+            XCTAssertTrue(vm.isAlipayActive)
+            XCTAssertEqual(vm.alipayAttemptId, "alipay_srv_a")
+
+            await vm.startQrPair(theme: theme)
+            XCTAssertTrue(vm.isQrPairActive)
+            XCTAssertEqual(vm.qrPairToken, "pair_srv_a")
+
+            vm.activeTwoFactorChallenge = FabushiTwoFactorChallenge(
+                challengeToken: "2fa_srv_a",
+                hint: "Server A hint",
+                isQrPair: false
+            )
+            vm.twoFactorPasswordText = "old-2fa-password"
+
+            // 2. Switch Server URL from Server A -> Server B via applyServerURLIfNeeded
+            vm.serverURLText = serverB.baseURLString
+            let switchedToB = await vm.applyServerURLIfNeeded(theme: theme)
+            XCTAssertTrue(switchedToB)
+            XCTAssertEqual(coordinator.settingsStore.activeServerURL, serverB.baseURLString)
+            XCTAssertEqual(vm.serverSwitchGeneration, 1)
+
+            XCTAssertFalse(vm.isAlipayActive, "Server switch must cancel Alipay login")
+            XCTAssertNil(vm.alipayAttemptId)
+            XCTAssertFalse(vm.isQrPairActive, "Server switch must cancel QR pair")
+            XCTAssertNil(vm.qrPairToken)
+            XCTAssertNil(vm.phoneCodeHash, "Server switch must clear previous server phoneCodeHash")
+            XCTAssertFalse(vm.otpCodeSent, "Server switch must clear otpCodeSent")
+            XCTAssertEqual(vm.otpResendRemainingSeconds, 0, "Server switch must cancel OTP countdown")
+            XCTAssertNil(vm.otpStatusMessage)
+            XCTAssertNil(vm.activeTwoFactorChallenge, "Server switch must clear previous server 2FA challenge")
+            XCTAssertEqual(vm.twoFactorPasswordText, "")
+
+            // 3. Mid-flight race fence: start sendOTP against Server A, switch to Server B mid-flight,
+            //    release Server A response -> stale Server A phoneCodeHash & error MUST be discarded!
+            vm.serverURLText = serverA.baseURLString
+            let switchedBackToA = await vm.applyServerURLIfNeeded(theme: theme)
+            XCTAssertTrue(switchedBackToA)
+            XCTAssertEqual(vm.serverSwitchGeneration, 2)
+
+            holdPhoneSend.withLock { $0 = true }
+            phoneSendArrived.withLock { $0 = false }
+            let inFlightSend = Task { @MainActor in
+                await vm.sendOTP(theme: theme)
+            }
+            let deadline = Date().addingTimeInterval(5.0)
+            while !phoneSendArrived.withLock({ $0 }) && Date() < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(phoneSendArrived.withLock { $0 })
+
+            vm.serverURLText = serverB.baseURLString
+            let switchedMidFlight = await vm.applyServerURLIfNeeded(theme: theme)
+            XCTAssertTrue(switchedMidFlight)
+            XCTAssertEqual(vm.serverSwitchGeneration, 3)
+
+            holdPhoneSend.withLock { $0 = false }
+            await inFlightSend.value
+
+            XCTAssertNil(
+                vm.phoneCodeHash,
+                "Stale Server A sendOTP response arriving after switch to Server B must be discarded (M2-D2)"
+            )
+            XCTAssertFalse(vm.otpCodeSent)
+            XCTAssertNil(vm.errorMessage, "Stale Server A failure/cancellation must not bleed into Server B UI")
+
+            // 4. Positive control: fresh sendOTP against Server B succeeds cleanly
+            await vm.sendOTP(theme: theme)
+            XCTAssertEqual(vm.phoneCodeHash, "server-b-hash-88")
+            XCTAssertTrue(vm.otpCodeSent)
+
+            vm.cancelActiveTasks()
+            await coordinator.shutdown()
+        } catch {
+            holdPhoneSend.withLock { $0 = false }
+            await coordinator.shutdown()
+            throw error
+        }
+    }
 }

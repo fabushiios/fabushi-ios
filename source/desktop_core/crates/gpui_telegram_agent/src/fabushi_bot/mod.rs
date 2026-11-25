@@ -1242,20 +1242,25 @@ impl FabushiBotHost {
                 hidden_from_sidebar: DEFAULT_HIDDEN_FROM_SIDEBAR,
             }
         };
+        // Keep `preferred_model` empty when no explicit per-bot override was specified so the bot
+        // dynamically follows the user's current active Settings model rather than freezing startup state.
         let preferred_model = spec
             .preferred_model
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                let active = self.core_engine.providers().active_info().1;
-                if active.eq_ignore_ascii_case("hermes-local-v1") {
-                    String::new()
-                } else {
-                    active
-                }
-            });
+            .unwrap_or_default();
+        let runner_default_model = if !preferred_model.is_empty() {
+            preferred_model.clone()
+        } else {
+            let active = self.core_engine.providers().active_info().1;
+            if active.eq_ignore_ascii_case("hermes-local-v1") {
+                String::new()
+            } else {
+                active
+            }
+        };
         let thinking_level = Self::normalize_thinking_level(spec.thinking_level.as_deref());
         let approval_mode = Self::normalize_approval_mode_name(spec.approval_mode.as_deref());
         let toolset_preset = Self::normalize_toolset_preset_name(spec.toolset_preset.as_deref());
@@ -1349,8 +1354,9 @@ impl FabushiBotHost {
             } else if let Some(dock) = self.core_engine.permission_dock() {
                 engine.set_permission_dock(dock);
             }
-            let runner =
-                Arc::new(AcpRunner::new(&preferred_model).with_hermes_engine(Arc::clone(&engine)));
+            let runner = Arc::new(
+                AcpRunner::new(&runner_default_model).with_hermes_engine(Arc::clone(&engine)),
+            );
             (engine, runner)
         };
 

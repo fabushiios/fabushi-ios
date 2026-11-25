@@ -195,9 +195,27 @@ public final class ShellNavigationRouter {
         }
     }
 
-    public var isAccountSwitcherPresented: Bool = false
-    public var isCallsSheetPresented: Bool = false
-    public var presentedMiniAppId: String?
+    public var isAccountSwitcherPresented: Bool = false {
+        didSet {
+            if isAccountSwitcherPresented {
+                toastController.clearAllChatScopedToasts()
+            }
+        }
+    }
+    public var isCallsSheetPresented: Bool = false {
+        didSet {
+            if isCallsSheetPresented {
+                toastController.clearAllChatScopedToasts()
+            }
+        }
+    }
+    public var presentedMiniAppId: String? {
+        didSet {
+            if presentedMiniAppId != nil {
+                toastController.clearAllChatScopedToasts()
+            }
+        }
+    }
 
     /// Runtime passcode lock policy and lock state (initialized from `launchConfiguration.requirePasscode`,
     /// writable by M2b Security when user enables/disables passcode at runtime).
@@ -404,6 +422,7 @@ public final class ShellNavigationRouter {
     public func engagePasscodeLockIfEnabled() {
         if isPasscodeLockEnabled {
             isPasscodeLocked = true
+            toastController.clearAllChatScopedToasts()
         }
     }
 
@@ -415,6 +434,7 @@ public final class ShellNavigationRouter {
         guard generation > lastPasscodeLockTransitionGeneration else { return false }
         lastPasscodeLockTransitionGeneration = generation
         isPasscodeLocked = true
+        toastController.clearAllChatScopedToasts()
         return true
     }
 
@@ -422,6 +442,94 @@ public final class ShellNavigationRouter {
     public func unlockPasscode(coordinator: FabushiCoordinator) -> Bool {
         isPasscodeLocked = false
         return replayPendingDeepLinkIfReady(coordinator: coordinator)
+    }
+
+    // MARK: - Blocking Overlay & Chat-Scoped Toast Reconciliation (v1.6.10 M2-D1 / M2-D3)
+
+    /// Returns true whenever a blocking modal overlay or lock screen obscures the chat stage
+    /// (passcode lock, primary/add-account onboarding hold, account switcher, calls sheet,
+    /// mini app sheet, or compact iPhone inspector sheet).
+    public func hasBlockingOverlay(isCompact: Bool) -> Bool {
+        if isPasscodeLocked || isHoldingPrimaryAuthGate || isHoldingAddAccountGate {
+            return true
+        }
+        if isAccountSwitcherPresented || isCallsSheetPresented || presentedMiniAppId != nil {
+            return true
+        }
+        if isCompact && isInspectorPresented {
+            return true
+        }
+        return false
+    }
+
+    /// Returns true iff `chatId` is currently the active visible chat stage with no blocking
+    /// overlay and an authenticated session.
+    public func isChatVisibleForToast(
+        _ chatId: Int64,
+        coordinator: FabushiCoordinator,
+        isCompact: Bool
+    ) -> Bool {
+        guard coordinator.authState != .unauthenticated else { return false }
+        guard !hasBlockingOverlay(isCompact: isCompact) else { return false }
+        guard activeTab == .chats else { return false }
+        guard case .chats(let currentChatId, _) = activeRoute, currentChatId == chatId else {
+            return false
+        }
+        return true
+    }
+
+    /// Reconciles active and queued chat-scoped toasts against current visibility and blocking
+    /// overlay state, purging chat-scoped toasts whenever the target chat is obscured while
+    /// preserving unscoped non-chat toasts (`scopeChatId == nil`).
+    public func reconcileChatScopedToasts(
+        coordinator: FabushiCoordinator,
+        isCompact: Bool
+    ) {
+        if coordinator.authState == .unauthenticated
+            || hasBlockingOverlay(isCompact: isCompact)
+            || activeTab != .chats {
+            toastController.clearAllChatScopedToasts()
+            return
+        }
+        guard case .chats(let visibleChatId, _) = activeRoute, let visibleChatId else {
+            toastController.clearAllChatScopedToasts()
+            return
+        }
+        if let stage = toastController.stagePill,
+           let stageChatId = stage.scopeChatId,
+           stageChatId != visibleChatId {
+            toastController.clearToasts(forChatId: stageChatId)
+        }
+        let staleWindowChatIds = Set(
+            ([toastController.windowBanner].compactMap { $0 } + toastController.windowQueue)
+                .compactMap(\.scopeChatId)
+                .filter { $0 != visibleChatId }
+        )
+        for staleChatId in staleWindowChatIds {
+            toastController.clearToasts(forChatId: staleChatId)
+        }
+    }
+
+    /// Emits a chat-scoped toast ONLY when `chatId` is visibly foregrounded without a blocking overlay.
+    @discardableResult
+    public func showChatToastIfVisible(
+        _ rawMessage: String,
+        chatId: Int64,
+        coordinator: FabushiCoordinator,
+        isCompact: Bool,
+        isError: Bool? = nil,
+        durationSeconds: TimeInterval = FabushiToastController.defaultWindowDurationSeconds
+    ) -> Bool {
+        guard isChatVisibleForToast(chatId, coordinator: coordinator, isCompact: isCompact) else {
+            return false
+        }
+        toastController.showChatToast(
+            rawMessage,
+            chatId: chatId,
+            isError: isError,
+            durationSeconds: durationSeconds
+        )
+        return true
     }
 
     // MARK: - Deep Link Handling (`fabushi://`)

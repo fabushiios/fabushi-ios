@@ -68,7 +68,7 @@ fn unregister_host(handle: *mut c_void) -> Option<Arc<FabushiAppHost>> {
 }
 
 // ============================================================================
-// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.9 API)
+// 1. Canonical Fabushi Host C-ABI Exports (Primary v1.6.10 API)
 // ============================================================================
 
 /// Creates a canonical `FabushiAppHost` instance from optional JSON configuration.

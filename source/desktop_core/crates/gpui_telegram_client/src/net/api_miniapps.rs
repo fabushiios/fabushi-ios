@@ -576,146 +576,253 @@ impl HttpClient {
 }
 
 impl TelegramClient {
-    pub async fn search_global_catalog(
-        &self,
-        query: &str,
-        category: Option<&str>,
-    ) -> std::result::Result<GlobalCatalogSearchResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .search_global_catalog(&token, query, category)
-            .await
+    pub fn search_global_catalog<'a>(
+        &'a self,
+        query: &'a str,
+        category: Option<&'a str>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<GlobalCatalogSearchResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.search_global_catalog_with_token(&token, expected_epoch, query, category)
+                .await
+        }
     }
 
-    pub async fn list_mini_apps(
+    pub async fn list_mini_apps_with_token(
         &self,
+        token: &str,
+        expected_epoch: u64,
         query: Option<&str>,
         category: Option<&str>,
     ) -> std::result::Result<Vec<MiniAppEntry>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_mini_apps(&token, query, category).await
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_mini_apps(token, query, category).await
     }
 
-    pub async fn list_installed_mini_apps(
+    pub fn list_mini_apps<'a>(
+        &'a self,
+        query: Option<&'a str>,
+        category: Option<&'a str>,
+    ) -> impl std::future::Future<Output = std::result::Result<Vec<MiniAppEntry>, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_mini_apps_with_token(&token, expected_epoch, query, category)
+                .await
+        }
+    }
+
+    pub fn list_installed_mini_apps(
         &self,
-    ) -> std::result::Result<Vec<MiniAppEntry>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_installed_mini_apps(&token).await
+    ) -> impl std::future::Future<Output = std::result::Result<Vec<MiniAppEntry>, HttpClientError>>
+           + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_installed_mini_apps_with_token(&token, expected_epoch)
+                .await
+        }
     }
 
-    pub async fn list_attach_menu_bots(
+    pub fn list_attach_menu_bots(
         &self,
-    ) -> std::result::Result<Vec<BotRegistryEntry>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_attach_menu_bots(&token).await
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Vec<BotRegistryEntry>, HttpClientError>,
+    > + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_attach_menu_bots_with_token(&token, expected_epoch)
+                .await
+        }
     }
 
-    pub async fn list_my_bots(
+    pub fn list_my_bots(
         &self,
-    ) -> std::result::Result<Vec<BotRegistryEntry>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_my_bots(&token).await
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Vec<BotRegistryEntry>, HttpClientError>,
+    > + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_my_bots_with_token(&token, expected_epoch).await
+        }
     }
 
-    pub async fn create_bot(
+    pub fn create_bot<'a>(
+        &'a self,
+        req: &'a CreateBotRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<BotTokenResponse, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.create_bot_with_token(&token, expected_epoch, req).await
+        }
+    }
+
+    pub fn list_fabushi_bots(
         &self,
-        req: &CreateBotRequest,
-    ) -> std::result::Result<BotTokenResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.create_bot(&token, req).await
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Vec<FabushiBotSummaryDto>, HttpClientError>,
+    > + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_fabushi_bots_with_token(&token, expected_epoch)
+                .await
+        }
     }
 
-    pub async fn list_fabushi_bots(
-        &self,
-    ) -> std::result::Result<Vec<FabushiBotSummaryDto>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_fabushi_bots(&token).await
-    }
-
-    pub async fn get_fabushi_bot(
+    pub fn get_fabushi_bot(
         &self,
         bot_id: u64,
-    ) -> std::result::Result<FabushiBotSummaryDto, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.get_fabushi_bot(&token, bot_id).await
+    ) -> impl std::future::Future<Output = std::result::Result<FabushiBotSummaryDto, HttpClientError>>
+           + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.get_fabushi_bot_with_token(&token, expected_epoch, bot_id)
+                .await
+        }
     }
 
-    pub async fn create_fabushi_bot(
-        &self,
-        req: &CreateFabushiBotRequest,
-    ) -> std::result::Result<FabushiBotCreateResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.create_fabushi_bot(&token, req).await
+    pub fn create_fabushi_bot<'a>(
+        &'a self,
+        req: &'a CreateFabushiBotRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<FabushiBotCreateResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.create_fabushi_bot_with_token(&token, expected_epoch, req)
+                .await
+        }
     }
 
-    pub async fn patch_fabushi_bot(
-        &self,
+    pub fn patch_fabushi_bot<'a>(
+        &'a self,
         bot_id: u64,
-        req: &PatchFabushiBotRequest,
-    ) -> std::result::Result<FabushiBotSummaryDto, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.patch_fabushi_bot(&token, bot_id, req).await
+        req: &'a PatchFabushiBotRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<FabushiBotSummaryDto, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.patch_fabushi_bot_with_token(&token, expected_epoch, bot_id, req)
+                .await
+        }
     }
 
-    pub async fn create_mini_app(
-        &self,
-        req: &CreateMiniAppRequest,
-    ) -> std::result::Result<MiniAppEntry, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.create_mini_app(&token, req).await
+    pub fn create_mini_app<'a>(
+        &'a self,
+        req: &'a CreateMiniAppRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<MiniAppEntry, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.http_client.create_mini_app(&token, req).await
+        }
     }
 
-    pub async fn create_from_natural_language(
-        &self,
-        prompt: &str,
-    ) -> std::result::Result<NaturalLanguageCreateResponse, HttpClientError> {
+    pub fn create_from_natural_language<'a>(
+        &'a self,
+        prompt: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<NaturalLanguageCreateResponse, HttpClientError>,
+    > + Send
+           + 'a {
         self.create_from_natural_language_with_avatar(prompt, None, None)
-            .await
     }
 
-    pub async fn create_from_natural_language_with_avatar(
-        &self,
-        prompt: &str,
+    pub fn create_from_natural_language_with_avatar<'a>(
+        &'a self,
+        prompt: &'a str,
         avatar_shape: Option<String>,
         avatar_color: Option<String>,
-    ) -> std::result::Result<NaturalLanguageCreateResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .create_from_natural_language_with_avatar(&token, prompt, avatar_shape, avatar_color)
+    ) -> impl std::future::Future<
+        Output = std::result::Result<NaturalLanguageCreateResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.create_from_natural_language_with_avatar_with_token(
+                &token,
+                expected_epoch,
+                prompt,
+                avatar_shape,
+                avatar_color,
+            )
             .await
+        }
     }
 
-    pub async fn install_mini_app(
-        &self,
-        bot_username: &str,
-        short_name: &str,
+    pub fn install_mini_app<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
         allow_write_access: bool,
-    ) -> std::result::Result<PeerBotActionResult, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .install_mini_app(&token, bot_username, short_name, allow_write_access)
+    ) -> impl std::future::Future<Output = std::result::Result<PeerBotActionResult, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.install_mini_app_with_token(
+                &token,
+                expected_epoch,
+                bot_username,
+                short_name,
+                allow_write_access,
+            )
             .await
+        }
     }
 
-    pub async fn uninstall_mini_app(
-        &self,
-        bot_username: &str,
-        short_name: &str,
-    ) -> std::result::Result<PeerBotActionResult, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .uninstall_mini_app(&token, bot_username, short_name)
-            .await
+    pub fn uninstall_mini_app<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+    ) -> impl std::future::Future<Output = std::result::Result<PeerBotActionResult, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.uninstall_mini_app_with_token(&token, expected_epoch, bot_username, short_name)
+                .await
+        }
     }
 
-    pub async fn launch_mini_app(
-        &self,
-        bot_username: &str,
-        short_name: &str,
+    pub fn launch_mini_app<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
         chat_id: Option<i64>,
         launch_mode: MiniAppLaunchMode,
-        start_param: Option<&str>,
-    ) -> std::result::Result<MiniAppLaunchContext, HttpClientError> {
+        start_param: Option<&'a str>,
+    ) -> impl std::future::Future<Output = std::result::Result<MiniAppLaunchContext, HttpClientError>>
+           + Send
+           + 'a {
         self.launch_mini_app_with_url(
             bot_username,
             short_name,
@@ -724,11 +831,453 @@ impl TelegramClient {
             start_param,
             None,
         )
-        .await
     }
 
-    pub async fn launch_mini_app_with_url(
+    pub fn launch_mini_app_with_url<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+        chat_id: Option<i64>,
+        launch_mode: MiniAppLaunchMode,
+        start_param: Option<&'a str>,
+        custom_url: Option<&'a str>,
+    ) -> impl std::future::Future<Output = std::result::Result<MiniAppLaunchContext, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.launch_mini_app_with_url_with_token(
+                &token,
+                expected_epoch,
+                bot_username,
+                short_name,
+                chat_id,
+                launch_mode,
+                start_param,
+                custom_url,
+            )
+            .await
+        }
+    }
+
+    pub fn validate_mini_app_init_data<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+        init_data: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<ValidateInitDataResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.http_client
+                .validate_mini_app_init_data(&token, bot_username, short_name, init_data)
+                .await
+        }
+    }
+
+    pub async fn send_mini_app_action_with_token(
         &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+        req: &MiniAppActionRequest,
+    ) -> std::result::Result<MiniAppActionResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .send_mini_app_action(token, bot_username, short_name, req)
+            .await
+    }
+
+    pub fn send_mini_app_action<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+        req: &'a MiniAppActionRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<MiniAppActionResponse, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.send_mini_app_action_with_token(
+                &token,
+                expected_epoch,
+                bot_username,
+                short_name,
+                req,
+            )
+            .await
+        }
+    }
+
+    pub async fn get_cloud_storage_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+    ) -> std::result::Result<Vec<CloudStorageItem>, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .get_cloud_storage(token, bot_username, short_name)
+            .await
+    }
+
+    pub fn get_cloud_storage<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Vec<CloudStorageItem>, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.get_cloud_storage_with_token(&token, expected_epoch, bot_username, short_name)
+                .await
+        }
+    }
+
+    pub async fn set_cloud_storage_item_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+        key: &str,
+        value: &str,
+    ) -> std::result::Result<CloudStorageItem, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .set_cloud_storage_item(token, bot_username, short_name, key, value)
+            .await
+    }
+
+    pub fn set_cloud_storage_item<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+        key: &'a str,
+        value: &'a str,
+    ) -> impl std::future::Future<Output = std::result::Result<CloudStorageItem, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.set_cloud_storage_item_with_token(
+                &token,
+                expected_epoch,
+                bot_username,
+                short_name,
+                key,
+                value,
+            )
+            .await
+        }
+    }
+
+    pub async fn delete_cloud_storage_item_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+        key: &str,
+    ) -> std::result::Result<bool, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .delete_cloud_storage_item(token, bot_username, short_name, key)
+            .await
+    }
+
+    pub fn delete_cloud_storage_item<'a>(
+        &'a self,
+        bot_username: &'a str,
+        short_name: &'a str,
+        key: &'a str,
+    ) -> impl std::future::Future<Output = std::result::Result<bool, HttpClientError>> + Send + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.delete_cloud_storage_item_with_token(
+                &token,
+                expected_epoch,
+                bot_username,
+                short_name,
+                key,
+            )
+            .await
+        }
+    }
+
+    pub fn send_chat_callback<'a>(
+        &'a self,
+        chat_id: i64,
+        msg_id: i64,
+        callback_data: &'a str,
+    ) -> impl std::future::Future<Output = std::result::Result<PeerBotActionResult, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.send_chat_callback_with_token(&token, expected_epoch, chat_id, msg_id, callback_data)
+                .await
+        }
+    }
+
+    pub fn get_bot_public_profile<'a>(
+        &'a self,
+        target: &'a str,
+    ) -> impl std::future::Future<Output = std::result::Result<BotPublicProfileDto, HttpClientError>>
+           + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.get_bot_public_profile_with_token(&token, expected_epoch, target)
+                .await
+        }
+    }
+
+    pub fn list_recent_mini_apps(
+        &self,
+    ) -> impl std::future::Future<Output = std::result::Result<Vec<MiniAppEntry>, HttpClientError>>
+           + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.list_recent_mini_apps_with_token(&token, expected_epoch)
+                .await
+        }
+    }
+
+    pub fn can_bot_send_message(
+        &self,
+        bot_id: u64,
+    ) -> impl std::future::Future<Output = std::result::Result<CanSendMessageResponse, HttpClientError>>
+           + Send
+           + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.ensure_pinned_session(expected_epoch, &token)?;
+            self.http_client.can_bot_send_message(&token, bot_id).await
+        }
+    }
+
+    pub async fn allow_bot_send_message_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_id: u64,
+        req: &AllowSendMessageRequest,
+    ) -> std::result::Result<AllowSendMessageResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .allow_bot_send_message(token, bot_id, req)
+            .await
+    }
+
+    pub fn allow_bot_send_message<'a>(
+        &'a self,
+        bot_id: u64,
+        req: &'a AllowSendMessageRequest,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<AllowSendMessageResponse, HttpClientError>,
+    > + Send
+           + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.allow_bot_send_message_with_token(&token, expected_epoch, bot_id, req)
+                .await
+        }
+    }
+
+    pub async fn accept_mini_app_tos_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_id: u64,
+        req: &AcceptMiniAppTosRequest,
+    ) -> std::result::Result<bool, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .accept_mini_app_tos(token, bot_id, req)
+            .await
+    }
+
+    pub fn accept_mini_app_tos<'a>(
+        &'a self,
+        bot_id: u64,
+        req: &'a AcceptMiniAppTosRequest,
+    ) -> impl std::future::Future<Output = std::result::Result<bool, HttpClientError>> + Send + 'a {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.accept_mini_app_tos_with_token(&token, expected_epoch, bot_id, req)
+                .await
+        }
+    }
+
+    pub fn set_bot_blocked(
+        &self,
+        bot_id: u64,
+        blocked: bool,
+    ) -> impl std::future::Future<Output = std::result::Result<bool, HttpClientError>> + Send + '_ {
+        let pinned = self.snapshot_pinned_session();
+        async move {
+            let (expected_epoch, token) = pinned?;
+            self.set_bot_blocked_with_token(&token, expected_epoch, bot_id, blocked)
+                .await
+        }
+    }
+
+    pub async fn search_global_catalog_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        query: &str,
+        category: Option<&str>,
+    ) -> std::result::Result<GlobalCatalogSearchResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .search_global_catalog(token, query, category)
+            .await
+    }
+
+    pub async fn list_installed_mini_apps_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+    ) -> std::result::Result<Vec<MiniAppEntry>, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_installed_mini_apps(token).await
+    }
+
+    pub async fn list_attach_menu_bots_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+    ) -> std::result::Result<Vec<BotRegistryEntry>, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_attach_menu_bots(token).await
+    }
+
+    pub async fn list_my_bots_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+    ) -> std::result::Result<Vec<BotRegistryEntry>, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_my_bots(token).await
+    }
+
+    pub async fn create_bot_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        req: &CreateBotRequest,
+    ) -> std::result::Result<BotTokenResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.create_bot(token, req).await
+    }
+
+    pub async fn list_fabushi_bots_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+    ) -> std::result::Result<Vec<FabushiBotSummaryDto>, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_fabushi_bots(token).await
+    }
+
+    pub async fn get_fabushi_bot_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_id: u64,
+    ) -> std::result::Result<FabushiBotSummaryDto, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.get_fabushi_bot(token, bot_id).await
+    }
+
+    pub async fn create_fabushi_bot_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        req: &CreateFabushiBotRequest,
+    ) -> std::result::Result<FabushiBotCreateResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.create_fabushi_bot(token, req).await
+    }
+
+    pub async fn patch_fabushi_bot_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_id: u64,
+        req: &PatchFabushiBotRequest,
+    ) -> std::result::Result<FabushiBotSummaryDto, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.patch_fabushi_bot(token, bot_id, req).await
+    }
+
+    pub async fn create_from_natural_language_with_avatar_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        prompt: &str,
+        avatar_shape: Option<String>,
+        avatar_color: Option<String>,
+    ) -> std::result::Result<NaturalLanguageCreateResponse, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .create_from_natural_language_with_avatar(token, prompt, avatar_shape, avatar_color)
+            .await
+    }
+
+    pub async fn install_mini_app_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+        allow_write_access: bool,
+    ) -> std::result::Result<PeerBotActionResult, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .install_mini_app(token, bot_username, short_name, allow_write_access)
+            .await
+    }
+
+    pub async fn uninstall_mini_app_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
+        bot_username: &str,
+        short_name: &str,
+    ) -> std::result::Result<PeerBotActionResult, HttpClientError> {
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client
+            .uninstall_mini_app(token, bot_username, short_name)
+            .await
+    }
+
+    pub async fn launch_mini_app_with_url_with_token(
+        &self,
+        token: &str,
+        expected_epoch: u64,
         bot_username: &str,
         short_name: &str,
         chat_id: Option<i64>,
@@ -736,10 +1285,10 @@ impl TelegramClient {
         start_param: Option<&str>,
         custom_url: Option<&str>,
     ) -> std::result::Result<MiniAppLaunchContext, HttpClientError> {
-        let token = self.require_token()?;
+        self.ensure_pinned_session(expected_epoch, token)?;
         self.http_client
             .launch_mini_app_with_url(
-                &token,
+                token,
                 bot_username,
                 short_name,
                 chat_id,
@@ -750,132 +1299,48 @@ impl TelegramClient {
             .await
     }
 
-    pub async fn validate_mini_app_init_data(
+    pub async fn send_chat_callback_with_token(
         &self,
-        bot_username: &str,
-        short_name: &str,
-        init_data: &str,
-    ) -> std::result::Result<ValidateInitDataResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .validate_mini_app_init_data(&token, bot_username, short_name, init_data)
-            .await
-    }
-
-    pub async fn send_mini_app_action(
-        &self,
-        bot_username: &str,
-        short_name: &str,
-        req: &MiniAppActionRequest,
-    ) -> std::result::Result<MiniAppActionResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .send_mini_app_action(&token, bot_username, short_name, req)
-            .await
-    }
-
-    pub async fn get_cloud_storage(
-        &self,
-        bot_username: &str,
-        short_name: &str,
-    ) -> std::result::Result<Vec<CloudStorageItem>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .get_cloud_storage(&token, bot_username, short_name)
-            .await
-    }
-
-    pub async fn set_cloud_storage_item(
-        &self,
-        bot_username: &str,
-        short_name: &str,
-        key: &str,
-        value: &str,
-    ) -> std::result::Result<CloudStorageItem, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .set_cloud_storage_item(&token, bot_username, short_name, key, value)
-            .await
-    }
-
-    pub async fn delete_cloud_storage_item(
-        &self,
-        bot_username: &str,
-        short_name: &str,
-        key: &str,
-    ) -> std::result::Result<bool, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .delete_cloud_storage_item(&token, bot_username, short_name, key)
-            .await
-    }
-
-    pub async fn send_chat_callback(
-        &self,
+        token: &str,
+        expected_epoch: u64,
         chat_id: i64,
         msg_id: i64,
         callback_data: &str,
     ) -> std::result::Result<PeerBotActionResult, HttpClientError> {
-        let token = self.require_token()?;
+        self.ensure_pinned_session(expected_epoch, token)?;
         self.http_client
-            .send_chat_callback(&token, chat_id, msg_id, callback_data)
+            .send_chat_callback(token, chat_id, msg_id, callback_data)
             .await
     }
 
-    pub async fn get_bot_public_profile(
+    pub async fn get_bot_public_profile_with_token(
         &self,
+        token: &str,
+        expected_epoch: u64,
         target: &str,
     ) -> std::result::Result<BotPublicProfileDto, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.get_bot_public_profile(&token, target).await
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.get_bot_public_profile(token, target).await
     }
 
-    pub async fn list_recent_mini_apps(
+    pub async fn list_recent_mini_apps_with_token(
         &self,
+        token: &str,
+        expected_epoch: u64,
     ) -> std::result::Result<Vec<MiniAppEntry>, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.list_recent_mini_apps(&token).await
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.list_recent_mini_apps(token).await
     }
 
-    pub async fn can_bot_send_message(
+    pub async fn set_bot_blocked_with_token(
         &self,
-        bot_id: u64,
-    ) -> std::result::Result<CanSendMessageResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client.can_bot_send_message(&token, bot_id).await
-    }
-
-    pub async fn allow_bot_send_message(
-        &self,
-        bot_id: u64,
-        req: &AllowSendMessageRequest,
-    ) -> std::result::Result<AllowSendMessageResponse, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .allow_bot_send_message(&token, bot_id, req)
-            .await
-    }
-
-    pub async fn accept_mini_app_tos(
-        &self,
-        bot_id: u64,
-        req: &AcceptMiniAppTosRequest,
-    ) -> std::result::Result<bool, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .accept_mini_app_tos(&token, bot_id, req)
-            .await
-    }
-
-    pub async fn set_bot_blocked(
-        &self,
+        token: &str,
+        expected_epoch: u64,
         bot_id: u64,
         blocked: bool,
     ) -> std::result::Result<bool, HttpClientError> {
-        let token = self.require_token()?;
-        self.http_client
-            .set_bot_blocked(&token, bot_id, blocked)
-            .await
+        self.ensure_pinned_session(expected_epoch, token)?;
+        self.http_client.set_bot_blocked(token, bot_id, blocked).await
     }
 }
 

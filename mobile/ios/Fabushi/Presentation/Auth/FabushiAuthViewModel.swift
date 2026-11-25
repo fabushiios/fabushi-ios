@@ -77,6 +77,7 @@ public final class FabushiAuthViewModel {
     @ObservationIgnored private let onAuthenticatedCallback: (() -> Void)?
     @ObservationIgnored private let taskBag = FabushiCancellableTaskBag()
     @ObservationIgnored private var hasViewDisappeared: Bool = false
+    @ObservationIgnored public private(set) var serverSwitchGeneration: UInt64 = 0
 
     // Core F01 Form State
     public var serverURLText: String
@@ -205,11 +206,32 @@ public final class FabushiAuthViewModel {
         guard normalized != coordinator.settingsStore.activeServerURL else {
             return true
         }
+
+        // v1.6.10 M2-D2 (D10-04 / t5_51): Cancel active Alipay/QR/OTP countdown tasks,
+        // scrub previous-server OTP/2FA state, and advance serverSwitchGeneration so any
+        // concurrent pre-switch poll/submit discards its stale response.
+        serverSwitchGeneration &+= 1
+        let switchGen = serverSwitchGeneration
+        cancelAlipayLogin()
+        cancelQrPair()
+        taskBag.cancel(key: "otpCountdown")
+        phoneCodeHash = nil
+        otpCodeSent = false
+        otpResendRemainingSeconds = 0
+        otpStatusMessage = nil
+        activeTwoFactorChallenge = nil
+        twoFactorPasswordText = ""
+
         do {
             _ = try await coordinator.setServerURL(normalized)
+            guard serverSwitchGeneration == switchGen else {
+                return false
+            }
             return true
         } catch {
-            serverURLError = error.localizedDescription
+            if serverSwitchGeneration == switchGen {
+                serverURLError = error.localizedDescription
+            }
             return false
         }
     }
@@ -219,6 +241,7 @@ public final class FabushiAuthViewModel {
     public func submitLogin(theme: FabushiTheme) async {
         clearErrors()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         let trimmedUsername = usernameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedUsername.isEmpty, !passwordText.isEmpty else {
@@ -231,6 +254,7 @@ public final class FabushiAuthViewModel {
 
         do {
             let kdfParamsResponse = try await fetchKdfParamsOrFallback(username: trimmedUsername)
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
 
             if let kdf = kdfParamsResponse, kdf.authVersion >= 2 {
                 let derived: FabushiDeriveSplitKeyResponse = try await coordinator.dispatchFenced(
@@ -263,7 +287,8 @@ public final class FabushiAuthViewModel {
                         expectedGeneration: envelope.generation
                     )
                 }
-                guard coordinator.accountScopeGeneration == envelope.generation,
+                guard serverSwitchGeneration == capturedSwitchGen,
+                      coordinator.accountScopeGeneration == envelope.generation,
                       coordinator.authState != .unauthenticated
                 else {
                     return
@@ -287,7 +312,8 @@ public final class FabushiAuthViewModel {
                         expectedGeneration: envelope.generation
                     )
                 }
-                guard coordinator.accountScopeGeneration == envelope.generation,
+                guard serverSwitchGeneration == capturedSwitchGen,
+                      coordinator.accountScopeGeneration == envelope.generation,
                       coordinator.authState != .unauthenticated
                 else {
                     return
@@ -295,7 +321,9 @@ public final class FabushiAuthViewModel {
                 completeAuthentication(expectedGeneration: envelope.generation)
             }
         } catch {
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
@@ -304,6 +332,7 @@ public final class FabushiAuthViewModel {
     public func submitRegistration(theme: FabushiTheme) async {
         clearErrors()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         let trimmedUsername = usernameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedUsername.isEmpty, !passwordText.isEmpty else {
@@ -384,10 +413,16 @@ public final class FabushiAuthViewModel {
                     expectedGeneration: envelope.generation
                 )
             }
+            guard serverSwitchGeneration == capturedSwitchGen else {
+                router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                return
+            }
             finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
         } catch {
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
@@ -397,6 +432,7 @@ public final class FabushiAuthViewModel {
         clearErrors()
         otpStatusMessage = nil
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         isSubmitting = true
         defer { isSubmitting = false }
@@ -415,6 +451,7 @@ public final class FabushiAuthViewModel {
                     method: FabushiRPCNamespace.auth.method("phoneSendCode"),
                     params: FabushiPhoneSendCodeRequest(phone: normalizedPhone)
                 )
+                guard serverSwitchGeneration == capturedSwitchGen else { return }
                 phoneCodeHash = response.phoneCodeHash
                 otpCodeSent = true
                 otpStatusMessage = theme.localized("hig.auth.otpSent")
@@ -431,19 +468,23 @@ public final class FabushiAuthViewModel {
                     method: FabushiRPCNamespace.auth.method("emailSendCode"),
                     params: FabushiEmailSendCodeRequest(email: trimmedEmail)
                 )
+                guard serverSwitchGeneration == capturedSwitchGen else { return }
                 otpCodeSent = response.sent
                 otpStatusMessage = theme.localized("hig.auth.otpSent")
                 let cooldown = max(1, min(300, Int(response.cooldownSeconds)))
                 startOtpCountdown(seconds: cooldown)
             }
         } catch {
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
     public func verifyOTP(theme: FabushiTheme) async {
         clearErrors()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         let trimmedCode = otpCodeText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedCode.count >= 4, trimmedCode.count <= 8 else {
@@ -465,7 +506,7 @@ public final class FabushiAuthViewModel {
                     return
                 }
                 let trimmedUsername = usernameText.trimmingCharacters(in: .whitespacesAndNewlines)
-                let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                     method: FabushiRPCNamespace.auth.method("phoneVerify"),
                     params: FabushiPhoneVerifyRequest(
                         phone: normalizedPhone,
@@ -481,7 +522,8 @@ public final class FabushiAuthViewModel {
                     ),
                     extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                 )
-                completeAuthentication()
+                guard serverSwitchGeneration == capturedSwitchGen else { return }
+                completeAuthentication(expectedGeneration: envelope.generation)
 
             case .email:
                 let trimmedEmail = emailText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -500,6 +542,7 @@ public final class FabushiAuthViewModel {
                             fastKdf: useFastKdfForTests ? true : nil
                         )
                     )
+                    guard serverSwitchGeneration == capturedSwitchGen else { return }
                     let resolvedFirst = firstNameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? trimmedUsername
                         : firstNameText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -533,19 +576,26 @@ public final class FabushiAuthViewModel {
                             expectedGeneration: envelope.generation
                         )
                     }
+                    guard serverSwitchGeneration == capturedSwitchGen else {
+                        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                        return
+                    }
                     finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
                 } else {
-                    let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                    let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                         method: FabushiRPCNamespace.auth.method("emailVerify"),
                         params: FabushiEmailVerifyRequest(email: trimmedEmail, code: trimmedCode),
                         extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                     )
-                    completeAuthentication()
+                    guard serverSwitchGeneration == capturedSwitchGen else { return }
+                    completeAuthentication(expectedGeneration: envelope.generation)
                 }
             }
         } catch {
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
@@ -555,6 +605,7 @@ public final class FabushiAuthViewModel {
         clearErrors()
         cancelAlipayLogin()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         isSubmitting = true
         defer { isSubmitting = false }
@@ -564,6 +615,7 @@ public final class FabushiAuthViewModel {
                 method: FabushiRPCNamespace.auth.method("alipayStart"),
                 params: FabushiEmptyParams()
             )
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
             alipayAttemptId = startResp.attemptId
             alipayLoginURL = startResp.loginUrl
             alipayExpectedState = FabushiAuthValidation.extractStateQueryParam(from: startResp.loginUrl)
@@ -576,7 +628,9 @@ public final class FabushiAuthViewModel {
 
             startAlipayPollingLoop(attemptId: startResp.attemptId, theme: theme)
         } catch {
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
@@ -632,6 +686,7 @@ public final class FabushiAuthViewModel {
     @discardableResult
     public func pollAlipayOnce(theme: FabushiTheme) async -> FabushiAlipayPollResponse? {
         guard let attemptId = alipayAttemptId else { return nil }
+        let capturedSwitchGen = serverSwitchGeneration
         if let expiresAtMs = alipayExpiresAtMs,
            expiresAtMs > 0,
            Int64(Date().timeIntervalSince1970 * 1_000) > expiresAtMs {
@@ -646,6 +701,9 @@ public final class FabushiAuthViewModel {
                 params: FabushiAlipayPollRequest(attemptId: attemptId),
                 extractIdentity: { (res: FabushiAlipayPollResponse) in res.resolvedIdentity() }
             )
+            guard serverSwitchGeneration == capturedSwitchGen, alipayAttemptId == attemptId else {
+                return nil
+            }
             let poll = envelope.result
             if poll.isCompleted {
                 taskBag.cancel(key: "alipayPoll")
@@ -654,7 +712,8 @@ public final class FabushiAuthViewModel {
                 if coordinator.authState == .unauthenticated {
                     _ = try? await coordinator.syncAuthoritativeSessionState()
                 }
-                completeAuthentication()
+                guard serverSwitchGeneration == capturedSwitchGen else { return nil }
+                completeAuthentication(expectedGeneration: envelope.generation)
             } else if poll.isExpired {
                 taskBag.cancel(key: "alipayPoll")
                 alipayStatusText = theme.localized("hig.auth.alipayExpired")
@@ -663,7 +722,7 @@ public final class FabushiAuthViewModel {
             }
             return poll
         } catch {
-            if !Task.isCancelled {
+            if !Task.isCancelled && serverSwitchGeneration == capturedSwitchGen {
                 errorMessage = error.localizedDescription
             }
             return nil
@@ -675,6 +734,7 @@ public final class FabushiAuthViewModel {
     public func signInWithPasskey(theme: FabushiTheme) async {
         clearErrors()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         isSubmitting = true
         defer { isSubmitting = false }
@@ -687,13 +747,15 @@ public final class FabushiAuthViewModel {
                     username: trimmedUsername.isEmpty ? nil : trimmedUsername
                 )
             )
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
 
             let assertion = try await passkeyController.performAssertion(
                 rpId: challenge.rpId,
                 challenge: challenge.challenge
             )
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
 
-            let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+            let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                 method: FabushiRPCNamespace.auth.method("passkeyVerify"),
                 params: FabushiPasskeyVerifyRequest(
                     challenge: challenge.challenge,
@@ -705,8 +767,10 @@ public final class FabushiAuthViewModel {
                 ),
                 extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
             )
-            completeAuthentication()
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
+            completeAuthentication(expectedGeneration: envelope.generation)
         } catch let webAuthnError as FabushiWebAuthnError {
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
             switch webAuthnError {
             case .cancelled:
                 errorMessage = theme.localized("hig.auth.passkeyCancelled")
@@ -716,7 +780,9 @@ public final class FabushiAuthViewModel {
                 errorMessage = webAuthnError.localizedDescription
             }
         } catch {
-            handleAuthError(error, isQrPair: false)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: false)
+            }
         }
     }
 
@@ -724,6 +790,7 @@ public final class FabushiAuthViewModel {
         clearErrors()
         cancelQrPair()
         guard await applyServerURLIfNeeded(theme: theme) else { return }
+        let capturedSwitchGen = serverSwitchGeneration
 
         isSubmitting = true
         defer { isSubmitting = false }
@@ -733,6 +800,7 @@ public final class FabushiAuthViewModel {
                 method: FabushiRPCNamespace.auth.method("qrPairInit"),
                 params: FabushiEmptyParams()
             )
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
             qrPairToken = initResp.pairToken
             qrPairURL = initResp.qrUrl
             qrPairExpiresAtMs = initResp.expiresAtMs
@@ -744,7 +812,9 @@ public final class FabushiAuthViewModel {
 
             startQrPairPollingLoop(pairToken: initResp.pairToken, theme: theme)
         } catch {
-            handleAuthError(error, isQrPair: true)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: true)
+            }
         }
     }
 
@@ -763,6 +833,7 @@ public final class FabushiAuthViewModel {
     @discardableResult
     public func pollQrPairOnce(theme: FabushiTheme) async -> FabushiQrPairPollResponse? {
         guard let token = qrPairToken else { return nil }
+        let capturedSwitchGen = serverSwitchGeneration
         if let expiresAtMs = qrPairExpiresAtMs,
            expiresAtMs > 0,
            Int64(Date().timeIntervalSince1970 * 1_000) > expiresAtMs {
@@ -777,6 +848,9 @@ public final class FabushiAuthViewModel {
                 params: FabushiQrPairPollRequest(pairToken: token),
                 extractIdentity: { (res: FabushiQrPairPollResponse) in res.resolvedIdentity() }
             )
+            guard serverSwitchGeneration == capturedSwitchGen, qrPairToken == token else {
+                return nil
+            }
             let poll = envelope.result
             if poll.resolvedIdentity() != nil || (poll.token != nil && !(poll.token?.isEmpty ?? true)) {
                 taskBag.cancel(key: "qrPairPoll")
@@ -784,7 +858,8 @@ public final class FabushiAuthViewModel {
                 if coordinator.authState == .unauthenticated {
                     _ = try? await coordinator.syncAuthoritativeSessionState()
                 }
-                completeAuthentication()
+                guard serverSwitchGeneration == capturedSwitchGen else { return nil }
+                completeAuthentication(expectedGeneration: envelope.generation)
             } else if poll.requiresTwoFactor {
                 taskBag.cancel(key: "qrPairPoll")
                 activeTwoFactorChallenge = FabushiTwoFactorChallenge(
@@ -800,7 +875,9 @@ public final class FabushiAuthViewModel {
             }
             return poll
         } catch {
-            handleAuthError(error, isQrPair: true)
+            if serverSwitchGeneration == capturedSwitchGen {
+                handleAuthError(error, isQrPair: true)
+            }
             return nil
         }
     }
@@ -809,6 +886,7 @@ public final class FabushiAuthViewModel {
 
     public func submitTwoFactorVerification(theme: FabushiTheme) async {
         guard let challenge = activeTwoFactorChallenge else { return }
+        let capturedSwitchGen = serverSwitchGeneration
         clearErrors()
 
         guard !twoFactorPasswordText.isEmpty else {
@@ -820,6 +898,7 @@ public final class FabushiAuthViewModel {
         defer { isSubmitting = false }
 
         do {
+            let expectedGeneration: UInt64
             if challenge.isQrPair {
                 let envelope: FabushiRPCEnvelopeResult<FabushiQrPairPollResponse> = try await coordinator.dispatchAuthTransition(
                     method: FabushiRPCNamespace.auth.method("qrPairVerify"),
@@ -829,12 +908,13 @@ public final class FabushiAuthViewModel {
                     ),
                     extractIdentity: { (res: FabushiQrPairPollResponse) in res.resolvedIdentity() }
                 )
+                expectedGeneration = envelope.generation
                 if envelope.result.resolvedIdentity() == nil,
                    coordinator.authState == .unauthenticated {
                     _ = try? await coordinator.syncAuthoritativeSessionState()
                 }
             } else {
-                let _: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
+                let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                     method: FabushiRPCNamespace.auth.method("twoFactorVerify"),
                     params: FabushiTwoFactorVerifyRequest(
                         challengeToken: challenge.challengeToken,
@@ -843,12 +923,16 @@ public final class FabushiAuthViewModel {
                     ),
                     extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                 )
+                expectedGeneration = envelope.generation
             }
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
             activeTwoFactorChallenge = nil
             twoFactorPasswordText = ""
-            completeAuthentication()
+            completeAuthentication(expectedGeneration: expectedGeneration)
         } catch {
-            errorMessage = error.localizedDescription
+            if serverSwitchGeneration == capturedSwitchGen {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 

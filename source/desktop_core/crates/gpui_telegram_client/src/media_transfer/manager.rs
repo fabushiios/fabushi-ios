@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -113,6 +113,7 @@ pub struct ChunkedTransferManager {
     token_provider: TokenProvider,
     default_part_size: Option<u32>,
     controls: Arc<Mutex<HashMap<String, TransferControl>>>,
+    session_epoch: Arc<AtomicU64>,
     progress_tx: broadcast::Sender<TransferProgress>,
 }
 
@@ -130,6 +131,20 @@ impl ChunkedTransferManager {
         http_client: HttpClient,
         token_provider: TokenProvider,
     ) -> Arc<Self> {
+        Self::new_with_session_epoch(
+            store,
+            http_client,
+            token_provider,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_session_epoch(
+        store: FileTransferStore,
+        http_client: HttpClient,
+        token_provider: TokenProvider,
+        session_epoch: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let (progress_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             store,
@@ -137,8 +152,13 @@ impl ChunkedTransferManager {
             token_provider,
             default_part_size: None,
             controls: Arc::new(Mutex::new(HashMap::new())),
+            session_epoch,
             progress_tx,
         })
+    }
+
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::SeqCst)
     }
 
     pub fn with_default_part_size(mut self, part_size: Option<u32>) -> Self {
@@ -174,16 +194,78 @@ impl ChunkedTransferManager {
         self.control_handle(transfer_id).cancel();
     }
 
-    pub async fn start_or_resume_upload(
+    pub fn clear_session_state(&self) {
+        self.session_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut guard = self.controls.lock();
+        for ctl in guard.values() {
+            ctl.cancel();
+        }
+        guard.clear();
+        drop(guard);
+        self.store.clear();
+    }
+
+    fn ensure_session_epoch(&self, start_epoch: u64) -> Result<()> {
+        if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+            return Err(TelegramError::Auth(
+                "Session changed during chunked transfer".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_active(
         &self,
-        file_path: &Path,
-        mime_type: &str,
+        control: &TransferControl,
+        start_epoch: u64,
+        allow_paused: bool,
+        mark_store: bool,
+        transfer_id: &str,
+    ) -> Result<()> {
+        self.ensure_session_epoch(start_epoch)?;
+        if control.cancelled.load(Ordering::SeqCst) {
+            if mark_store {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.store.mark_status_with_error(
+                    transfer_id,
+                    TransferStatus::Cancelled,
+                    Some("Cancelled by caller"),
+                    now_ms,
+                )?;
+            }
+            return Err(TelegramError::Validation("Chunked upload cancelled".into()));
+        }
+        if !allow_paused && control.paused.load(Ordering::SeqCst) {
+            if mark_store {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                self.store.mark_status_with_error(
+                    transfer_id,
+                    TransferStatus::Paused,
+                    None,
+                    now_ms,
+                )?;
+            }
+            return Err(TelegramError::Validation("Chunked upload paused".into()));
+        }
+        Ok(())
+    }
+
+    pub fn start_or_resume_upload<'a>(
+        &'a self,
+        file_path: &'a Path,
+        mime_type: &'a str,
         chat_id: Option<i64>,
-        existing_transfer_id: Option<&str>,
-    ) -> Result<MediaUploadCompleteResponse> {
-        let token = (self.token_provider)()
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| TelegramError::Auth("No active session token for chunked upload".into()))?;
+        existing_transfer_id: Option<&'a str>,
+    ) -> impl std::future::Future<Output = Result<MediaUploadCompleteResponse>> + Send + 'a {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            let token = start_token
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| {
+                    TelegramError::Auth("No active session token for chunked upload".into())
+                })?;
+            self.ensure_session_epoch(start_epoch)?;
 
         let mut record = match existing_transfer_id {
             Some(tid) => match self.store.get(tid)? {
@@ -217,10 +299,13 @@ impl ChunkedTransferManager {
 
         let control = self.control_handle(&record.transfer_id);
         control.resume();
+        self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
 
         // If we already have a server upload_id, reconcile against GET /api/v1/media/upload/{id}/status
         if let Some(ref uid) = record.upload_id.clone() {
-            match self.http_client.get_chunked_upload_status(&token, uid).await {
+            let status_res = self.http_client.get_chunked_upload_status(&token, uid).await;
+            self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+            match status_res {
                 Ok(status) => {
                     if status.uploaded_parts.len() == record.total_parts as usize {
                         record.uploaded_parts = status.uploaded_parts;
@@ -274,6 +359,7 @@ impl ChunkedTransferManager {
 
         let mut reinit_attempts = 0u32;
         'session_loop: loop {
+            self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
             // Initialize on server if no active upload_id
             if record.upload_id.is_none() {
                 let init_req = ChunkedUploadInitRequest {
@@ -282,11 +368,12 @@ impl ChunkedTransferManager {
                     chunk_size: Some(record.part_size),
                     expected_sha256: Some(record.file_sha256.clone()),
                 };
-                let init_resp = match self
+                let init_res = self
                     .http_client
                     .init_chunked_upload(&token, &init_req)
-                    .await
-                {
+                    .await;
+                self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+                let init_resp = match init_res {
                     Ok(resp) => resp,
                     Err(err) => {
                         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -312,6 +399,7 @@ impl ChunkedTransferManager {
                 if server_part_size != record.part_size {
                     let (sz, ps, tp, sha, hashes) =
                         index_file_chunks(Path::new(&record.file_path), Some(server_part_size))?;
+                    self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
                     record.total_size = sz;
                     record.part_size = ps;
                     record.total_parts = tp;
@@ -320,6 +408,7 @@ impl ChunkedTransferManager {
                     record.uploaded_parts = vec![false; tp as usize];
                     self.store.insert(&record)?;
                 }
+                self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
                 record.status = TransferStatus::InProgress;
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 self.store.update_upload_session(
@@ -354,26 +443,7 @@ impl ChunkedTransferManager {
 
             let disk_path = Path::new(&record.file_path);
             for part_index in missing_parts {
-                if control.cancelled.load(Ordering::SeqCst) {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    self.store.mark_status_with_error(
-                        &record.transfer_id,
-                        TransferStatus::Cancelled,
-                        Some("Cancelled by caller"),
-                        now_ms,
-                    )?;
-                    return Err(TelegramError::Validation("Chunked upload cancelled".into()));
-                }
-                if control.paused.load(Ordering::SeqCst) {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    self.store.mark_status_with_error(
-                        &record.transfer_id,
-                        TransferStatus::Paused,
-                        None,
-                        now_ms,
-                    )?;
-                    return Err(TelegramError::Validation("Chunked upload paused".into()));
-                }
+                self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
 
                 let chunk = read_chunk_at(disk_path, part_index, record.part_size, record.total_size)?;
                 let actual_hash = sha256_hex(&chunk);
@@ -396,11 +466,13 @@ impl ChunkedTransferManager {
                 let mut last_err: Option<HttpClientError> = None;
                 let mut uploaded = false;
                 for attempt in 0..3u32 {
-                    match self
+                    self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+                    let part_res = self
                         .http_client
                         .upload_chunk_part(&token, &upload_id, part_index, chunk.clone())
-                        .await
-                    {
+                        .await;
+                    self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+                    match part_res {
                         Ok(()) => {
                             uploaded = true;
                             break;
@@ -415,9 +487,12 @@ impl ChunkedTransferManager {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(150 * (1u64 << attempt))).await;
+                            self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
                         }
                     }
                 }
+
+                self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
 
                 if !uploaded {
                     let err = last_err.unwrap_or(HttpClientError::Api {
@@ -470,7 +545,8 @@ impl ChunkedTransferManager {
                 self.emit_progress(&record, TransferStatus::InProgress);
             }
 
-            match self
+            self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+            let complete_res = self
                 .http_client
                 .complete_chunked_upload(
                     &token,
@@ -479,8 +555,9 @@ impl ChunkedTransferManager {
                     Some(&record.mime_type),
                     chat_id,
                 )
-                .await
-            {
+                .await;
+            self.check_active(&control, start_epoch, false, true, &record.transfer_id)?;
+            match complete_res {
                 Ok(complete_resp) => {
                     let done_ms = chrono::Utc::now().timestamp_millis();
                     self.store.mark_completed(
@@ -529,6 +606,7 @@ impl ChunkedTransferManager {
                     return Err(err.into());
                 }
             }
+        }
         }
     }
 

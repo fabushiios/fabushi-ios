@@ -5351,6 +5351,292 @@ fn test_vault_cross_account_isolation_concurrent_argon2_and_vault_db_wipe() {
     }
 }
 
+#[test]
+fn test_v1610_coding_owner_isolation_same_user_outbox_preservation_and_proxy_validation() {
+    let dir = tempdir().unwrap();
+    let cfg = CString::new(
+        json!({
+            "app_data_dir": dir.path().to_string_lossy(),
+            "storage_passphrase": "v1610-regression-test-keychain-key",
+            "test_mode": true
+        })
+        .to_string(),
+    )
+    .unwrap();
 
+    unsafe {
+        let host = fabushi_host_create(cfg.as_ptr());
+        assert!(!host.is_null());
 
+        // 1. Authenticate Alice (101)
+        let set_alice = dispatch(
+            host,
+            &json!({
+                "method": "session.setAuthSession",
+                "params": {
+                    "user_id": 101,
+                    "username": "alice_v1610",
+                    "session_id": "sess-alice-1",
+                    "token": "TOKEN_ALICE_101",
+                    "first_name": "Alice"
+                }
+            }),
+        );
+        assert_eq!(set_alice["ok"], true, "setAuthSession Alice failed: {set_alice}");
 
+        // 2. D10-02: CodingStore per-owner_user_id isolation (forged owner_user_id param must be ignored)
+        let alice_thread = dispatch(
+            host,
+            &json!({
+                "method": "coding.upsertThread",
+                "params": {
+                    "owner_user_id": 202,
+                    "bot_user_id": 9001,
+                    "chat_id": 500,
+                    "topic_id": 0,
+                    "thread_id": "alice-thread-1",
+                    "workspace_path": "/workspace/alice",
+                    "turn_count": 1
+                }
+            }),
+        );
+        assert_eq!(alice_thread["ok"], true, "Alice upsertThread failed: {alice_thread}");
+        assert_eq!(
+            alice_thread["result"]["owner_user_id"], 101,
+            "Authenticated coding.upsertThread must enforce client.current_user_id() (101)"
+        );
+
+        let alice_cp = dispatch(
+            host,
+            &json!({
+                "method": "coding.saveCheckpoint",
+                "params": {
+                    "owner_user_id": 202,
+                    "thread_id": "alice-thread-1",
+                    "turn_idx": 1,
+                    "before_ref": "abc000",
+                    "after_ref": "abc111",
+                    "prompt_preview": "Alice prompt",
+                    "reply_preview": "Alice reply"
+                }
+            }),
+        );
+        assert_eq!(alice_cp["ok"], true, "Alice saveCheckpoint failed: {alice_cp}");
+        assert_eq!(alice_cp["result"]["owner_user_id"], 101);
+
+        let alice_get_thread = dispatch(
+            host,
+            &json!({
+                "method": "coding.getThread",
+                "params": { "bot_user_id": 9001, "chat_id": 500, "topic_id": 0 }
+            }),
+        );
+        assert_eq!(alice_get_thread["ok"], true);
+        assert_eq!(alice_get_thread["result"]["owner_user_id"], 101);
+        assert_eq!(alice_get_thread["result"]["thread_id"], "alice-thread-1");
+
+        // 3. Same-user re-login and same-user switchAccount MUST preserve queued offline outbox!
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "outbox.setNetworkState", "params": {"online": false}})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({
+                    "method": "outbox.enqueue",
+                    "params": { "chat_id": 500, "text": "Alice offline outbox msg", "client_nonce": 777001 }
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            1
+        );
+
+        // Same-user re-login via session.setAuthSession (uses suspend_session_preserving_stores)
+        let relogin_alice = dispatch(
+            host,
+            &json!({
+                "method": "session.setAuthSession",
+                "params": {
+                    "user_id": 101,
+                    "username": "alice_v1610",
+                    "session_id": "sess-alice-2",
+                    "token": "TOKEN_ALICE_101_REFRESHED",
+                    "first_name": "Alice"
+                }
+            }),
+        );
+        assert_eq!(relogin_alice["ok"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            1,
+            "Same-user re-login must preserve queued offline outbox messages"
+        );
+
+        // Same-user re-select via session.switchAccount (uses suspend_session_preserving_stores)
+        let reselect_alice = dispatch(
+            host,
+            &json!({"method": "session.switchAccount", "params": {"account_id": "101"}}),
+        );
+        assert_eq!(reselect_alice["ok"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            1,
+            "Same-user switchAccount must preserve queued offline outbox messages"
+        );
+
+        // 4. Cross-user switch to Bob (202): wipes Alice's outbox AND isolates CodingStore!
+        let set_bob = dispatch(
+            host,
+            &json!({
+                "method": "session.setAuthSession",
+                "params": {
+                    "user_id": 202,
+                    "username": "bob_v1610",
+                    "session_id": "sess-bob-1",
+                    "token": "TOKEN_BOB_202",
+                    "first_name": "Bob"
+                }
+            }),
+        );
+        assert_eq!(set_bob["ok"], true);
+        assert_eq!(
+            dispatch(host, &json!({"method": "outbox.pendingCount"}))["result"]["pending_count"],
+            0,
+            "Cross-user session switch must wipe prior account's outbox"
+        );
+
+        // Bob must NOT see Alice's coding thread or checkpoints even if passing owner_user_id=101
+        let bob_get_alice_thread = dispatch(
+            host,
+            &json!({
+                "method": "coding.getThread",
+                "params": { "owner_user_id": 101, "bot_user_id": 9001, "chat_id": 500, "topic_id": 0 }
+            }),
+        );
+        assert_eq!(bob_get_alice_thread["ok"], true);
+        assert!(
+            bob_get_alice_thread["result"].is_null(),
+            "Bob must not read Alice's coding thread: {bob_get_alice_thread}"
+        );
+
+        let bob_get_alice_cps = dispatch(
+            host,
+            &json!({
+                "method": "coding.getCheckpoints",
+                "params": { "owner_user_id": 101, "thread_id": "alice-thread-1", "limit": 10 }
+            }),
+        );
+        assert_eq!(bob_get_alice_cps["ok"], true);
+        assert_eq!(
+            bob_get_alice_cps["result"].as_array().unwrap().len(),
+            0,
+            "Bob must not read Alice's coding checkpoints"
+        );
+
+        // Bob stores his own thread on the exact same (bot_user_id, chat_id, topic_id)
+        let bob_thread = dispatch(
+            host,
+            &json!({
+                "method": "coding.upsertThread",
+                "params": {
+                    "bot_user_id": 9001,
+                    "chat_id": 500,
+                    "topic_id": 0,
+                    "thread_id": "bob-thread-1",
+                    "workspace_path": "/workspace/bob"
+                }
+            }),
+        );
+        assert_eq!(bob_thread["ok"], true);
+        assert_eq!(bob_thread["result"]["owner_user_id"], 202);
+
+        // Switch back to Alice -> Alice still sees her isolated coding thread & checkpoint
+        assert_eq!(
+            dispatch(
+                host,
+                &json!({"method": "session.switchAccount", "params": {"account_id": "101"}})
+            )["ok"],
+            true
+        );
+        let alice_thread_again = dispatch(
+            host,
+            &json!({
+                "method": "coding.getThread",
+                "params": { "bot_user_id": 9001, "chat_id": 500, "topic_id": 0 }
+            }),
+        );
+        assert_eq!(alice_thread_again["result"]["owner_user_id"], 101);
+        assert_eq!(alice_thread_again["result"]["thread_id"], "alice-thread-1");
+        let alice_cps_again = dispatch(
+            host,
+            &json!({
+                "method": "coding.getCheckpoints",
+                "params": { "thread_id": "alice-thread-1", "limit": 10 }
+            }),
+        );
+        assert_eq!(alice_cps_again["result"].as_array().unwrap().len(), 1);
+        assert_eq!(alice_cps_again["result"][0]["owner_user_id"], 101);
+
+        // 5. D10-13: Strict v1.6.10 proxy validation on both proxy.upsert AND proxy.setActive
+        let bad_upsert = dispatch(
+            host,
+            &json!({
+                "method": "proxy.upsert",
+                "params": {
+                    "id": "bad-host",
+                    "proxy_type": "Socks5",
+                    "host": "bad@evil.example/path",
+                    "port": 1080
+                }
+            }),
+        );
+        assert_eq!(bad_upsert["ok"], false, "proxy.upsert must reject metacharacter host");
+        assert_eq!(bad_upsert["error"]["code"], "invalid_arguments");
+
+        // Inject an invalid legacy persisted proxy record directly into host_state.db
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("host_state.db")).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO host_kv (namespace, key, value, updated_at_ms) VALUES ('proxies', 'legacy-bad', ?1, 1700000000000)",
+                rusqlite::params![r#"{"proxy_type":"Socks5","host":"bad@evil.example/path","port":1080,"fallback_to_direct":false}"#],
+            )
+            .unwrap();
+        }
+        let bad_activate = dispatch(
+            host,
+            &json!({"method": "proxy.setActive", "params": {"id": "legacy-bad"}}),
+        );
+        assert_eq!(
+            bad_activate["ok"], false,
+            "proxy.setActive must fail closed on invalid persisted proxy record: {bad_activate}"
+        );
+        assert_eq!(bad_activate["error"]["code"], "invalid_arguments");
+        let active_after_bad = dispatch(host, &json!({"method": "proxy.getActive"}));
+        assert!(active_after_bad["result"]["active_proxy_id"].is_null());
+
+        // Positive control: valid proxy upsert + activate succeeds
+        let good_upsert = dispatch(
+            host,
+            &json!({
+                "method": "proxy.upsert",
+                "params": { "id": "good-socks", "url": "socks5://127.0.0.1:1080", "activate": false }
+            }),
+        );
+        assert_eq!(good_upsert["ok"], true, "valid proxy.upsert failed: {good_upsert}");
+        let good_activate = dispatch(
+            host,
+            &json!({"method": "proxy.setActive", "params": {"id": "good-socks"}}),
+        );
+        assert_eq!(good_activate["ok"], true, "valid proxy.setActive failed: {good_activate}");
+        assert_eq!(good_activate["result"]["active_proxy_id"], "good-socks");
+
+        fabushi_host_destroy(host);
+    }
+}

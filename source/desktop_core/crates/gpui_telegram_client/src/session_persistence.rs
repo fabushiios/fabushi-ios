@@ -44,19 +44,55 @@ pub struct ProxyEndpointRecord {
 
 impl ProxyEndpointRecord {
     pub fn tg_deep_link(&self) -> String {
-        match self.kind.as_str() {
-            "MTProto" => format!(
-                "tg://proxy?server={}&port={}&secret={}",
-                self.host,
-                self.port,
-                if self.secret_or_user.is_empty() {
-                    "ee00000000000000000000000000000001"
+        use crate::net::http_helpers::percent_encode_rfc3986;
+
+        let kind_lower = self.kind.trim().to_ascii_lowercase();
+        match kind_lower.as_str() {
+            "direct" | "none" => String::new(),
+            "mtproto" => {
+                let secret = if self.secret_or_user.trim().is_empty() {
+                    "ee000000000000000000000000000001"
                 } else {
-                    &self.secret_or_user
+                    self.secret_or_user.trim()
+                };
+                format!(
+                    "tg://proxy?server={}&port={}&secret={}",
+                    percent_encode_rfc3986(self.host.trim()),
+                    self.port,
+                    percent_encode_rfc3986(secret),
+                )
+            }
+            "socks5" | "socks5h" => {
+                let mut link = format!(
+                    "tg://socks?server={}&port={}",
+                    percent_encode_rfc3986(self.host.trim()),
+                    self.port,
+                );
+                let effective_user = self
+                    .username
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        let s = self.secret_or_user.trim();
+                        (!s.is_empty()).then_some(s)
+                    });
+                if let Some(user) = effective_user {
+                    link.push_str(&format!("&user={}", percent_encode_rfc3986(user)));
                 }
-            ),
-            "SOCKS5" => format!("tg://socks?server={}&port={}", self.host, self.port),
-            _ => format!("http://{}:{}", self.host, self.port),
+                if let Some(pass) = self.password.as_deref().filter(|s| !s.is_empty()) {
+                    link.push_str(&format!("&pass={}", percent_encode_rfc3986(pass)));
+                }
+                link
+            }
+            _ => {
+                let host = self.host.trim();
+                let formatted_host = if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]")
+                } else {
+                    host.to_string()
+                };
+                format!("http://{}:{}", formatted_host, self.port)
+            }
         }
     }
 }
@@ -342,6 +378,18 @@ impl SessionPersistenceBridge {
     fn load_from_disk(path: &Path) -> Option<PersistedClientState> {
         let raw = fs::read_to_string(path).ok()?;
         serde_json::from_str(&raw).ok()
+    }
+
+    pub fn load_state_from_disk() -> PersistedClientState {
+        let storage_path = Self::resolve_storage_path();
+        Self::load_from_disk(&storage_path).unwrap_or_else(PersistedClientState::empty)
+    }
+
+    pub fn save_state_to_disk(state: &PersistedClientState) {
+        let storage_path = Self::resolve_storage_path();
+        if let Ok(serialized) = serde_json::to_string_pretty(state) {
+            let _ = fs::write(&storage_path, serialized);
+        }
     }
 
     pub fn save_to_disk(&self) {

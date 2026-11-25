@@ -10,8 +10,8 @@ use crate::git::checkpoint::{
 };
 use crate::git::pr::{commit_and_pr, count_dirty_entries};
 use crate::git::worktree::{
-    ensure_worktree, git_repo_root, list_worktrees, remove_worktree, thread_worktree_slug,
-    validate_workspace_dir,
+    ensure_worktree, git_repo_root, list_worktrees, remove_worktree,
+    thread_worktree_slug_for_owner, validate_workspace_dir,
 };
 use crate::probe::{check_provider_login_status, probe_local_coding_providers};
 use crate::store::{
@@ -122,6 +122,18 @@ impl LocalCodingHostRuntime {
         self.inner.config.owner_user_id
     }
 
+    pub fn db_path(&self) -> &Path {
+        &self.inner.config.db_path
+    }
+
+    pub fn worktrees_root(&self) -> &Path {
+        &self.inner.config.worktrees_root
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// Dispatches a `CodingHostCommand`, enforcing strict `owner_user_id` verification.
     pub async fn handle_command(
         &self,
@@ -178,7 +190,12 @@ impl LocalCodingHostRuntime {
             } => {
                 self.enqueue_start_turn(
                     turn_id,
-                    ThreadKey::new(bot_user_id, chat_id, topic_id),
+                    ThreadKey::for_owner(
+                        self.inner.config.owner_user_id,
+                        bot_user_id,
+                        chat_id,
+                        topic_id,
+                    ),
                     is_forum_topic,
                     prompt,
                     config,
@@ -209,7 +226,12 @@ impl LocalCodingHostRuntime {
                 let result = self
                     .handle_control_action(
                         req_id,
-                        ThreadKey::new(bot_user_id, chat_id, topic_id),
+                        ThreadKey::for_owner(
+                            self.inner.config.owner_user_id,
+                            bot_user_id,
+                            chat_id,
+                            topic_id,
+                        ),
                         is_forum_topic,
                         config,
                         action,
@@ -266,7 +288,11 @@ impl LocalCodingHostRuntime {
         emit: mpsc::UnboundedSender<CodingHostEvent>,
     ) {
         let deterministic_tid = default_thread_id(key);
-        match self.inner.store.claim_turn_receipt(&turn_id, &deterministic_tid) {
+        match self.inner.store.claim_turn_receipt(
+            self.inner.config.owner_user_id,
+            &turn_id,
+            &deterministic_tid,
+        ) {
             Ok(TurnReceiptClaim::Claimed) => {}
             Ok(TurnReceiptClaim::AlreadyCompleted(ev)) => {
                 let _ = emit.send(ev);
@@ -330,7 +356,13 @@ impl LocalCodingHostRuntime {
 
         if let Err(err) = worker_tx.send(queued) {
             self.inner.active_turns.lock().remove(&turn_id);
-            let _ = self.inner.store.finish_turn_receipt(&turn_id, "failed", 0, None);
+            let _ = self.inner.store.finish_turn_receipt(
+                self.inner.config.owner_user_id,
+                &turn_id,
+                "failed",
+                0,
+                None,
+            );
             let _ = emit.send(CodingHostEvent::TurnCompleted {
                 turn_id,
                 ok: false,
@@ -495,7 +527,8 @@ impl LocalCodingHostRuntime {
                     }
                     "on" | "enable" | "create" | "new" | "ensure" => {
                         let wt_root = self.inner.config.worktrees_root.clone();
-                        let slug = thread_worktree_slug(
+                        let slug = thread_worktree_slug_for_owner(
+                            self.inner.config.owner_user_id,
                             key.bot_user_id,
                             key.chat_id,
                             (key.topic_id != 0).then_some(key.topic_id),
@@ -603,7 +636,11 @@ impl LocalCodingHostRuntime {
                         format!("Workspace `{}` is not a git repository.", cwd.display()),
                     );
                 }
-                let cp = match self.inner.store.get_checkpoint(&rec.thread_id, turn_idx) {
+                let cp = match self.inner.store.get_checkpoint(
+                    self.inner.config.owner_user_id,
+                    &rec.thread_id,
+                    turn_idx,
+                ) {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         return control_ok(req_id, "No checkpoint recorded for the requested turn.");
@@ -650,7 +687,11 @@ impl LocalCodingHostRuntime {
                         format!("Workspace `{}` is not a git repository.", cwd.display()),
                     );
                 }
-                let cp = match self.inner.store.get_checkpoint(&rec.thread_id, turn_idx) {
+                let cp = match self.inner.store.get_checkpoint(
+                    self.inner.config.owner_user_id,
+                    &rec.thread_id,
+                    turn_idx,
+                ) {
                     Ok(Some(c)) => c,
                     Ok(None) => return control_err(req_id, "Requested checkpoint turn was not found."),
                     Err(e) => return control_err(req_id, e),
@@ -873,7 +914,16 @@ impl LocalCodingHostRuntime {
                 };
                 let checkpoints = rec
                     .as_ref()
-                    .and_then(|r| self.inner.store.list_recent_checkpoints(&r.thread_id, 5).ok())
+                    .and_then(|r| {
+                        self.inner
+                            .store
+                            .list_recent_checkpoints(
+                                self.inner.config.owner_user_id,
+                                &r.thread_id,
+                                5,
+                            )
+                            .ok()
+                    })
                     .unwrap_or_default();
 
                 let target_clean = target_bot_username.trim().trim_start_matches('@');
@@ -1033,6 +1083,7 @@ impl RuntimeInner {
 
         if clear_allow_rules {
             let key = ThreadKey {
+                owner_user_id: rec.owner_user_id,
                 bot_user_id: rec.bot_user_id,
                 chat_id: rec.chat_id,
                 topic_id: rec.topic_id,
@@ -1050,6 +1101,9 @@ impl RuntimeInner {
         config: &CodingAgentBotConfig,
     ) -> Option<ThreadRecord> {
         let mut rec = self.store.get_thread(key).ok().flatten()?;
+        if rec.owner_user_id != self.config.owner_user_id {
+            return None;
+        }
         if self.reconcile_thread_with_bot_config(&mut rec, is_forum_topic, config) {
             rec.updated_at_ms = now_ms();
             let _ = self.store.upsert_thread(&rec);
@@ -1069,6 +1123,7 @@ impl RuntimeInner {
         }
         let bot_model = normalized_opt_str(config.model_override.as_deref());
         ThreadRecord {
+            owner_user_id: key.owner_user_id,
             bot_user_id: key.bot_user_id,
             chat_id: key.chat_id,
             topic_id: key.topic_id,
@@ -1109,7 +1164,7 @@ async fn execute_queued_turn(inner: &Arc<RuntimeInner>, turn: QueuedTurn) {
         };
         let _ = inner
             .store
-            .finish_turn_receipt(&turn_id, "cancelled", 0, Some(&ev));
+            .finish_turn_receipt(inner.config.owner_user_id, &turn_id, "cancelled", 0, Some(&ev));
         inner.active_turns.lock().remove(&turn_id);
         let _ = emit.send(ev);
         return;
@@ -1157,7 +1212,8 @@ async fn execute_queued_turn(inner: &Arc<RuntimeInner>, turn: QueuedTurn) {
     if effective_use_worktree {
         if let Some(repo_root) = git_repo_root(&base_ws) {
             let wt_root = inner.config.worktrees_root.clone();
-            let slug = thread_worktree_slug(
+            let slug = thread_worktree_slug_for_owner(
+                inner.config.owner_user_id,
                 turn.key.bot_user_id,
                 turn.key.chat_id,
                 (turn.key.topic_id != 0).then_some(turn.key.topic_id),
@@ -1284,6 +1340,7 @@ async fn execute_queued_turn(inner: &Arc<RuntimeInner>, turn: QueuedTurn) {
         match cp_res {
             Ok(Ok((a_ref, stat))) => {
                 let cp_record = CheckpointRecord {
+                    owner_user_id: inner.config.owner_user_id,
                     thread_id: rec.thread_id.clone(),
                     turn_idx,
                     before_ref: before_ref.clone(),
@@ -1338,9 +1395,13 @@ async fn execute_queued_turn(inner: &Arc<RuntimeInner>, turn: QueuedTurn) {
         token_usage: output.token_usage,
     };
 
-    let _ = inner
-        .store
-        .finish_turn_receipt(&turn_id, receipt_status, turn_idx, Some(&completed_ev));
+    let _ = inner.store.finish_turn_receipt(
+        inner.config.owner_user_id,
+        &turn_id,
+        receipt_status,
+        turn_idx,
+        Some(&completed_ev),
+    );
     inner.active_turns.lock().remove(&turn_id);
     let _ = emit.send(completed_ev);
 }
@@ -1362,9 +1423,13 @@ fn finish_turn_failure(
         diff_stat: None,
         token_usage: None,
     };
-    let _ = inner
-        .store
-        .finish_turn_receipt(turn_id, "failed", turn_idx, Some(&ev));
+    let _ = inner.store.finish_turn_receipt(
+        inner.config.owner_user_id,
+        turn_id,
+        "failed",
+        turn_idx,
+        Some(&ev),
+    );
     inner.active_turns.lock().remove(turn_id);
     let _ = emit.send(ev);
 }
@@ -1383,7 +1448,10 @@ fn resolve_effective_cwd_readonly(rec: &ThreadRecord, fallback_ws: &str) -> Path
 }
 
 fn default_thread_id(key: ThreadKey) -> String {
-    format!("thr_{}_{}_{}", key.bot_user_id, key.chat_id, key.topic_id)
+    format!(
+        "thr_u{}_{}_{}_{}",
+        key.owner_user_id, key.bot_user_id, key.chat_id, key.topic_id
+    )
 }
 
 fn command_owner_and_target(cmd: &CodingHostCommand) -> (u64, Option<&str>) {
@@ -2577,5 +2645,211 @@ for line in sys.stdin:
         }
 
         rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_isolates_owner_user_ids_sharing_single_db_path() {
+        let tmp = TempDir::new().unwrap();
+        let shared_db = tmp.path().join("shared_coding_host_state.db");
+        let shared_wt_root = tmp.path().join("shared-worktrees");
+        let alice_repo = tmp.path().join("alice_repo");
+        let bob_repo = tmp.path().join("bob_repo");
+        std::fs::create_dir_all(&alice_repo).unwrap();
+        std::fs::create_dir_all(&bob_repo).unwrap();
+        init_git_repo(&alice_repo);
+        init_git_repo(&bob_repo);
+
+        let rt_alice = LocalCodingHostRuntime::new(CodingHostRuntimeConfig {
+            owner_user_id: 1001,
+            device_id: "dev-shared".into(),
+            db_path: shared_db.clone(),
+            worktrees_root: shared_wt_root.clone(),
+        })
+        .unwrap();
+
+        let alice_cfg = CodingAgentBotConfig {
+            provider_kind: CodingProviderKind::ClaudeCode,
+            workspace_path: alice_repo.to_string_lossy().into_owned(),
+            use_worktree: false,
+            permission_mode: CodingPermissionMode::AutoEdit,
+            model_override: Some("alice-secret-model".into()),
+            ..Default::default()
+        };
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        rt_alice
+            .handle_command(
+                CodingHostCommand::Control {
+                    req_id: "alice_wt_on".into(),
+                    owner_user_id: 1001,
+                    target_device_id: None,
+                    bot_user_id: 500,
+                    chat_id: 102,
+                    topic_id: None,
+                    is_forum_topic: false,
+                    config: alice_cfg.clone(),
+                    action: CodingControlAction::WorktreeOp {
+                        op: "on".into(),
+                        branch: None,
+                    },
+                },
+                tx_a,
+            )
+            .await;
+        match rx_a.recv().await.unwrap() {
+            CodingHostEvent::ControlResult {
+                ok, markdown_reply, ..
+            } => {
+                assert!(ok, "alice worktree on failed: {markdown_reply}");
+                assert!(markdown_reply.contains("u1001_b500_c102"), "{markdown_reply}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Seed Alice's provider_session_id, turn_count=17, last_summary, and a checkpoint directly.
+        {
+            let store = CodingStore::open(&shared_db).unwrap();
+            let mut rec = store
+                .get_thread(ThreadKey::for_owner(1001, 500, 102, None))
+                .unwrap()
+                .expect("alice thread must exist");
+            rec.turn_count = 17;
+            rec.provider_session_id = Some("secret_claude_sess_alice".to_string());
+            rec.last_summary = Some("alice confidential summary".to_string());
+            store.upsert_thread(&rec).unwrap();
+
+            store
+                .save_checkpoint(&CheckpointRecord {
+                    owner_user_id: 1001,
+                    thread_id: rec.thread_id.clone(),
+                    turn_idx: 1,
+                    before_ref: "refs/a/1-before".into(),
+                    after_ref: "refs/a/1".into(),
+                    diff_stat: CodingDiffStat::default(),
+                    prompt_preview: "alice secret prompt".into(),
+                    reply_preview: "alice secret reply".into(),
+                    created_at_ms: now_ms(),
+                })
+                .unwrap();
+        }
+        rt_alice.shutdown().await;
+
+        let rt_bob = LocalCodingHostRuntime::new(CodingHostRuntimeConfig {
+            owner_user_id: 2002,
+            device_id: "dev-shared".into(),
+            db_path: shared_db.clone(),
+            worktrees_root: shared_wt_root.clone(),
+        })
+        .unwrap();
+
+        let bob_cfg = CodingAgentBotConfig {
+            provider_kind: CodingProviderKind::ClaudeCode,
+            workspace_path: bob_repo.to_string_lossy().into_owned(),
+            use_worktree: false,
+            permission_mode: CodingPermissionMode::Ask,
+            model_override: None,
+            ..Default::default()
+        };
+
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        rt_bob
+            .handle_command(
+                CodingHostCommand::Control {
+                    req_id: "bob_status".into(),
+                    owner_user_id: 2002,
+                    target_device_id: None,
+                    bot_user_id: 500,
+                    chat_id: 102,
+                    topic_id: None,
+                    is_forum_topic: false,
+                    config: bob_cfg.clone(),
+                    action: CodingControlAction::GetStatus,
+                },
+                tx_b.clone(),
+            )
+            .await;
+        match rx_b.recv().await.unwrap() {
+            CodingHostEvent::ControlResult {
+                ok, markdown_reply, ..
+            } => {
+                assert!(ok);
+                assert!(markdown_reply.contains(&bob_repo.display().to_string()), "{markdown_reply}");
+                assert!(markdown_reply.contains("Turns: `0`"), "{markdown_reply}");
+                assert!(markdown_reply.contains("Session: `(none)`"), "{markdown_reply}");
+                assert!(markdown_reply.contains("Worktree: `(none)`"), "{markdown_reply}");
+                assert!(!markdown_reply.contains("alice"), "{markdown_reply}");
+                assert!(!markdown_reply.contains("17"), "{markdown_reply}");
+                assert!(!markdown_reply.contains("secret_claude_sess_alice"), "{markdown_reply}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        rt_bob
+            .handle_command(
+                CodingHostCommand::Control {
+                    req_id: "bob_handoff".into(),
+                    owner_user_id: 2002,
+                    target_device_id: None,
+                    bot_user_id: 500,
+                    chat_id: 102,
+                    topic_id: None,
+                    is_forum_topic: false,
+                    config: bob_cfg.clone(),
+                    action: CodingControlAction::BuildHandoffSummary {
+                        target_bot_username: "codex_bot".into(),
+                    },
+                },
+                tx_b.clone(),
+            )
+            .await;
+        match rx_b.recv().await.unwrap() {
+            CodingHostEvent::ControlResult {
+                ok, handoff_summary, ..
+            } => {
+                assert!(ok);
+                let summary = handoff_summary.unwrap();
+                assert!(!summary.contains("alice"), "{summary}");
+                assert!(!summary.contains("Turn #1"), "{summary}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Bob creating a worktree even on the SAME shared git repo uses u2002_b500_c102, never colliding with Alice's u1001_b500_c102.
+        let bob_shared_repo_cfg = CodingAgentBotConfig {
+            workspace_path: alice_repo.to_string_lossy().into_owned(),
+            ..bob_cfg
+        };
+        rt_bob
+            .handle_command(
+                CodingHostCommand::Control {
+                    req_id: "bob_wt_on".into(),
+                    owner_user_id: 2002,
+                    target_device_id: None,
+                    bot_user_id: 500,
+                    chat_id: 102,
+                    topic_id: None,
+                    is_forum_topic: false,
+                    config: bob_shared_repo_cfg,
+                    action: CodingControlAction::WorktreeOp {
+                        op: "on".into(),
+                        branch: None,
+                    },
+                },
+                tx_b,
+            )
+            .await;
+        match rx_b.recv().await.unwrap() {
+            CodingHostEvent::ControlResult {
+                ok, markdown_reply, ..
+            } => {
+                assert!(ok, "bob worktree on failed: {markdown_reply}");
+                assert!(markdown_reply.contains("u2002_b500_c102"), "{markdown_reply}");
+                assert!(markdown_reply.contains("fabushi/u2002_b500_c102"), "{markdown_reply}");
+                assert!(!markdown_reply.contains("u1001"), "{markdown_reply}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        rt_bob.shutdown().await;
     }
 }

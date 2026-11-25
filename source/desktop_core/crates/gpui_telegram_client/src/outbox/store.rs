@@ -457,4 +457,9 @@ impl OutboxStore {
     pub fn max_nonce(&self) -> u64 {
         self.cache.max_outbox_nonce()
     }
+
+    pub fn clear(&self) {
+        let conn = self.cache.conn.lock();
+        let _ = conn.execute("DELETE FROM outbox_messages", []);
+    }
 }

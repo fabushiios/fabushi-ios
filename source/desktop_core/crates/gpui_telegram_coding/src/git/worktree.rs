@@ -60,6 +60,21 @@ pub fn thread_worktree_slug(bot_user_id: i64, chat_id: i64, topic_id: Option<i64
     sanitize_slug(&raw)
 }
 
+/// Builds an owner-isolated, filesystem-safe worktree slug so distinct local accounts never
+/// collide on worktree directory paths or `fabushi/*` Git branches.
+pub fn thread_worktree_slug_for_owner(
+    owner_user_id: u64,
+    bot_user_id: i64,
+    chat_id: i64,
+    topic_id: Option<i64>,
+) -> String {
+    let raw = match topic_id {
+        Some(tid) if tid != 0 => format!("u{owner_user_id}_b{bot_user_id}_c{chat_id}_t{tid}"),
+        _ => format!("u{owner_user_id}_b{bot_user_id}_c{chat_id}"),
+    };
+    sanitize_slug(&raw)
+}
+
 fn sanitize_slug(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {

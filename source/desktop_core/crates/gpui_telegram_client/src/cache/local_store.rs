@@ -25,10 +25,21 @@ struct LocalCacheState {
     mem_media_bytes: HashMap<String, Vec<u8>>,
 }
 
+#[derive(Default, Clone)]
+struct ClearHookList(Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>);
+
+impl std::fmt::Debug for ClearHookList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.0.lock().len();
+        f.debug_tuple("ClearHookList").field(&len).finish()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct LocalStore {
     state: Arc<RwLock<LocalCacheState>>,
     sqlite: Option<Arc<SqliteClientCache>>,
+    clear_hooks: ClearHookList,
 }
 
 impl LocalStore {
@@ -73,7 +84,12 @@ impl LocalStore {
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             sqlite: Some(db),
+            clear_hooks: ClearHookList::default(),
         })
+    }
+
+    pub(crate) fn register_clear_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.clear_hooks.0.lock().push(hook);
     }
 
     pub(crate) fn sqlite_cache(&self) -> Option<Arc<SqliteClientCache>> {
@@ -149,9 +165,14 @@ impl LocalStore {
             guard.pinned_ids.clear();
             guard.read_inbox_max.clear();
             guard.read_outbox_max.clear();
+            guard.mem_media_bytes.clear();
         }
         if let Some(db) = &self.sqlite {
             db.clear_all();
+        }
+        let hooks = self.clear_hooks.0.lock().clone();
+        for hook in hooks {
+            hook();
         }
     }
 

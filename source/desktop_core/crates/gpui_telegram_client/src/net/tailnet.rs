@@ -841,6 +841,7 @@ pub struct TailnetEngine {
     disco_pings: Mutex<HashMap<String, (Instant, String)>>,
     disco_notify: Arc<Notify>,
     stop_notify: Arc<Notify>,
+    lifecycle_lock: Mutex<()>,
     runtime_cfg: RwLock<Option<RuntimeConfigSnapshot>>,
 }
 
@@ -872,6 +873,7 @@ impl TailnetEngine {
             disco_pings: Mutex::new(HashMap::new()),
             disco_notify: Arc::new(Notify::new()),
             stop_notify: Arc::new(Notify::new()),
+            lifecycle_lock: Mutex::new(()),
             runtime_cfg: RwLock::new(None),
         })
     }
@@ -1196,25 +1198,12 @@ impl TailnetEngine {
     }
 
     pub fn stop(&self) {
+        let _gate = self.lifecycle_lock.lock();
         self.running.store(false, Ordering::Release);
         self.run_generation.fetch_add(1, Ordering::AcqRel);
         self.stop_notify.notify_waiters();
-        self.derp_connected.store(false, Ordering::Release);
-        self.local_udp_port.store(0, Ordering::Release);
-        self.owner_user_id.store(0, Ordering::Release);
-        *self.derp_rtt_ms.lock() = None;
-        *self.derp_tx.write() = None;
-        *self.udp_socket.write() = None;
+        self.reset_transient_state_locked();
         *self.runtime_cfg.write() = None;
-        *self.netmap.write() = None;
-        *self.cached_stun_endpoint.write() = None;
-        self.peer_states.write().clear();
-        self.pending_approvals.lock().clear();
-        self.inflight_rpc.lock().clear();
-        self.recent_exec_requests.lock().clear();
-        self.replay_windows.lock().clear();
-        self.frag_assembler.lock().pending.clear();
-        self.disco_pings.lock().clear();
     }
 
     /// Starts the embedded Tailnet engine (UDP Magicsock, STUN, signed registration,
@@ -1227,45 +1216,139 @@ impl TailnetEngine {
         http_client: HttpClient,
         runtime_handle: Handle,
     ) {
+        let _ = self.start_if(base_url, token, user_id, http_client, runtime_handle, || true);
+    }
+
+    /// Starts the embedded Tailnet engine atomically only if `predicate()` holds under
+    /// `lifecycle_lock`, preserving `start()`'s `same_cfg` and `reset_transient_state_locked()` semantics.
+    pub fn start_if(
+        self: &Arc<Self>,
+        base_url: String,
+        token: String,
+        user_id: Option<u64>,
+        http_client: HttpClient,
+        runtime_handle: Handle,
+        predicate: impl FnOnce() -> bool,
+    ) -> bool {
         let clean_base = base_url.trim().trim_end_matches('/').to_string();
         let clean_token = token.trim().to_string();
         if clean_base.is_empty() || clean_token.is_empty() {
-            return;
+            return false;
         }
 
-        if self.running.load(Ordering::Acquire) {
-            let same_cfg = self.runtime_cfg.read().as_ref().is_some_and(|cfg| {
-                cfg.base_url == clean_base && cfg.token == clean_token
-            });
-            if same_cfg {
-                return;
+        let (my_gen, spawn_base, spawn_token, spawn_http, spawn_rt) = {
+            let _gate = self.lifecycle_lock.lock();
+            if !predicate() {
+                return false;
             }
-        }
+            if self.running.load(Ordering::Acquire) {
+                let same_cfg = self.runtime_cfg.read().as_ref().is_some_and(|cfg| {
+                    cfg.base_url == clean_base && cfg.token == clean_token
+                });
+                if same_cfg {
+                    return true;
+                }
+            }
 
-        let my_gen = self.run_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.stop_notify.notify_waiters();
-        self.running.store(true, Ordering::Release);
-        if let Some(uid) = user_id.filter(|&u| u > 0) {
-            self.owner_user_id.store(uid, Ordering::Release);
-        }
+            let my_gen = self.run_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.stop_notify.notify_waiters();
+            self.reset_transient_state_locked();
+            self.running.store(true, Ordering::Release);
+            if let Some(uid) = user_id.filter(|&u| u > 0) {
+                self.owner_user_id.store(uid, Ordering::Release);
+            }
 
-        *self.runtime_cfg.write() = Some(RuntimeConfigSnapshot {
-            base_url: clean_base.clone(),
-            token: clean_token.clone(),
-            http_client: http_client.clone(),
-            runtime_handle: runtime_handle.clone(),
-        });
+            *self.runtime_cfg.write() = Some(RuntimeConfigSnapshot {
+                base_url: clean_base.clone(),
+                token: clean_token.clone(),
+                http_client: http_client.clone(),
+                runtime_handle: runtime_handle.clone(),
+            });
+            (my_gen, clean_base, clean_token, http_client, runtime_handle)
+        };
 
         let engine = Arc::clone(self);
-        runtime_handle.clone().spawn(async move {
+        spawn_rt.clone().spawn(async move {
             engine
-                .run_supervisor(my_gen, clean_base, clean_token, user_id, http_client, runtime_handle)
+                .run_supervisor(my_gen, spawn_base, spawn_token, user_id, spawn_http, spawn_rt)
                 .await;
         });
+        true
     }
 
     fn is_gen_active(&self, my_gen: u64) -> bool {
         self.running.load(Ordering::Acquire) && self.run_generation.load(Ordering::Acquire) == my_gen
+    }
+
+    async fn wait_gen_inactive(&self, my_gen: u64) {
+        loop {
+            let notified = self.stop_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.is_gen_active(my_gen) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn reset_transient_state_locked(&self) {
+        self.derp_connected.store(false, Ordering::Release);
+        *self.derp_rtt_ms.lock() = None;
+        *self.derp_tx.write() = None;
+        self.local_udp_port.store(0, Ordering::Release);
+        self.owner_user_id.store(0, Ordering::Release);
+        *self.udp_socket.write() = None;
+        *self.netmap.write() = None;
+        *self.cached_stun_endpoint.write() = None;
+        self.peer_states.write().clear();
+        self.pending_approvals.lock().clear();
+        self.inflight_rpc.lock().clear();
+        self.recent_exec_requests.lock().clear();
+        self.replay_windows.lock().clear();
+        self.frag_assembler.lock().pending.clear();
+        self.disco_pings.lock().clear();
+    }
+
+    fn set_derp_connected_for_gen(
+        &self,
+        my_gen: u64,
+        tx: mpsc::UnboundedSender<DerpClientFrame>,
+    ) -> bool {
+        let _gate = self.lifecycle_lock.lock();
+        if !self.is_gen_active(my_gen) {
+            return false;
+        }
+        self.derp_connected.store(true, Ordering::Release);
+        *self.derp_tx.write() = Some(tx);
+        true
+    }
+
+    fn clear_derp_state_for_gen(&self, my_gen: u64) {
+        let _gate = self.lifecycle_lock.lock();
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
+        self.derp_connected.store(false, Ordering::Release);
+        *self.derp_tx.write() = None;
+    }
+
+    fn apply_netmap_for_gen(&self, my_gen: u64, netmap: TailnetNetMap) -> bool {
+        let _gate = self.lifecycle_lock.lock();
+        if !self.is_gen_active(my_gen) {
+            return false;
+        }
+        self.apply_netmap(netmap);
+        true
+    }
+
+    pub fn apply_netmap_if(&self, netmap: TailnetNetMap, predicate: impl FnOnce() -> bool) -> bool {
+        let _gate = self.lifecycle_lock.lock();
+        if !predicate() {
+            return false;
+        }
+        self.apply_netmap(netmap);
+        true
     }
 
     async fn run_supervisor(
@@ -1278,12 +1361,22 @@ impl TailnetEngine {
         runtime_handle: Handle,
     ) {
         // 1. Bind Magicsock UDP socket on ephemeral port.
-        match UdpSocket::bind("0.0.0.0:0").await {
+        let bind_res = tokio::select! {
+            _ = self.wait_gen_inactive(my_gen) => return,
+            res = UdpSocket::bind("0.0.0.0:0") => res,
+        };
+        match bind_res {
             Ok(sock) => {
                 let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
                 let arc_sock = Arc::new(sock);
-                self.local_udp_port.store(port, Ordering::Release);
-                *self.udp_socket.write() = Some(Arc::clone(&arc_sock));
+                {
+                    let _gate = self.lifecycle_lock.lock();
+                    if !self.is_gen_active(my_gen) {
+                        return;
+                    }
+                    self.local_udp_port.store(port, Ordering::Release);
+                    *self.udp_socket.write() = Some(Arc::clone(&arc_sock));
+                }
                 info!("Tailnet Magicsock UDP bound on 0.0.0.0:{}", port);
 
                 let engine_udp = Arc::clone(&self);
@@ -1294,6 +1387,10 @@ impl TailnetEngine {
             }
             Err(err) => {
                 warn!("Tailnet UDP bind failed (continuing with DERP/HTTP): {}", err);
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
                 self.local_udp_port.store(0, Ordering::Release);
                 *self.udp_socket.write() = None;
             }
@@ -1304,15 +1401,27 @@ impl TailnetEngine {
         }
 
         // 2. Refresh STUN reflexive endpoint (best effort).
-        self.refresh_stun_endpoint(&http_client, &token).await;
+        self.refresh_stun_endpoint(my_gen, &http_client, &token).await;
+
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
 
         // 3. Resolve owner_user_id if needed for Ed25519 registration signature.
         let mut resolved_user_id = initial_user_id
             .filter(|&u| u > 0)
             .unwrap_or_else(|| self.owner_user_id.load(Ordering::Acquire));
         if resolved_user_id == 0 {
-            if let Ok(me) = http_client.get_me(&token).await {
+            let me_res = tokio::select! {
+                _ = self.wait_gen_inactive(my_gen) => return,
+                res = http_client.get_me(&token) => res,
+            };
+            if let Ok(me) = me_res {
                 if me.user_id > 0 {
+                    let _gate = self.lifecycle_lock.lock();
+                    if !self.is_gen_active(my_gen) {
+                        return;
+                    }
                     resolved_user_id = me.user_id;
                     self.owner_user_id.store(me.user_id, Ordering::Release);
                 }
@@ -1320,7 +1429,7 @@ impl TailnetEngine {
         }
 
         // 4. Initial signed registration (falling back to /api/v1/computers/local/register on 404/405).
-        self.perform_registration(&http_client, &token, resolved_user_id)
+        self.perform_registration(&http_client, &token, resolved_user_id, my_gen)
             .await;
 
         if !self.is_gen_active(my_gen) {
@@ -1358,37 +1467,60 @@ impl TailnetEngine {
         }
     }
 
-    async fn refresh_stun_endpoint(&self, http_client: &HttpClient, token: &str) {
-        if let Ok(Ok(stun)) =
-            tokio::time::timeout(Duration::from_secs(2), http_client.get_tailnet_stun(token)).await
-        {
+    async fn refresh_stun_endpoint(&self, my_gen: u64, http_client: &HttpClient, token: &str) {
+        let stun_res = tokio::select! {
+            _ = self.wait_gen_inactive(my_gen) => return,
+            res = tokio::time::timeout(Duration::from_secs(2), http_client.get_tailnet_stun(token)) => res,
+        };
+        if let Ok(Ok(stun)) = stun_res {
             let trimmed = stun.observed_ip.trim();
             if !trimmed.is_empty() && stun.observed_port > 0 {
                 if let Ok(ip) = trimmed.parse::<IpAddr>() {
                     if !ip.is_loopback() && !ip.is_unspecified() {
-                        *self.cached_stun_endpoint.write() = Some(TailnetEndpoint {
-                            addr: format!("{ip}:{}", stun.observed_port),
-                            kind: TailnetEndpointKind::StunReflexive,
-                        });
+                        let _gate = self.lifecycle_lock.lock();
+                        if self.is_gen_active(my_gen) {
+                            *self.cached_stun_endpoint.write() = Some(TailnetEndpoint {
+                                addr: format!("{ip}:{}", stun.observed_port),
+                                kind: TailnetEndpointKind::StunReflexive,
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    async fn perform_registration(&self, http_client: &HttpClient, token: &str, user_id: u64) {
+    async fn perform_registration(
+        &self,
+        http_client: &HttpClient,
+        token: &str,
+        user_id: u64,
+        my_gen: u64,
+    ) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         let req = self.build_register_request(user_id);
-        match http_client.register_tailnet(token, &req).await {
+        let reg_res = tokio::select! {
+            _ = self.wait_gen_inactive(my_gen) => return,
+            res = http_client.register_tailnet(token, &req) => res,
+        };
+        match reg_res {
             Ok(netmap) => {
-                self.apply_netmap(netmap);
+                self.apply_netmap_for_gen(my_gen, netmap);
             }
             Err(HttpClientError::Api {
                 status: 404 | 405, ..
             }) => {
                 #[cfg(not(target_os = "ios"))]
                 {
-                    debug!("Tailnet register endpoint unavailable (404/405); using HTTP fallback");
-                    let _ = http_client.register_current_host_computer(token).await;
+                    if self.is_gen_active(my_gen) {
+                        debug!("Tailnet register endpoint unavailable (404/405); using HTTP fallback");
+                        tokio::select! {
+                            _ = self.wait_gen_inactive(my_gen) => return,
+                            _ = http_client.register_current_host_computer(token) => {}
+                        }
+                    }
                 }
                 #[cfg(target_os = "ios")]
                 {
@@ -1414,22 +1546,33 @@ impl TailnetEngine {
         while self.is_gen_active(my_gen) {
             tokio::select! {
                 _ = interval.tick() => {}
-                _ = self.stop_notify.notified() => break,
+                _ = self.wait_gen_inactive(my_gen) => break,
             }
             if !self.is_gen_active(my_gen) {
                 break;
             }
-            self.refresh_stun_endpoint(&http_client, &token).await;
+            self.refresh_stun_endpoint(my_gen, &http_client, &token).await;
+            if !self.is_gen_active(my_gen) {
+                break;
+            }
             let mut uid = self.owner_user_id.load(Ordering::Acquire);
             if uid == 0 {
-                if let Ok(me) = http_client.get_me(&token).await {
+                let me_res = tokio::select! {
+                    _ = self.wait_gen_inactive(my_gen) => break,
+                    res = http_client.get_me(&token) => res,
+                };
+                if let Ok(me) = me_res {
                     if me.user_id > 0 {
+                        let _gate = self.lifecycle_lock.lock();
+                        if !self.is_gen_active(my_gen) {
+                            break;
+                        }
                         uid = me.user_id;
                         self.owner_user_id.store(uid, Ordering::Release);
                     }
                 }
             }
-            self.perform_registration(&http_client, &token, uid).await;
+            self.perform_registration(&http_client, &token, uid, my_gen).await;
         }
     }
 
@@ -1463,15 +1606,21 @@ impl TailnetEngine {
 
         while self.is_gen_active(my_gen) {
             let ws_url = self.format_derp_ws_url(&base_url, &token);
-            match connect_async(&ws_url).await {
+            let conn_res = tokio::select! {
+                _ = self.wait_gen_inactive(my_gen) => break,
+                res = connect_async(&ws_url) => res,
+            };
+            match conn_res {
                 Ok((ws_stream, _)) => {
-                    info!("Tailnet DERP WebSocket connected: {}", ws_url);
-                    backoff_ms = 250;
-                    self.derp_connected.store(true, Ordering::Release);
-
                     let (mut ws_write, mut ws_read) = ws_stream.split();
                     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<DerpClientFrame>();
-                    *self.derp_tx.write() = Some(out_tx.clone());
+                    if !self.set_derp_connected_for_gen(my_gen, out_tx.clone()) {
+                        drop(ws_write);
+                        drop(ws_read);
+                        break;
+                    }
+                    info!("Tailnet DERP WebSocket connected: {}", ws_url);
+                    backoff_ms = 250;
 
                     let id = self.identity.read().clone();
                     let endpoints = self.build_local_endpoints();
@@ -1482,9 +1631,23 @@ impl TailnetEngine {
                         endpoints: endpoints.clone(),
                     };
                     if let Ok(json) = serde_json::to_string(&hello) {
-                        if ws_write.send(Message::Text(json.into())).await.is_err() {
-                            self.derp_connected.store(false, Ordering::Release);
-                            *self.derp_tx.write() = None;
+                        let send_res = tokio::select! {
+                            _ = self.wait_gen_inactive(my_gen) => {
+                                self.clear_derp_state_for_gen(my_gen);
+                                break;
+                            }
+                            res = ws_write.send(Message::Text(json.into())) => res,
+                        };
+                        if send_res.is_err() {
+                            self.clear_derp_state_for_gen(my_gen);
+                            if !self.is_gen_active(my_gen) {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                                _ = self.wait_gen_inactive(my_gen) => break,
+                            }
+                            backoff_ms = (backoff_ms * 2).min(15_000);
                             continue;
                         }
                     }
@@ -1495,7 +1658,25 @@ impl TailnetEngine {
                         endpoints,
                     };
                     if let Ok(json) = serde_json::to_string(&init_ka) {
-                        let _ = ws_write.send(Message::Text(json.into())).await;
+                        let ka_res = tokio::select! {
+                            _ = self.wait_gen_inactive(my_gen) => {
+                                self.clear_derp_state_for_gen(my_gen);
+                                break;
+                            }
+                            res = ws_write.send(Message::Text(json.into())) => res,
+                        };
+                        if ka_res.is_err() {
+                            self.clear_derp_state_for_gen(my_gen);
+                            if !self.is_gen_active(my_gen) {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                                _ = self.wait_gen_inactive(my_gen) => break,
+                            }
+                            backoff_ms = (backoff_ms * 2).min(15_000);
+                            continue;
+                        }
                     }
 
                     let mut ping_interval = tokio::time::interval(DERP_PING_INTERVAL);
@@ -1504,14 +1685,18 @@ impl TailnetEngine {
 
                     while self.is_gen_active(my_gen) {
                         tokio::select! {
-                            _ = self.stop_notify.notified() => break,
+                            _ = self.wait_gen_inactive(my_gen) => break,
                             _ = ping_interval.tick() => {
                                 let ka = DerpClientFrame::KeepAlive {
                                     client_time_ms: now_ms(),
                                     endpoints: self.build_local_endpoints(),
                                 };
                                 if let Ok(json) = serde_json::to_string(&ka) {
-                                    if ws_write.send(Message::Text(json.into())).await.is_err() {
+                                    let res = tokio::select! {
+                                        _ = self.wait_gen_inactive(my_gen) => break,
+                                        r = ws_write.send(Message::Text(json.into())) => r,
+                                    };
+                                    if res.is_err() {
                                         break;
                                     }
                                 }
@@ -1520,7 +1705,11 @@ impl TailnetEngine {
                                 match maybe_out {
                                     Some(frame) => {
                                         if let Ok(json) = serde_json::to_string(&frame) {
-                                            if ws_write.send(Message::Text(json.into())).await.is_err() {
+                                            let res = tokio::select! {
+                                                _ = self.wait_gen_inactive(my_gen) => break,
+                                                r = ws_write.send(Message::Text(json.into())) => r,
+                                            };
+                                            if res.is_err() {
                                                 break;
                                             }
                                         }
@@ -1541,7 +1730,10 @@ impl TailnetEngine {
                                         }
                                     }
                                     Some(Ok(Message::Ping(data))) => {
-                                        let _ = ws_write.send(Message::Pong(data)).await;
+                                        let _ = tokio::select! {
+                                            _ = self.wait_gen_inactive(my_gen) => break,
+                                            r = ws_write.send(Message::Pong(data)) => r,
+                                        };
                                     }
                                     Some(Ok(Message::Close(_))) | None => break,
                                     Some(Err(err)) => {
@@ -1554,20 +1746,19 @@ impl TailnetEngine {
                         }
                     }
 
-                    self.derp_connected.store(false, Ordering::Release);
-                    *self.derp_tx.write() = None;
+                    self.clear_derp_state_for_gen(my_gen);
                 }
                 Err(tokio_tungstenite::tungstenite::Error::Http(resp))
                     if resp.status()
                         == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED =>
                 {
                     warn!("Tailnet DERP handshake rejected (401 Unauthorized); stopping loop");
-                    self.derp_connected.store(false, Ordering::Release);
+                    self.clear_derp_state_for_gen(my_gen);
                     break;
                 }
                 Err(err) => {
                     debug!("Tailnet DERP WebSocket connect error: {}", err);
-                    self.derp_connected.store(false, Ordering::Release);
+                    self.clear_derp_state_for_gen(my_gen);
                 }
             }
 
@@ -1576,7 +1767,7 @@ impl TailnetEngine {
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
-                _ = self.stop_notify.notified() => break,
+                _ = self.wait_gen_inactive(my_gen) => break,
             }
             backoff_ms = (backoff_ms * 2).min(15_000);
         }
@@ -1588,16 +1779,22 @@ impl TailnetEngine {
         frame: DerpServerFrame,
         out_tx: &mpsc::UnboundedSender<DerpClientFrame>,
     ) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         match frame {
             DerpServerFrame::Welcome { netmap, .. } => {
-                self.apply_netmap(netmap);
+                self.apply_netmap_for_gen(my_gen, netmap);
             }
             DerpServerFrame::NetMapUpdate { netmap } => {
-                self.apply_netmap(netmap);
+                self.apply_netmap_for_gen(my_gen, netmap);
             }
             DerpServerFrame::KeepAliveAck { client_time_ms, .. } => {
-                let rtt = now_ms().saturating_sub(client_time_ms).max(1) as u32;
-                *self.derp_rtt_ms.lock() = Some(rtt);
+                let _gate = self.lifecycle_lock.lock();
+                if self.is_gen_active(my_gen) {
+                    let rtt = now_ms().saturating_sub(client_time_ms).max(1) as u32;
+                    *self.derp_rtt_ms.lock() = Some(rtt);
+                }
             }
             DerpServerFrame::RecvPacket {
                 src_node_key: _,
@@ -1610,6 +1807,9 @@ impl TailnetEngine {
             DerpServerFrame::ServerCommandDispatch { command } => {
                 #[cfg(target_os = "ios")]
                 {
+                    if !self.is_gen_active(my_gen) {
+                        return;
+                    }
                     let res = RemoteComputerCommandResult {
                         command_id: command.command_id.clone(),
                         node_id: command.node_id.clone(),
@@ -1629,20 +1829,31 @@ impl TailnetEngine {
                     };
                     if out_tx.send(frame).is_err() {
                         let engine = Arc::clone(self);
-                        let handle = self
-                            .runtime_cfg
-                            .read()
-                            .as_ref()
-                            .map(|c| c.runtime_handle.clone())
-                            .or_else(|| Handle::try_current().ok());
+                        let handle = {
+                            let _gate = self.lifecycle_lock.lock();
+                            if !self.is_gen_active(my_gen) {
+                                return;
+                            }
+                            self.runtime_cfg
+                                .read()
+                                .as_ref()
+                                .map(|c| c.runtime_handle.clone())
+                                .or_else(|| Handle::try_current().ok())
+                        };
                         if let Some(rt) = handle {
                             rt.spawn(async move {
-                                let cfg = engine.runtime_cfg.read().clone();
+                                let cfg = {
+                                    let _gate = engine.lifecycle_lock.lock();
+                                    if !engine.is_gen_active(my_gen) {
+                                        return;
+                                    }
+                                    engine.runtime_cfg.read().clone()
+                                };
                                 if let Some(c) = cfg {
-                                    let _ = c
-                                        .http_client
-                                        .complete_computer_command(&c.token, &command.command_id, &res)
-                                        .await;
+                                    tokio::select! {
+                                        _ = engine.wait_gen_inactive(my_gen) => {}
+                                        _ = c.http_client.complete_computer_command(&c.token, &command.command_id, &res) => {}
+                                    }
                                 }
                             });
                         }
@@ -1657,31 +1868,50 @@ impl TailnetEngine {
                     }
                     let engine = Arc::clone(self);
                     let derp_sender = out_tx.clone();
-                    let handle = self
-                        .runtime_cfg
-                        .read()
-                        .as_ref()
-                        .map(|c| c.runtime_handle.clone())
-                        .or_else(|| Handle::try_current().ok());
+                    let handle = {
+                        let _gate = self.lifecycle_lock.lock();
+                        if !self.is_gen_active(my_gen) {
+                            return;
+                        }
+                        self.runtime_cfg
+                            .read()
+                            .as_ref()
+                            .map(|c| c.runtime_handle.clone())
+                            .or_else(|| Handle::try_current().ok())
+                    };
                     if let Some(rt) = handle {
                         rt.spawn(async move {
-                            let res = execute_local_computer_op(
-                                &command.node_id,
-                                &command.command_id,
-                                &command.operation,
-                            )
-                            .await;
+                            if !engine.is_gen_active(my_gen) {
+                                return;
+                            }
+                            let res = tokio::select! {
+                                _ = engine.wait_gen_inactive(my_gen) => return,
+                                r = execute_local_computer_op(
+                                    &command.node_id,
+                                    &command.command_id,
+                                    &command.operation,
+                                ) => r,
+                            };
+                            if !engine.is_gen_active(my_gen) {
+                                return;
+                            }
                             let frame = DerpClientFrame::CommandResult {
                                 command_id: command.command_id.clone(),
                                 result: res.clone(),
                             };
                             if derp_sender.send(frame).is_err() {
-                                let cfg = engine.runtime_cfg.read().clone();
+                                let cfg = {
+                                    let _gate = engine.lifecycle_lock.lock();
+                                    if !engine.is_gen_active(my_gen) {
+                                        return;
+                                    }
+                                    engine.runtime_cfg.read().clone()
+                                };
                                 if let Some(c) = cfg {
-                                    let _ = c
-                                        .http_client
-                                        .complete_computer_command(&c.token, &command.command_id, &res)
-                                        .await;
+                                    tokio::select! {
+                                        _ = engine.wait_gen_inactive(my_gen) => {}
+                                        _ = c.http_client.complete_computer_command(&c.token, &command.command_id, &res) => {}
+                                    }
                                 }
                             }
                         });
@@ -1698,7 +1928,7 @@ impl TailnetEngine {
         let mut buf = vec![0u8; 65_535];
         while self.is_gen_active(my_gen) {
             tokio::select! {
-                _ = self.stop_notify.notified() => break,
+                _ = self.wait_gen_inactive(my_gen) => break,
                 recv_res = sock.recv_from(&mut buf) => {
                     match recv_res {
                         Ok((n, from_addr)) => {
@@ -1710,16 +1940,29 @@ impl TailnetEngine {
                             }
                             let datagram = &buf[..n];
                             if datagram.len() >= 4 && &datagram[..4] == TSFR_MAGIC {
-                                if let Some(assembled) = self.frag_assembler.lock().ingest(from_addr, datagram) {
+                                let assembled_opt = {
+                                    let _gate = self.lifecycle_lock.lock();
+                                    if !self.is_gen_active(my_gen) {
+                                        break;
+                                    }
+                                    self.frag_assembler.lock().ingest(from_addr, datagram)
+                                };
+                                if let Some(assembled) = assembled_opt {
                                     self.handle_wire_packet(my_gen, &assembled, Some(from_addr));
                                 }
                             } else {
+                                if !self.is_gen_active(my_gen) {
+                                    break;
+                                }
                                 self.handle_wire_packet(my_gen, datagram, Some(from_addr));
                             }
                         }
                         Err(err) => {
                             debug!("Tailnet UDP recv_from error: {}", err);
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = self.wait_gen_inactive(my_gen) => break,
+                            }
                         }
                     }
                 }
@@ -1733,7 +1976,7 @@ impl TailnetEngine {
         bytes: &[u8],
         from_addr: Option<SocketAddr>,
     ) {
-        if bytes.len() < 4 {
+        if !self.is_gen_active(my_gen) || bytes.len() < 4 {
             return;
         }
         if &bytes[..4] == TSDC_MAGIC {
@@ -1748,6 +1991,10 @@ impl TailnetEngine {
         if &bytes[..4] == TSWG_MAGIC {
             let id = self.identity.read().clone();
             let decrypted = {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
                 let mut windows = self.replay_windows.lock();
                 open_tswg_packet(&id.node_key, &id.node_public_bytes, bytes, &mut windows)
             };
@@ -1761,11 +2008,14 @@ impl TailnetEngine {
 
     fn handle_disco_payload(
         self: &Arc<Self>,
-        _my_gen: u64,
+        my_gen: u64,
         src_disco_pub_hex: &str,
         disco: DiscoPayload,
         from_addr: Option<SocketAddr>,
     ) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         let peer_opt = self.find_peer_by_disco_key(src_disco_pub_hex);
         let Some(peer) = peer_opt else {
             return;
@@ -1796,7 +2046,7 @@ impl TailnetEngine {
                 if let Ok(pkt) =
                     seal_tsdc_packet(&id.disco_key, &id.disco_public_bytes, &peer_disco_pub, &pong)
                 {
-                    self.spawn_udp_send(addr, pkt);
+                    self.spawn_udp_send(my_gen, addr, pkt);
                 }
             }
             DiscoPayload::Pong {
@@ -1811,6 +2061,10 @@ impl TailnetEngine {
                 let Some(addr) = from_addr else {
                     return;
                 };
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
                 let rtt_ms = {
                     let mut pings = self.disco_pings.lock();
                     pings.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(10));
@@ -1854,7 +2108,7 @@ impl TailnetEngine {
                 if self.force_derp_only.load(Ordering::Acquire) {
                     return;
                 }
-                self.probe_peer_udp_endpoints(&peer, &my_endpoints);
+                self.probe_peer_udp_endpoints(my_gen, &peer, &my_endpoints);
             }
         }
     }
@@ -1901,7 +2155,7 @@ impl TailnetEngine {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = self.disco_notify.notified() => {}
-                _ = self.stop_notify.notified() => break,
+                _ = self.wait_gen_inactive(my_gen) => break,
             }
             if !self.is_gen_active(my_gen) {
                 break;
@@ -1909,11 +2163,14 @@ impl TailnetEngine {
             if self.force_derp_only.load(Ordering::Acquire) {
                 continue;
             }
-            self.send_disco_probes_to_online_peers();
+            self.send_disco_probes_to_online_peers(my_gen);
         }
     }
 
-    fn send_disco_probes_to_online_peers(&self) {
+    fn send_disco_probes_to_online_peers(self: &Arc<Self>, my_gen: u64) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         let my_endpoints = self.build_local_endpoints();
         let peers: Vec<TailnetPeerDescriptor> = {
             let my_node_pub = self.identity.read().node_public_key_hex.clone();
@@ -1943,6 +2200,9 @@ impl TailnetEngine {
 
         let id = self.identity.read().clone();
         for peer in peers {
+            if !self.is_gen_active(my_gen) {
+                return;
+            }
             let Ok(peer_disco_pub) = decode_hex_32(&peer.disco_public_key) else {
                 continue;
             };
@@ -1958,122 +2218,154 @@ impl TailnetEngine {
                     &peer_disco_pub,
                     &cmm,
                 ) {
-                    let _ = self.send_derp_packet(&peer.node_public_key, &pkt);
+                    let _ = self.send_derp_packet_for_gen(my_gen, &peer.node_public_key, &pkt);
                 }
             }
 
             // 2. Send UDP Ping probes to all peer endpoints.
-            self.probe_peer_udp_endpoints(&peer, &[]);
+            self.probe_peer_udp_endpoints(my_gen, &peer, &[]);
         }
     }
 
     fn probe_peer_udp_endpoints(
-        &self,
+        self: &Arc<Self>,
+        my_gen: u64,
         peer: &TailnetPeerDescriptor,
         extra_endpoints: &[TailnetEndpoint],
     ) {
-        if self.force_derp_only.load(Ordering::Acquire) {
+        if self.force_derp_only.load(Ordering::Acquire) || !self.is_gen_active(my_gen) {
             return;
         }
-        let Some(sock) = self.udp_socket.read().clone() else {
-            return;
-        };
         let Ok(peer_disco_pub) = decode_hex_32(&peer.disco_public_key) else {
             return;
         };
         let id = self.identity.read().clone();
 
-        let mut addrs: Vec<SocketAddr> = Vec::new();
-        let mut seen = HashSet::new();
-        for ep in extra_endpoints.iter().chain(peer.endpoints.iter()) {
-            if let Ok(addr) = ep.addr.trim().parse::<SocketAddr>() {
-                if addr.is_ipv4() && addr.port() > 0 && seen.insert(addr) {
-                    addrs.push(addr);
+        let (sock, rt, probes) = {
+            let _gate = self.lifecycle_lock.lock();
+            if !self.is_gen_active(my_gen) || self.force_derp_only.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(sock) = self.udp_socket.read().clone() else {
+                return;
+            };
+            let handle = self
+                .runtime_cfg
+                .read()
+                .as_ref()
+                .map(|c| c.runtime_handle.clone())
+                .or_else(|| Handle::try_current().ok());
+            let Some(rt) = handle else {
+                return;
+            };
+
+            let mut addrs: Vec<SocketAddr> = Vec::new();
+            let mut seen = HashSet::new();
+            for ep in extra_endpoints.iter().chain(peer.endpoints.iter()) {
+                if let Ok(addr) = ep.addr.trim().parse::<SocketAddr>() {
+                    if addr.is_ipv4() && addr.port() > 0 && seen.insert(addr) {
+                        addrs.push(addr);
+                    }
                 }
             }
-        }
-        if let Some(active) = self
-            .peer_states
-            .read()
-            .get(&peer.node_public_key)
-            .and_then(|st| st.active_socket_addr)
-        {
-            if active.is_ipv4() && seen.insert(active) {
-                addrs.push(active);
+            if let Some(active) = self
+                .peer_states
+                .read()
+                .get(&peer.node_public_key)
+                .and_then(|st| st.active_socket_addr)
+            {
+                if active.is_ipv4() && seen.insert(active) {
+                    addrs.push(active);
+                }
             }
-        }
+            if addrs.is_empty() {
+                return;
+            }
 
-        if addrs.is_empty() {
-            return;
-        }
-
-        let handle = self
-            .runtime_cfg
-            .read()
-            .as_ref()
-            .map(|c| c.runtime_handle.clone())
-            .or_else(|| Handle::try_current().ok());
-        let Some(rt) = handle else {
-            return;
+            let mut probes = Vec::with_capacity(addrs.len());
+            {
+                let mut pings = self.disco_pings.lock();
+                pings.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(10));
+                for addr in addrs {
+                    let tx_id = Uuid::new_v4().to_string();
+                    let ping = DiscoPayload::Ping {
+                        tx_id: tx_id.clone(),
+                        sent_at_ms: now_ms(),
+                        src_node_key: id.node_public_key_hex.clone(),
+                    };
+                    if let Ok(pkt) = seal_tsdc_packet(
+                        &id.disco_key,
+                        &id.disco_public_bytes,
+                        &peer_disco_pub,
+                        &ping,
+                    ) {
+                        pings.insert(tx_id, (Instant::now(), peer.node_public_key.clone()));
+                        probes.push((addr, pkt));
+                    }
+                }
+            }
+            (sock, rt, probes)
         };
 
-        let mut probes = Vec::with_capacity(addrs.len());
-        {
-            let mut pings = self.disco_pings.lock();
-            pings.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(10));
-            for addr in addrs {
-                let tx_id = Uuid::new_v4().to_string();
-                let ping = DiscoPayload::Ping {
-                    tx_id: tx_id.clone(),
-                    sent_at_ms: now_ms(),
-                    src_node_key: id.node_public_key_hex.clone(),
-                };
-                if let Ok(pkt) = seal_tsdc_packet(
-                    &id.disco_key,
-                    &id.disco_public_bytes,
-                    &peer_disco_pub,
-                    &ping,
-                ) {
-                    pings.insert(tx_id, (Instant::now(), peer.node_public_key.clone()));
-                    probes.push((addr, pkt));
-                }
-            }
-        }
-
         if !probes.is_empty() {
+            let engine = Arc::clone(self);
             rt.spawn(async move {
                 for (addr, pkt) in probes {
+                    if !engine.is_gen_active(my_gen) {
+                        return;
+                    }
                     let _ = sock.send_to(&pkt, addr).await;
                 }
             });
         }
     }
 
-    fn spawn_udp_send(&self, addr: SocketAddr, packet: Vec<u8>) {
-        let Some(sock) = self.udp_socket.read().clone() else {
-            return;
-        };
-        let handle = self
-            .runtime_cfg
-            .read()
-            .as_ref()
-            .map(|c| c.runtime_handle.clone())
-            .or_else(|| Handle::try_current().ok());
-        let Some(rt) = handle else {
-            return;
+    fn spawn_udp_send(self: &Arc<Self>, my_gen: u64, addr: SocketAddr, packet: Vec<u8>) {
+        let (sock, rt) = {
+            let _gate = self.lifecycle_lock.lock();
+            if !self.is_gen_active(my_gen) {
+                return;
+            }
+            let Some(sock) = self.udp_socket.read().clone() else {
+                return;
+            };
+            let handle = self
+                .runtime_cfg
+                .read()
+                .as_ref()
+                .map(|c| c.runtime_handle.clone())
+                .or_else(|| Handle::try_current().ok());
+            let Some(rt) = handle else {
+                return;
+            };
+            (sock, rt)
         };
         let msg_id = self.frag_msg_seq.fetch_add(1, Ordering::Relaxed);
+        let engine = Arc::clone(self);
         rt.spawn(async move {
+            if !engine.is_gen_active(my_gen) {
+                return;
+            }
             let _ = send_udp_datagrams(&sock, addr, msg_id, &packet).await;
         });
     }
 
-    fn send_derp_packet(&self, dst_node_key: &str, packet: &[u8]) -> Result<(), String> {
-        let tx = self
-            .derp_tx
-            .read()
-            .clone()
-            .ok_or_else(|| "DERP relay is not connected".to_string())?;
+    fn send_derp_packet_for_gen(
+        &self,
+        my_gen: u64,
+        dst_node_key: &str,
+        packet: &[u8],
+    ) -> Result<(), String> {
+        let tx = {
+            let _gate = self.lifecycle_lock.lock();
+            if !self.is_gen_active(my_gen) {
+                return Err("Tailnet generation is no longer active".to_string());
+            }
+            self.derp_tx
+                .read()
+                .clone()
+                .ok_or_else(|| "DERP relay is not connected".to_string())?
+        };
         let frame = DerpClientFrame::SendPacket {
             dst_node_key: dst_node_key.to_string(),
             packet_b64: encode_base64(packet),
@@ -2102,10 +2394,19 @@ impl TailnetEngine {
         frame: PeerApiFrame,
         from_addr: Option<SocketAddr>,
     ) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         match frame {
             PeerApiFrame::ExecResponse { ref request_id, .. }
             | PeerApiFrame::ApprovalPending { ref request_id, .. } => {
-                let sender = self.inflight_rpc.lock().get(request_id).cloned();
+                let sender = {
+                    let _gate = self.lifecycle_lock.lock();
+                    if !self.is_gen_active(my_gen) {
+                        return;
+                    }
+                    self.inflight_rpc.lock().get(request_id).cloned()
+                };
                 if let Some(tx) = sender {
                     let _ = tx.send(frame);
                 }
@@ -2121,22 +2422,27 @@ impl TailnetEngine {
                 if caller_node_key != src_node_pub_hex {
                     return;
                 }
-                {
-                    let mut recent = self.recent_exec_requests.lock();
-                    recent.retain(|_, ts| ts.elapsed() < Duration::from_secs(60));
-                    if recent.contains_key(&request_id) {
+                let handle = {
+                    let _gate = self.lifecycle_lock.lock();
+                    if !self.is_gen_active(my_gen) {
                         return;
                     }
-                    recent.insert(request_id.clone(), Instant::now());
-                }
+                    {
+                        let mut recent = self.recent_exec_requests.lock();
+                        recent.retain(|_, ts| ts.elapsed() < Duration::from_secs(60));
+                        if recent.contains_key(&request_id) {
+                            return;
+                        }
+                        recent.insert(request_id.clone(), Instant::now());
+                    }
+                    self.runtime_cfg
+                        .read()
+                        .as_ref()
+                        .map(|c| c.runtime_handle.clone())
+                        .or_else(|| Handle::try_current().ok())
+                };
 
                 let engine = Arc::clone(self);
-                let handle = self
-                    .runtime_cfg
-                    .read()
-                    .as_ref()
-                    .map(|c| c.runtime_handle.clone())
-                    .or_else(|| Handle::try_current().ok());
                 if let Some(rt) = handle {
                     rt.spawn(async move {
                         engine
@@ -2196,13 +2502,13 @@ impl TailnetEngine {
                     duration_ms: 0,
                 },
             };
-            self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+            self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+                .await;
             return;
         }
 
         #[cfg(not(target_os = "ios"))]
         {
-
         // Refresh netmap once if caller is missing/offline or self_peer missing.
         let mut caller_opt = self.find_peer_by_node_key(&caller_node_key);
         let mut self_peer_opt = self
@@ -2213,10 +2519,22 @@ impl TailnetEngine {
 
         let mut refreshed_netmap = false;
         if caller_opt.as_ref().map_or(true, |p| !p.online) || self_peer_opt.is_none() {
-            let cfg = self.runtime_cfg.read().clone();
+            let cfg = {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
+                self.runtime_cfg.read().clone()
+            };
             if let Some(c) = cfg {
-                if let Ok(fresh_map) = c.http_client.get_tailnet_netmap(&c.token).await {
-                    self.apply_netmap(fresh_map);
+                let map_res = tokio::select! {
+                    _ = self.wait_gen_inactive(my_gen) => return,
+                    res = c.http_client.get_tailnet_netmap(&c.token) => res,
+                };
+                if let Ok(fresh_map) = map_res {
+                    if !self.apply_netmap_for_gen(my_gen, fresh_map) {
+                        return;
+                    }
                     refreshed_netmap = true;
                     caller_opt = self.find_peer_by_node_key(&caller_node_key);
                     self_peer_opt = self
@@ -2258,17 +2576,30 @@ impl TailnetEngine {
                     duration_ms: 0,
                 },
             };
-            self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+            self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+                .await;
             return;
         }
 
         let mut auth_eval =
             evaluate_local_p2p_authorization(&self_peer, &caller_device_id, &operation);
         if !refreshed_netmap && !matches!(auth_eval, Ok(false)) {
-            let cfg = self.runtime_cfg.read().clone();
+            let cfg = {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
+                self.runtime_cfg.read().clone()
+            };
             if let Some(c) = cfg {
-                if let Ok(fresh_map) = c.http_client.get_tailnet_netmap(&c.token).await {
-                    self.apply_netmap(fresh_map);
+                let map_res = tokio::select! {
+                    _ = self.wait_gen_inactive(my_gen) => return,
+                    res = c.http_client.get_tailnet_netmap(&c.token) => res,
+                };
+                if let Ok(fresh_map) = map_res {
+                    if !self.apply_netmap_for_gen(my_gen, fresh_map) {
+                        return;
+                    }
                     if let Some(sp) = self
                         .netmap
                         .read()
@@ -2304,7 +2635,8 @@ impl TailnetEngine {
                         duration_ms: 0,
                     },
                 };
-                self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+                self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+                    .await;
                 return;
             }
         };
@@ -2328,10 +2660,16 @@ impl TailnetEngine {
                 operation: operation.clone(),
                 created_at_ms: now_ms(),
             };
-            self.pending_approvals.lock().insert(
-                command_id.clone(),
-                LocalPendingApproval { dto, decision_tx },
-            );
+            {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(my_gen) {
+                    return;
+                }
+                self.pending_approvals.lock().insert(
+                    command_id.clone(),
+                    LocalPendingApproval { dto, decision_tx },
+                );
+            }
 
             // Inform the caller immediately so it suppresses the 1.5s DERP retry and awaits user approval.
             let pending_notice = PeerApiFrame::ApprovalPending {
@@ -2339,11 +2677,11 @@ impl TailnetEngine {
                 command_id: command_id.clone(),
                 message: "Waiting for user approval on local device".to_string(),
             };
-            self.send_peer_reply(&caller_node_key, &pending_notice, from_addr)
+            self.send_peer_reply(my_gen, &caller_node_key, &pending_notice, from_addr)
                 .await;
 
             let approved_res = tokio::select! {
-                _ = self.stop_notify.notified() => Err(()),
+                _ = self.wait_gen_inactive(my_gen) => Err(()),
                 res = tokio::time::timeout(LOCAL_APPROVAL_TIMEOUT, decision_rx) => {
                     match res {
                         Ok(Ok(val)) => Ok(val),
@@ -2353,6 +2691,10 @@ impl TailnetEngine {
             };
 
             self.pending_approvals.lock().remove(&command_id);
+
+            if !self.is_gen_active(my_gen) {
+                return;
+            }
 
             match approved_res {
                 Ok(true) => {}
@@ -2372,7 +2714,8 @@ impl TailnetEngine {
                             duration_ms: 0,
                         },
                     };
-                    self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+                    self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+                        .await;
                     return;
                 }
                 Err(()) => {
@@ -2391,27 +2734,42 @@ impl TailnetEngine {
                             duration_ms: LOCAL_APPROVAL_TIMEOUT.as_millis() as u64,
                         },
                     };
-                    self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+                    self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+                        .await;
                     return;
                 }
             }
         }
 
-        let exec_res = execute_local_computer_op(&target_node_id, &command_id, &operation).await;
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
+        let exec_res = tokio::select! {
+            _ = self.wait_gen_inactive(my_gen) => return,
+            r = execute_local_computer_op(&target_node_id, &command_id, &operation) => r,
+        };
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         let reply = PeerApiFrame::ExecResponse {
             request_id,
             result: exec_res,
         };
-        self.send_peer_reply(&caller_node_key, &reply, from_addr).await;
+        self.send_peer_reply(my_gen, &caller_node_key, &reply, from_addr)
+            .await;
         }
     }
 
     async fn send_peer_reply(
         &self,
+        my_gen: u64,
         dst_node_key: &str,
         frame: &PeerApiFrame,
         preferred_udp: Option<SocketAddr>,
     ) {
+        if !self.is_gen_active(my_gen) {
+            return;
+        }
         let Ok(tswg_bytes) = self.seal_peer_api_frame(dst_node_key, frame) else {
             return;
         };
@@ -2431,7 +2789,13 @@ impl TailnetEngine {
                     })
             });
             if let Some(addr) = udp_target {
-                let sock_opt = self.udp_socket.read().clone();
+                let sock_opt = {
+                    let _gate = self.lifecycle_lock.lock();
+                    if !self.is_gen_active(my_gen) {
+                        return;
+                    }
+                    self.udp_socket.read().clone()
+                };
                 if let Some(sock) = sock_opt {
                     let msg_id = self.frag_msg_seq.fetch_add(1, Ordering::Relaxed);
                     if send_udp_datagrams(&sock, addr, msg_id, &tswg_bytes)
@@ -2444,7 +2808,7 @@ impl TailnetEngine {
             }
         }
 
-        let _ = self.send_derp_packet(dst_node_key, &tswg_bytes);
+        let _ = self.send_derp_packet_for_gen(my_gen, dst_node_key, &tswg_bytes);
     }
 
     /// Executes an operation over E2E-encrypted Tailnet Direct UDP (with automatic 1.5s DERP fallback)
@@ -2456,9 +2820,14 @@ impl TailnetEngine {
         &self,
         req: &RemoteComputerCommandRequest,
     ) -> Option<RemoteComputerCommandResult> {
-        if req.caller_bot_id.is_some() || !self.running.load(Ordering::Acquire) {
-            return None;
-        }
+        let start_gen = {
+            let _gate = self.lifecycle_lock.lock();
+            let g = self.run_generation.load(Ordering::Acquire);
+            if req.caller_bot_id.is_some() || !self.is_gen_active(g) {
+                return None;
+            }
+            g
+        };
         let target_id = req.node_id.trim();
         if target_id.is_empty()
             || target_id.starts_with("cloud:")
@@ -2469,10 +2838,22 @@ impl TailnetEngine {
 
         let mut peer_opt = self.find_peer_by_node_id(target_id);
         if peer_opt.as_ref().map_or(true, |p| !p.online) {
-            let cfg = self.runtime_cfg.read().clone();
+            let cfg = {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(start_gen) {
+                    return None;
+                }
+                self.runtime_cfg.read().clone()
+            };
             if let Some(c) = cfg {
-                if let Ok(fresh_map) = c.http_client.get_tailnet_netmap(&c.token).await {
-                    self.apply_netmap(fresh_map);
+                let netmap_res = tokio::select! {
+                    _ = self.wait_gen_inactive(start_gen) => return None,
+                    res = c.http_client.get_tailnet_netmap(&c.token) => res,
+                };
+                if let Ok(fresh_map) = netmap_res {
+                    if !self.apply_netmap_for_gen(start_gen, fresh_map) {
+                        return None;
+                    }
                     peer_opt = self.find_peer_by_node_id(target_id);
                 }
             }
@@ -2504,7 +2885,13 @@ impl TailnetEngine {
         let tswg_bytes = self.seal_peer_api_frame(&peer.node_public_key, &rpc).ok()?;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<PeerApiFrame>();
-        self.inflight_rpc.lock().insert(request_id.clone(), tx);
+        {
+            let _gate = self.lifecycle_lock.lock();
+            if !self.is_gen_active(start_gen) {
+                return None;
+            }
+            self.inflight_rpc.lock().insert(request_id.clone(), tx);
+        }
 
         struct InflightCleanup<'a> {
             map: &'a Mutex<HashMap<String, mpsc::UnboundedSender<PeerApiFrame>>>,
@@ -2540,24 +2927,43 @@ impl TailnetEngine {
         let mut sent_via_derp = false;
 
         if let Some(addr) = direct_addr {
-            let sock_opt = self.udp_socket.read().clone();
+            let sock_opt = {
+                let _gate = self.lifecycle_lock.lock();
+                if !self.is_gen_active(start_gen) {
+                    return None;
+                }
+                self.udp_socket.read().clone()
+            };
             if let Some(sock) = sock_opt {
                 let msg_id = self.frag_msg_seq.fetch_add(1, Ordering::Relaxed);
                 let udp_sent = send_udp_datagrams(&sock, addr, msg_id, &tswg_bytes)
                     .await
                     .is_ok();
+                if !self.is_gen_active(start_gen) {
+                    return None;
+                }
                 if udp_sent {
-                    match tokio::time::timeout(DIRECT_UDP_RPC_FALLBACK_TIMEOUT, rx.recv()).await {
+                    let udp_rx_res = tokio::select! {
+                        _ = self.wait_gen_inactive(start_gen) => return None,
+                        res = tokio::time::timeout(DIRECT_UDP_RPC_FALLBACK_TIMEOUT, rx.recv()) => res,
+                    };
+                    if !self.is_gen_active(start_gen) {
+                        return None;
+                    }
+                    match udp_rx_res {
                         Ok(Some(PeerApiFrame::ExecResponse { result, .. })) => {
                             return Some(result);
                         }
                         Ok(Some(PeerApiFrame::ApprovalPending { .. })) => {
                             peer_acknowledged = true;
                         }
-                        _ => {
+                        Ok(None) => {
+                            return None;
+                        }
+                        Ok(Some(PeerApiFrame::ExecRequest { .. })) | Err(_) => {
                             // Direct UDP did not reply in 1.5s; fall back to DERP SendPacket.
                             if self
-                                .send_derp_packet(&peer.node_public_key, &tswg_bytes)
+                                .send_derp_packet_for_gen(start_gen, &peer.node_public_key, &tswg_bytes)
                                 .is_ok()
                             {
                                 sent_via_derp = true;
@@ -2566,40 +2972,56 @@ impl TailnetEngine {
                             }
                         }
                     }
-                } else if self
-                    .send_derp_packet(&peer.node_public_key, &tswg_bytes)
+                } else {
+                    if self
+                        .send_derp_packet_for_gen(start_gen, &peer.node_public_key, &tswg_bytes)
+                        .is_ok()
+                    {
+                        sent_via_derp = true;
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                if self
+                    .send_derp_packet_for_gen(start_gen, &peer.node_public_key, &tswg_bytes)
                     .is_ok()
                 {
                     sent_via_derp = true;
                 } else {
                     return None;
                 }
-            } else if self
-                .send_derp_packet(&peer.node_public_key, &tswg_bytes)
+            }
+        } else {
+            if self
+                .send_derp_packet_for_gen(start_gen, &peer.node_public_key, &tswg_bytes)
                 .is_ok()
             {
                 sent_via_derp = true;
             } else {
                 return None;
             }
-        } else if self
-            .send_derp_packet(&peer.node_public_key, &tswg_bytes)
-            .is_ok()
-        {
-            sent_via_derp = true;
-        } else {
-            return None;
         }
 
         let _ = sent_via_derp;
         let deadline = tokio::time::Instant::now() + PEER_EXEC_WAIT_TIMEOUT;
         loop {
+            if !self.is_gen_active(start_gen) {
+                return None;
+            }
             let now_inst = tokio::time::Instant::now();
             if now_inst >= deadline {
                 break;
             }
             let remaining = deadline - now_inst;
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            let rx_res = tokio::select! {
+                _ = self.wait_gen_inactive(start_gen) => return None,
+                res = tokio::time::timeout(remaining, rx.recv()) => res,
+            };
+            if !self.is_gen_active(start_gen) {
+                return None;
+            }
+            match rx_res {
                 Ok(Some(PeerApiFrame::ExecResponse { result, .. })) => {
                     return Some(result);
                 }
@@ -2607,9 +3029,14 @@ impl TailnetEngine {
                     peer_acknowledged = true;
                     continue;
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => return None,
+                Err(_) => break,
                 Ok(Some(PeerApiFrame::ExecRequest { .. })) => continue,
             }
+        }
+
+        if !self.is_gen_active(start_gen) {
+            return None;
         }
 
         if peer_acknowledged {
@@ -2966,5 +3393,170 @@ mod tests {
         );
         assembler.prune_expired();
         assert!(!assembler.pending.contains_key(&expired_key));
+    }
+
+    #[test]
+    fn test_tailnet_generation_fence_guards_stale_derp_and_disco_mutations() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = rt.enter();
+
+        let alice = TailnetIdentity::ephemeral();
+        let peer = TailnetIdentity::ephemeral();
+        let engine = TailnetEngine::new(alice);
+
+        let (gen2_tx, mut gen2_rx) = mpsc::unbounded_channel::<DerpClientFrame>();
+        let (stale_tx, mut stale_rx) = mpsc::unbounded_channel::<DerpClientFrame>();
+
+        engine.running.store(true, Ordering::Release);
+        engine.run_generation.store(2, Ordering::Release);
+        assert!(engine.set_derp_connected_for_gen(2, gen2_tx));
+        *engine.derp_rtt_ms.lock() = Some(42);
+
+        let gen2_peer = TailnetPeerDescriptor {
+            node_id: "node-gen2".to_string(),
+            device_id: "dev-gen2".to_string(),
+            display_name: "Peer Gen2".to_string(),
+            node_public_key: peer.node_public_key_hex.clone(),
+            disco_public_key: peer.disco_public_key_hex.clone(),
+            derp_region: "local".to_string(),
+            derp_connected: true,
+            online: true,
+            relay_mode: TailnetRelayMode::DerpRelay,
+            ..Default::default()
+        };
+        let gen2_map = TailnetNetMap {
+            owner_user_id: 2,
+            seq: 200,
+            generated_at_ms: 1_700_000_000_000,
+            derp_region: "local".to_string(),
+            derp_ws_path: "/api/v1/tailnet/derp".to_string(),
+            stun_http_path: "/api/v1/tailnet/stun".to_string(),
+            self_peer: None,
+            peers: vec![gen2_peer],
+        };
+        assert!(engine.apply_netmap_for_gen(2, gen2_map));
+
+        // 1. Stale generation 1 set_derp_connected_for_gen must not hijack *derp_tx.
+        assert!(!engine.set_derp_connected_for_gen(1, stale_tx.clone()));
+        assert!(engine
+            .send_derp_packet_for_gen(2, &peer.node_public_key_hex, b"hello")
+            .is_ok());
+        assert!(gen2_rx.try_recv().is_ok());
+        assert!(stale_rx.try_recv().is_err());
+
+        // 2. Stale generation 1 clear_derp_state_for_gen must not clobber gen 2 DERP state.
+        engine.clear_derp_state_for_gen(1);
+        let st = engine.status();
+        assert!(st.derp_connected);
+        assert_eq!(st.relay_mode, TailnetRelayMode::DerpRelay);
+        assert!(engine.derp_tx.read().is_some());
+
+        // 3. Stale generation 1 Welcome, NetMapUpdate, KeepAliveAck must all be ignored.
+        let stale_peer = TailnetPeerDescriptor {
+            node_id: "node-stale".to_string(),
+            device_id: "dev-stale".to_string(),
+            display_name: "Peer Stale".to_string(),
+            node_public_key: peer.node_public_key_hex.clone(),
+            disco_public_key: peer.disco_public_key_hex.clone(),
+            derp_region: "local".to_string(),
+            derp_connected: true,
+            online: true,
+            relay_mode: TailnetRelayMode::DerpRelay,
+            ..Default::default()
+        };
+        let stale_map_welcome = TailnetNetMap {
+            owner_user_id: 1,
+            seq: 999,
+            generated_at_ms: 1_700_000_000_000,
+            derp_region: "local".to_string(),
+            derp_ws_path: "/api/v1/tailnet/derp".to_string(),
+            stun_http_path: "/api/v1/tailnet/stun".to_string(),
+            self_peer: None,
+            peers: vec![stale_peer.clone()],
+        };
+        engine.handle_derp_server_frame(
+            1,
+            DerpServerFrame::Welcome {
+                derp_region: "local".to_string(),
+                server_time_ms: 1_700_000_000_000,
+                netmap: stale_map_welcome,
+            },
+            &stale_tx,
+        );
+        let stale_map_update = TailnetNetMap {
+            owner_user_id: 1,
+            seq: 1000,
+            generated_at_ms: 1_700_000_000_000,
+            derp_region: "local".to_string(),
+            derp_ws_path: "/api/v1/tailnet/derp".to_string(),
+            stun_http_path: "/api/v1/tailnet/stun".to_string(),
+            self_peer: None,
+            peers: vec![stale_peer],
+        };
+        engine.handle_derp_server_frame(
+            1,
+            DerpServerFrame::NetMapUpdate {
+                netmap: stale_map_update,
+            },
+            &stale_tx,
+        );
+        engine.handle_derp_server_frame(
+            1,
+            DerpServerFrame::KeepAliveAck {
+                client_time_ms: now_ms().saturating_sub(500),
+                server_time_ms: now_ms(),
+            },
+            &stale_tx,
+        );
+        let st_after_frames = engine.status();
+        assert_eq!(st_after_frames.netmap_seq, 200);
+        assert_eq!(engine.owner_user_id.load(Ordering::Acquire), 2);
+        assert_eq!(st_after_frames.derp_rtt_ms, Some(42));
+        assert_eq!(st_after_frames.peers.len(), 1);
+        assert_eq!(st_after_frames.peers[0].node_id, "node-gen2");
+
+        // 4. Stale generation 1 Disco Pong must not mutate disco_pings or promote peer_states to DirectUdp.
+        engine.disco_pings.lock().insert(
+            "tx-stale".to_string(),
+            (Instant::now(), peer.node_public_key_hex.clone()),
+        );
+        engine.handle_disco_payload(
+            1,
+            &peer.disco_public_key_hex,
+            DiscoPayload::Pong {
+                tx_id: "tx-stale".to_string(),
+                sent_at_ms: now_ms(),
+                observed_addr: "127.0.0.1:41641".to_string(),
+                src_node_key: peer.node_public_key_hex.clone(),
+            },
+            Some("127.0.0.1:41641".parse().unwrap()),
+        );
+        assert!(engine.disco_pings.lock().contains_key("tx-stale"));
+        assert_eq!(
+            engine.peer_states.read()[&peer.node_public_key_hex].relay_mode,
+            TailnetRelayMode::DerpRelay
+        );
+
+        // 5. Direct start() restart without stop() must reset all transient state synchronously.
+        engine.start(
+            "http://127.0.0.1:9".to_string(),
+            "tok-gen3".to_string(),
+            Some(99),
+            HttpClient::new("http://127.0.0.1:9".to_string()),
+            rt.handle().clone(),
+        );
+        assert_eq!(engine.run_generation.load(Ordering::Acquire), 3);
+        assert!(!engine.derp_connected.load(Ordering::Acquire));
+        assert!(engine.derp_tx.read().is_none());
+        assert!(engine.netmap.read().is_none());
+        assert!(engine.peer_states.read().is_empty());
+        assert!(engine.disco_pings.lock().is_empty());
+        assert_eq!(*engine.derp_rtt_ms.lock(), None);
+        assert_eq!(engine.owner_user_id.load(Ordering::Acquire), 99);
+
+        engine.stop();
     }
 }

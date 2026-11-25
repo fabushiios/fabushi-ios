@@ -150,7 +150,7 @@ impl ClientProxyConfig {
         let password = rec.password.clone().filter(|s| !s.is_empty());
         let cfg = Self {
             proxy_type,
-            host: rec.host.trim().to_string(),
+            host: rec.host.clone(),
             port: rec.port,
             username,
             password,
@@ -159,22 +159,58 @@ impl ClientProxyConfig {
         cfg.validate().ok().map(|_| cfg)
     }
 
-    pub fn validate(&self) -> Result<(), HttpClientError> {
+    pub fn validate_record(rec: &ProxyEndpointRecord) -> Result<Option<Self>, HttpClientError> {
+        let kind_lower = rec.kind.trim().to_ascii_lowercase();
+        match kind_lower.as_str() {
+            "direct" | "none" => Ok(if rec.enabled {
+                Some(Self::direct())
+            } else {
+                None
+            }),
+            "mtproto" => {
+                validate_proxy_host(&rec.host)?;
+                if rec.port == 0 {
+                    return Err(HttpClientError::Proxy("Proxy port must be > 0".into()));
+                }
+                validate_mtproto_secret(&rec.secret_or_user)?;
+                Ok(None)
+            }
+            "http" | "https" | "socks5" | "socks5h" => {
+                let proxy_type = match kind_lower.as_str() {
+                    "http" | "https" => ClientProxyType::Http,
+                    _ => ClientProxyType::Socks5,
+                };
+                let username = rec
+                    .username
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        let s = rec.secret_or_user.trim();
+                        (!s.is_empty()).then(|| s.to_string())
+                    });
+                let password = rec.password.clone().filter(|s| !s.is_empty());
+                let cfg = Self {
+                    proxy_type,
+                    host: rec.host.clone(),
+                    port: rec.port,
+                    username,
+                    password,
+                    fallback_to_direct: false,
+                };
+                cfg.validate()?;
+                Ok(if rec.enabled { Some(cfg) } else { None })
+            }
+            other => Err(HttpClientError::Proxy(format!(
+                "Unsupported proxy kind '{other}'"
+            ))),
+        }
+    }
+
+    fn validate_fields(&self) -> Result<(), HttpClientError> {
         if self.proxy_type == ClientProxyType::Direct {
             return Ok(());
         }
-        if self.host.trim().is_empty() {
-            return Err(HttpClientError::Proxy("Proxy host cannot be empty".into()));
-        }
-        if self
-            .host
-            .chars()
-            .any(|c| c.is_ascii_control() || c.is_whitespace())
-        {
-            return Err(HttpClientError::Proxy(
-                "Proxy host contains invalid control or whitespace characters".into(),
-            ));
-        }
+        validate_proxy_host(&self.host)?;
         if self.port == 0 {
             return Err(HttpClientError::Proxy("Proxy port must be > 0".into()));
         }
@@ -189,7 +225,7 @@ impl ClientProxyConfig {
             if u.len() > 255 {
                 return Err(HttpClientError::Proxy("Proxy username exceeds 255 bytes".into()));
             }
-            if u.chars().any(|c| c.is_ascii_control() || c == ':') {
+            if u.chars().any(|c| c.is_control() || c == ':') {
                 return Err(HttpClientError::Proxy(
                     "Proxy username contains invalid control characters or ':'".into(),
                 ));
@@ -199,7 +235,7 @@ impl ClientProxyConfig {
             if p.len() > 255 {
                 return Err(HttpClientError::Proxy("Proxy password exceeds 255 bytes".into()));
             }
-            if p.chars().any(|c| c.is_ascii_control()) {
+            if p.chars().any(|c| c.is_control()) {
                 return Err(HttpClientError::Proxy(
                     "Proxy password contains invalid control characters".into(),
                 ));
@@ -208,16 +244,7 @@ impl ClientProxyConfig {
         Ok(())
     }
 
-    pub fn display_endpoint(&self) -> String {
-        if self.is_direct() {
-            "Direct".to_string()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
-    pub fn to_reqwest_proxy(&self) -> Result<Option<reqwest::Proxy>, HttpClientError> {
-        self.validate()?;
+    fn build_reqwest_proxy(&self) -> Result<Option<reqwest::Proxy>, HttpClientError> {
         let scheme = match self.proxy_type {
             ClientProxyType::Direct => return Ok(None),
             ClientProxyType::Http => "http",
@@ -231,6 +258,25 @@ impl ClientProxyConfig {
             proxy = proxy.basic_auth(user, pass);
         }
         Ok(Some(proxy))
+    }
+
+    pub fn validate(&self) -> Result<(), HttpClientError> {
+        self.validate_fields()?;
+        let _ = self.build_reqwest_proxy()?;
+        Ok(())
+    }
+
+    pub fn display_endpoint(&self) -> String {
+        if self.is_direct() {
+            "Direct".to_string()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    pub fn to_reqwest_proxy(&self) -> Result<Option<reqwest::Proxy>, HttpClientError> {
+        self.validate_fields()?;
+        self.build_reqwest_proxy()
     }
 
     pub async fn probe_health(
@@ -259,6 +305,71 @@ impl ClientProxyConfig {
             ))),
         }
     }
+}
+
+fn validate_proxy_host(raw_host: &str) -> Result<(), HttpClientError> {
+    if raw_host.is_empty() {
+        return Err(HttpClientError::Proxy("Proxy host cannot be empty".into()));
+    }
+    if raw_host
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_whitespace())
+    {
+        return Err(HttpClientError::Proxy(
+            "Proxy host contains invalid control or whitespace characters".into(),
+        ));
+    }
+    if raw_host.contains("://")
+        || raw_host.chars().any(|c| {
+            matches!(
+                c,
+                '@' | '/' | '\\' | '?' | '#' | '[' | ']' | '%' | ',' | ';' | '&' | '='
+            )
+        })
+    {
+        return Err(HttpClientError::Proxy(
+            "Proxy host contains invalid URL characters".into(),
+        ));
+    }
+    if raw_host.contains(':') && raw_host.parse::<Ipv6Addr>().is_err() {
+        return Err(HttpClientError::Proxy(
+            "Proxy host contains ':' but is not a valid IPv6 address".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mtproto_secret(secret: &str) -> Result<(), HttpClientError> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    if secret.len() > 1024 {
+        return Err(HttpClientError::Proxy(
+            "MTProto proxy secret exceeds 1024 bytes".into(),
+        ));
+    }
+    if secret
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(HttpClientError::Proxy(
+            "MTProto proxy secret contains invalid control or whitespace characters".into(),
+        ));
+    }
+    let core = secret
+        .strip_suffix("==")
+        .or_else(|| secret.strip_suffix('='))
+        .unwrap_or(secret);
+    if core.is_empty()
+        || !core
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(HttpClientError::Proxy(
+            "MTProto proxy secret must contain only hex or base64url characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn format_host_for_url(host: &str) -> String {

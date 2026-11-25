@@ -88,6 +88,7 @@ pub struct OutboxWorker {
     flush_mutex: AsyncMutex<()>,
     max_retries: u32,
     is_running: Arc<RwLock<bool>>,
+    session_epoch: Arc<AtomicU64>,
     run_generation: Arc<AtomicU64>,
     generation_tx: watch::Sender<u64>,
     active_task: Arc<Mutex<Option<AbortHandle>>>,
@@ -101,6 +102,7 @@ impl std::fmt::Debug for OutboxWorker {
         f.debug_struct("OutboxWorker")
             .field("max_retries", &self.max_retries)
             .field("is_running", &*self.is_running.read())
+            .field("session_epoch", &self.session_epoch.load(Ordering::SeqCst))
             .field("run_generation", &self.run_generation.load(Ordering::SeqCst))
             .finish()
     }
@@ -115,6 +117,26 @@ impl OutboxWorker {
         local_store: LocalStore,
         sync_coordinator: ClientSyncCoordinator,
     ) -> Arc<Self> {
+        Self::new_with_session_epoch(
+            store,
+            network,
+            http_client,
+            token_provider,
+            local_store,
+            sync_coordinator,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    pub fn new_with_session_epoch(
+        store: OutboxStore,
+        network: Arc<NetworkStatusListener>,
+        http_client: HttpClient,
+        token_provider: TokenProvider,
+        local_store: LocalStore,
+        sync_coordinator: ClientSyncCoordinator,
+        session_epoch: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(256);
         let (generation_tx, _) = watch::channel(0u64);
         Arc::new(Self {
@@ -128,6 +150,7 @@ impl OutboxWorker {
             flush_mutex: AsyncMutex::new(()),
             max_retries: DEFAULT_OUTBOX_MAX_RETRIES,
             is_running: Arc::new(RwLock::new(false)),
+            session_epoch,
             run_generation: Arc::new(AtomicU64::new(0)),
             generation_tx,
             active_task: Arc::new(Mutex::new(None)),
@@ -135,6 +158,20 @@ impl OutboxWorker {
             op_fence: Arc::new(RwLock::new(())),
             events_tx,
         })
+    }
+
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn bump_session_epoch(&self) -> u64 {
+        self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn clear_session_state(&self) {
+        self.stop();
+        self.bump_session_epoch();
+        self.store.clear();
     }
 
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
@@ -228,7 +265,10 @@ impl OutboxWorker {
                 }
 
                 if worker.network.is_online() {
-                    let _ = worker.flush_due_internal(Some((my_gen, &mut gen_rx))).await;
+                    let flush_epoch = worker.session_epoch.load(Ordering::SeqCst);
+                    let _ = worker
+                        .flush_due_internal(flush_epoch, Some((my_gen, &mut gen_rx)))
+                        .await;
                 }
                 if !worker.is_active(my_gen) {
                     break;
@@ -285,25 +325,74 @@ impl OutboxWorker {
         drop(_drain);
     }
 
-    pub async fn notify_reconnected_and_flush(&self) -> Result<Vec<OutboxMessageRecord>> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.network.notify_reconnected();
-        self.store.reset_all_pending_retry_times(now_ms)?;
-        self.flush_due().await
+    pub fn notify_reconnected_and_flush(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<OutboxMessageRecord>>> + Send + '_ {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        async move {
+            let actual = self.session_epoch.load(Ordering::SeqCst);
+            if actual != start_epoch {
+                return Err(gpui_telegram_core::error::TelegramError::GenerationFenced {
+                    expected: start_epoch,
+                    actual,
+                });
+            }
+            let _flush_guard = self.flush_mutex.lock().await;
+            let actual = self.session_epoch.load(Ordering::SeqCst);
+            if actual != start_epoch {
+                return Err(gpui_telegram_core::error::TelegramError::GenerationFenced {
+                    expected: start_epoch,
+                    actual,
+                });
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            self.network.notify_reconnected();
+            let actual = self.session_epoch.load(Ordering::SeqCst);
+            if actual != start_epoch {
+                return Err(gpui_telegram_core::error::TelegramError::GenerationFenced {
+                    expected: start_epoch,
+                    actual,
+                });
+            }
+            self.store.reset_all_pending_retry_times(now_ms)?;
+            self.flush_due_locked(start_epoch, None).await
+        }
     }
 
-    pub async fn flush_due(&self) -> Result<Vec<OutboxMessageRecord>> {
-        self.flush_due_internal(None).await
+    pub fn flush_due(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<OutboxMessageRecord>>> + Send + '_ {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        async move {
+            let actual = self.session_epoch.load(Ordering::SeqCst);
+            if actual != start_epoch {
+                return Err(gpui_telegram_core::error::TelegramError::GenerationFenced {
+                    expected: start_epoch,
+                    actual,
+                });
+            }
+            let _flush_guard = self.flush_mutex.lock().await;
+            let actual = self.session_epoch.load(Ordering::SeqCst);
+            if actual != start_epoch {
+                return Err(gpui_telegram_core::error::TelegramError::GenerationFenced {
+                    expected: start_epoch,
+                    actual,
+                });
+            }
+            self.flush_due_locked(start_epoch, None).await
+        }
     }
 
     async fn flush_due_internal(
         &self,
+        flush_epoch: u64,
         mut fence: Option<(u64, &mut watch::Receiver<u64>)>,
     ) -> Result<Vec<OutboxMessageRecord>> {
         let _flush_guard = match fence.as_mut() {
             Some((expected_gen, gen_rx)) => {
                 let exp = *expected_gen;
-                if !self.is_active(exp) {
+                if !self.is_active(exp) || self.session_epoch.load(Ordering::SeqCst) != flush_epoch
+                {
                     return Ok(Vec::new());
                 }
                 tokio::select! {
@@ -314,16 +403,23 @@ impl OutboxWorker {
             }
             None => self.flush_mutex.lock().await,
         };
+        self.flush_due_locked(flush_epoch, fence).await
+    }
 
+    async fn flush_due_locked(
+        &self,
+        flush_epoch: u64,
+        mut fence: Option<(u64, &mut watch::Receiver<u64>)>,
+    ) -> Result<Vec<OutboxMessageRecord>> {
         let mut processed = Vec::new();
-        while self.network.is_online() {
+        while self.network.is_online() && self.session_epoch.load(Ordering::SeqCst) == flush_epoch {
             let expected_gen = fence.as_ref().map(|(g, _)| *g);
             if let Some(exp) = expected_gen {
                 if !self.is_active(exp) {
                     break;
                 }
             }
-            let (record, req, token) = match self.prepare_next_due(expected_gen)? {
+            let (record, req, token) = match self.prepare_next_due(flush_epoch, expected_gen)? {
                 PreHttpStep::NoDue | PreHttpStep::Stopped => break,
                 PreHttpStep::EarlyOutcome(outcome) => {
                     processed.push(outcome);
@@ -332,6 +428,9 @@ impl OutboxWorker {
                 PreHttpStep::ReadyToSend { record, req, token } => (record, req, token),
             };
 
+            if self.session_epoch.load(Ordering::SeqCst) != flush_epoch {
+                break;
+            }
             if let Some(exp) = expected_gen {
                 if !self.is_active(exp) {
                     break;
@@ -341,7 +440,9 @@ impl OutboxWorker {
             // HTTP Phase: strictly zero synchronous locks held across `.await`.
             let http_res = match fence.as_mut() {
                 Some((expected_gen_ref, gen_rx)) => {
-                    if !self.is_active(*expected_gen_ref) {
+                    if !self.is_active(*expected_gen_ref)
+                        || self.session_epoch.load(Ordering::SeqCst) != flush_epoch
+                    {
                         break;
                     }
                     tokio::select! {
@@ -353,7 +454,9 @@ impl OutboxWorker {
                 None => self.http_client.send_message_rich(&token, &req).await,
             };
 
-            let Some(outcome) = self.finalize_http_result(expected_gen, &record, http_res) else {
+            let Some(outcome) =
+                self.finalize_http_result(flush_epoch, expected_gen, &record, http_res)
+            else {
                 break;
             };
             processed.push(outcome);
@@ -361,11 +464,102 @@ impl OutboxWorker {
         Ok(processed)
     }
 
-    pub async fn send_or_enqueue_direct(
+    pub fn send_or_enqueue_direct<'a>(
+        &'a self,
+        req: &'a RichSendMessageRequest,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = std::result::Result<RichSendMessageResponse, HttpClientError>>
+           + Send
+           + 'a {
+        let start_epoch = self.session_epoch.load(Ordering::SeqCst);
+        let start_token = (self.token_provider)();
+        async move {
+            if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+                return Err(HttpClientError::Unauthorized("Session changed".to_string()));
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Ok(Some(existing)) = self.store.get(nonce) {
+                return Err(HttpClientError::Conflict(format!(
+                    "Duplicate client_nonce {nonce}: already in outbox ({})",
+                    existing.status.as_str()
+                )));
+            }
+            if !self.network.is_online() {
+                if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+                    return Err(HttpClientError::Unauthorized("Session changed".to_string()));
+                }
+                self.enqueue(req, nonce).map_err(|e| HttpClientError::Api {
+                    status: 400,
+                    message: e.to_string(),
+                })?;
+                return Err(HttpClientError::Api {
+                    status: 503,
+                    message: "Client is offline; message queued in persistent outbox".into(),
+                });
+            }
+            let Some(token) = start_token.filter(|t| !t.trim().is_empty()) else {
+                if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+                    return Err(HttpClientError::Unauthorized(
+                        "No active session token".to_string(),
+                    ));
+                }
+                self.enqueue(req, nonce).map_err(|e| HttpClientError::Api {
+                    status: 400,
+                    message: e.to_string(),
+                })?;
+                return Err(HttpClientError::Unauthorized(
+                    "No active session token".to_string(),
+                ));
+            };
+            if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+                return Err(HttpClientError::Unauthorized("Session changed".to_string()));
+            }
+            if let Err(e) = self.store.enqueue_in_flight(req, nonce, now_ms) {
+                return Err(HttpClientError::Api {
+                    status: 400,
+                    message: e.to_string(),
+                });
+            }
+            let res = self.http_client.send_message_rich(&token, req).await;
+            if self.session_epoch.load(Ordering::SeqCst) != start_epoch {
+                return res;
+            }
+            match res {
+                Ok(resp) => {
+                    let done_ms = chrono::Utc::now().timestamp_millis();
+                    if let Ok(updated) = self.store.mark_delivered(nonce, resp.message_id, done_ms)
+                    {
+                        self.emit_event(&updated);
+                    }
+                    self.apply_delivery_ack(nonce, &resp);
+                    Ok(resp)
+                }
+                Err(err) => {
+                    let fail_ms = chrono::Utc::now().timestamp_millis();
+                    let _ = self.record_dispatch_error(nonce, 0, &err, fail_ms);
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    pub async fn send_or_enqueue_direct_with_token(
         &self,
+        token: &str,
+        expected_epoch: u64,
         req: &RichSendMessageRequest,
         nonce: u64,
     ) -> std::result::Result<RichSendMessageResponse, HttpClientError> {
+        if token.trim().is_empty() || self.session_epoch.load(Ordering::SeqCst) != expected_epoch {
+            return Err(HttpClientError::Unauthorized(
+                "Session changed before pinned send".to_string(),
+            ));
+        }
+        if (self.token_provider)().is_some_and(|cur| !cur.trim().is_empty() && cur != token) {
+            return Err(HttpClientError::Unauthorized(
+                "Session token changed before pinned send".to_string(),
+            ));
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Ok(Some(existing)) = self.store.get(nonce) {
             return Err(HttpClientError::Conflict(format!(
@@ -374,6 +568,9 @@ impl OutboxWorker {
             )));
         }
         if !self.network.is_online() {
+            if self.session_epoch.load(Ordering::SeqCst) != expected_epoch {
+                return Err(HttpClientError::Unauthorized("Session changed".to_string()));
+            }
             self.enqueue(req, nonce).map_err(|e| HttpClientError::Api {
                 status: 400,
                 message: e.to_string(),
@@ -383,20 +580,20 @@ impl OutboxWorker {
                 message: "Client is offline; message queued in persistent outbox".into(),
             });
         }
-        let Some(token) = (self.token_provider)().filter(|t| !t.trim().is_empty()) else {
-            self.enqueue(req, nonce).map_err(|e| HttpClientError::Api {
-                status: 400,
-                message: e.to_string(),
-            })?;
-            return Err(HttpClientError::Unauthorized("No active session token".to_string()));
-        };
+        if self.session_epoch.load(Ordering::SeqCst) != expected_epoch {
+            return Err(HttpClientError::Unauthorized("Session changed".to_string()));
+        }
         if let Err(e) = self.store.enqueue_in_flight(req, nonce, now_ms) {
             return Err(HttpClientError::Api {
                 status: 400,
                 message: e.to_string(),
             });
         }
-        match self.http_client.send_message_rich(&token, req).await {
+        let res = self.http_client.send_message_rich(token, req).await;
+        if self.session_epoch.load(Ordering::SeqCst) != expected_epoch {
+            return res;
+        }
+        match res {
             Ok(resp) => {
                 let done_ms = chrono::Utc::now().timestamp_millis();
                 if let Ok(updated) = self.store.mark_delivered(nonce, resp.message_id, done_ms) {
@@ -413,24 +610,31 @@ impl OutboxWorker {
         }
     }
 
-    fn prepare_next_due(&self, expected_gen: Option<u64>) -> Result<PreHttpStep> {
+    fn prepare_next_due(
+        &self,
+        flush_epoch: u64,
+        expected_gen: Option<u64>,
+    ) -> Result<PreHttpStep> {
         let _op = expected_gen.map(|_| self.op_fence.read());
-        if let Some(exp) = expected_gen {
-            if !self.is_active(exp) {
-                return Ok(PreHttpStep::Stopped);
-            }
+        let fenced = || {
+            self.session_epoch.load(Ordering::SeqCst) != flush_epoch
+                || expected_gen.is_some_and(|exp| !self.is_active(exp))
+        };
+        if fenced() {
+            return Ok(PreHttpStep::Stopped);
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let Some(record) = self.store.claim_next_due(now_ms)? else {
             return Ok(PreHttpStep::NoDue);
         };
+        if fenced() {
+            return Ok(PreHttpStep::Stopped);
+        }
         let req = match record.decode_request() {
             Ok(r) => r,
             Err(e) => {
-                if let Some(exp) = expected_gen {
-                    if !self.is_active(exp) {
-                        return Ok(PreHttpStep::Stopped);
-                    }
+                if fenced() {
+                    return Ok(PreHttpStep::Stopped);
                 }
                 let updated = self
                     .store
@@ -441,11 +645,12 @@ impl OutboxWorker {
             }
         };
 
+        if fenced() {
+            return Ok(PreHttpStep::Stopped);
+        }
         let Some(token) = (self.token_provider)().filter(|t| !t.trim().is_empty()) else {
-            if let Some(exp) = expected_gen {
-                if !self.is_active(exp) {
-                    return Ok(PreHttpStep::Stopped);
-                }
+            if fenced() {
+                return Ok(PreHttpStep::Stopped);
             }
             let next_retry_count = record.retry_count.saturating_add(1);
             let updated = if next_retry_count >= self.max_retries {
@@ -472,25 +677,24 @@ impl OutboxWorker {
             return Ok(PreHttpStep::EarlyOutcome(updated));
         };
 
-        if let Some(exp) = expected_gen {
-            if !self.is_active(exp) {
-                return Ok(PreHttpStep::Stopped);
-            }
+        if fenced() {
+            return Ok(PreHttpStep::Stopped);
         }
         Ok(PreHttpStep::ReadyToSend { record, req, token })
     }
 
     fn finalize_http_result(
         &self,
+        flush_epoch: u64,
         expected_gen: Option<u64>,
         record: &OutboxMessageRecord,
         http_res: std::result::Result<RichSendMessageResponse, HttpClientError>,
     ) -> Option<OutboxMessageRecord> {
         let _op = expected_gen.map(|_| self.op_fence.read());
-        if let Some(exp) = expected_gen {
-            if !self.is_active(exp) {
-                return None;
-            }
+        if self.session_epoch.load(Ordering::SeqCst) != flush_epoch
+            || expected_gen.is_some_and(|exp| !self.is_active(exp))
+        {
+            return None;
         }
         let outcome = match http_res {
             Ok(resp) => {

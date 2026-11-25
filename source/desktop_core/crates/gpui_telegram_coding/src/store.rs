@@ -11,6 +11,7 @@ use std::path::Path;
 /// Canonical thread composite key (`topic_id == 0` when `None`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadKey {
+    pub owner_user_id: u64,
     pub bot_user_id: i64,
     pub chat_id: i64,
     pub topic_id: i64,
@@ -18,7 +19,17 @@ pub struct ThreadKey {
 
 impl ThreadKey {
     pub fn new(bot_user_id: i64, chat_id: i64, topic_id: Option<i64>) -> Self {
+        Self::for_owner(0, bot_user_id, chat_id, topic_id)
+    }
+
+    pub fn for_owner(
+        owner_user_id: u64,
+        bot_user_id: i64,
+        chat_id: i64,
+        topic_id: Option<i64>,
+    ) -> Self {
         Self {
+            owner_user_id,
             bot_user_id,
             chat_id,
             topic_id: topic_id.unwrap_or(0),
@@ -29,6 +40,7 @@ impl ThreadKey {
 /// Persistent thread metadata and provider session binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadRecord {
+    pub owner_user_id: u64,
     pub bot_user_id: i64,
     pub chat_id: i64,
     pub topic_id: i64,
@@ -54,6 +66,7 @@ pub struct ThreadRecord {
 /// Persistent checkpoint record for one completed coding turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRecord {
+    pub owner_user_id: u64,
     pub thread_id: String,
     pub turn_idx: u64,
     pub before_ref: String,
@@ -107,6 +120,7 @@ impl CodingStore {
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS coding_threads (
+                owner_user_id       INTEGER NOT NULL DEFAULT 0,
                 bot_user_id         INTEGER NOT NULL,
                 chat_id             INTEGER NOT NULL,
                 topic_id            INTEGER NOT NULL,
@@ -126,13 +140,11 @@ impl CodingStore {
                 bot_use_worktree    INTEGER NOT NULL DEFAULT 0,
                 bot_active_model    TEXT,
                 bot_permission_mode TEXT,
-                PRIMARY KEY (bot_user_id, chat_id, topic_id)
+                PRIMARY KEY (owner_user_id, bot_user_id, chat_id, topic_id)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_coding_threads_thread_id
-                ON coding_threads(thread_id);
-
             CREATE TABLE IF NOT EXISTS coding_checkpoints (
+                owner_user_id   INTEGER NOT NULL DEFAULT 0,
                 thread_id       TEXT NOT NULL,
                 turn_idx        INTEGER NOT NULL,
                 before_ref      TEXT NOT NULL,
@@ -141,27 +153,226 @@ impl CodingStore {
                 prompt_preview  TEXT NOT NULL,
                 reply_preview   TEXT NOT NULL,
                 created_at_ms   INTEGER NOT NULL,
-                PRIMARY KEY (thread_id, turn_idx)
+                PRIMARY KEY (owner_user_id, thread_id, turn_idx)
             );
 
             CREATE TABLE IF NOT EXISTS command_receipts (
-                turn_id               TEXT PRIMARY KEY,
+                owner_user_id         INTEGER NOT NULL DEFAULT 0,
+                turn_id               TEXT NOT NULL,
                 thread_id             TEXT NOT NULL,
                 status                TEXT NOT NULL,
                 turn_idx              INTEGER NOT NULL DEFAULT 0,
                 completed_event_json  TEXT,
                 created_at_ms         INTEGER NOT NULL,
-                updated_at_ms         INTEGER NOT NULL
+                updated_at_ms         INTEGER NOT NULL,
+                PRIMARY KEY (owner_user_id, turn_id)
             );
             ",
         )
         .map_err(|e| format!("failed to initialize coding store schema: {e}"))?;
 
         Self::migrate_coding_threads_baseline_columns(&conn)?;
+        Self::migrate_owner_user_id_tables(&conn)?;
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_coding_threads_thread_id ON coding_threads(owner_user_id, thread_id);",
+        )
+        .map_err(|e| format!("failed to create coding_threads index: {e}"))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn table_has_col(conn: &Connection, table: &str, col: &str) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| format!("failed to inspect {table} schema: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("failed to read {table} columns: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("failed to iterate {table} columns: {e}"))?
+        {
+            let name: String = row
+                .get(1)
+                .map_err(|e| format!("failed to decode {table} column name: {e}"))?;
+            if name == col {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn table_has_owner_pk(conn: &Connection, table: &str) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| format!("failed to inspect {table} schema: {e}"))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("failed to read {table} columns: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("failed to iterate {table} columns: {e}"))?
+        {
+            let name: String = row
+                .get(1)
+                .map_err(|e| format!("failed to decode {table} column name: {e}"))?;
+            let pk: i64 = row
+                .get(5)
+                .map_err(|e| format!("failed to decode {table} pk flag: {e}"))?;
+            if name == "owner_user_id" && pk > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn migrate_owner_user_id_tables(conn: &Connection) -> Result<(), String> {
+        let threads_ok = Self::table_has_owner_pk(conn, "coding_threads")?;
+        let checkpoints_ok = Self::table_has_owner_pk(conn, "coding_checkpoints")?;
+        let receipts_ok = Self::table_has_owner_pk(conn, "command_receipts")?;
+        if threads_ok && checkpoints_ok && receipts_ok {
+            return Ok(());
+        }
+
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| format!("failed to begin owner_user_id migration transaction: {e}"))?;
+
+        let run = || -> Result<(), String> {
+            if !threads_ok {
+                let owner_expr = if Self::table_has_col(conn, "coding_threads", "owner_user_id")? {
+                    "owner_user_id"
+                } else {
+                    "0"
+                };
+                conn.execute_batch(&format!(
+                    "
+                    CREATE TABLE coding_threads_new (
+                        owner_user_id       INTEGER NOT NULL DEFAULT 0,
+                        bot_user_id         INTEGER NOT NULL,
+                        chat_id             INTEGER NOT NULL,
+                        topic_id            INTEGER NOT NULL,
+                        thread_id           TEXT NOT NULL,
+                        provider_session_id TEXT,
+                        workspace_path      TEXT NOT NULL,
+                        worktree_path       TEXT,
+                        branch_name         TEXT,
+                        use_worktree        INTEGER NOT NULL DEFAULT 0,
+                        active_model        TEXT,
+                        permission_mode     TEXT NOT NULL,
+                        turn_count          INTEGER NOT NULL DEFAULT 0,
+                        last_summary        TEXT,
+                        updated_at_ms       INTEGER NOT NULL,
+                        bot_provider_kind   TEXT,
+                        bot_workspace_path  TEXT NOT NULL DEFAULT '',
+                        bot_use_worktree    INTEGER NOT NULL DEFAULT 0,
+                        bot_active_model    TEXT,
+                        bot_permission_mode TEXT,
+                        PRIMARY KEY (owner_user_id, bot_user_id, chat_id, topic_id)
+                    );
+                    INSERT INTO coding_threads_new (
+                        owner_user_id, bot_user_id, chat_id, topic_id, thread_id,
+                        provider_session_id, workspace_path, worktree_path, branch_name,
+                        use_worktree, active_model, permission_mode, turn_count, last_summary,
+                        updated_at_ms, bot_provider_kind, bot_workspace_path, bot_use_worktree,
+                        bot_active_model, bot_permission_mode
+                    )
+                    SELECT
+                        {owner_expr}, bot_user_id, chat_id, topic_id, thread_id,
+                        provider_session_id, workspace_path, worktree_path, branch_name,
+                        use_worktree, active_model, permission_mode, turn_count, last_summary,
+                        updated_at_ms, bot_provider_kind, bot_workspace_path, bot_use_worktree,
+                        bot_active_model, bot_permission_mode
+                    FROM coding_threads;
+                    DROP TABLE coding_threads;
+                    ALTER TABLE coding_threads_new RENAME TO coding_threads;
+                    "
+                ))
+                .map_err(|e| format!("failed to migrate coding_threads owner_user_id: {e}"))?;
+            }
+
+            if !checkpoints_ok {
+                let owner_expr = if Self::table_has_col(conn, "coding_checkpoints", "owner_user_id")? {
+                    "owner_user_id"
+                } else {
+                    "0"
+                };
+                conn.execute_batch(&format!(
+                    "
+                    CREATE TABLE coding_checkpoints_new (
+                        owner_user_id   INTEGER NOT NULL DEFAULT 0,
+                        thread_id       TEXT NOT NULL,
+                        turn_idx        INTEGER NOT NULL,
+                        before_ref      TEXT NOT NULL,
+                        after_ref       TEXT NOT NULL,
+                        diff_stat_json  TEXT NOT NULL,
+                        prompt_preview  TEXT NOT NULL,
+                        reply_preview   TEXT NOT NULL,
+                        created_at_ms   INTEGER NOT NULL,
+                        PRIMARY KEY (owner_user_id, thread_id, turn_idx)
+                    );
+                    INSERT INTO coding_checkpoints_new (
+                        owner_user_id, thread_id, turn_idx, before_ref, after_ref,
+                        diff_stat_json, prompt_preview, reply_preview, created_at_ms
+                    )
+                    SELECT
+                        {owner_expr}, thread_id, turn_idx, before_ref, after_ref,
+                        diff_stat_json, prompt_preview, reply_preview, created_at_ms
+                    FROM coding_checkpoints;
+                    DROP TABLE coding_checkpoints;
+                    ALTER TABLE coding_checkpoints_new RENAME TO coding_checkpoints;
+                    "
+                ))
+                .map_err(|e| format!("failed to migrate coding_checkpoints owner_user_id: {e}"))?;
+            }
+
+            if !receipts_ok {
+                let owner_expr = if Self::table_has_col(conn, "command_receipts", "owner_user_id")? {
+                    "owner_user_id"
+                } else {
+                    "0"
+                };
+                conn.execute_batch(&format!(
+                    "
+                    CREATE TABLE command_receipts_new (
+                        owner_user_id         INTEGER NOT NULL DEFAULT 0,
+                        turn_id               TEXT NOT NULL,
+                        thread_id             TEXT NOT NULL,
+                        status                TEXT NOT NULL,
+                        turn_idx              INTEGER NOT NULL DEFAULT 0,
+                        completed_event_json  TEXT,
+                        created_at_ms         INTEGER NOT NULL,
+                        updated_at_ms         INTEGER NOT NULL,
+                        PRIMARY KEY (owner_user_id, turn_id)
+                    );
+                    INSERT INTO command_receipts_new (
+                        owner_user_id, turn_id, thread_id, status, turn_idx,
+                        completed_event_json, created_at_ms, updated_at_ms
+                    )
+                    SELECT
+                        {owner_expr}, turn_id, thread_id, status, turn_idx,
+                        completed_event_json, created_at_ms, updated_at_ms
+                    FROM command_receipts;
+                    DROP TABLE command_receipts;
+                    ALTER TABLE command_receipts_new RENAME TO command_receipts;
+                    "
+                ))
+                .map_err(|e| format!("failed to migrate command_receipts owner_user_id: {e}"))?;
+            }
+
+            Ok(())
+        };
+
+        if let Err(err) = run() {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+
+        conn.execute_batch("COMMIT;")
+            .map_err(|e| format!("failed to commit owner_user_id migration transaction: {e}"))?;
+        Ok(())
     }
 
     fn migrate_coding_threads_baseline_columns(conn: &Connection) -> Result<(), String> {
@@ -217,43 +428,45 @@ impl CodingStore {
         let conn = self.conn.lock();
         conn.query_row(
             "
-            SELECT bot_user_id, chat_id, topic_id, thread_id, provider_session_id,
+            SELECT owner_user_id, bot_user_id, chat_id, topic_id, thread_id, provider_session_id,
                    workspace_path, worktree_path, branch_name, use_worktree,
                    active_model, permission_mode, turn_count, last_summary, updated_at_ms,
                    bot_provider_kind, bot_workspace_path, bot_use_worktree,
                    bot_active_model, bot_permission_mode
             FROM coding_threads
-            WHERE bot_user_id = ?1 AND chat_id = ?2 AND topic_id = ?3
+            WHERE owner_user_id = ?1 AND bot_user_id = ?2 AND chat_id = ?3 AND topic_id = ?4
             ",
-            params![key.bot_user_id, key.chat_id, key.topic_id],
+            params![key.owner_user_id as i64, key.bot_user_id, key.chat_id, key.topic_id],
             |row| {
-                let perm_raw: String = row.get(10)?;
-                let turn_count_i64: i64 = row.get(11)?;
-                let use_wt_i64: i64 = row.get(8)?;
-                let bot_provider_raw: Option<String> = row.get(14)?;
-                let bot_use_wt_i64: i64 = row.get(16)?;
-                let bot_perm_raw: Option<String> = row.get(18)?;
+                let owner_i64: i64 = row.get(0)?;
+                let use_wt_i64: i64 = row.get(9)?;
+                let perm_raw: String = row.get(11)?;
+                let turn_count_i64: i64 = row.get(12)?;
+                let bot_provider_raw: Option<String> = row.get(15)?;
+                let bot_use_wt_i64: i64 = row.get(17)?;
+                let bot_perm_raw: Option<String> = row.get(19)?;
                 Ok(ThreadRecord {
-                    bot_user_id: row.get(0)?,
-                    chat_id: row.get(1)?,
-                    topic_id: row.get(2)?,
-                    thread_id: row.get(3)?,
-                    provider_session_id: row.get(4)?,
-                    workspace_path: row.get(5)?,
-                    worktree_path: row.get(6)?,
-                    branch_name: row.get(7)?,
+                    owner_user_id: owner_i64.max(0) as u64,
+                    bot_user_id: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    topic_id: row.get(3)?,
+                    thread_id: row.get(4)?,
+                    provider_session_id: row.get(5)?,
+                    workspace_path: row.get(6)?,
+                    worktree_path: row.get(7)?,
+                    branch_name: row.get(8)?,
                     use_worktree: use_wt_i64 != 0,
-                    active_model: row.get(9)?,
+                    active_model: row.get(10)?,
                     permission_mode: CodingPermissionMode::parse(&perm_raw).unwrap_or_default(),
                     turn_count: turn_count_i64.max(0) as u64,
-                    last_summary: row.get(12)?,
-                    updated_at_ms: row.get(13)?,
+                    last_summary: row.get(13)?,
+                    updated_at_ms: row.get(14)?,
                     bot_provider_kind: bot_provider_raw
                         .as_deref()
                         .and_then(CodingProviderKind::parse),
-                    bot_workspace_path: row.get(15)?,
+                    bot_workspace_path: row.get(16)?,
                     bot_use_worktree: bot_use_wt_i64 != 0,
-                    bot_active_model: row.get(17)?,
+                    bot_active_model: row.get(18)?,
                     bot_permission_mode: bot_perm_raw
                         .as_deref()
                         .and_then(CodingPermissionMode::parse),
@@ -269,13 +482,13 @@ impl CodingStore {
         conn.execute(
             "
             INSERT INTO coding_threads (
-                bot_user_id, chat_id, topic_id, thread_id, provider_session_id,
+                owner_user_id, bot_user_id, chat_id, topic_id, thread_id, provider_session_id,
                 workspace_path, worktree_path, branch_name, use_worktree,
                 active_model, permission_mode, turn_count, last_summary, updated_at_ms,
                 bot_provider_kind, bot_workspace_path, bot_use_worktree,
                 bot_active_model, bot_permission_mode
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-            ON CONFLICT(bot_user_id, chat_id, topic_id) DO UPDATE SET
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            ON CONFLICT(owner_user_id, bot_user_id, chat_id, topic_id) DO UPDATE SET
                 thread_id           = excluded.thread_id,
                 provider_session_id = excluded.provider_session_id,
                 workspace_path      = excluded.workspace_path,
@@ -294,6 +507,7 @@ impl CodingStore {
                 bot_permission_mode = excluded.bot_permission_mode
             ",
             params![
+                rec.owner_user_id as i64,
                 rec.bot_user_id,
                 rec.chat_id,
                 rec.topic_id,
@@ -326,10 +540,10 @@ impl CodingStore {
         conn.execute(
             "
             INSERT INTO coding_checkpoints (
-                thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
+                owner_user_id, thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
                 prompt_preview, reply_preview, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(thread_id, turn_idx) DO UPDATE SET
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(owner_user_id, thread_id, turn_idx) DO UPDATE SET
                 before_ref     = excluded.before_ref,
                 after_ref      = excluded.after_ref,
                 diff_stat_json = excluded.diff_stat_json,
@@ -338,6 +552,7 @@ impl CodingStore {
                 created_at_ms  = excluded.created_at_ms
             ",
             params![
+                cp.owner_user_id as i64,
                 cp.thread_id,
                 cp.turn_idx as i64,
                 cp.before_ref,
@@ -354,35 +569,38 @@ impl CodingStore {
 
     pub fn get_checkpoint(
         &self,
+        owner_user_id: u64,
         thread_id: &str,
         turn_idx: Option<u64>,
     ) -> Result<Option<CheckpointRecord>, String> {
         let conn = self.conn.lock();
         let row_map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CheckpointRecord> {
-            let turn_i64: i64 = row.get(1)?;
-            let diff_json: String = row.get(4)?;
+            let owner_i64: i64 = row.get(0)?;
+            let turn_i64: i64 = row.get(2)?;
+            let diff_json: String = row.get(5)?;
             let diff_stat: CodingDiffStat = serde_json::from_str(&diff_json).unwrap_or_default();
             Ok(CheckpointRecord {
-                thread_id: row.get(0)?,
+                owner_user_id: owner_i64.max(0) as u64,
+                thread_id: row.get(1)?,
                 turn_idx: turn_i64.max(0) as u64,
-                before_ref: row.get(2)?,
-                after_ref: row.get(3)?,
+                before_ref: row.get(3)?,
+                after_ref: row.get(4)?,
                 diff_stat,
-                prompt_preview: row.get(5)?,
-                reply_preview: row.get(6)?,
-                created_at_ms: row.get(7)?,
+                prompt_preview: row.get(6)?,
+                reply_preview: row.get(7)?,
+                created_at_ms: row.get(8)?,
             })
         };
 
         if let Some(idx) = turn_idx {
             conn.query_row(
                 "
-                SELECT thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
+                SELECT owner_user_id, thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
                        prompt_preview, reply_preview, created_at_ms
                 FROM coding_checkpoints
-                WHERE thread_id = ?1 AND turn_idx = ?2
+                WHERE owner_user_id = ?1 AND thread_id = ?2 AND turn_idx = ?3
                 ",
-                params![thread_id, idx as i64],
+                params![owner_user_id as i64, thread_id, idx as i64],
                 row_map,
             )
             .optional()
@@ -390,14 +608,14 @@ impl CodingStore {
         } else {
             conn.query_row(
                 "
-                SELECT thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
+                SELECT owner_user_id, thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
                        prompt_preview, reply_preview, created_at_ms
                 FROM coding_checkpoints
-                WHERE thread_id = ?1
+                WHERE owner_user_id = ?1 AND thread_id = ?2
                 ORDER BY turn_idx DESC
                 LIMIT 1
                 ",
-                params![thread_id],
+                params![owner_user_id as i64, thread_id],
                 row_map,
             )
             .optional()
@@ -407,6 +625,7 @@ impl CodingStore {
 
     pub fn list_recent_checkpoints(
         &self,
+        owner_user_id: u64,
         thread_id: &str,
         limit: usize,
     ) -> Result<Vec<CheckpointRecord>, String> {
@@ -414,31 +633,33 @@ impl CodingStore {
         let mut stmt = conn
             .prepare(
                 "
-                SELECT thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
+                SELECT owner_user_id, thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
                        prompt_preview, reply_preview, created_at_ms
                 FROM coding_checkpoints
-                WHERE thread_id = ?1
+                WHERE owner_user_id = ?1 AND thread_id = ?2
                 ORDER BY turn_idx DESC
-                LIMIT ?2
+                LIMIT ?3
                 ",
             )
             .map_err(|e| format!("failed to prepare recent checkpoints query: {e}"))?;
 
         let rows = stmt
-            .query_map(params![thread_id, limit as i64], |row| {
-                let turn_i64: i64 = row.get(1)?;
-                let diff_json: String = row.get(4)?;
+            .query_map(params![owner_user_id as i64, thread_id, limit as i64], |row| {
+                let owner_i64: i64 = row.get(0)?;
+                let turn_i64: i64 = row.get(2)?;
+                let diff_json: String = row.get(5)?;
                 let diff_stat: CodingDiffStat =
                     serde_json::from_str(&diff_json).unwrap_or_default();
                 Ok(CheckpointRecord {
-                    thread_id: row.get(0)?,
+                    owner_user_id: owner_i64.max(0) as u64,
+                    thread_id: row.get(1)?,
                     turn_idx: turn_i64.max(0) as u64,
-                    before_ref: row.get(2)?,
-                    after_ref: row.get(3)?,
+                    before_ref: row.get(3)?,
+                    after_ref: row.get(4)?,
                     diff_stat,
-                    prompt_preview: row.get(5)?,
-                    reply_preview: row.get(6)?,
-                    created_at_ms: row.get(7)?,
+                    prompt_preview: row.get(6)?,
+                    reply_preview: row.get(7)?,
+                    created_at_ms: row.get(8)?,
                 })
             })
             .map_err(|e| format!("failed to query recent checkpoints: {e}"))?;
@@ -454,6 +675,7 @@ impl CodingStore {
     /// Atomically claims `turn_id` in `command_receipts` for idempotent retry protection.
     pub fn claim_turn_receipt(
         &self,
+        owner_user_id: u64,
         turn_id: &str,
         thread_id: &str,
     ) -> Result<TurnReceiptClaim, String> {
@@ -463,12 +685,12 @@ impl CodingStore {
             .execute(
                 "
                 INSERT INTO command_receipts (
-                    turn_id, thread_id, status, turn_idx, completed_event_json,
+                    owner_user_id, turn_id, thread_id, status, turn_idx, completed_event_json,
                     created_at_ms, updated_at_ms
-                ) VALUES (?1, ?2, 'running', 0, NULL, ?3, ?3)
-                ON CONFLICT(turn_id) DO NOTHING
+                ) VALUES (?1, ?2, ?3, 'running', 0, NULL, ?4, ?4)
+                ON CONFLICT(owner_user_id, turn_id) DO NOTHING
                 ",
-                params![turn_id, thread_id, now],
+                params![owner_user_id as i64, turn_id, thread_id, now],
             )
             .map_err(|e| format!("failed to claim turn receipt: {e}"))?;
 
@@ -481,9 +703,9 @@ impl CodingStore {
                 "
                 SELECT status, turn_idx, completed_event_json
                 FROM command_receipts
-                WHERE turn_id = ?1
+                WHERE owner_user_id = ?1 AND turn_id = ?2
                 ",
-                params![turn_id],
+                params![owner_user_id as i64, turn_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -512,6 +734,7 @@ impl CodingStore {
     /// Updates `command_receipts` once a turn finishes (success, failure, or cancellation).
     pub fn finish_turn_receipt(
         &self,
+        owner_user_id: u64,
         turn_id: &str,
         status: &str,
         turn_idx: u64,
@@ -526,13 +749,13 @@ impl CodingStore {
         conn.execute(
             "
             UPDATE command_receipts
-            SET status = ?2,
-                turn_idx = ?3,
-                completed_event_json = ?4,
-                updated_at_ms = ?5
-            WHERE turn_id = ?1
+            SET status = ?3,
+                turn_idx = ?4,
+                completed_event_json = ?5,
+                updated_at_ms = ?6
+            WHERE owner_user_id = ?1 AND turn_id = ?2
             ",
-            params![turn_id, status, turn_idx as i64, event_json, now],
+            params![owner_user_id as i64, turn_id, status, turn_idx as i64, event_json, now],
         )
         .map_err(|e| format!("failed to finalize turn receipt: {e}"))?;
         Ok(())
@@ -580,6 +803,7 @@ mod tests {
         assert!(store.get_thread(key).unwrap().is_none());
 
         let rec = ThreadRecord {
+            owner_user_id: key.owner_user_id,
             bot_user_id: key.bot_user_id,
             chat_id: key.chat_id,
             topic_id: key.topic_id,
@@ -606,6 +830,7 @@ mod tests {
 
         // Save checkpoint and fetch by explicit turn_idx and None (latest).
         let cp = CheckpointRecord {
+            owner_user_id: 0,
             thread_id: "thr_1".to_string(),
             turn_idx: 1,
             before_ref: "refs/fabushi-coding/checkpoints/thr_1/1-before".to_string(),
@@ -621,16 +846,16 @@ mod tests {
             created_at_ms: now_ms(),
         };
         store.save_checkpoint(&cp).unwrap();
-        assert_eq!(store.get_checkpoint("thr_1", Some(1)).unwrap(), Some(cp.clone()));
-        assert_eq!(store.get_checkpoint("thr_1", None).unwrap(), Some(cp));
+        assert_eq!(store.get_checkpoint(0, "thr_1", Some(1)).unwrap(), Some(cp.clone()));
+        assert_eq!(store.get_checkpoint(0, "thr_1", None).unwrap(), Some(cp));
 
         // Idempotent command receipts.
         assert!(matches!(
-            store.claim_turn_receipt("turn_1", "thr_1").unwrap(),
+            store.claim_turn_receipt(0, "turn_1", "thr_1").unwrap(),
             TurnReceiptClaim::Claimed
         ));
         assert!(matches!(
-            store.claim_turn_receipt("turn_1", "thr_1").unwrap(),
+            store.claim_turn_receipt(0, "turn_1", "thr_1").unwrap(),
             TurnReceiptClaim::InProgress
         ));
 
@@ -645,10 +870,10 @@ mod tests {
             token_usage: None,
         };
         store
-            .finish_turn_receipt("turn_1", "completed", 1, Some(&completed_ev))
+            .finish_turn_receipt(0, "turn_1", "completed", 1, Some(&completed_ev))
             .unwrap();
 
-        match store.claim_turn_receipt("turn_1", "thr_1").unwrap() {
+        match store.claim_turn_receipt(0, "turn_1", "thr_1").unwrap() {
             TurnReceiptClaim::AlreadyCompleted(ev) => assert_eq!(ev, completed_ev),
             other => panic!("expected AlreadyCompleted, got {other:?}"),
         }
@@ -683,6 +908,36 @@ mod tests {
                     bot_user_id, chat_id, topic_id, thread_id, workspace_path,
                     use_worktree, permission_mode, turn_count, updated_at_ms
                 ) VALUES (10, 20, 0, 'thr_legacy', '/old', 0, 'full_access', 2, 1000);
+
+                CREATE TABLE coding_checkpoints (
+                    thread_id       TEXT NOT NULL,
+                    turn_idx        INTEGER NOT NULL,
+                    before_ref      TEXT NOT NULL,
+                    after_ref       TEXT NOT NULL,
+                    diff_stat_json  TEXT NOT NULL,
+                    prompt_preview  TEXT NOT NULL,
+                    reply_preview   TEXT NOT NULL,
+                    created_at_ms   INTEGER NOT NULL,
+                    PRIMARY KEY (thread_id, turn_idx)
+                );
+                INSERT INTO coding_checkpoints (
+                    thread_id, turn_idx, before_ref, after_ref, diff_stat_json,
+                    prompt_preview, reply_preview, created_at_ms
+                ) VALUES ('thr_legacy', 1, 'b1', 'a1', '{}', 'p', 'r', 1000);
+
+                CREATE TABLE command_receipts (
+                    turn_id               TEXT PRIMARY KEY,
+                    thread_id             TEXT NOT NULL,
+                    status                TEXT NOT NULL,
+                    turn_idx              INTEGER NOT NULL DEFAULT 0,
+                    completed_event_json  TEXT,
+                    created_at_ms         INTEGER NOT NULL,
+                    updated_at_ms         INTEGER NOT NULL
+                );
+                INSERT INTO command_receipts (
+                    turn_id, thread_id, status, turn_idx, completed_event_json,
+                    created_at_ms, updated_at_ms
+                ) VALUES ('turn_legacy', 'thr_legacy', 'completed', 1, NULL, 1000, 1000);
                 ",
             )
             .unwrap();
@@ -690,12 +945,168 @@ mod tests {
 
         let store = CodingStore::open(&db_path).unwrap();
         let rec = store.get_thread(ThreadKey::new(10, 20, None)).unwrap().unwrap();
+        assert_eq!(rec.owner_user_id, 0);
         assert_eq!(rec.thread_id, "thr_legacy");
         assert_eq!(rec.bot_workspace_path, "");
         assert_eq!(rec.bot_permission_mode, None);
 
+        // Real authenticated owner (e.g. 1001) must NOT see migrated owner_user_id=0 rows.
+        assert!(
+            store
+                .get_thread(ThreadKey::for_owner(1001, 10, 20, None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_checkpoint(1001, "thr_legacy", Some(1)).unwrap().is_none());
+        assert!(store.get_checkpoint(0, "thr_legacy", Some(1)).unwrap().is_some());
+
+        // Upserting for owner 1001 with colliding (10, 20, 0) must succeed without PK conflict.
+        let rec_1001 = ThreadRecord {
+            owner_user_id: 1001,
+            bot_user_id: 10,
+            chat_id: 20,
+            topic_id: 0,
+            thread_id: "thr_1001".to_string(),
+            provider_session_id: None,
+            workspace_path: "/new".to_string(),
+            worktree_path: None,
+            branch_name: None,
+            use_worktree: false,
+            active_model: None,
+            permission_mode: CodingPermissionMode::Ask,
+            turn_count: 0,
+            last_summary: None,
+            updated_at_ms: 2000,
+            bot_provider_kind: None,
+            bot_workspace_path: "/new".to_string(),
+            bot_use_worktree: false,
+            bot_active_model: None,
+            bot_permission_mode: Some(CodingPermissionMode::Ask),
+        };
+        store.upsert_thread(&rec_1001).unwrap();
+        assert_eq!(
+            store.get_thread(ThreadKey::for_owner(1001, 10, 20, None)).unwrap().unwrap().thread_id,
+            "thr_1001"
+        );
+        assert_eq!(
+            store.get_thread(ThreadKey::new(10, 20, None)).unwrap().unwrap().thread_id,
+            "thr_legacy"
+        );
+
         // Re-opening must be a clean idempotent no-op.
         let store2 = CodingStore::open(&db_path).unwrap();
         assert!(store2.get_thread(ThreadKey::new(10, 20, None)).unwrap().is_some());
+        assert!(store2.get_thread(ThreadKey::for_owner(1001, 10, 20, None)).unwrap().is_some());
+    }
+
+    #[test]
+    fn store_isolates_threads_checkpoints_and_receipts_by_owner_user_id() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let store = CodingStore::open(&db_path).unwrap();
+
+        let key_alice = ThreadKey::for_owner(1001, 500, 102, None);
+        let key_bob = ThreadKey::for_owner(2002, 500, 102, None);
+
+        let rec_alice = ThreadRecord {
+            owner_user_id: 1001,
+            bot_user_id: 500,
+            chat_id: 102,
+            topic_id: 0,
+            thread_id: "thr_shared".to_string(),
+            provider_session_id: Some("secret_claude_sess_alice".to_string()),
+            workspace_path: "/Users/alice/private-repo".to_string(),
+            worktree_path: Some("/tmp/wt-alice".to_string()),
+            branch_name: Some("fabushi/alice".to_string()),
+            use_worktree: true,
+            active_model: Some("alice-model".to_string()),
+            permission_mode: CodingPermissionMode::AutoEdit,
+            turn_count: 17,
+            last_summary: Some("alice secret summary".to_string()),
+            updated_at_ms: now_ms(),
+            bot_provider_kind: Some(CodingProviderKind::ClaudeCode),
+            bot_workspace_path: "/Users/alice/private-repo".to_string(),
+            bot_use_worktree: true,
+            bot_active_model: Some("alice-model".to_string()),
+            bot_permission_mode: Some(CodingPermissionMode::AutoEdit),
+        };
+        store.upsert_thread(&rec_alice).unwrap();
+
+        assert!(store.get_thread(key_bob).unwrap().is_none());
+        assert_eq!(store.get_thread(key_alice).unwrap(), Some(rec_alice.clone()));
+
+        let rec_bob = ThreadRecord {
+            owner_user_id: 2002,
+            bot_user_id: 500,
+            chat_id: 102,
+            topic_id: 0,
+            thread_id: "thr_shared".to_string(),
+            provider_session_id: None,
+            workspace_path: "/Users/bob/clean-repo".to_string(),
+            worktree_path: None,
+            branch_name: Some("main".to_string()),
+            use_worktree: false,
+            active_model: None,
+            permission_mode: CodingPermissionMode::Ask,
+            turn_count: 0,
+            last_summary: None,
+            updated_at_ms: now_ms(),
+            bot_provider_kind: Some(CodingProviderKind::ClaudeCode),
+            bot_workspace_path: "/Users/bob/clean-repo".to_string(),
+            bot_use_worktree: false,
+            bot_active_model: None,
+            bot_permission_mode: Some(CodingPermissionMode::Ask),
+        };
+        store.upsert_thread(&rec_bob).unwrap();
+        assert_eq!(store.get_thread(key_alice).unwrap(), Some(rec_alice));
+        assert_eq!(store.get_thread(key_bob).unwrap(), Some(rec_bob));
+
+        let cp_alice = CheckpointRecord {
+            owner_user_id: 1001,
+            thread_id: "thr_shared".to_string(),
+            turn_idx: 1,
+            before_ref: "refs/a/before".to_string(),
+            after_ref: "refs/a/after".to_string(),
+            diff_stat: CodingDiffStat::default(),
+            prompt_preview: "alice prompt".to_string(),
+            reply_preview: "alice reply".to_string(),
+            created_at_ms: now_ms(),
+        };
+        store.save_checkpoint(&cp_alice).unwrap();
+
+        assert!(store.get_checkpoint(2002, "thr_shared", Some(1)).unwrap().is_none());
+        assert!(store.get_checkpoint(2002, "thr_shared", None).unwrap().is_none());
+        assert!(store.list_recent_checkpoints(2002, "thr_shared", 5).unwrap().is_empty());
+        assert_eq!(store.get_checkpoint(1001, "thr_shared", Some(1)).unwrap(), Some(cp_alice));
+
+        assert!(matches!(
+            store.claim_turn_receipt(1001, "shared_turn_1", "thr_shared").unwrap(),
+            TurnReceiptClaim::Claimed
+        ));
+        let ev_alice = CodingHostEvent::TurnCompleted {
+            turn_id: "shared_turn_1".to_string(),
+            ok: true,
+            final_text: "alice confidential result".to_string(),
+            error: None,
+            turn_idx: 1,
+            checkpoint_ref: None,
+            diff_stat: None,
+            token_usage: None,
+        };
+        store
+            .finish_turn_receipt(1001, "shared_turn_1", "completed", 1, Some(&ev_alice))
+            .unwrap();
+
+        assert!(matches!(
+            store.claim_turn_receipt(2002, "shared_turn_1", "thr_shared").unwrap(),
+            TurnReceiptClaim::Claimed
+        ));
+        store
+            .finish_turn_receipt(2002, "shared_turn_1", "completed", 1, None)
+            .unwrap();
+        assert!(matches!(
+            store.claim_turn_receipt(1001, "shared_turn_1", "thr_shared").unwrap(),
+            TurnReceiptClaim::AlreadyCompleted(_)
+        ));
     }
 }

@@ -179,6 +179,37 @@ public final class FabushiToastController {
         }
     }
 
+    /// Displays a Layer 2 window toast strictly scoped to `chatId` (`v1.6.10` `M2-D3`).
+    public func showChatToast(
+        _ rawMessage: String,
+        chatId: Int64,
+        isError: Bool? = nil,
+        durationSeconds: TimeInterval = defaultWindowDurationSeconds
+    ) {
+        showWindowToast(
+            rawMessage,
+            chatId: chatId,
+            isError: isError,
+            durationSeconds: durationSeconds
+        )
+    }
+
+    /// Displays a Layer 2 window toast explicitly unscoped (`scopeChatId == nil`) so Vault,
+    /// Settings, Auth, Proxy, Magpie, and Remote Computer notices never inherit a background
+    /// chat scope (`v1.6.10` `M2-D3`).
+    public func showNonChatToast(
+        _ rawMessage: String,
+        isError: Bool? = nil,
+        durationSeconds: TimeInterval = defaultWindowDurationSeconds
+    ) {
+        showWindowToast(
+            rawMessage,
+            chatId: nil,
+            isError: isError,
+            durationSeconds: durationSeconds
+        )
+    }
+
     /// Dismisses the active window toast (strictly ID-fenced when `id != nil`) and promotes
     /// the next FIFO queued toast if present.
     public func dismissWindowToast(id: UUID? = nil) {
@@ -201,6 +232,24 @@ public final class FabushiToastController {
         windowQueue.removeAll { $0.scopeChatId == chatId }
 
         if let active = windowBanner, active.scopeChatId == chatId {
+            windowDismissTask?.cancel()
+            windowDismissTask = nil
+            windowBanner = nil
+            promoteNextQueuedWindowToast()
+        }
+    }
+
+    /// Synchronously clears any active Layer 1 stage pill AND active/queued Layer 2 window toasts
+    /// that carry a non-nil `scopeChatId`, preserving unscoped non-chat toasts (`scopeChatId == nil`)
+    /// and promoting the next queued non-chat toast if the active banner was purged (`v1.6.10` `M2-D1`).
+    public func clearAllChatScopedToasts() {
+        if let stage = stagePill, stage.scopeChatId != nil {
+            dismissStagePill()
+        }
+
+        windowQueue.removeAll { $0.scopeChatId != nil }
+
+        if let active = windowBanner, active.scopeChatId != nil {
             windowDismissTask?.cancel()
             windowDismissTask = nil
             windowBanner = nil

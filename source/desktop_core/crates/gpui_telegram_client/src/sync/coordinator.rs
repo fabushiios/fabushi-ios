@@ -36,6 +36,11 @@ impl ClientSyncCoordinator {
         self.last_seen_pts.write().insert(chat_id, pts);
     }
 
+    pub fn clear(&self) {
+        self.last_seen_pts.write().clear();
+        self.pending_gap_buffers.write().clear();
+    }
+
     pub fn evaluate_update(&self, update: &PtsUpdate) -> SyncOutcome {
         let mut map = self.last_seen_pts.write();
         let last = map.entry(update.chat_id).or_insert(0);

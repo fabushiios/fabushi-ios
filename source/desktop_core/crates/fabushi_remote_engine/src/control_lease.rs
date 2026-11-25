@@ -2,7 +2,7 @@ use crate::error::{EngineResult, RemoteEngineError};
 use gpui_telegram_proto::remote_control_contracts::{
     RemoteControlMode, RemoteControllerKind, RemoteSessionDto,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -25,6 +25,7 @@ pub enum ControlHubEvent {
 pub struct PreemptionToken {
     epoch: u64,
     rx: watch::Receiver<u64>,
+    global_epoch: Option<&'static AtomicU64>,
 }
 
 impl PreemptionToken {
@@ -33,7 +34,10 @@ impl PreemptionToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        *self.rx.borrow() != self.epoch || USER_OVERRIDE_EPOCH.load(Ordering::SeqCst) != self.epoch
+        *self.rx.borrow() != self.epoch
+            || self
+                .global_epoch
+                .is_some_and(|g| g.load(Ordering::SeqCst) != self.epoch)
     }
 
     pub fn check(&self) -> EngineResult<()> {
@@ -63,6 +67,8 @@ impl PreemptionToken {
 pub struct RemoteControlHub {
     sessions: RwLock<HashMap<String, RemoteSessionDto>>,
     override_epoch: AtomicU64,
+    global_epoch: Option<&'static AtomicU64>,
+    epoch_lock: Mutex<()>,
     epoch_tx: watch::Sender<u64>,
     event_tx: broadcast::Sender<ControlHubEvent>,
 }
@@ -74,21 +80,29 @@ impl Default for RemoteControlHub {
 }
 
 impl RemoteControlHub {
-    pub fn new() -> Self {
-        let initial_epoch = USER_OVERRIDE_EPOCH.load(Ordering::SeqCst);
+    fn with_global_epoch(global_epoch: Option<&'static AtomicU64>) -> Self {
+        let initial_epoch = global_epoch.map_or(0, |g| g.load(Ordering::SeqCst));
         let (epoch_tx, _) = watch::channel(initial_epoch);
         let (event_tx, _) = broadcast::channel(128);
         Self {
             sessions: RwLock::new(HashMap::new()),
             override_epoch: AtomicU64::new(initial_epoch),
+            global_epoch,
+            epoch_lock: Mutex::new(()),
             epoch_tx,
             event_tx,
         }
     }
 
+    pub fn new() -> Self {
+        Self::with_global_epoch(None)
+    }
+
     pub fn shared() -> Arc<Self> {
         static SHARED: OnceLock<Arc<RemoteControlHub>> = OnceLock::new();
-        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new())))
+        Arc::clone(
+            SHARED.get_or_init(|| Arc::new(Self::with_global_epoch(Some(&USER_OVERRIDE_EPOCH)))),
+        )
     }
 
     pub fn override_epoch(&self) -> u64 {
@@ -96,19 +110,28 @@ impl RemoteControlHub {
     }
 
     pub fn bump_user_override(&self) -> u64 {
-        let global = USER_OVERRIDE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        let _guard = self.epoch_lock.lock();
         let local = self.override_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let next = global.max(local);
-        self.override_epoch.store(next, Ordering::SeqCst);
-        let _ = self.epoch_tx.send(next);
+        let next = if let Some(global_epoch) = self.global_epoch {
+            let global = global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            let max_epoch = global.max(local);
+            self.override_epoch.store(max_epoch, Ordering::SeqCst);
+            max_epoch
+        } else {
+            local
+        };
+        self.epoch_tx.send_replace(next);
         next
     }
 
     pub fn preemption_token(&self) -> PreemptionToken {
-        let epoch = self.override_epoch();
+        let _guard = self.epoch_lock.lock();
+        let rx = self.epoch_tx.subscribe();
+        let epoch = *rx.borrow();
         PreemptionToken {
             epoch,
-            rx: self.epoch_tx.subscribe(),
+            rx,
+            global_epoch: self.global_epoch,
         }
     }
 
@@ -223,6 +246,18 @@ impl RemoteControlHub {
         let removed = self.sessions.write().remove(session_id).is_some();
         if removed {
             self.bump_user_override();
+            let _ = self.event_tx.send(ControlHubEvent::SessionDisconnected {
+                session_id: session_id.to_string(),
+            });
+        }
+        removed
+    }
+
+    /// Removes a short-lived ephemeral local IPC/CLI session without bumping `override_epoch`
+    /// or cancelling active preemption tokens.
+    pub fn finish_ephemeral_session(&self, session_id: &str) -> bool {
+        let removed = self.sessions.write().remove(session_id).is_some();
+        if removed {
             let _ = self.event_tx.send(ControlHubEvent::SessionDisconnected {
                 session_id: session_id.to_string(),
             });

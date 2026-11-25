@@ -113,9 +113,18 @@ async fn test_ipc_roundtrip_permissions_and_uid_check() {
     server.wait_stopped().await;
 }
 
+static SHARED_HUB_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn shared_hub_test_lock() -> &'static tokio::sync::Mutex<()> {
+    SHARED_HUB_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[tokio::test]
 async fn test_control_hub_kill_switch_preempts_under_50ms() {
-    let hub = RemoteControlHub::new();
+    let _guard = shared_hub_test_lock().lock().await;
+    let hub = RemoteControlHub::shared();
+    let _ = hub.disconnect_all();
     let before_global = USER_OVERRIDE_EPOCH.load(Ordering::SeqCst);
     let session = RemoteSessionDto {
         session_id: "ai-sess-1".into(),
@@ -608,4 +617,90 @@ async fn test_windows_powershell_pty_exec() {
     );
 
     assert!(mux.kill_session("ps-ci").expect("kill ps session"));
+}
+
+// [T5-29] R8-5: finish_ephemeral_session removes only the ephemeral session without bumping override_epoch,
+// while disconnect_session continues to bump override_epoch.
+#[test]
+fn t5_29_finish_ephemeral_session_does_not_bump_override_epoch() {
+    let hub = RemoteControlHub::new();
+    let base_sess = RemoteSessionDto {
+        session_id: "cli-1".into(),
+        controller_kind: RemoteControllerKind::Cli,
+        controller_name: "fabushi CLI".into(),
+        controller_platform: "macos".into(),
+        controller_id: "dev-1".into(),
+        target_node_id: "local:1".into(),
+        target_device_id: "dev-1".into(),
+        mode: RemoteControlMode::Desktop,
+        started_at_ms: 0,
+        last_activity_ms: 0,
+        active_tool: None,
+        relay_mode: TailnetRelayMode::DirectUdp,
+        rtt_ms: Some(1),
+        fps: None,
+    };
+    let mut eph_sess = base_sess.clone();
+    eph_sess.session_id = "cli-1-ipc-1".into();
+    eph_sess.active_tool = Some("ipc".into());
+
+    hub.register_session(base_sess);
+    hub.register_session(eph_sess);
+    let epoch_before = hub.override_epoch();
+    let token = hub.preemption_token();
+    assert!(!token.is_cancelled());
+
+    assert!(hub.finish_ephemeral_session("cli-1-ipc-1"));
+    assert_eq!(hub.override_epoch(), epoch_before);
+    assert!(!token.is_cancelled());
+    assert!(hub.get_session("cli-1").is_some());
+    assert!(hub.get_session("cli-1-ipc-1").is_none());
+
+    assert!(hub.disconnect_session("cli-1"));
+    assert!(hub.override_epoch() > epoch_before);
+    assert!(token.is_cancelled());
+}
+
+#[tokio::test]
+async fn isolated_control_hub_does_not_mutate_or_observe_global_override_epoch() {
+    let _guard = shared_hub_test_lock().lock().await;
+    let hub_a = RemoteControlHub::new();
+    let hub_b = RemoteControlHub::new();
+    let shared = RemoteControlHub::shared();
+    let _ = shared.disconnect_all();
+
+    let make_session = |id: &str| RemoteSessionDto {
+        session_id: id.into(),
+        controller_kind: RemoteControllerKind::Cli,
+        controller_name: "fabushi CLI".into(),
+        controller_platform: "macos".into(),
+        controller_id: "dev-1".into(),
+        target_node_id: "local:1".into(),
+        target_device_id: "dev-1".into(),
+        mode: RemoteControlMode::Desktop,
+        started_at_ms: 0,
+        last_activity_ms: 0,
+        active_tool: None,
+        relay_mode: TailnetRelayMode::DirectUdp,
+        rtt_ms: Some(1),
+        fps: None,
+    };
+
+    hub_a.register_session(make_session("sess-a"));
+    hub_b.register_session(make_session("sess-b"));
+    shared.register_session(make_session("sess-shared"));
+
+    let tok_b = hub_b.preemption_token();
+    let tok_shared = shared.preemption_token();
+    let global_before = USER_OVERRIDE_EPOCH.load(Ordering::SeqCst);
+
+    assert!(hub_a.disconnect_session("sess-a"));
+    assert_eq!(hub_a.disconnect_all(), 0);
+
+    assert_eq!(USER_OVERRIDE_EPOCH.load(Ordering::SeqCst), global_before);
+    assert!(!tok_b.is_cancelled());
+    assert!(!tok_shared.is_cancelled());
+    assert_eq!(hub_b.active_count(), 1);
+    assert_eq!(shared.active_count(), 1);
+    let _ = shared.disconnect_all();
 }

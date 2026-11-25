@@ -297,6 +297,10 @@ fn test_fabushi_provider_sync_propagates_to_all_isolated_bots() {
     let (active_id, active_model, _mode) = bot.hermes().providers().active_info();
     assert_eq!(active_id, "test_cloud");
     assert_eq!(active_model, "gpt-4.1-mini");
+    assert!(
+        bot.settings().preferred_model.is_empty(),
+        "bot provisioned with preferred_model: None must keep preferred_model empty so it follows Settings"
+    );
 }
 
 #[tokio::test]

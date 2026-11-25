@@ -256,6 +256,17 @@ public struct FabushiAdaptiveShellView: View {
         .onChange(of: scenePhase) { _, phase in
             router.handleScenePhaseChange(phase)
         }
+        .onChange(of: router.isInspectorPresented) { _, presented in
+            if presented && horizontalSizeClass == .compact {
+                router.reconcileChatScopedToasts(coordinator: coordinator, isCompact: true)
+            }
+        }
+        .onChange(of: horizontalSizeClass) { _, newSizeClass in
+            router.reconcileChatScopedToasts(
+                coordinator: coordinator,
+                isCompact: newSizeClass == .compact
+            )
+        }
     }
 
     // MARK: - Lifecycle Gating Order

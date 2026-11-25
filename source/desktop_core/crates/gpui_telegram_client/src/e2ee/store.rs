@@ -783,4 +783,25 @@ impl E2eeStore {
         ));
         Ok(())
     }
+
+    pub fn clear(&self) {
+        if let Some(ref cache) = self.cache {
+            let conn = cache.conn.lock();
+            let _ = conn.execute_batch(
+                "DELETE FROM e2ee_identity;
+                 DELETE FROM e2ee_signed_prekeys;
+                 DELETE FROM e2ee_one_time_prekeys;
+                 DELETE FROM e2ee_sessions;
+                 DELETE FROM e2ee_sender_keys;
+                 DELETE FROM e2ee_sender_key_history;
+                 DELETE FROM e2ee_distributed_keys;",
+            );
+        }
+        let mut mem = self.mem.write();
+        *mem = MemoryE2eeState {
+            next_spk_id: 1,
+            next_otpk_id: 1,
+            ..Default::default()
+        };
+    }
 }

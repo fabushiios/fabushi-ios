@@ -4350,9 +4350,7 @@ impl HermesEngine {
         }
 
         if let Some(err) = error_msg {
-            if response_text.is_empty() {
-                return Err(TelegramError::Internal(err));
-            }
+            return Err(TelegramError::Internal(err));
         }
 
         Ok(HermesTurnResult {
@@ -4867,6 +4865,12 @@ impl HermesEngine {
             while let Some(ev) = sub_rx.recv().await {
                 match &ev {
                     HermesEvent::ToolStart { .. } => step_used_tools = true,
+                    HermesEvent::Error { .. } => {
+                        recorded.push(ev.clone());
+                        let _ = tx.send(ev).await;
+                        self.update_session_settings(session_id, |s| s.active_goal = None);
+                        return;
+                    }
                     HermesEvent::Done {
                         response_text,
                         usage,
@@ -7827,5 +7831,138 @@ mod tests {
         );
         assert!(fallback_assembled.tier3_volatile.content.contains("Runtime: Fabushi Bot"));
         assert!(!fallback_assembled.tier3_volatile.content.contains("hermes-local-v1"));
+    }
+
+    #[tokio::test]
+    async fn test_goal_loop_aborts_immediately_on_provider_error_and_run_turn_returns_err() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = TempDir::new().expect("temp dir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+
+        let srv = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let hits_req = Arc::clone(&hits_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    hits_req.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"error":{"message":"Upstream model rejected request","type":"invalid_request_error"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = HermesEngineConfig {
+            workspace_root: dir.path().to_path_buf(),
+            data_dir: Some(dir.path().join(".hermes_data")),
+            default_model: "mock-model".into(),
+            ..Default::default()
+        };
+        let engine = HermesEngine::new(cfg).expect("init HermesEngine");
+        engine.providers().set_allow_local_fallback(false);
+        engine.providers().set_offline_rule_bot_allowed(false);
+
+        // 0. Unconfigured provider on /goal must also abort on step 1 and return Err.
+        let uncfg_err = engine
+            .run_turn(
+                HermesTurnRequest::new("/goal Verify unconfigured abort")
+                    .with_chat_bot(403, "bot_goal_uncfg")
+                    .with_session("s_goal_uncfg"),
+            )
+            .await
+            .expect_err("unconfigured /goal run_turn must return Err");
+        assert!(
+            uncfg_err.to_string().contains("PROVIDER_ERROR:"),
+            "unexpected unconfigured error: {uncfg_err}"
+        );
+
+        engine
+            .providers()
+            .register_provider(providers::ProviderConfig::openai_compatible(
+                "mock_err",
+                "Mock Err",
+                format!("http://{addr}/v1"),
+                "mock-model",
+                "sk-mock",
+            ));
+        engine
+            .providers()
+            .set_active("mock_err", Some("mock-model"))
+            .expect("set active");
+
+        // 1. run_turn_stream on /goal must abort after step 1 with Error and emit zero Done events.
+        let mut rx = engine
+            .run_turn_stream(
+                HermesTurnRequest::new("/goal Verify system health")
+                    .with_chat_bot(404, "bot_goal_err")
+                    .with_session("s_goal_err_stream"),
+            )
+            .await
+            .expect("start stream");
+        let mut events = Vec::new();
+        while let Some(ev) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("stream timeout")
+        {
+            events.push(ev);
+        }
+        let goal_progress_count = events
+            .iter()
+            .filter(|e| matches!(e, HermesEvent::GoalProgress { .. }))
+            .count();
+        assert_eq!(
+            goal_progress_count, 1,
+            "run_goal_loop must abort after step 1 on PROVIDER_ERROR, got events={events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HermesEvent::Error { code, .. } if code == "PROVIDER_ERROR")),
+            "expected PROVIDER_ERROR event: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, HermesEvent::Done { .. })),
+            "must NOT emit HermesEvent::Done after PROVIDER_ERROR: {events:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "must NOT execute remaining goal steps 2..=8 after step 1 PROVIDER_ERROR"
+        );
+
+        // 2. run_turn on /goal must return Err(TelegramError::Internal("PROVIDER_ERROR: ...")), never Ok("Goal loop finished...").
+        let hits_before = hits.load(Ordering::SeqCst);
+        let res = engine
+            .run_turn(
+                HermesTurnRequest::new("/goal Verify system health")
+                    .with_chat_bot(404, "bot_goal_err")
+                    .with_session("s_goal_err_turn"),
+            )
+            .await;
+        let err = res.expect_err("/goal run_turn must return Err on PROVIDER_ERROR");
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("PROVIDER_ERROR:") && err_str.contains("400"),
+            "unexpected error string: {err_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst) - hits_before,
+            1,
+            "run_turn /goal must abort after 1 provider attempt on 400"
+        );
+
+        srv.abort();
     }
 }

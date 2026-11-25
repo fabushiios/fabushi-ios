@@ -417,7 +417,7 @@ class DesktopMainAuthorityTests(unittest.TestCase):
             # Valid CI-verified TEST_READY.md with anchored GitHub Actions URL and non-zero 40-hex SHA passes
             (root / "TEST_READY.md").write_text(
                 "# E2E Test Readiness\n"
-                "Exact HEAD: 57a62ef92be2fa816704d7337aca3254dc8f943e\n"
+                "Exact HEAD: feb07a857f420a3f2c3c4badaa20e0242a017fa9\n"
                 "GitHub Actions Run: https://github.com/fabushiios/fabushi-ios/actions/runs/45114476960\n",
                 encoding="utf-8",
             )

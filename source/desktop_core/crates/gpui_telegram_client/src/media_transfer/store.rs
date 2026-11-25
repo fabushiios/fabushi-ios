@@ -253,4 +253,9 @@ impl FileTransferStore {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_err)
     }
+
+    pub fn clear(&self) {
+        let conn = self.cache.conn.lock();
+        let _ = conn.execute("DELETE FROM file_transfers", []);
+    }
 }
