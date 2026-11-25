@@ -98,41 +98,36 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             startNetworkMonitor: false
         )
 
-        do {
-            let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
-            let module = FabushiPlatformModule()
-            let isolatedRegistry = FabushiFeatureModuleRegistry(platform: module)
+        let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
+        let module = FabushiPlatformModule()
+        let isolatedRegistry = FabushiFeatureModuleRegistry(platform: module)
 
-            // Invoke ALL 8 sealed PlatformModulesProviding factories + M6 Browser hook
-            _ = isolatedRegistry.platform.makeRemoteComputerWorkbenchView(nodeId: nil, coordinator: coordinator, router: router)
-            _ = isolatedRegistry.platform.makeRemoteControlledPillView(
-                status: RemoteControlStatusState(id: "node-1", nodeName: "Studio Mac", controllerLabel: "Mobile"),
-                coordinator: coordinator,
-                router: router
-            )
-            _ = isolatedRegistry.platform.makeMiniAppHostSheetView(miniAppId: "catalog", coordinator: coordinator, router: router)
-            _ = isolatedRegistry.platform.makeMiniAppFloatingPipView(
-                pip: MiniAppPipOverlayState(id: "app-1", title: "Global Dharma"),
-                coordinator: coordinator,
-                router: router
-            )
-            _ = isolatedRegistry.platform.makeCallAndTalkOverlayView(
-                callPip: CallPipOverlayState(id: "call-1", peerTitle: "Peer", stateText: "Connected"),
-                coordinator: coordinator,
-                router: router
-            )
-            _ = isolatedRegistry.platform.makeCallsTabView(coordinator: coordinator, router: router)
-            _ = isolatedRegistry.platform.makeSettingsRootView(initialSection: "proxy", coordinator: coordinator, router: router)
-            _ = isolatedRegistry.platform.makeWalletAndPremiumViews(coordinator: coordinator, router: router)
-            _ = module.makeBrowserWorkspaceView(initialURL: URL(string: "https://example.com"), coordinator: coordinator, router: router)
+        // Invoke ALL 8 sealed PlatformModulesProviding factories + M6 Browser hook
+        _ = isolatedRegistry.platform.makeRemoteComputerWorkbenchView(nodeId: nil, coordinator: coordinator, router: router)
+        _ = isolatedRegistry.platform.makeRemoteControlledPillView(
+            status: RemoteControlStatusState(id: "node-1", nodeName: "Studio Mac", controllerLabel: "Mobile"),
+            coordinator: coordinator,
+            router: router
+        )
+        _ = isolatedRegistry.platform.makeMiniAppHostSheetView(miniAppId: "catalog", coordinator: coordinator, router: router)
+        _ = isolatedRegistry.platform.makeMiniAppFloatingPipView(
+            pip: MiniAppPipOverlayState(id: "app-1", title: "Global Dharma"),
+            coordinator: coordinator,
+            router: router
+        )
+        _ = isolatedRegistry.platform.makeCallAndTalkOverlayView(
+            callPip: CallPipOverlayState(id: "call-1", peerTitle: "Peer", stateText: "Connected"),
+            coordinator: coordinator,
+            router: router
+        )
+        _ = isolatedRegistry.platform.makeCallsTabView(coordinator: coordinator, router: router)
+        _ = isolatedRegistry.platform.makeSettingsRootView(initialSection: "proxy", coordinator: coordinator, router: router)
+        _ = isolatedRegistry.platform.makeWalletAndPremiumViews(coordinator: coordinator, router: router)
+        _ = module.makeBrowserWorkspaceView(initialURL: URL(string: "https://example.com"), coordinator: coordinator, router: router)
 
-            XCTAssertTrue(isolatedRegistry.platform is FabushiPlatformModule)
+        XCTAssertTrue(isolatedRegistry.platform is FabushiPlatformModule)
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 3. Real Rust Storage Metrics, Seed File Purge, Update Check & Push BLK-01
@@ -167,17 +162,20 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             XCTAssertGreaterThanOrEqual(storageVM.metrics.mediaCasBytes, 8_192)
             XCTAssertGreaterThanOrEqual(storageVM.metrics.mediaCasFiles, 1)
 
-            let purgeRes = try XCTUnwrap(await storageVM.purgeMediaCache(locale: .en))
+            let rawPurge = await storageVM.purgeMediaCache(locale: .en)
+            let purgeRes = try XCTUnwrap(rawPurge)
             XCTAssertGreaterThanOrEqual(purgeRes.freedBytes, 8_192)
             XCTAssertGreaterThanOrEqual(purgeRes.removedFiles, 1)
             XCTAssertEqual(purgeRes.metrics.mediaCasBytes, 0)
 
-            let wal = try XCTUnwrap(await storageVM.runWalCheckpoint(locale: .en))
+            let rawWal = await storageVM.runWalCheckpoint(locale: .en)
+            let wal = try XCTUnwrap(rawWal)
             XCTAssertTrue(wal.checkpointed)
 
             // 2. Real `settings.updateCheck` -> strictly App Store / TestFlight, zero binary self-updater!
             let updatesVM = FabushiAppUpdatesViewModel(coordinator: coordinator)
-            let updateInfo = try XCTUnwrap(await updatesVM.checkForUpdates())
+            let rawUpdateInfo = await updatesVM.checkForUpdates()
+            let updateInfo = try XCTUnwrap(rawUpdateInfo)
             XCTAssertFalse(updateInfo.selfUpdateSupported)
             XCTAssertEqual(updateInfo.distribution, "app_store_testflight")
 
@@ -218,27 +216,22 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             startNetworkMonitor: false
         )
 
-        do {
-            let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
-            let vm = FabushiActionBusViewModel(coordinator: coordinator, router: router)
+        let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))
+        let vm = FabushiActionBusViewModel(coordinator: coordinator, router: router)
 
-            await vm.loadActions()
-            XCTAssertGreaterThan(vm.actions.count, 0)
+        await vm.loadActions()
+        XCTAssertGreaterThan(vm.actions.count, 0)
 
-            // Desktop host-control actions MUST fail closed with capability_unavailable on iOS!
-            let powerExecuted = await vm.executeAction(name: "device_power_action")
-            XCTAssertFalse(powerExecuted)
-            XCTAssertTrue(vm.lastExecutionWasSandboxBlocked)
+        // Desktop host-control actions MUST fail closed with capability_unavailable on iOS!
+        let powerExecuted = await vm.executeAction(name: "device_power_action")
+        XCTAssertFalse(powerExecuted)
+        XCTAssertTrue(vm.lastExecutionWasSandboxBlocked)
 
-            let termExecuted = await vm.executeAction(name: "terminal_exec")
-            XCTAssertFalse(termExecuted)
-            XCTAssertTrue(vm.lastExecutionWasSandboxBlocked)
+        let termExecuted = await vm.executeAction(name: "terminal_exec")
+        XCTAssertFalse(termExecuted)
+        XCTAssertTrue(vm.lastExecutionWasSandboxBlocked)
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 5. D10-13 Strict Proxy Validation Matrix, IPv6 Bracket Stripping & MTProto Secret Rules
@@ -400,23 +393,22 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             )
             XCTAssertNil(invalidSaved)
             XCTAssertTrue(vm.proxies.isEmpty)
-            XCTAssertNotNil(toastCtrl.windowToast)
+            XCTAssertNotNil(toastCtrl.windowBanner)
 
             // 2. Real Rust `proxy.upsert` + IPv6 bracket stripping `[::1]` -> `::1` + activation
-            let saved = try XCTUnwrap(
-                await vm.upsertProxy(
-                    FabushiProxyRecord(
-                        id: "proxy_ipv6_1",
-                        kind: .socks5,
-                        host: "[::1]",
-                        port: 1080,
-                        username: "alice",
-                        password: "pw"
-                    ),
-                    activate: true,
-                    locale: .en
-                )
+            let rawSaved = await vm.upsertProxy(
+                FabushiProxyRecord(
+                    id: "proxy_ipv6_1",
+                    kind: .socks5,
+                    host: "[::1]",
+                    port: 1080,
+                    username: "alice",
+                    password: "pw"
+                ),
+                activate: true,
+                locale: .en
             )
+            let saved = try XCTUnwrap(rawSaved)
             XCTAssertEqual(saved.host, "::1")
             XCTAssertEqual(vm.activeProxyId, "proxy_ipv6_1")
 
@@ -446,8 +438,8 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             let switchedMissing = await vm.selectActiveProxy(id: "does_not_exist_999", locale: .en)
             XCTAssertFalse(switchedMissing)
             XCTAssertEqual(vm.activeProxyId, "proxy_ipv6_1", "Failed proxy.setActive MUST roll back to previous active proxy")
-            XCTAssertEqual(toastCtrl.windowToast?.isError, true)
-            XCTAssertNil(toastCtrl.windowToast?.scopeChatId, "Proxy error toast MUST be non-chat scoped")
+            XCTAssertEqual(toastCtrl.windowBanner?.isError, true)
+            XCTAssertNil(toastCtrl.windowBanner?.scopeChatId, "Proxy error toast MUST be non-chat scoped")
 
             // 5. Disable proxy (`id: nil`) & delete cleanly
             let disabled = await vm.selectActiveProxy(id: nil, locale: .en)
@@ -548,15 +540,18 @@ final class FabushiSettingsProxyEconomyAndIntentsTests: XCTestCase, @unchecked S
             XCTAssertTrue(gifted)
             XCTAssertEqual(vm.balance.starsBalance, 470)
 
-            let redeemed = try XCTUnwrap(await vm.redeemCode("FABUSHI-30D", locale: .en))
+            let rawRedeemed = await vm.redeemCode("FABUSHI-30D", locale: .en)
+            let redeemed = try XCTUnwrap(rawRedeemed)
             XCTAssertTrue(redeemed.success)
             XCTAssertEqual(redeemed.durationDays, 30)
             XCTAssertTrue(vm.membership.isPremium)
 
-            let createdOrder = try XCTUnwrap(await vm.createAlipayOrder(plan: "monthly"))
+            let rawCreatedOrder = await vm.createAlipayOrder(plan: "monthly")
+            let createdOrder = try XCTUnwrap(rawCreatedOrder)
             XCTAssertEqual(createdOrder.orderId, "ord-808")
 
-            let queriedOrder = try XCTUnwrap(await vm.queryAlipayOrder(orderId: "ord-808"))
+            let rawQueriedOrder = await vm.queryAlipayOrder(orderId: "ord-808")
+            let queriedOrder = try XCTUnwrap(rawQueriedOrder)
             XCTAssertEqual(queriedOrder.status, "pending")
 
             // TON signing MUST fail closed with upstream_not_implemented (BLK-03)

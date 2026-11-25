@@ -249,50 +249,45 @@ final class FabushiCallsAndTalkModeTests: XCTestCase, @unchecked Sendable {
             startNetworkMonitor: false
         )
 
-        do {
-            let launchConfig = FabushiLaunchConfiguration(
-                environment: [
-                    "FABUSHI_E2E_SIMULATE_CALL_PERMISSION_DENIED": "1",
-                    "FABUSHI_E2E_SIMULATE_REPLAYKIT_DENIED": "1",
-                ],
-                arguments: []
-            )
-            XCTAssertTrue(launchConfig.simulateCallPermissionDenied)
-            XCTAssertTrue(launchConfig.simulateReplayKitDenied)
+        let launchConfig = FabushiLaunchConfiguration(
+            environment: [
+                "FABUSHI_E2E_SIMULATE_CALL_PERMISSION_DENIED": "1",
+                "FABUSHI_E2E_SIMULATE_REPLAYKIT_DENIED": "1",
+            ],
+            arguments: []
+        )
+        XCTAssertTrue(launchConfig.simulateCallPermissionDenied)
+        XCTAssertTrue(launchConfig.simulateReplayKitDenied)
 
-            let toastCtrl = FabushiToastController(autoDismissEnabled: false)
-            let router = ShellNavigationRouter(toastController: toastCtrl)
-            let controller = FabushiCallSessionController(
-                coordinator: coordinator,
-                router: router,
-                launchConfiguration: launchConfig
-            )
-            defer { controller.detachLifecycleHooks() }
+        let toastCtrl = FabushiToastController(autoDismissEnabled: false)
+        let router = ShellNavigationRouter(toastController: toastCtrl)
+        let controller = FabushiCallSessionController(
+            coordinator: coordinator,
+            router: router,
+            launchConfiguration: launchConfig
+        )
+        defer { controller.detachLifecycleHooks() }
 
-            // Honest BLK-02 disclosure MUST always remain visible
-            XCTAssertTrue(controller.isBlk02SfuDisclosureVisible)
-            XCTAssertTrue(controller.isPermissionDenied)
-            XCTAssertTrue(controller.isScreenShareUnavailable)
+        // Honest BLK-02 disclosure MUST always remain visible
+        XCTAssertTrue(controller.isBlk02SfuDisclosureVisible)
+        XCTAssertTrue(controller.isPermissionDenied)
+        XCTAssertTrue(controller.isScreenShareUnavailable)
 
-            // Outgoing call fails closed under simulated permission denial
-            let allowed = await controller.startOutgoingCall(calleeUserId: 999, peerTitle: "Peer", isVideo: true)
-            XCTAssertFalse(allowed)
-            XCTAssertEqual(controller.callState, .failed)
-            XCTAssertTrue(controller.isPermissionDenied)
+        // Outgoing call fails closed under simulated permission denial
+        let allowed = await controller.startOutgoingCall(calleeUserId: 999, peerTitle: "Peer", isVideo: true)
+        XCTAssertFalse(allowed)
+        XCTAssertEqual(controller.callState, .failed)
+        XCTAssertTrue(controller.isPermissionDenied)
 
-            // Screen share refuses honestly when ReplayKit is denied
-            await controller.toggleScreenShare(locale: .en)
-            XCTAssertFalse(controller.isScreenSharing)
-            XCTAssertTrue(controller.isScreenShareUnavailable)
+        // Screen share refuses honestly when ReplayKit is denied
+        await controller.toggleScreenShare(locale: .en)
+        XCTAssertFalse(controller.isScreenSharing)
+        XCTAssertTrue(controller.isScreenShareUnavailable)
 
-            // Verify HumanCallMediaPort interruption recovery helper works deterministically
-            XCTAssertFalse(HumanCallMediaPort.shouldRecoverAfterAudioInterruption(userInfo: nil))
+        // Verify HumanCallMediaPort interruption recovery helper works deterministically
+        XCTAssertFalse(HumanCallMediaPort.shouldRecoverAfterAudioInterruption(userInfo: nil))
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 4. Real Rust TalkCoordinator 320-Chunk Boundary, <60ms VAD Barge-In & Terminal Close Invariant
