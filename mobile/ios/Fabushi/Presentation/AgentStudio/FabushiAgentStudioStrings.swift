@@ -336,7 +336,7 @@ public enum FabushiAgentStudioStrings: Sendable {
             zhHans: "群组唤醒门控与静默 [PASS] 诊断"
         ),
         "m4.multiAgent.wakeGateMessagePlaceholder": Entry(
-            en: "Test message (e.g. @rust_bot你好 or ok thanks)",
+            en: "Test message (e.g. @rust_bot hello or ok thanks)",
             zhHans: "测试群消息（如 @rust_bot你好 或 收到）"
         ),
         "m4.multiAgent.wakeGateRunButton": Entry(en: "Evaluate Wake Gate", zhHans: "评估唤醒门控"),
@@ -391,6 +391,94 @@ public enum FabushiAgentStudioStrings: Sendable {
             en: "Local home-directory credential scans are disabled on iOS; sync desktop AI OAuth safely via Zero-Knowledge Vault",
             zhHans: "iOS 禁止扫描本地主目录凭据，请通过零知识保险库安全同步桌面端 AI OAuth 凭据"
         ),
+        "m4.magpie.emptyProviders": Entry(
+            en: "No configured providers synced yet",
+            zhHans: "暂未同步已配置的供应商"
+        ),
+        "m4.magpie.emptySubscriptions": Entry(
+            en: "No active AI subscriptions detected",
+            zhHans: "暂未检测到活跃 AI 订阅"
+        ),
+        "m4.magpie.presetSearchPlaceholder": Entry(
+            en: "Filter presets or models.dev catalog",
+            zhHans: "筛选预设供应商或 models.dev 模型目录"
+        ),
+        "m4.magpie.providerNamePlaceholder": Entry(
+            en: "Provider display name",
+            zhHans: "供应商显示名称"
+        ),
+        "m4.magpie.baseUrlPlaceholder": Entry(
+            en: "HTTPS endpoint base URL",
+            zhHans: "HTTPS 接口基础地址"
+        ),
+        "m4.magpie.apiKeyPlaceholder": Entry(
+            en: "API key (stored in Zero-Knowledge Vault)",
+            zhHans: "API 密钥（加密保存在零知识保险库）"
+        ),
+        "m4.magpie.defaultModelPlaceholder": Entry(
+            en: "Default model identifier",
+            zhHans: "默认模型标识"
+        ),
+        "m4.magpie.groupIdPlaceholder": Entry(
+            en: "Group ID (e.g. mix)",
+            zhHans: "分组标识（如 mix）"
+        ),
+        "m4.magpie.groupNamePlaceholder": Entry(
+            en: "Group display name",
+            zhHans: "分组显示名称"
+        ),
+        "m4.magpie.groupMembersPlaceholder": Entry(
+            en: "Targets (comma-separated, e.g. openai/gpt-4o)",
+            zhHans: "成员目标（逗号分隔，如 openai/gpt-4o）"
+        ),
+        "m4.magpie.routeTargetPlaceholder": Entry(
+            en: "Route target (e.g. group/mix)",
+            zhHans: "路由测试目标（如 group/mix）"
+        ),
+        "m4.magpie.recordFailureButton": Entry(
+            en: "Simulate 429 Rest",
+            zhHans: "模拟 429 熔断"
+        ),
+        "m4.magpie.strategyLabel": Entry(
+            en: "Routing Strategy",
+            zhHans: "路由策略"
+        ),
+        "m4.magpie.vaultLockedNotice": Entry(
+            en: "Unlock your Zero-Knowledge Vault in Security first to sync or store AI OAuth credentials",
+            zhHans: "请先在隐私与安全中解锁零知识保险库，再同步或保存 AI OAuth 凭据"
+        ),
+        "m4.magpie.vaultSyncedFormat": Entry(
+            en: "%d AI OAuth records synced from Vault",
+            zhHans: "已从保险库同步 %d 条 AI OAuth 记录"
+        ),
+        "m4.magpie.oauthUrlPlaceholder": Entry(
+            en: "Provider OAuth authorize HTTPS URL",
+            zhHans: "供应商 OAuth 授权 HTTPS 地址"
+        ),
+        "m4.magpie.probePendingM6Notice": Entry(
+            en: "Endpoint & route verified locally; live upstream HTTP probe RPC is scheduled for M6 integration",
+            zhHans: "已完成本地端点与路由校验，远端实时 HTTP 探测接口将在 M6 接入"
+        ),
+        "m4.magpie.savePendingM6Notice": Entry(
+            en: "Saved to encrypted Vault cache; server provider save RPC syncs in M6 integration",
+            zhHans: "已加密保存至保险库缓存，服务器端供应商写回接口将在 M6 接入"
+        ),
+        "m4.magpie.usageEmpty": Entry(
+            en: "No LLM token usage recorded in this session",
+            zhHans: "当前会话暂无大模型用量记录"
+        ),
+        "m4.magpie.activateSubscription": Entry(
+            en: "Activate",
+            zhHans: "设为当前"
+        ),
+        "m4.magpie.activeBadge": Entry(
+            en: "Active",
+            zhHans: "使用中"
+        ),
+        "m4.magpie.customWordsPlaceholder": Entry(
+            en: "Custom masked words (comma-separated)",
+            zhHans: "自定义脱敏词（逗号分隔）"
+        ),
 
         // MARK: - Coding Agents Mobile Client (Shared for Worker 2 M4b)
         "m4.coding.title": Entry(en: "Coding Agents", zhHans: "编程智能体"),
@@ -417,6 +505,37 @@ public enum FabushiAgentStudioStrings: Sendable {
             en: "Account-Isolated Store",
             zhHans: "按账号隔离存储"
         ),
+        "m4.coding.acpBadge": Entry(en: "ACP", zhHans: "支持 ACP"),
+        "m4.coding.noBots": Entry(
+            en: "No coding bots configured for this account",
+            zhHans: "当前账号暂未配置编程机器人"
+        ),
+        "m4.coding.newBotButton": Entry(en: "New Coding Bot", zhHans: "新建编程机器人"),
+        "m4.coding.botNamePlaceholder": Entry(en: "Bot display name", zhHans: "机器人名称"),
+        "m4.coding.workspacePlaceholder": Entry(en: "Remote workspace path (e.g. /repo/app)", zhHans: "远程工作区路径（如 /repo/app）"),
+        "m4.coding.branchPlaceholder": Entry(en: "Git branch (e.g. feat/ios-ui)", zhHans: "Git 分支名（如 feat/ios-ui）"),
+        "m4.coding.useWorktreeToggle": Entry(en: "Isolate Git Worktree", zhHans: "使用独立 Git 工作树"),
+        "m4.coding.threadSection": Entry(en: "Active Thread & Worktree", zhHans: "当前线程与工作树"),
+        "m4.coding.checkpointsSection": Entry(en: "Turn Checkpoints", zhHans: "轮次检查点"),
+        "m4.coding.noCheckpoints": Entry(
+            en: "No checkpoints saved for this thread",
+            zhHans: "当前线程暂无检查点记录"
+        ),
+        "m4.coding.prTitlePlaceholder": Entry(en: "Pull request title", zhHans: "合并请求标题"),
+        "m4.coding.prBodyPlaceholder": Entry(en: "Commit summary", zhHans: "提交变更说明"),
+        "m4.coding.remoteHostsSection": Entry(en: "Remote Coding Hosts", zhHans: "远程编码宿主"),
+        "m4.coding.noRemoteHosts": Entry(
+            en: "No bound desktop or cloud coding hosts online",
+            zhHans: "暂无在线的桌面端或云端编码宿主"
+        ),
+        "m4.coding.diffSummaryFormat": Entry(
+            en: "%d files · +%d / -%d",
+            zhHans: "%d 个文件 · +%d / -%d"
+        ),
+        "m4.coding.approvalDockTitle": Entry(en: "Coding Approval Request", zhHans: "编程操作审批请求"),
+        "m4.coding.allowOnce": Entry(en: "Allow Once", zhHans: "单次允许"),
+        "m4.coding.allowSession": Entry(en: "Allow Session", zhHans: "本会话允许"),
+        "m4.coding.denyAction": Entry(en: "Deny", zhHans: "拒绝"),
 
         // MARK: - Official OAuth 2.1 Remote MCP Console (Shared for Worker 2 M4b)
         "m4.mcp.title": Entry(en: "Official OAuth 2.1 MCP", zhHans: "官方 OAuth 2.1 MCP 控制台"),
@@ -446,6 +565,41 @@ public enum FabushiAgentStudioStrings: Sendable {
             en: "%d official tools across %d OAuth scopes",
             zhHans: "涵盖 %d 项官方工具与 %d 项 OAuth 权限范围"
         ),
+        "m4.mcp.grantsEmpty": Entry(
+            en: "No active OAuth 2.1 MCP grants",
+            zhHans: "暂无活跃的 OAuth 2.1 MCP 授权"
+        ),
+        "m4.mcp.serversEmpty": Entry(
+            en: "No remote MCP servers registered",
+            zhHans: "暂未注册远程 MCP 服务器"
+        ),
+        "m4.mcp.addServerButton": Entry(en: "Register Server", zhHans: "注册服务器"),
+        "m4.mcp.serverNamePlaceholder": Entry(en: "Server name", zhHans: "服务器名称"),
+        "m4.mcp.serverUrlPlaceholder": Entry(en: "HTTPS Streamable HTTP or SSE URL", zhHans: "HTTPS Streamable HTTP 或 SSE 地址"),
+        "m4.mcp.transportLabel": Entry(en: "Transport", zhHans: "传输协议"),
+        "m4.mcp.auditPendingM6Notice": Entry(
+            en: "Server-side 31-tool audit log sync awaits M6 host RPC; showing real local approval ledger & session audit entries",
+            zhHans: "服务器端 31 项工具审计同步将在 M6 宿主接口接入，当前如实展示本地审批与会话记录"
+        ),
+        "m4.mcp.auditFilterPlaceholder": Entry(en: "Filter by tool or scope", zhHans: "按工具名或权限范围筛选"),
+        "m4.mcp.filterAll": Entry(en: "All", zhHans: "全部"),
+        "m4.mcp.filterOk": Entry(en: "Allowed", zhHans: "成功"),
+        "m4.mcp.filterFailed": Entry(en: "Blocked", zhHans: "失败"),
+        "m4.mcp.cameraUnavailableNotice": Entry(
+            en: "Camera unavailable in this environment; paste the QR pair token or URL below",
+            zhHans: "当前环境无可用摄像头，请在下方粘贴二维码配对令牌或链接"
+        ),
+        "m4.mcp.grantCameraButton": Entry(en: "Allow Camera Access", zhHans: "允许访问摄像头"),
+        "m4.mcp.qrApprovedToast": Entry(
+            en: "QR-poll MCP login approved",
+            zhHans: "已批准 MCP 扫码登录授权"
+        ),
+        "m4.mcp.killSwitchDoneToast": Entry(
+            en: "All remote MCP sessions disconnected",
+            zhHans: "已断开全部远程 MCP 会话"
+        ),
+        "m4.mcp.catalogSection": Entry(en: "Official 31-Tool Catalog", zhHans: "官方 31 项工具目录"),
+        "m4.mcp.allDevicesScope": Entry(en: "All User Devices", zhHans: "全部绑定设备"),
     ]
 
     public static var allKeys: [String] {
