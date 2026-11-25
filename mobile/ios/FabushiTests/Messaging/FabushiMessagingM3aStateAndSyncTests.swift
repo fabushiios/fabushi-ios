@@ -546,75 +546,70 @@ final class FabushiMessagingM3aStateAndSyncTests: XCTestCase, @unchecked Sendabl
     func testD14_04GroupBotActivityNonCorruptionAndStaleEventFence() async throws {
         let harness = try await makeHarness { _ in .json(200, "[]") }
 
-        do {
-            // Group chat with `"Bot"` in title MUST remain `isGroup == true, isBot == false`
-            let groupChat = FabushiMessagingChat(
-                chatId: 900,
-                title: "RustBot, FinBot",
-                kind: "group",
-                chatType: 1,
-                isGroup: true,
-                isBot: false
-            )
-            let dmBotChat = FabushiMessagingChat(
-                chatId: 901,
-                title: "RustBot",
-                kind: "bot",
-                chatType: 3,
-                isGroup: false,
-                isBot: true
-            )
-            harness.store.upsertChat(groupChat)
-            harness.store.upsertChat(dmBotChat)
+        // Group chat with `"Bot"` in title MUST remain `isGroup == true, isBot == false`
+        let groupChat = FabushiMessagingChat(
+            chatId: 900,
+            title: "RustBot, FinBot",
+            kind: "group",
+            chatType: 1,
+            isGroup: true,
+            isBot: false
+        )
+        let dmBotChat = FabushiMessagingChat(
+            chatId: 901,
+            title: "RustBot",
+            kind: "bot",
+            chatType: 3,
+            isGroup: false,
+            isBot: true
+        )
+        harness.store.upsertChat(groupChat)
+        harness.store.upsertChat(dmBotChat)
 
-            XCTAssertTrue(harness.store.knownBotIds.contains(901))
-            XCTAssertFalse(harness.store.knownBotIds.contains(900))
-            XCTAssertTrue(harness.store.canDisplayBotActivity(for: 900))
-            XCTAssertTrue(harness.store.canDisplayBotActivity(for: 901))
+        XCTAssertTrue(harness.store.knownBotIds.contains(901))
+        XCTAssertFalse(harness.store.knownBotIds.contains(900))
+        XCTAssertTrue(harness.store.canDisplayBotActivity(for: 900))
+        XCTAssertTrue(harness.store.canDisplayBotActivity(for: 901))
 
-            let gen = harness.coordinator.accountScopeGeneration
+        let gen = harness.coordinator.accountScopeGeneration
 
-            // Stale generation event MUST be dropped
-            let staleEvent = FabushiDomainEvent.parse(
-                seq: 1,
-                generation: gen - 1,
-                timestampMs: 1_730_000_000_000,
-                type: "botActivityChanged",
-                rawPayloadJSON: #"{"chat_id":900,"bot_user_id":901,"state":"thinking","detail":"Stale"}"#
-            )
-            XCTAssertFalse(harness.store.ingestDomainEvent(staleEvent))
-            XCTAssertNil(harness.store.activeBotActivityByChat[900])
+        // Stale generation event MUST be dropped
+        let staleEvent = FabushiDomainEvent.parse(
+            seq: 1,
+            generation: gen - 1,
+            timestampMs: 1_730_000_000_000,
+            type: "botActivityChanged",
+            rawPayloadJSON: #"{"chat_id":900,"bot_user_id":901,"state":"thinking","detail":"Stale"}"#
+        )
+        XCTAssertFalse(harness.store.ingestDomainEvent(staleEvent))
+        XCTAssertNil(harness.store.activeBotActivityByChat[900])
 
-            // Current generation group `botActivityChanged` displays thinking WITHOUT flipping `isBot` or polluting `knownBotIds`!
-            let activeEvent = FabushiDomainEvent.parse(
-                seq: 2,
-                generation: gen,
-                timestampMs: 1_730_000_001_000,
-                type: "botActivityChanged",
-                rawPayloadJSON: #"{"chat_id":900,"bot_user_id":901,"state":"thinking","detail":"Analyzing diff..."}"#
-            )
-            XCTAssertTrue(harness.store.ingestDomainEvent(activeEvent))
-            XCTAssertEqual(harness.store.activeBotActivityByChat[900]?.isActive, true)
-            XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 900 })?.isBot, false)
-            XCTAssertFalse(harness.store.knownBotIds.contains(900))
+        // Current generation group `botActivityChanged` displays thinking WITHOUT flipping `isBot` or polluting `knownBotIds`!
+        let activeEvent = FabushiDomainEvent.parse(
+            seq: 2,
+            generation: gen,
+            timestampMs: 1_730_000_001_000,
+            type: "botActivityChanged",
+            rawPayloadJSON: #"{"chat_id":900,"bot_user_id":901,"state":"thinking","detail":"Analyzing diff..."}"#
+        )
+        XCTAssertTrue(harness.store.ingestDomainEvent(activeEvent))
+        XCTAssertEqual(harness.store.activeBotActivityByChat[900]?.isActive, true)
+        XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 900 })?.isBot, false)
+        XCTAssertFalse(harness.store.knownBotIds.contains(900))
 
-            // Incoming live WS `newMessage` with nested Rust `MessageItem` JSON decodes text & auto-clears `"thinking"`!
-            let replyEvent = FabushiDomainEvent.parse(
-                seq: 3,
-                generation: gen,
-                timestampMs: 1_730_000_002_000,
-                type: "newMessage",
-                rawPayloadJSON: #"{"id":999,"chat_id":900,"sender_id":901,"date":"2026-11-25T15:05:00Z","content":{"type":"Text","data":{"text":"Diff looks clean!","entities":[]}}}"#
-            )
-            XCTAssertTrue(harness.store.ingestDomainEvent(replyEvent))
-            XCTAssertNil(harness.store.activeBotActivityByChat[900], "D14-04: Incoming message must auto-clear thinking state")
-            XCTAssertEqual(harness.store.messagesByChat[900]?.last?.text, "Diff looks clean!")
+        // Incoming live WS `newMessage` with nested Rust `MessageItem` JSON decodes text & auto-clears `"thinking"`!
+        let replyEvent = FabushiDomainEvent.parse(
+            seq: 3,
+            generation: gen,
+            timestampMs: 1_730_000_002_000,
+            type: "newMessage",
+            rawPayloadJSON: #"{"id":999,"chat_id":900,"sender_id":901,"date":"2026-11-25T15:05:00Z","content":{"type":"Text","data":{"text":"Diff looks clean!","entities":[]}}}"#
+        )
+        XCTAssertTrue(harness.store.ingestDomainEvent(replyEvent))
+        XCTAssertNil(harness.store.activeBotActivityByChat[900], "D14-04: Incoming message must auto-clear thinking state")
+        XCTAssertEqual(harness.store.messagesByChat[900]?.last?.text, "Diff looks clean!")
 
-            await harness.tearDown()
-        } catch {
-            await harness.tearDown()
-            throw error
-        }
+        await harness.tearDown()
     }
 
     // MARK: - 7. `D10-08` Authoritative Blocklist & TTL Post-RPC Toast + Error Rollback
@@ -643,43 +638,38 @@ final class FabushiMessagingM3aStateAndSyncTests: XCTestCase, @unchecked Sendabl
             return .json(200, "[]")
         }
 
-        do {
-            harness.store.upsertChat(FabushiMessagingChat(chatId: 100, title: "Alice", ttlSeconds: 0))
-            harness.router.navigate(to: .chats(chatId: 100, messageId: nil), coordinator: harness.coordinator)
+        harness.store.upsertChat(FabushiMessagingChat(chatId: 100, title: "Alice", ttlSeconds: 0))
+        harness.router.navigate(to: .chats(chatId: 100, messageId: nil), coordinator: harness.coordinator)
 
-            // HTTP 500 -> rollback + error toast (NO success toast!)
-            let blockFailed = await harness.store.setUserBlocked(userId: 555, blocked: true, router: harness.router, locale: .en)
-            XCTAssertFalse(blockFailed)
-            XCTAssertFalse(harness.store.isUserBlocked(555))
-            XCTAssertEqual(harness.router.toastController.windowBanner?.isError, true)
-            harness.router.toastController.clearAll()
+        // HTTP 500 -> rollback + error toast (NO success toast!)
+        let blockFailed = await harness.store.setUserBlocked(userId: 555, blocked: true, router: harness.router, locale: .en)
+        XCTAssertFalse(blockFailed)
+        XCTAssertFalse(harness.store.isUserBlocked(555))
+        XCTAssertEqual(harness.router.toastController.windowBanner?.isError, true)
+        harness.router.toastController.clearAll()
 
-            let ttlFailed = await harness.store.setChatTTL(chatId: 100, ttlSeconds: 86_400, router: harness.router, isCompact: false, locale: .en)
-            XCTAssertFalse(ttlFailed)
-            XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 100 })?.ttlSeconds, 0)
-            XCTAssertEqual(harness.router.toastController.windowBanner?.isError, true)
-            harness.router.toastController.clearAll()
+        let ttlFailed = await harness.store.setChatTTL(chatId: 100, ttlSeconds: 86_400, router: harness.router, isCompact: false, locale: .en)
+        XCTAssertFalse(ttlFailed)
+        XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 100 })?.ttlSeconds, 0)
+        XCTAssertEqual(harness.router.toastController.windowBanner?.isError, true)
+        harness.router.toastController.clearAll()
 
-            // HTTP 200 -> authoritative update + post-RPC confirmation toast!
-            shouldFail.withLock { $0 = false }
-            let blockOk = await harness.store.setUserBlocked(userId: 555, blocked: true, router: harness.router, locale: .en)
-            XCTAssertTrue(blockOk)
-            XCTAssertTrue(harness.store.isUserBlocked(555))
-            XCTAssertEqual(harness.router.toastController.windowBanner?.message, "User blocked")
-            XCTAssertEqual(harness.router.toastController.windowBanner?.isError, false)
-            harness.router.toastController.clearAll()
+        // HTTP 200 -> authoritative update + post-RPC confirmation toast!
+        shouldFail.withLock { $0 = false }
+        let blockOk = await harness.store.setUserBlocked(userId: 555, blocked: true, router: harness.router, locale: .en)
+        XCTAssertTrue(blockOk)
+        XCTAssertTrue(harness.store.isUserBlocked(555))
+        XCTAssertEqual(harness.router.toastController.windowBanner?.message, "User blocked")
+        XCTAssertEqual(harness.router.toastController.windowBanner?.isError, false)
+        harness.router.toastController.clearAll()
 
-            let ttlOk = await harness.store.setChatTTL(chatId: 100, ttlSeconds: 86_400, router: harness.router, isCompact: false, locale: .en)
-            XCTAssertTrue(ttlOk)
-            XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 100 })?.ttlSeconds, 86_400)
-            XCTAssertEqual(harness.router.toastController.windowBanner?.message, "Auto-delete timer updated")
-            XCTAssertEqual(harness.router.toastController.windowBanner?.isError, false)
+        let ttlOk = await harness.store.setChatTTL(chatId: 100, ttlSeconds: 86_400, router: harness.router, isCompact: false, locale: .en)
+        XCTAssertTrue(ttlOk)
+        XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 100 })?.ttlSeconds, 86_400)
+        XCTAssertEqual(harness.router.toastController.windowBanner?.message, "Auto-delete timer updated")
+        XCTAssertEqual(harness.router.toastController.windowBanner?.isError, false)
 
-            await harness.tearDown()
-        } catch {
-            await harness.tearDown()
-            throw error
-        }
+        await harness.tearDown()
     }
 
     // MARK: - 8. `D13-04` `<3s` WS Dedup & `D13-05` Bounded Top-8 Prefetcher + Low Power / Constrained Guards
@@ -940,7 +930,8 @@ final class FabushiMessagingM3aStateAndSyncTests: XCTestCase, @unchecked Sendabl
             XCTAssertEqual(resolved?.userId, 502)
 
             await harness.store.updateComposerDraft(chatId: 901, text: "Keep my draft", persistRemote: false)
-            let botProfile = try XCTUnwrap(await harness.store.loadBotPublicProfile(target: "rustbot"))
+            let loadedBotProfile = await harness.store.loadBotPublicProfile(target: "rustbot")
+            let botProfile = try XCTUnwrap(loadedBotProfile)
             XCTAssertFalse(botProfile.hasStartedChat)
             let startedChatId = await harness.store.startPrestartBot(
                 botId: botProfile.bot.botId,
