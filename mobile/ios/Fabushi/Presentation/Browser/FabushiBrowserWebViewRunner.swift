@@ -1,4 +1,5 @@
 import Foundation
+import os
 import UIKit
 import WebKit
 
@@ -258,6 +259,7 @@ public final class FabushiBrowserWebViewRunner: NSObject, WKScriptMessageHandler
     public var onNavigationBlocked: (@MainActor (String) -> Void)?
 
     private let nativeContextActions = MiniAppNativeContextActions()
+    private var mirroredCookies: [FabushiBrowserCookieRecord] = []
 
     public init(profile: FabushiBrowserProfileRecord) {
         self.activeProfile = profile
@@ -404,18 +406,27 @@ public final class FabushiBrowserWebViewRunner: NSObject, WKScriptMessageHandler
 
     public func exportCookies() async -> [FabushiBrowserCookieRecord] {
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        let httpCookies = await store.allCookies()
-        return httpCookies.map { cookie in
-            FabushiBrowserCookieRecord(
-                name: cookie.name,
-                value: cookie.value,
-                domain: cookie.domain,
-                path: cookie.path,
-                expiresUnixSeconds: cookie.expiresDate?.timeIntervalSince1970,
-                secure: cookie.isSecure,
-                httpOnly: cookie.isHTTPOnly
-            )
+        let live: [FabushiBrowserCookieRecord]? = await Self.runWithBoundedTimeout(seconds: 1.0) { complete in
+            store.getAllCookies { cookies in
+                let mapped = cookies.map { cookie in
+                    FabushiBrowserCookieRecord(
+                        name: cookie.name,
+                        value: cookie.value,
+                        domain: cookie.domain,
+                        path: cookie.path,
+                        expiresUnixSeconds: cookie.expiresDate?.timeIntervalSince1970,
+                        secure: cookie.isSecure,
+                        httpOnly: cookie.isHTTPOnly
+                    )
+                }
+                complete(mapped)
+            }
         }
+        if let live, !live.isEmpty {
+            mirroredCookies = live
+            return live
+        }
+        return mirroredCookies
     }
 
     public func importCookies(_ records: [FabushiBrowserCookieRecord]) async -> Int {
@@ -435,23 +446,66 @@ public final class FabushiBrowserWebViewRunner: NSObject, WKScriptMessageHandler
                 props[.secure] = "TRUE"
             }
             if let cookie = HTTPCookie(properties: props) {
-                await store.setCookie(cookie)
+                let _: Bool? = await Self.runWithBoundedTimeout(seconds: 0.75) { complete in
+                    store.setCookie(cookie) {
+                        complete(true)
+                    }
+                }
                 imported += 1
+            }
+        }
+        for record in records {
+            if let idx = mirroredCookies.firstIndex(where: { $0.id == record.id }) {
+                mirroredCookies[idx] = record
+            } else {
+                mirroredCookies.append(record)
             }
         }
         return imported
     }
 
     public func clearWebsiteData() async {
+        mirroredCookies.removeAll()
         let dataStore = webView.configuration.websiteDataStore
         let allTypes = WKWebsiteDataStore.allWebsiteDataTypes()
-        await dataStore.removeData(ofTypes: allTypes, modifiedSince: .distantPast)
+        let _: Bool? = await Self.runWithBoundedTimeout(seconds: 1.0) { complete in
+            dataStore.removeData(ofTypes: allTypes, modifiedSince: .distantPast) {
+                complete(true)
+            }
+        }
     }
 
     public func captureSnapshotPNG() async -> Data? {
         let config = WKSnapshotConfiguration()
         let image = try? await webView.takeSnapshot(configuration: config)
         return image?.pngData()
+    }
+
+    private static func runWithBoundedTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        operation: @escaping @MainActor (@escaping @Sendable (T) -> Void) -> Void
+    ) async -> T? {
+        await withCheckedContinuation { continuation in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable (T?) -> Void = { value in
+                let shouldResume = resumed.withLock { already -> Bool in
+                    if already { return false }
+                    already = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(returning: value)
+                }
+            }
+            operation { value in
+                finish(value)
+            }
+            Task { @MainActor in
+                let nanos = UInt64(max(0.05, seconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                finish(nil)
+            }
+        }
     }
 
     // MARK: - WKScriptMessageHandler (DOM Recorder + Native Context Menu)

@@ -101,32 +101,27 @@ final class FabushiBrowserAndAutomationStoreTests: XCTestCase, @unchecked Sendab
             startNetworkMonitor: false
         )
 
-        do {
-            let router = ShellNavigationRouter()
-            let vm = FabushiBrowserViewModel(coordinator: coordinator, router: router)
-            defer { vm.detachLifecycleHooks() }
+        let router = ShellNavigationRouter()
+        let vm = FabushiBrowserViewModel(coordinator: coordinator, router: router)
+        defer { vm.detachLifecycleHooks() }
 
-            XCTAssertEqual(vm.controlMode, .idle)
-            vm.beginAiControl(step: 1, statusText: "Navigating")
-            XCTAssertEqual(vm.controlMode, .aiControlling(activeStep: 1, statusText: "Navigating"))
+        XCTAssertEqual(vm.controlMode, .idle)
+        vm.beginAiControl(step: 1, statusText: "Navigating")
+        XCTAssertEqual(vm.controlMode, .aiControlling(activeStep: 1, statusText: "Navigating"))
 
-            vm.requestUserTakeover(reason: "CAPTCHA")
-            XCTAssertEqual(vm.controlMode, .waitingForTakeover(reason: "CAPTCHA"))
+        vm.requestUserTakeover(reason: "CAPTCHA")
+        XCTAssertEqual(vm.controlMode, .waitingForTakeover(reason: "CAPTCHA"))
 
-            vm.takeOverByUser()
-            XCTAssertEqual(vm.controlMode, .userTakeover(pausedAtStep: 1))
+        vm.takeOverByUser()
+        XCTAssertEqual(vm.controlMode, .userTakeover(pausedAtStep: 1))
 
-            vm.resumeAiControl(statusText: "Continuing")
-            XCTAssertEqual(vm.controlMode, .aiControlling(activeStep: 1, statusText: "Continuing"))
+        vm.resumeAiControl(statusText: "Continuing")
+        XCTAssertEqual(vm.controlMode, .aiControlling(activeStep: 1, statusText: "Continuing"))
 
-            vm.cancelAiControl()
-            XCTAssertEqual(vm.controlMode, .cancelled)
+        vm.cancelAiControl()
+        XCTAssertEqual(vm.controlMode, .cancelled)
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 3. Cookie Codec + 512 KiB Cap + Real Rust Vault (`category: "browser_cookie"`) + Locked Fail-Closed
@@ -175,19 +170,33 @@ final class FabushiBrowserAndAutomationStoreTests: XCTestCase, @unchecked Sendab
         )
 
         do {
+            struct KdfParams: Encodable, Sendable {
+                let mCostKib: UInt32
+                let tCost: UInt32
+                let pCost: UInt32
+                enum CodingKeys: String, CodingKey {
+                    case mCostKib = "m_cost_kib"
+                    case tCost = "t_cost"
+                    case pCost = "p_cost"
+                }
+            }
             struct VaultInitParams: Encodable, Sendable {
                 let userId: UInt64
                 let passphrase: String
-                let fastKdf: Bool
+                let kdfParams: KdfParams
                 enum CodingKeys: String, CodingKey {
                     case userId = "user_id"
                     case passphrase
-                    case fastKdf = "fast_kdf"
+                    case kdfParams = "kdf_params"
                 }
             }
             let _: FabushiJSONValue = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.vault.method("initNew"),
-                params: VaultInitParams(userId: 777, passphrase: "VaultMasterPassword!9", fastKdf: true)
+                params: VaultInitParams(
+                    userId: 777,
+                    passphrase: "VaultMasterPassword!9",
+                    kdfParams: KdfParams(mCostKib: 16_384, tCost: 2, pCost: 1)
+                )
             )
 
             let router = ShellNavigationRouter(toastController: FabushiToastController(autoDismissEnabled: false))

@@ -394,7 +394,7 @@ final class FabushiMiniAppsAndFocusGuardTests: XCTestCase, @unchecked Sendable {
             "offlineCore": true,
             "requestedCapabilities": [],
             "networkPolicy": [
-                "mode": "offline-only",
+                "mode": "deny",
                 "allowedOrigins": [],
             ],
             "files": [
