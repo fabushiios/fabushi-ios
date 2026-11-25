@@ -41,36 +41,31 @@ final class FabushiCodingAgentsClientTests: XCTestCase, @unchecked Sendable {
             startNetworkMonitor: false
         )
 
-        do {
-            let vm = FabushiCodingViewModel(chatId: 901, coordinator: coordinator, router: makeRouter())
-            await vm.loadProvidersCatalog()
+        let vm = FabushiCodingViewModel(chatId: 901, coordinator: coordinator, router: makeRouter())
+        await vm.loadProvidersCatalog()
 
-            XCTAssertEqual(vm.providersCatalog.count, 6)
-            XCTAssertEqual(
-                vm.providersCatalog.map(\.kind),
-                [.claudeCode, .codex, .openCode, .cursorCli, .antigravity, .acpCustom]
-            )
-            XCTAssertEqual(
-                vm.providersCatalog.filter(\.supportsAcp).map(\.kind),
-                [.openCode, .cursorCli, .acpCustom]
-            )
+        XCTAssertEqual(vm.providersCatalog.count, 6)
+        XCTAssertEqual(
+            vm.providersCatalog.map(\.kind),
+            [.claudeCode, .codex, .openCode, .cursorCli, .antigravity, .acpCustom]
+        )
+        XCTAssertEqual(
+            vm.providersCatalog.filter(\.supportsAcp).map(\.kind),
+            [.openCode, .cursorCli, .acpCustom]
+        )
 
-            let parsedClaude = await vm.parseProvider("claude")
-            XCTAssertEqual(parsedClaude?.kind, .claudeCode)
-            XCTAssertEqual(parsedClaude?.supportsAcp, false)
+        let parsedClaude = await vm.parseProvider("claude")
+        XCTAssertEqual(parsedClaude?.kind, .claudeCode)
+        XCTAssertEqual(parsedClaude?.supportsAcp, false)
 
-            let parsedCursor = await vm.parseProvider("cursor-agent")
-            XCTAssertEqual(parsedCursor?.kind, .cursorCli)
-            XCTAssertEqual(parsedCursor?.supportsAcp, true)
+        let parsedCursor = await vm.parseProvider("cursor-agent")
+        XCTAssertEqual(parsedCursor?.kind, .cursorCli)
+        XCTAssertEqual(parsedCursor?.supportsAcp, true)
 
-            let parsedAgy = await vm.parseProvider("agy")
-            XCTAssertEqual(parsedAgy?.kind, .antigravity)
+        let parsedAgy = await vm.parseProvider("agy")
+        XCTAssertEqual(parsedAgy?.kind, .antigravity)
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 2. BotFather NL, Coding Bots CRUD, Remote Hosts & Remote Slash Commands via Loopback
@@ -454,18 +449,13 @@ final class FabushiCodingAgentsClientTests: XCTestCase, @unchecked Sendable {
             startNetworkMonitor: false
         )
 
-        do {
-            let vm = FabushiCodingViewModel(chatId: 0, coordinator: coordinator, router: makeRouter())
-            for forbiddenAction in ["probeLocal", "startLocalTurn", "localControl"] {
-                let blocked = await vm.probeLocalSubprocessFailClosed(action: forbiddenAction)
-                XCTAssertTrue(blocked, "Expected coding.\(forbiddenAction) to fail closed with capabilityUnavailable on iOS")
-            }
-            XCTAssertNotNil(vm.lastSandboxNotice)
-
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
+        let vm = FabushiCodingViewModel(chatId: 0, coordinator: coordinator, router: makeRouter())
+        for forbiddenAction in ["probeLocal", "startLocalTurn", "localControl"] {
+            let blocked = await vm.probeLocalSubprocessFailClosed(action: forbiddenAction)
+            XCTAssertTrue(blocked, "Expected coding.\(forbiddenAction) to fail closed with capabilityUnavailable on iOS")
         }
+        XCTAssertNotNil(vm.lastSandboxNotice)
+
+        await coordinator.shutdown()
     }
 }

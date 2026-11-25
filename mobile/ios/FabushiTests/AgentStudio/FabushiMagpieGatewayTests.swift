@@ -19,7 +19,10 @@ final class FabushiMagpieGatewayTests: XCTestCase, @unchecked Sendable {
             account: "m4b-magpie-core-\(suffix)"
         )
         let sec = FabushiSecurityKeychainStore(
-            service: "com.ombhrum.fabushi.tests.m4b.magpie.sec.\(suffix).\(token)"
+            passcodeService: "com.ombhrum.fabushi.tests.m4b.magpie.passcode.\(suffix).\(token)",
+            passcodeAccount: "m4b-magpie-passcode-\(suffix)",
+            vaultKeyService: "com.ombhrum.fabushi.tests.m4b.magpie.vault.\(suffix).\(token)",
+            totpService: "com.ombhrum.fabushi.tests.m4b.magpie.totp.\(suffix).\(token)"
         )
         return (core, sec)
     }
@@ -46,29 +49,24 @@ final class FabushiMagpieGatewayTests: XCTestCase, @unchecked Sendable {
             startNetworkMonitor: false
         )
 
-        do {
-            let vm = FabushiMagpieViewModel(coordinator: coordinator, router: makeRouter())
-            await vm.loadPresets()
-            XCTAssertGreaterThanOrEqual(vm.presets.count, 40)
-            XCTAssertTrue(vm.presets.contains(where: { $0.id == "deepseek" }))
-            XCTAssertTrue(vm.presets.contains(where: { $0.id == "google-vertex" }))
+        let vm = FabushiMagpieViewModel(coordinator: coordinator, router: makeRouter())
+        await vm.loadPresets()
+        XCTAssertGreaterThanOrEqual(vm.presets.count, 40)
+        XCTAssertTrue(vm.presets.contains(where: { $0.id == "deepseek" }))
+        XCTAssertTrue(vm.presets.contains(where: { $0.id == "google-vertex" }))
 
-            let zhipu = await vm.findPreset(id: "zhipu")
-            XCTAssertEqual(zhipu?.id, "zhipu")
+        let zhipu = await vm.findPreset(id: "zhipu")
+        XCTAssertEqual(zhipu?.id, "zhipu")
 
-            let resolved = await vm.resolvePresetEndpoints(presetId: "zhipu", region: "coding")
-            XCTAssertEqual(resolved?.presetId, "zhipu")
-            XCTAssertTrue(resolved?.baseUrl.contains("open.bigmodel.cn") == true)
+        let resolved = await vm.resolvePresetEndpoints(presetId: "zhipu", region: "coding")
+        XCTAssertEqual(resolved?.presetId, "zhipu")
+        XCTAssertTrue(resolved?.baseUrl.contains("open.bigmodel.cn") == true)
 
-            await vm.probeProviderHealth(presetId: "zhipu", region: "coding")
-            XCTAssertTrue(vm.probeStatusText.contains("open.bigmodel.cn"))
-            XCTAssertTrue(vm.probeStatusText.contains("M6"))
+        await vm.probeProviderHealth(presetId: "zhipu", region: "coding")
+        XCTAssertTrue(vm.probeStatusText.contains("open.bigmodel.cn"))
+        XCTAssertTrue(vm.probeStatusText.contains("M6"))
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 2. Dual-Shape `magpie.state`, `D10-10` `google_vertex` Match & Single-Tap Instant Switch
@@ -363,7 +361,8 @@ final class FabushiMagpieGatewayTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(updatedCfg?.enabled, true)
 
             let sampleSensitive = "Contact alice@corp.io about ProjectApollo using sk-proj-1234567890abcdefghij"
-            let masked = try XCTUnwrap(await vm.maskText(sampleSensitive))
+            let maskedRaw = await vm.maskText(sampleSensitive)
+            let masked = try XCTUnwrap(maskedRaw)
             XCTAssertFalse(masked.maskedText.contains("alice@corp.io"))
             XCTAssertFalse(masked.maskedText.contains("ProjectApollo"))
             XCTAssertFalse(masked.maskedText.contains("sk-proj-1234567890abcdefghij"))
@@ -375,7 +374,8 @@ final class FabushiMagpieGatewayTests: XCTestCase, @unchecked Sendable {
             var disabledCfg = enabledCfg
             disabledCfg.enabled = false
             _ = await vm.updateMaskingConfig(disabledCfg)
-            let preview = try XCTUnwrap(await vm.previewMasking(text: sampleSensitive))
+            let previewRaw = await vm.previewMasking(text: sampleSensitive)
+            let preview = try XCTUnwrap(previewRaw)
             XCTAssertFalse(preview.maskedText.contains("alice@corp.io"))
             XCTAssertFalse(preview.hits.isEmpty)
 

@@ -508,7 +508,8 @@ final class FabushiAgentStudioCoreAndSecurityTests: XCTestCase, @unchecked Senda
             let cronId = try XCTUnwrap(savedCron?.id)
             await vm.loadCronJobs()
             XCTAssertTrue(vm.cronJobs.contains(where: { $0.id == cronId }))
-            XCTAssertTrue(await vm.deleteCronJob(jobId: cronId))
+            let cronDeleted = await vm.deleteCronJob(jobId: cronId)
+            XCTAssertTrue(cronDeleted)
 
             // 4. Sessions: create -> list -> get (present + nil for missing) -> search
             let createdSession = await vm.createSession(title: "M4 Audit Session")
@@ -536,12 +537,16 @@ final class FabushiAgentStudioCoreAndSecurityTests: XCTestCase, @unchecked Senda
             let decided = await vm.decideApproval(approvalId: approvalId, decision: .approvedOnce)
             XCTAssertEqual(decided?.status, .approvedOnce, "Must send 'approved_once' so Rust does not revert to 'pending'")
 
-            let token = try XCTUnwrap(await vm.issueValueBoundApproval(action: "file_write", target: "/workspace/a.swift"))
+            let issuedToken = await vm.issueValueBoundApproval(action: "file_write", target: "/workspace/a.swift")
+            let token = try XCTUnwrap(issuedToken)
             XCTAssertFalse(token.spent)
 
-            let consumed = try XCTUnwrap(
-                await vm.consumeValueBoundApproval(approvalId: token.approvalId, action: "file_write", target: "/workspace/a.swift")
+            let consumedRaw = await vm.consumeValueBoundApproval(
+                approvalId: token.approvalId,
+                action: "file_write",
+                target: "/workspace/a.swift"
             )
+            let consumed = try XCTUnwrap(consumedRaw)
             XCTAssertTrue(consumed.spent)
 
             // Second replay MUST fail closed (`approval_rejected`)

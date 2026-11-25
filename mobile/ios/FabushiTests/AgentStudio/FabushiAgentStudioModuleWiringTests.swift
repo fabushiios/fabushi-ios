@@ -41,52 +41,47 @@ final class FabushiAgentStudioModuleWiringTests: XCTestCase, @unchecked Sendable
             startNetworkMonitor: false
         )
 
-        do {
-            let router = makeRouter()
-            // Strict zero-argument initializer required for 1-line M6 registration
-            let module = FabushiAgentStudioModule()
-            let registry = FabushiFeatureModuleRegistry()
-            registry.register(agentStudio: module)
+        let router = makeRouter()
+        // Strict zero-argument initializer required for 1-line M6 registration
+        let module = FabushiAgentStudioModule()
+        let registry = FabushiFeatureModuleRegistry()
+        registry.register(agentStudio: module)
 
-            XCTAssertTrue(registry.agentStudio is FabushiAgentStudioModule)
+        XCTAssertTrue(registry.agentStudio is FabushiAgentStudioModule)
 
-            // Invoke ALL 5 sealed `AgentStudioModuleProviding` factory methods
-            let workspaceView = registry.agentStudio.makeAgentStudioWorkspaceView(
-                initialTab: "skills",
-                coordinator: coordinator,
-                router: router
-            )
-            let magpieView = registry.agentStudio.makeMagpieAiProvidersSettingsView(
-                coordinator: coordinator,
-                router: router
-            )
-            let mcpView = registry.agentStudio.makeOfficialMcpConsoleView(
-                coordinator: coordinator,
-                router: router
-            )
-            let codingAccessories = registry.agentStudio.makeCodingAgentThreadAccessories(
-                chatId: 8001,
-                coordinator: coordinator,
-                router: router
-            )
-            let multiAgentAccessories = registry.agentStudio.makeMultiAgentRoomAccessories(
-                chatId: 8001,
-                coordinator: coordinator,
-                router: router
-            )
+        // Invoke ALL 5 sealed `AgentStudioModuleProviding` factory methods
+        let workspaceView = registry.agentStudio.makeAgentStudioWorkspaceView(
+            initialTab: "skills",
+            coordinator: coordinator,
+            router: router
+        )
+        let magpieView = registry.agentStudio.makeMagpieAiProvidersSettingsView(
+            coordinator: coordinator,
+            router: router
+        )
+        let mcpView = registry.agentStudio.makeOfficialMcpConsoleView(
+            coordinator: coordinator,
+            router: router
+        )
+        let codingAccessories = registry.agentStudio.makeCodingAgentThreadAccessories(
+            chatId: 8001,
+            coordinator: coordinator,
+            router: router
+        )
+        let multiAgentAccessories = registry.agentStudio.makeMultiAgentRoomAccessories(
+            chatId: 8001,
+            coordinator: coordinator,
+            router: router
+        )
 
-            // Verify all 5 views construct valid AnyView instances
-            XCTAssertEqual(String(describing: type(of: workspaceView)), "AnyView")
-            XCTAssertEqual(String(describing: type(of: magpieView)), "AnyView")
-            XCTAssertEqual(String(describing: type(of: mcpView)), "AnyView")
-            XCTAssertEqual(String(describing: type(of: codingAccessories)), "AnyView")
-            XCTAssertEqual(String(describing: type(of: multiAgentAccessories)), "AnyView")
+        // Verify all 5 views construct valid AnyView instances
+        XCTAssertEqual(String(describing: type(of: workspaceView)), "AnyView")
+        XCTAssertEqual(String(describing: type(of: magpieView)), "AnyView")
+        XCTAssertEqual(String(describing: type(of: mcpView)), "AnyView")
+        XCTAssertEqual(String(describing: type(of: codingAccessories)), "AnyView")
+        XCTAssertEqual(String(describing: type(of: multiAgentAccessories)), "AnyView")
 
-            await coordinator.shutdown()
-        } catch {
-            await coordinator.shutdown()
-            throw error
-        }
+        await coordinator.shutdown()
     }
 
     // MARK: - 2. `installLogoutCleanup` Purge Propagation on Logout & Server Switch Across All 5 M4 ViewModels

@@ -49,11 +49,12 @@ final class FabushiMultiAgentProtocolTests: XCTestCase, @unchecked Sendable {
         )
         do {
             // 1. FloorControlQueue: explicit 120s group floor lease (`D14-02`)
-            let req1 = try XCTUnwrap(await vm.requestFloor(
+            let req1Raw = await vm.requestFloor(
                 agentId: "rust_bot",
                 priority: .directMention,
                 leaseMs: FabushiMultiAgentConstants.groupFloorLeaseMs
-            ))
+            )
+            let req1 = try XCTUnwrap(req1Raw)
             XCTAssertEqual(req1.granted, true)
             XCTAssertEqual(req1.currentSpeaker, "rust_bot")
             XCTAssertEqual(req1.activeGrant?.staleAfterMs, 120_000)
@@ -66,24 +67,28 @@ final class FabushiMultiAgentProtocolTests: XCTestCase, @unchecked Sendable {
             }
 
             // Second agent enqueues behind active speaker
-            let req2 = try XCTUnwrap(await vm.requestFloor(agentId: "qa_bot", priority: .generalContribution))
+            let req2Raw = await vm.requestFloor(agentId: "qa_bot", priority: .generalContribution)
+            let req2 = try XCTUnwrap(req2Raw)
             XCTAssertEqual(req2.granted, false)
             XCTAssertEqual(req2.queuedCount, 1)
 
             // UserInterruption preempts active speaker and emits a `trn_` nonce
-            let preempt = try XCTUnwrap(await vm.preemptFloorForUser())
+            let preemptRaw = await vm.preemptFloorForUser()
+            let preempt = try XCTUnwrap(preemptRaw)
             XCTAssertEqual(preempt.preemptedAgent, "rust_bot")
             XCTAssertTrue(preempt.preemptedNonce?.hasPrefix("trn_") ?? false)
             XCTAssertNil(preempt.currentSpeaker)
 
             // Re-acquire and release cleanly
             _ = await vm.requestFloor(agentId: "qa_bot", priority: .taskAssignee)
-            let released = try XCTUnwrap(await vm.releaseFloor(agentId: "qa_bot"))
+            let releasedRaw = await vm.releaseFloor(agentId: "qa_bot")
+            let released = try XCTUnwrap(releasedRaw)
             XCTAssertNil(released.currentSpeaker)
 
             // 2. 5-Hop LoopBudget: 5 hops succeed, 6th hop fails closed (`loop_budget_exceeded`), reset clears trace
             for hopIdx in 1...5 {
-                let status = try XCTUnwrap(await vm.recordLoopHop(agentId: "agent_\(hopIdx)"))
+                let statusRaw = await vm.recordLoopHop(agentId: "agent_\(hopIdx)")
+                let status = try XCTUnwrap(statusRaw)
                 XCTAssertEqual(status.currentHop, UInt32(hopIdx))
                 XCTAssertEqual(status.maxHops, 5)
                 XCTAssertEqual(status.exhausted, hopIdx == 5)
@@ -98,12 +103,13 @@ final class FabushiMultiAgentProtocolTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(vm.loopBudget.trace.isEmpty)
 
             // 3. Revision-Fenced SharedGroupWorkspace: CAS conflict detection + overwrite + remove -> nil
-            let set1 = try XCTUnwrap(await vm.setWorkspaceEntry(
+            let set1Raw = await vm.setWorkspaceEntry(
                 key: "plan.md",
                 value: .string("# Initial Plan"),
                 updatedBy: "alice",
                 expectedRevision: 0
-            ))
+            )
+            let set1 = try XCTUnwrap(set1Raw)
             XCTAssertEqual(set1.revision, 1)
 
             // Stale expected_revision (0 when actual is 1) MUST trigger `.conflict`!
@@ -189,114 +195,127 @@ final class FabushiMultiAgentProtocolTests: XCTestCase, @unchecked Sendable {
             ))
 
             // 1. CJK-adjacent ASCII mention (`@rust_bot你好`)
-            let cjkDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+            let cjkDecisionRaw = await vm.evaluateWakeGate(
                 FabushiMultiAgentWakeGateInputDTO(candidates: candidates, messageText: "@rust_bot你好 请看一下")
-            ))
+            )
+            let cjkDecision = try XCTUnwrap(cjkDecisionRaw)
             XCTAssertTrue(cjkDecision.shouldWake)
             XCTAssertEqual(cjkDecision.reason, .explicitMention)
             XCTAssertEqual(cjkDecision.wakeBotUserIds, [900_002])
 
             // 2. Slash command bot mention (`/status@rust_bot`)
-            let slashDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+            let slashDecisionRaw = await vm.evaluateWakeGate(
                 FabushiMultiAgentWakeGateInputDTO(candidates: candidates, messageText: "/status@rust_bot")
-            ))
+            )
+            let slashDecision = try XCTUnwrap(slashDecisionRaw)
             XCTAssertTrue(slashDecision.shouldWake)
             XCTAssertEqual(slashDecision.reason, .explicitMention)
             XCTAssertEqual(slashDecision.wakeBotUserIds, [900_002])
 
             // 3. `@所有人你好` wakes all bots
-            let mentionAllDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+            let mentionAllDecisionRaw = await vm.evaluateWakeGate(
                 FabushiMultiAgentWakeGateInputDTO(candidates: candidates, messageText: "@所有人你好 开会了")
-            ))
+            )
+            let mentionAllDecision = try XCTUnwrap(mentionAllDecisionRaw)
             XCTAssertTrue(mentionAllDecision.shouldWake)
             XCTAssertEqual(mentionAllDecision.reason, .mentionAll)
             XCTAssertEqual(Set(mentionAllDecision.wakeBotUserIds), Set([FabushiMultiAgentConstants.officialDefaultBotUserId, 900_002]))
 
             // 4. Display-name mention (`@Rust Architect`)
-            let displayNameDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+            let displayNameDecisionRaw = await vm.evaluateWakeGate(
                 FabushiMultiAgentWakeGateInputDTO(candidates: candidates, messageText: "@Rust Architect please inspect")
-            ))
+            )
+            let displayNameDecision = try XCTUnwrap(displayNameDecisionRaw)
             XCTAssertTrue(displayNameDecision.shouldWake)
             XCTAssertEqual(displayNameDecision.reason, .explicitMention)
             XCTAssertEqual(displayNameDecision.wakeBotUserIds, [900_002])
 
             // 5. Low-signal ack suppression (`收到`, `ok thanks`)
             for ack in ["收到", "ok thanks"] {
-                let ackDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+                let ackDecisionRaw = await vm.evaluateWakeGate(
                     FabushiMultiAgentWakeGateInputDTO(candidates: candidates, messageText: ack)
-                ))
+                )
+                let ackDecision = try XCTUnwrap(ackDecisionRaw)
                 XCTAssertFalse(ackDecision.shouldWake, "Expected low-signal ack '\(ack)' to stay silent")
                 XCTAssertEqual(ackDecision.outcome, .pass)
                 XCTAssertEqual(ackDecision.reason, .noRelevantCandidate)
             }
 
             // 6. Unmentioned human question falls back deterministically to `primary_fallback` (`v1.6.14`)
-            let fallbackDecision = try XCTUnwrap(await vm.evaluateWakeGate(
+            let fallbackDecisionRaw = await vm.evaluateWakeGate(
                 FabushiMultiAgentWakeGateInputDTO(
                     candidates: candidates,
                     messageText: "今天下午三点天气怎么样",
                     senderIsHuman: true
                 )
-            ))
+            )
+            let fallbackDecision = try XCTUnwrap(fallbackDecisionRaw)
             XCTAssertTrue(fallbackDecision.shouldWake)
             XCTAssertEqual(fallbackDecision.reason, .primaryFallback)
             XCTAssertEqual(fallbackDecision.wakeBotUserIds, [FabushiMultiAgentConstants.officialDefaultBotUserId])
 
             // 7. Stage 2 Outbound Review & Stay-Silent `[PASS]` sentinels + duplicate echo
             for sentinel in ["[PASS]", "<PASS/>", "NO_REPLY"] {
-                let isPass = try XCTUnwrap(await vm.checkIsPassSentinel(sentinel))
+                let isPassRaw = await vm.checkIsPassSentinel(sentinel)
+                let isPass = try XCTUnwrap(isPassRaw)
                 XCTAssertTrue(isPass, "Expected '\(sentinel)' to be recognized as pass sentinel")
 
-                let verdict = try XCTUnwrap(await vm.evaluateOutboundReview(
+                let verdictRaw = await vm.evaluateOutboundReview(
                     FabushiMultiAgentOutboundReviewInputDTO(agentId: "rust_bot", candidateText: sentinel)
-                ))
+                )
+                let verdict = try XCTUnwrap(verdictRaw)
                 XCTAssertFalse(verdict.shouldSend)
                 XCTAssertEqual(verdict.outcome, .pass)
                 XCTAssertEqual(verdict.reason, .explicitPassSentinel)
             }
 
-            let dupVerdict = try XCTUnwrap(await vm.evaluateOutboundReview(
+            let dupVerdictRaw = await vm.evaluateOutboundReview(
                 FabushiMultiAgentOutboundReviewInputDTO(
                     agentId: "rust_bot",
                     candidateText: "The build succeeded with zero warnings on iOS 17.",
                     recentRoomMessages: ["The build succeeded with zero warnings on iOS 17."]
                 )
-            ))
+            )
+            let dupVerdict = try XCTUnwrap(dupVerdictRaw)
             XCTAssertFalse(dupVerdict.shouldSend)
             XCTAssertEqual(dupVerdict.reason, .duplicateEcho)
 
-            let okVerdict = try XCTUnwrap(await vm.evaluateOutboundReview(
+            let okVerdictRaw = await vm.evaluateOutboundReview(
                 FabushiMultiAgentOutboundReviewInputDTO(
                     agentId: "rust_bot",
                     candidateText: "I checked the Cargo lockfile and verified all crates compile."
                 )
-            ))
+            )
+            let okVerdict = try XCTUnwrap(okVerdictRaw)
             XCTAssertTrue(okVerdict.shouldSend)
             XCTAssertEqual(okVerdict.reason, .approved)
 
             // 8. Scoped Ed25519 Capability Token issue & verify
-            let issued = try XCTUnwrap(await vm.issueCapabilityToken(
+            let issuedRaw = await vm.issueCapabilityToken(
                 agentId: "rust_bot",
                 allowedActions: ["workspace.write", "floor.release"],
                 ttlSecs: 300
-            ))
+            )
+            let issued = try XCTUnwrap(issuedRaw)
             XCTAssertEqual(issued.verifyingKeyHex.count, 64)
 
-            let validVerify = try XCTUnwrap(await vm.verifyCapabilityToken(
+            let validVerifyRaw = await vm.verifyCapabilityToken(
                 token: issued.token,
                 verifyingKeyHex: issued.verifyingKeyHex,
                 agentId: "rust_bot",
                 action: "workspace.write"
-            ))
+            )
+            let validVerify = try XCTUnwrap(validVerifyRaw)
             XCTAssertTrue(validVerify.valid)
             XCTAssertEqual(validVerify.permitsAction, true)
 
-            let deniedVerify = try XCTUnwrap(await vm.verifyCapabilityToken(
+            let deniedVerifyRaw = await vm.verifyCapabilityToken(
                 token: issued.token,
                 verifyingKeyHex: issued.verifyingKeyHex,
                 agentId: "rust_bot",
                 action: "terminal.exec"
-            ))
+            )
+            let deniedVerify = try XCTUnwrap(deniedVerifyRaw)
             XCTAssertFalse(deniedVerify.valid)
             XCTAssertEqual(deniedVerify.permitsAction, false)
 
