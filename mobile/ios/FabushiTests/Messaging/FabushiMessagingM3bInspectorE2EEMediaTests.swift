@@ -103,7 +103,7 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                     "chat_id": 301,
                     "title": "Research Assistant",
                     "about": "Helps inspect documents",
-                    "chat_type": "bot",
+                    "chat_type": 3,
                     "creator_id": 1001,
                     "is_forum": false,
                     "members_count": 2,
@@ -146,22 +146,26 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                 return .jsonObject(200, [
                     "active_provider": "deepseek",
                     "active_model": "deepseek-chat",
+                    "has_configured_provider": true,
                     "providers": [[
-                        "id": "deepseek",
+                        "provider_id": "deepseek",
+                        "name": "DeepSeek",
                         "enabled": true,
                         "default_model": "deepseek-chat",
                         "models": ["deepseek-chat", "deepseek-reasoner"],
                     ]],
-                    "routing_groups": [["name": "fast-lane"]],
+                    "routing_groups": [["id": "grp-fast", "name": "fast-lane"]],
                 ])
             case ("GET", "/api/v1/fabushi-bots/301"):
                 return .jsonObject(200, [
-                    "bot_id": 301,
+                    "bot_user_id": 301,
+                    "owner_user_id": 1001,
+                    "agent_id": "agent-301",
                     "display_name": "Research Assistant",
                     "username": "research_bot",
                     "preferred_model": "retired-legacy-model",
                     "thinking_level": "medium",
-                    "approval_mode": "ask",
+                    "approval_mode": "ask_every_time",
                     "updated_at_ms": 1_730_000_000_000,
                 ])
             case ("PATCH", "/api/v1/fabushi-bots/301"):
@@ -169,7 +173,9 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                     patchedPreferredModel.withLock { $0 = obj["preferred_model"] as? String }
                 }
                 return .jsonObject(200, [
-                    "bot_id": 301,
+                    "bot_user_id": 301,
+                    "owner_user_id": 1001,
+                    "agent_id": "agent-301",
                     "display_name": "Research Assistant",
                     "username": "research_bot",
                     "preferred_model": "",
@@ -181,7 +187,7 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                     "bound_node_id": "node-studio-1",
                     "persona_prompt": "Be concise",
                     "preferred_model": "retired-legacy-model",
-                    "approval_mode": "ask",
+                    "approval_mode": "ask_every_time",
                     "allow_cross_device_control": false,
                     "allow_cloud_self_config": false,
                     "updated_at_ms": 1_730_000_000_000,
@@ -192,23 +198,29 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                     "bound_node_id": "node-studio-1",
                     "persona_prompt": "Be concise",
                     "preferred_model": "",
-                    "approval_mode": "ask",
+                    "approval_mode": "ask_every_time",
                     "allow_cross_device_control": false,
                     "allow_cloud_self_config": false,
                     "updated_at_ms": 1_730_000_100_000,
                 ])
             case ("GET", "/api/v1/computers"):
-                return .jsonObject(200, [[
-                    "node_id": "node-studio-1",
-                    "kind": "desktop",
-                    "display_name": "Mac Studio",
-                    "online": true,
-                    "bound_bot_ids": [301],
-                ]])
+                return .jsonObject(200, [
+                    "computers": [[
+                        "node_id": "node-studio-1",
+                        "owner_user_id": 1001,
+                        "kind": "local_device",
+                        "display_name": "Mac Studio",
+                        "ip_address": "127.0.0.1",
+                        "online": true,
+                        "bound_bot_ids": [301],
+                    ]],
+                    "pending_approvals": [],
+                ])
             case ("GET", "/api/v1/bots/profile/301"), ("GET", "/api/v1/bots/profile/research_bot"):
                 return .jsonObject(200, [
                     "bot": [
                         "bot_user_id": 301,
+                        "owner_user_id": 1001,
                         "username": "research_bot",
                         "display_name": "Research Assistant",
                         "description": "Research bot",
@@ -370,7 +382,7 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
             }
             XCTAssertFalse(plaintextSendCalled.withLock { $0 }, "E2EE send MUST NEVER silently downgrade to plaintext")
             XCTAssertEqual(
-                harness.router.toastController.activeWindowToast?.message,
+                harness.router.toastController.windowBanner?.message,
                 FabushiMessagingStrings.localized(.e2eePeerNotEnrolledNotice, locale: .en)
             )
 
@@ -403,7 +415,17 @@ final class FabushiMessagingM3bInspectorE2EEMediaTests: XCTestCase, @unchecked S
                     "title": "Fabushi Pack",
                     "count": 1,
                     "is_installed": false,
-                    "stickers": [["file_id": "stk-1", "emoji": "🚀"]],
+                    "stickers": [[
+                        "id": "stk-1",
+                        "set_id": "pack-1",
+                        "file_id": "stk-1",
+                        "emoji": "🚀",
+                        "mime_type": "image/webp",
+                        "width": 512,
+                        "height": 512,
+                        "is_animated": false,
+                        "is_video": false,
+                    ]],
                 ]])
             }
             if req.method == "POST" && req.path == "/api/v1/stickers/sets/pack-1" {

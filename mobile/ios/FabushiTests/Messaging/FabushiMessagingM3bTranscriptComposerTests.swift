@@ -249,6 +249,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
 
             // 1. `D11-02`: browser_takeover / browser_resume / browser_cancel
             for callback in ["browser_takeover:sid-42", "browser_resume:sid-42", "browser_cancel:sid-42"] {
+                harness.router.toastController.clearAll()
                 await harness.store.handleInlineKeyboardAction(
                     button: FabushiInlineKeyboardButton(text: "Browser", callbackData: callback),
                     chatId: 601,
@@ -259,7 +260,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                 )
                 XCTAssertEqual(harness.store.lastBrowserTakeoverAction, callback)
                 XCTAssertEqual(
-                    harness.router.toastController.activeWindowToast?.message,
+                    harness.router.toastController.windowBanner?.message,
                     FabushiMessagingStrings.localized(.browserTakeoverUnavailableToast, locale: .en)
                 )
             }
@@ -298,6 +299,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             XCTAssertEqual(harness.store.overlayController.presentedInstantView?.url, "https://example.org/guide")
 
             // 5. TRAP #5 honest non-destructive notice for unmapped callback
+            harness.router.toastController.clearAll()
             harness.router.navigate(to: .chats(chatId: 601, messageId: nil), coordinator: harness.coordinator)
             await harness.store.handleInlineKeyboardAction(
                 button: FabushiInlineKeyboardButton(text: "Custom", callbackData: "custom_bot_action:99"),
@@ -308,7 +310,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                 locale: .en
             )
             XCTAssertEqual(
-                harness.router.toastController.activeWindowToast?.message,
+                harness.router.toastController.windowBanner?.message,
                 FabushiMessagingStrings.localized(.inlineCallbackPendingNotice, locale: .en)
             )
 
@@ -325,7 +327,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
         let shouldFailTTL = OSAllocatedUnfairLock<Bool>(initialState: true)
 
         let harness = try await makeHarness { req in
-            if req.path.hasPrefix("/api/v1/media/stream/") {
+            if req.path.hasPrefix("/api/v1/media/") {
                 return .jsonObject(404, ["error": "not_found"])
             }
             if req.method == "POST" && req.path == "/api/v1/chats/701/ttl" {
@@ -351,10 +353,11 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                 locale: .en
             )
             XCTAssertNil(downloaded)
-            let downloadToast = try XCTUnwrap(harness.router.toastController.activeWindowToast)
+            let downloadToast = try XCTUnwrap(harness.router.toastController.windowBanner)
             XCTAssertTrue(downloadToast.isError)
             XCTAssertTrue(downloadToast.message.contains("Download failed: report.pdf"))
             XCTAssertFalse(downloadToast.message.localizedCaseInsensitiveContains("saved"))
+            harness.router.toastController.clearAll()
 
             // TTL fails -> rolls back to 0 and shows error toast
             let failedTTL = await harness.store.setChatTTL(
@@ -366,7 +369,8 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             )
             XCTAssertFalse(failedTTL)
             XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 701 })?.ttlSeconds, 0)
-            XCTAssertTrue(harness.router.toastController.activeWindowToast?.isError == true)
+            XCTAssertTrue(harness.router.toastController.windowBanner?.isError == true)
+            harness.router.toastController.clearAll()
 
             // TTL succeeds -> updates to 86400 and shows success toast
             shouldFailTTL.withLock { $0 = false }
@@ -379,7 +383,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             )
             XCTAssertTrue(okTTL)
             XCTAssertEqual(harness.store.chats.first(where: { $0.chatId == 701 })?.ttlSeconds, 86_400)
-            XCTAssertEqual(harness.router.toastController.activeWindowToast?.isError, false)
+            XCTAssertEqual(harness.router.toastController.windowBanner?.isError, false)
 
             await harness.tearDown()
         } catch {
@@ -412,7 +416,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             if req.method == "POST" && req.path == "/api/v1/messages/send" {
                 sendCalledCount.withLock { $0 += 1 }
                 if shouldFailSend.withLock({ $0 }) {
-                    return .jsonObject(500, ["error": "send_failed"])
+                    return .jsonObject(400, ["error": "bad_request"])
                 }
                 return .jsonObject(200, [
                     "message_id": 8801,
@@ -428,6 +432,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                 Thread.sleep(forTimeInterval: 0.12)
                 return .jsonObject(200, [
                     "file_id": "up-801",
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                     "size_bytes": 4,
                     "mime_type": "image/jpeg",
                 ])
@@ -456,7 +461,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             XCTAssertNil(failedResp)
             XCTAssertEqual(harness.store.unsentDraftTextByChat[801], "Will fail permanently")
             XCTAssertEqual(
-                harness.router.toastController.activeWindowToast?.message,
+                harness.router.toastController.windowBanner?.message,
                 FabushiMessagingStrings.localized(.messageSendFailedToast, locale: .en)
             )
 
@@ -577,6 +582,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                     "success": true,
                     "pts": 61,
                     "poll": [
+                        "id": "poll-555",
                         "poll_id": 555,
                         "question": "Favorite language?",
                         "options": [
@@ -585,6 +591,7 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
                         ],
                         "total_voters": 1,
                         "is_closed": false,
+                        "is_anonymous": true,
                     ],
                 ])
             }
@@ -614,26 +621,26 @@ final class FabushiMessagingM3bTranscriptComposerTests: XCTestCase, @unchecked S
             harness.store.upsertChat(FabushiMessagingChat(chatId: 902, title: "Target Chat"))
 
             // Seed message 100 + poll message 101 + todo message 102 via real domain events
-            _ = harness.store.ingestDomainEvent(FabushiDomainEvent(
-                type: "newMessage",
+            _ = harness.store.ingestDomainEvent(FabushiDomainEvent.parse(
                 generation: harness.coordinator.accountScopeGeneration,
                 timestampMs: baseMs,
+                type: "newMessage",
                 rawPayloadJSON: """
                 {"id":100,"chat_id":901,"sender_id":1001,"date":1730000000000,"is_outgoing":true,"content":{"type":"Text","data":{"text":"Initial body","entities":[]}}}
                 """
             ))
-            _ = harness.store.ingestDomainEvent(FabushiDomainEvent(
-                type: "newMessage",
+            _ = harness.store.ingestDomainEvent(FabushiDomainEvent.parse(
                 generation: harness.coordinator.accountScopeGeneration,
                 timestampMs: baseMs + 1000,
+                type: "newMessage",
                 rawPayloadJSON: """
                 {"id":101,"chat_id":901,"sender_id":1001,"date":1730000001000,"content":{"type":"Poll","data":{"poll_id":555,"question":"Favorite language?","options":[{"option_id":0,"text":"Swift","vote_count":0,"is_chosen":false,"percentage":0},{"option_id":1,"text":"Rust","vote_count":0,"is_chosen":false,"percentage":0}],"total_voters":0,"is_closed":false}}}
                 """
             ))
-            _ = harness.store.ingestDomainEvent(FabushiDomainEvent(
-                type: "newMessage",
+            _ = harness.store.ingestDomainEvent(FabushiDomainEvent.parse(
                 generation: harness.coordinator.accountScopeGeneration,
                 timestampMs: baseMs + 2000,
+                type: "newMessage",
                 rawPayloadJSON: """
                 {"id":102,"chat_id":901,"sender_id":1001,"date":1730000002000,"content":{"type":"Todo","data":{"id":"todo-1","title":"Checklist","items":[{"id":"i1","title":"Ship M3b","completed":false}],"completed_count":0}}}
                 """

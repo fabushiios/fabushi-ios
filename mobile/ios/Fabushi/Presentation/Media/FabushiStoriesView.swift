@@ -328,15 +328,14 @@ private struct FabushiStoryComposerSheetView: View {
         NavigationStack {
             Form {
                 Section {
+                    let pickerTitle = theme.messagingString(.attachPhotoVideoAction)
+                    let pickerIcon = selectedPhotoData == nil ? "photo.badge.plus" : "checkmark.circle.fill"
                     PhotosPicker(
                         selection: $selectedPhotoItem,
                         matching: .images
                     ) {
-                        Label(
-                            theme.messagingString(.attachPhotoVideoAction),
-                            systemImage: selectedPhotoData == nil ? "photo.badge.plus" : "checkmark.circle.fill"
-                        )
-                        .fabushiFont(.body)
+                        Label(pickerTitle, systemImage: pickerIcon)
+                            .font(FabushiTextStyle.body.font)
                     }
                     .onChange(of: selectedPhotoItem) { _, newItem in
                         guard let newItem else { return }

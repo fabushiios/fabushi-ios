@@ -1460,10 +1460,19 @@ public final class FabushiMessagingHostClient {
     }
 
     public func listComputers() async throws -> [FabushiBotComputer] {
-        try await coordinator.dispatchFenced(
+        struct ComputerListResp: Decodable, Sendable {
+            let computers: [FabushiBotComputer]?
+        }
+        let raw: FabushiJSONValue = try await coordinator.dispatchFenced(
             method: FabushiRPCNamespace.computers.method("list"),
             params: FabushiEmptyParams()
         )
+        let data = try JSONEncoder().encode(raw)
+        if let wrapped = try? JSONDecoder().decode(ComputerListResp.self, from: data),
+           let computers = wrapped.computers {
+            return computers
+        }
+        return (try? JSONDecoder().decode([FabushiBotComputer].self, from: data)) ?? []
     }
 
     public func getBotComputerProfile(botId: UInt64) async throws -> FabushiBotComputerProfile {

@@ -80,7 +80,12 @@ public struct FabushiInspectorAiModelView: View {
     @State private var isSaving: Bool = false
 
     private static let thinkingLevels: [String] = ["off", "minimal", "low", "medium", "high"]
-    private static let approvalModes: [String] = ["ask", "auto", "strict"]
+    private static let approvalModes: [String] = [
+        "ask_every_time",
+        "allow_read_only",
+        "always_allow_authorized",
+        "disabled",
+    ]
 
     private var theme: FabushiTheme { injectedTheme ?? .default }
 
@@ -126,7 +131,7 @@ public struct FabushiInspectorAiModelView: View {
         }
         _preferredModel = State(initialValue: FabushiAiModelCatalog.normalizePreferredModel(authoritativeRawModel))
         _thinkingLevel = State(initialValue: initialBotConfig?.thinkingLevel ?? "medium")
-        _approvalMode = State(initialValue: initialComputerProfile?.approvalMode ?? initialBotConfig?.approvalMode ?? "ask")
+        _approvalMode = State(initialValue: initialComputerProfile?.approvalMode ?? initialBotConfig?.approvalMode ?? "ask_every_time")
         _personaPrompt = State(initialValue: initialComputerProfile?.personaPrompt ?? "")
         _boundNodeId = State(initialValue: initialComputerProfile?.boundNodeId ?? "")
         _profileUpdatedAtMs = State(initialValue: max(initialComputerProfile?.updatedAtMs ?? 0, initialBotConfig?.updatedAtMs ?? 0))

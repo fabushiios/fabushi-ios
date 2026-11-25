@@ -3136,7 +3136,8 @@ public struct FabushiAiModelCatalog: Codable, Sendable, Equatable {
 
         if let providers = json["providers"]?.arrayValue {
             for provider in providers {
-                let providerId = provider["id"]?.stringValue
+                let providerId = provider["provider_id"]?.stringValue
+                    ?? provider["id"]?.stringValue
                     ?? provider["provider"]?.stringValue
                     ?? provider["name"]?.stringValue
                     ?? ""
@@ -3369,7 +3370,7 @@ public struct FabushiBotComputerProfile: Codable, Sendable, Equatable {
         boundNodeId: String? = nil,
         personaPrompt: String = "",
         preferredModel: String = "",
-        approvalMode: String = "ask",
+        approvalMode: String = "ask_every_time",
         allowCrossDeviceControl: Bool = false,
         allowCloudSelfConfig: Bool = false,
         updatedAtMs: Int64 = 0
@@ -3390,7 +3391,7 @@ public struct FabushiBotComputerProfile: Codable, Sendable, Equatable {
         self.boundNodeId = try container.decodeIfPresent(String.self, forKey: .boundNodeId)
         self.personaPrompt = try container.decodeIfPresent(String.self, forKey: .personaPrompt) ?? ""
         self.preferredModel = try container.decodeIfPresent(String.self, forKey: .preferredModel) ?? ""
-        self.approvalMode = try container.decodeIfPresent(String.self, forKey: .approvalMode) ?? "ask"
+        self.approvalMode = try container.decodeIfPresent(String.self, forKey: .approvalMode) ?? "ask_every_time"
         self.allowCrossDeviceControl = try container.decodeIfPresent(Bool.self, forKey: .allowCrossDeviceControl) ?? false
         self.allowCloudSelfConfig = try container.decodeIfPresent(Bool.self, forKey: .allowCloudSelfConfig) ?? false
         self.updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs) ?? 0
