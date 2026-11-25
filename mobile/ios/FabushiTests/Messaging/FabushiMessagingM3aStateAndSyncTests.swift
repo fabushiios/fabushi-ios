@@ -94,7 +94,7 @@ final class FabushiMessagingM3aStateAndSyncTests: XCTestCase, @unchecked Sendabl
         }
     }
 
-    private static func makeChatDetailJSON(
+    nonisolated private static func makeChatDetailJSON(
         chatId: Int64,
         title: String,
         kind: String = "group",

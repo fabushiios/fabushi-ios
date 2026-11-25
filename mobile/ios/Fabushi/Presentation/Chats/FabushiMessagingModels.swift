@@ -1490,10 +1490,10 @@ public struct FabushiMessageRecord: Identifiable, Codable, Sendable, Equatable, 
         let decodedContent = try? container.decodeIfPresent(FabushiMessageContent.self, forKey: .content)
         self.content = decodedContent
 
-        var resolvedText = (try container.decodeIfPresent(String.self, forKey: .text))
-            ?? (try container.decodeIfPresent(String.self, forKey: .body))
-            ?? ""
-        var resolvedEntities = (try container.decodeIfPresent([FabushiMessageEntity].self, forKey: .entities)) ?? []
+        let primaryText = try container.decodeIfPresent(String.self, forKey: .text)
+        let fallbackBody = try container.decodeIfPresent(String.self, forKey: .body)
+        var resolvedText = primaryText ?? fallbackBody ?? ""
+        var resolvedEntities = try container.decodeIfPresent([FabushiMessageEntity].self, forKey: .entities) ?? []
 
         if case .text(let nestedText, let nestedEntities)? = decodedContent {
             if resolvedText.isEmpty {

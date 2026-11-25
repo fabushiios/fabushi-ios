@@ -35,17 +35,16 @@ public struct FabushiMultiSelectComposeView: View {
     }
 
     public var body: some View {
-        @Bindable var bindableStore = store
         let candidates = store.composeCandidates()
         let combinedCandidates = candidates.humans + candidates.bots
 
         VStack(spacing: 0) {
             composeHeaderBar
             Divider().overlay(theme.separatorHairline)
-            recipientInputBar(bindableStore: bindableStore)
+            recipientInputBar
 
             if store.selectedComposeRecipients.count >= 2 || !store.composeGroupTitle.isEmpty {
-                groupTitleRow(bindableStore: bindableStore)
+                groupTitleRow
             }
 
             if let errorMessage = store.composeErrorMessage {
@@ -158,8 +157,9 @@ public struct FabushiMultiSelectComposeView: View {
 
     // MARK: - `To:` Field & Selected Chips
 
-    private func recipientInputBar(bindableStore: Bindable<FabushiMessagingStore>) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var recipientInputBar: some View {
+        @Bindable var bindableStore = store
+        return VStack(alignment: .leading, spacing: 8) {
             if !store.selectedComposeRecipients.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -205,7 +205,7 @@ public struct FabushiMultiSelectComposeView: View {
 
                 TextField(
                     theme.messagingString(.composeSearchPlaceholder),
-                    text: bindableStore.composeQuery
+                    text: $bindableStore.composeQuery
                 )
                 .fabushiFont(.body)
                 .foregroundStyle(theme.textPrimary)
@@ -240,8 +240,9 @@ public struct FabushiMultiSelectComposeView: View {
         .background(theme.surfacePrimary)
     }
 
-    private func groupTitleRow(bindableStore: Bindable<FabushiMessagingStore>) -> some View {
-        VStack(spacing: 0) {
+    private var groupTitleRow: some View {
+        @Bindable var bindableStore = store
+        return VStack(spacing: 0) {
             Divider().overlay(theme.separatorHairline).padding(.leading, 16)
             HStack(spacing: 8) {
                 Image(systemName: "person.3.fill")
@@ -251,7 +252,7 @@ public struct FabushiMultiSelectComposeView: View {
 
                 TextField(
                     theme.messagingString(.composeGroupTitlePlaceholder),
-                    text: bindableStore.composeGroupTitle
+                    text: $bindableStore.composeGroupTitle
                 )
                 .fabushiFont(.body)
                 .foregroundStyle(theme.textPrimary)

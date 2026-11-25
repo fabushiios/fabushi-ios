@@ -104,7 +104,7 @@ public final class FabushiMessagingCacheStore: Sendable {
                 try ensureProtectedDirectoryLocked()
                 var options: Data.WritingOptions = [.atomic]
                 #if os(iOS)
-                options.insert(.completeUntilFirstUserAuthentication)
+                options.insert(.completeFileProtectionUntilFirstUserAuthentication)
                 #endif
                 try encoded.write(to: fileURL, options: options)
                 #if os(iOS)
