@@ -74,6 +74,33 @@ pub enum BotBrowserError {
     #[error("approval denied: {0}")]
     ApprovalDenied(String),
 
+    #[error("locator not found: {0}")]
+    LocatorNotFound(String),
+
+    #[error("unsupported backend operation: {0}")]
+    Unsupported(String),
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("cookie import error: {0}")]
+    CookieImport(String),
+
+    #[error("script compilation error: {0}")]
+    ScriptCompilation(String),
+
+    #[error("script validation error: {0}")]
+    ScriptValidation(String),
+
+    #[error("script replay error: {0}")]
+    ScriptReplay(String),
+
+    #[error("secret leak detected in script manifest: {0}")]
+    SecretLeakDetected(String),
+
+    #[error("browser automation cancelled by user: {0}")]
+    ControlCancelled(String),
+
     #[error("io error: {0}")]
     Io(String),
 }
@@ -263,6 +290,10 @@ pub struct DomNodeSnapshot {
     pub id: Option<String>,
     pub aria_label: Option<String>,
     pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub text: String,
     pub value: Option<String>,
     pub is_password: bool,
@@ -503,4 +534,439 @@ pub enum BotBrowserEvent {
         restart_count: u64,
         restored_url: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBackendKind {
+    WkWebView,
+    ObscuraCdp,
+    ChromeCdp,
+    MockCdp,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticLocator {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub css_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_attr: Option<String>,
+}
+
+impl SemanticLocator {
+    pub fn from_test_id(id: impl Into<String>) -> Self {
+        Self {
+            test_id: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn by_test_id(id: impl Into<String>) -> Self {
+        Self::from_test_id(id)
+    }
+
+    pub fn from_aria_label(label: impl Into<String>) -> Self {
+        Self {
+            aria_label: Some(label.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn by_aria_label(label: impl Into<String>) -> Self {
+        Self::from_aria_label(label)
+    }
+
+    pub fn by_role_and_text(role: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: Some(role.into()),
+            text_anchor: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn by_text(text: impl Into<String>) -> Self {
+        Self {
+            text_anchor: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn from_css(sel: impl Into<String>) -> Self {
+        Self {
+            css_selector: Some(sel.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn by_css(sel: impl Into<String>) -> Self {
+        Self::from_css(sel)
+    }
+
+    pub fn by_name(name: impl Into<String>) -> Self {
+        Self {
+            name_attr: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.test_id,
+            &self.aria_label,
+            &self.role,
+            &self.text_anchor,
+            &self.css_selector,
+            &self.name_attr,
+        ]
+        .iter()
+        .all(|opt| opt.as_deref().is_none_or(|s| s.trim().is_empty()))
+    }
+
+    pub fn display_label(&self) -> String {
+        if let Some(tid) = self.test_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("test_id={tid}");
+        }
+        if let Some(aria) = self.aria_label.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("aria_label={aria}");
+        }
+        if let Some(txt) = self.text_anchor.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Some(role) = self.role.as_deref().filter(|s| !s.trim().is_empty()) {
+                return format!("role={role}:text={txt}");
+            }
+            return format!("text={txt}");
+        }
+        if let Some(nm) = self.name_attr.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("name={nm}");
+        }
+        if let Some(css) = self.css_selector.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("css={css}");
+        }
+        if let Some(role) = self.role.as_deref().filter(|s| !s.trim().is_empty()) {
+            return format!("role={role}");
+        }
+        "empty".to_string()
+    }
+
+    pub fn describe(&self) -> String {
+        self.display_label()
+    }
+
+    pub fn to_css_candidates(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(tid) = self.test_id.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(format!(r#"[data-testid="{}"]"#, escape_css_attr(tid)));
+        }
+        if let Some(aria) = self.aria_label.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(format!(r#"[aria-label="{}"]"#, escape_css_attr(aria)));
+        }
+        if let Some(nm) = self.name_attr.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(format!(r#"[name="{}"]"#, escape_css_attr(nm)));
+        }
+        if let Some(css) = self.css_selector.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(css.trim().to_string());
+        }
+        if let Some(role) = self.role.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push(format!(r#"[role="{}"]"#, escape_css_attr(role)));
+        }
+        out
+    }
+
+    pub fn is_sensitive_hint(&self) -> bool {
+        const MARKERS: &[&str] = &[
+            "password",
+            "passwd",
+            "passcode",
+            "pwd",
+            "one-time-code",
+            "totp",
+            "secret",
+            "api_key",
+            "apikey",
+            "auth_token",
+            "access_token",
+            "ct0",
+        ];
+        for candidate in [
+            self.test_id.as_deref(),
+            self.aria_label.as_deref(),
+            self.css_selector.as_deref(),
+            self.name_attr.as_deref(),
+            self.text_anchor.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let lower = candidate.to_ascii_lowercase();
+            if MARKERS.iter().any(|m| lower.contains(m)) {
+                return true;
+            }
+            if lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| tok == "otp" || tok == "token" || tok == "pin")
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn escape_css_attr(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SameSitePolicy {
+    Strict,
+    Lax,
+    None,
+}
+
+impl<'de> Deserialize<'de> for SameSitePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "lax" => Ok(Self::Lax),
+            "none" | "no_restriction" => Ok(Self::None),
+            other => Err(serde::de::Error::custom(format!(
+                "unsupported sameSite value: {other}"
+            ))),
+        }
+    }
+}
+
+fn default_cookie_path() -> String {
+    "/".to_string()
+}
+
+fn deserialize_same_site_opt<'de, D>(deserializer: D) -> Result<Option<SameSitePolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = opt else {
+        return Ok(None);
+    };
+    let Some(raw) = val.as_str() else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "unspecified" | "default" => Ok(None),
+        "strict" => Ok(Some(SameSitePolicy::Strict)),
+        "lax" => Ok(Some(SameSitePolicy::Lax)),
+        "none" | "no_restriction" => Ok(Some(SameSitePolicy::None)),
+        other => Err(serde::de::Error::custom(format!(
+            "unsupported sameSite value: {other}"
+        ))),
+    }
+}
+
+fn deserialize_cookie_expires_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = opt else {
+        return Ok(None);
+    };
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(num) => {
+            if let Some(i) = num.as_i64() {
+                if i <= 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(i))
+                }
+            } else if let Some(u) = num.as_u64() {
+                if u == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(i64::try_from(u).unwrap_or(i64::MAX)))
+                }
+            } else if let Some(f) = num.as_f64() {
+                if !f.is_finite() || f <= 0.0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(f.round() as i64))
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed
+                .parse::<f64>()
+                .map_err(|_| serde::de::Error::custom("invalid cookie expiration string"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                Ok(None)
+            } else {
+                Ok(Some(parsed.round() as i64))
+            }
+        }
+        _ => Err(serde::de::Error::custom("invalid cookie expiration type")),
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct BrowserCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    #[serde(default = "default_cookie_path")]
+    pub path: String,
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default, rename = "httpOnly", alias = "http_only")]
+    pub http_only: bool,
+    #[serde(
+        default,
+        rename = "sameSite",
+        alias = "same_site",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_same_site_opt"
+    )]
+    #[zeroize(skip)]
+    pub same_site: Option<SameSitePolicy>,
+    #[serde(
+        default,
+        alias = "expires_unix_secs",
+        alias = "expirationDate",
+        alias = "expiry",
+        alias = "expires_epoch_secs",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cookie_expires_opt"
+    )]
+    pub expires: Option<i64>,
+    #[serde(default, rename = "hostOnly", alias = "host_only")]
+    pub host_only: bool,
+    #[serde(default)]
+    pub session: bool,
+}
+
+impl std::fmt::Debug for BrowserCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserCookie")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("same_site", &self.same_site)
+            .field("expires", &self.expires)
+            .field("host_only", &self.host_only)
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+impl BrowserCookie {
+    pub fn new(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            domain: domain.into(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: None,
+            expires: None,
+            host_only: false,
+            session: true,
+        }
+    }
+
+    pub fn is_expired_at(&self, now_unix_secs: i64) -> bool {
+        self.expires.is_some_and(|exp| exp <= now_unix_secs)
+    }
+
+    pub fn matches_host(&self, host: &str) -> bool {
+        let host_norm = host.trim().trim_start_matches('.').to_ascii_lowercase();
+        let domain_norm = self.domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        if host_norm.is_empty() || domain_norm.is_empty() {
+            return false;
+        }
+        if self.host_only {
+            host_norm == domain_norm
+        } else {
+            host_norm == domain_norm || host_norm.ends_with(&format!(".{domain_norm}"))
+        }
+    }
+
+    pub fn to_cdp_cookie_param(&self) -> serde_json::Value {
+        let path = if self.path.trim().is_empty() {
+            "/"
+        } else if self.path.starts_with('/') {
+            self.path.as_str()
+        } else {
+            "/"
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), serde_json::Value::String(self.name.clone()));
+        obj.insert("value".to_string(), serde_json::Value::String(self.value.clone()));
+        obj.insert("domain".to_string(), serde_json::Value::String(self.domain.clone()));
+        obj.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+        obj.insert("secure".to_string(), serde_json::Value::Bool(self.secure));
+        obj.insert("httpOnly".to_string(), serde_json::Value::Bool(self.http_only));
+        if let Some(ss) = self.same_site {
+            let ss_str = match ss {
+                SameSitePolicy::Strict => "Strict",
+                SameSitePolicy::Lax => "Lax",
+                SameSitePolicy::None => "None",
+            };
+            obj.insert("sameSite".to_string(), serde_json::Value::String(ss_str.to_string()));
+        }
+        if !self.session {
+            if let Some(exp) = self.expires.filter(|&e| e > 0) {
+                obj.insert("expires".to_string(), serde_json::json!(exp));
+            }
+        }
+        let clean_domain = self.domain.trim().trim_start_matches('.');
+        if !clean_domain.is_empty() {
+            let scheme = if self.secure { "https" } else { "http" };
+            obj.insert(
+                "url".to_string(),
+                serde_json::Value::String(format!("{scheme}://{clean_domain}{path}")),
+            );
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepTimingMetric {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    pub operation: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BrowserBackendKind>,
+    pub duration_ms: u64,
+    pub success: bool,
+    #[serde(default)]
+    pub timestamp_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }

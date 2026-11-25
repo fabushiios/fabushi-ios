@@ -1197,7 +1197,11 @@ fn keyring_user_for(user_id: u64) -> String {
     format!("user-{user_id}-root-key-v1")
 }
 
-fn validate_item_key(item_key: &str) -> Result<(), BotBrowserError> {
+pub fn is_valid_vault_item_key(item_key: &str) -> bool {
+    validate_item_key(item_key).is_ok()
+}
+
+pub(crate) fn validate_item_key(item_key: &str) -> Result<(), BotBrowserError> {
     if item_key.is_empty() || item_key.len() > 128 {
         return Err(BotBrowserError::Storage(format!(
             "invalid vault item_key length ({}): must be 1..=128",

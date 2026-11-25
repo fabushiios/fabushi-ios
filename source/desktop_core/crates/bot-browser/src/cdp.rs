@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use crate::sidecar::ObscuraSidecar;
 use crate::types::{
-    BotBrowserError, BrowserSnapshot, DecryptedSecret, DomNodeSnapshot, ElementRect,
+    BotBrowserError, BrowserCookie, BrowserSnapshot, DecryptedSecret, DomNodeSnapshot, ElementRect,
     NormalizedClickPoint, NormalizedOrigin,
 };
 
@@ -30,6 +30,11 @@ const SENSITIVE_FIELD_MARKERS: &[&str] = &[
     "one-time-code",
     "totp",
     "secret",
+    "api_key",
+    "apikey",
+    "auth_token",
+    "access_token",
+    "ct0",
 ];
 
 #[async_trait]
@@ -91,7 +96,7 @@ impl WsCdpTransport {
 
     async fn resolve_ws_target(&self) -> Result<ResolvedWsTarget, BotBrowserError> {
         if self.endpoint.starts_with("ws://") || self.endpoint.starts_with("wss://") {
-            let needs_target_attach = self.endpoint.ends_with("/devtools/browser");
+            let needs_target_attach = self.endpoint.contains("/devtools/browser");
             return Ok(ResolvedWsTarget {
                 ws_url: self.endpoint.clone(),
                 needs_target_attach,
@@ -505,9 +510,27 @@ impl CdpBridge {
 
     pub async fn navigate(&self, url: &str) -> Result<Value, BotBrowserError> {
         let _guard = self.acquire_public_guard()?;
-        self.transport
+        let res = self
+            .transport
             .send_command("Page.navigate", json!({ "url": url }))
-            .await
+            .await?;
+        if let Some(err_text) = res
+            .get("errorText")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let is_download = res
+                .get("isDownload")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !(is_download && err_text == "net::ERR_ABORTED") {
+                return Err(BotBrowserError::Cdp(format!(
+                    "Page.navigate failed: {err_text}"
+                )));
+            }
+        }
+        Ok(res)
     }
 
     pub async fn click_selector(&self, selector: &str) -> Result<Value, BotBrowserError> {
@@ -535,6 +558,15 @@ impl CdpBridge {
                 json!({ "expression": expression, "returnByValue": true }),
             )
             .await
+    }
+
+    pub async fn send_guarded_command(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, BotBrowserError> {
+        let _guard = self.acquire_public_guard()?;
+        self.transport.send_command(method, params).await
     }
 
     pub async fn capture_screenshot_png(&self, full_page: bool) -> Result<Vec<u8>, BotBrowserError> {
@@ -575,13 +607,14 @@ impl CdpBridge {
   const pageUrl = String(window.location.href || "");
   const pageOrigin = String(window.location.origin || "");
   const title = String(document.title || "");
-  const textExcerpt = root && typeof root.innerText === "string"
-    ? root.innerText.slice(0, 12000)
-    : "";
 
   function cssPath(el) {
     if (el.id) {
       try { return "#" + CSS.escape(el.id); } catch (_) { return "#" + el.id; }
+    }
+    const tid = el.getAttribute("data-testid");
+    if (tid) {
+      return '[data-testid="' + String(tid).replace(/"/g, '\\"') + '"]';
     }
     const tag = (el.tagName || "div").toLowerCase();
     const nm = el.getAttribute("name");
@@ -611,7 +644,8 @@ impl CdpBridge {
     const eid = String(el.getAttribute("id") || "").toLowerCase();
     const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
     const ph = String(el.getAttribute("placeholder") || "").toLowerCase();
-    const hay = [ac, nm, eid, aria, ph].join(" ");
+    const tid = String(el.getAttribute("data-testid") || "").toLowerCase();
+    const hay = [ac, nm, eid, aria, ph, tid].join(" ");
     return (
       inputType === "password" ||
       ac.includes("password") ||
@@ -623,12 +657,71 @@ impl CdpBridge {
       hay.includes("totp") ||
       hay.includes("one-time-code") ||
       hay.includes("secret") ||
-      /\botp\b/.test(hay)
+      hay.includes("api_key") ||
+      hay.includes("apikey") ||
+      hay.includes("auth_token") ||
+      hay.includes("access_token") ||
+      hay.includes("ct0") ||
+      /(?:^|[^a-z0-9])(otp|token|pin)(?:[^a-z0-9]|$)/.test(hay)
     );
   }
 
+  let textExcerpt = "";
+  if (root) {
+    if (isSensitiveField(root)) {
+      textExcerpt = "[REDACTED]";
+    } else {
+      const hasTreeWalker =
+        typeof document.createTreeWalker === "function" &&
+        typeof NodeFilter !== "undefined";
+      const minFallbackLen = hasTreeWalker ? 4 : 1;
+      const restorations = [];
+      const leakedStrings = [];
+      try {
+        const sensitiveTargets = Array.from(
+          root.querySelectorAll(
+            'textarea, [contenteditable="true"], [type="password"], [autocomplete], [name], [id], [aria-label], [placeholder], [data-testid]'
+          )
+        );
+        for (const el of sensitiveTargets) {
+          if (!isSensitiveField(el)) continue;
+          const rawInner = typeof el.innerText === "string" ? el.innerText.trim() : "";
+          const rawContent = typeof el.textContent === "string" ? el.textContent.trim() : "";
+          if (rawInner.length >= minFallbackLen) leakedStrings.push(rawInner);
+          if (rawContent.length >= minFallbackLen && rawContent !== rawInner) {
+            leakedStrings.push(rawContent);
+          }
+          if (hasTreeWalker) {
+            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+            let tNode;
+            let replacedFirst = false;
+            while ((tNode = walker.nextNode())) {
+              const orig = tNode.nodeValue;
+              if (orig && orig.trim().length > 0) {
+                restorations.push({ node: tNode, value: orig });
+                tNode.nodeValue = replacedFirst ? "" : "[REDACTED]";
+                replacedFirst = true;
+              }
+            }
+          }
+        }
+        textExcerpt = typeof root.innerText === "string" ? root.innerText : "";
+      } finally {
+        for (let i = restorations.length - 1; i >= 0; i--) {
+          restorations[i].node.nodeValue = restorations[i].value;
+        }
+      }
+      for (const s of leakedStrings) {
+        if (s && textExcerpt.includes(s)) {
+          textExcerpt = textExcerpt.split(s).join("[REDACTED]");
+        }
+      }
+      textExcerpt = textExcerpt.slice(0, 12000);
+    }
+  }
+
   const candidates = root
-    ? Array.from(root.querySelectorAll('a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [contenteditable="true"]')).slice(0, 200)
+    ? Array.from(root.querySelectorAll('a, button, input, select, textarea, [data-testid], [role="button"], [role="link"], [role="textbox"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="switch"], [contenteditable="true"]')).slice(0, 200)
     : [];
   let redactedCount = 0;
   const interactive_elements = candidates.map((el, idx) => {
@@ -646,6 +739,9 @@ impl CdpBridge {
     const frameOrigin = (el.ownerDocument && el.ownerDocument.location && el.ownerDocument.location.origin) || pageOrigin || null;
     const rawVal = typeof el.value === "string" ? el.value : null;
     const value = sensitive ? "[REDACTED]" : (rawVal !== null ? rawVal.slice(0, 500) : null);
+    const text = sensitive
+      ? "[REDACTED]"
+      : String(el.innerText || el.textContent || "").trim().slice(0, 200);
     return {
       ref_id: "el_" + (idx + 1),
       tag: String(el.tagName || "").toLowerCase(),
@@ -654,8 +750,10 @@ impl CdpBridge {
       id: el.getAttribute("id"),
       aria_label: el.getAttribute("aria-label"),
       placeholder: el.getAttribute("placeholder"),
+      test_id: el.getAttribute("data-testid"),
+      role: el.getAttribute("role"),
       autocomplete: el.getAttribute("autocomplete"),
-      text: String(el.innerText || el.textContent || "").trim().slice(0, 200),
+      text,
       value,
       is_password: sensitive,
       selector: cssPath(el),
@@ -858,6 +956,80 @@ impl CdpBridge {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    pub async fn set_cookies(&self, cookies: &[Value]) -> Result<usize, BotBrowserError> {
+        let _guard = self.acquire_public_guard()?;
+        if cookies.is_empty() {
+            return Ok(0);
+        }
+        match self
+            .transport
+            .send_command("Network.setCookies", json!({ "cookies": cookies }))
+            .await
+        {
+            Ok(_) => Ok(cookies.len()),
+            Err(BotBrowserError::Cdp(_)) => {
+                if self
+                    .transport
+                    .send_command("Storage.setCookies", json!({ "cookies": cookies }))
+                    .await
+                    .is_ok()
+                {
+                    return Ok(cookies.len());
+                }
+                let mut count = 0usize;
+                for cookie in cookies {
+                    let res = self
+                        .transport
+                        .send_command("Network.setCookie", cookie.clone())
+                        .await?;
+                    if res.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                        return Err(BotBrowserError::Cdp(
+                            "Network.setCookie rejected cookie".to_string(),
+                        ));
+                    }
+                    count += 1;
+                }
+                Ok(count)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn get_browser_cookies(
+        &self,
+        domain_filter: Option<&str>,
+    ) -> Result<Vec<BrowserCookie>, BotBrowserError> {
+        let raw = self.get_cookies().await?;
+        let mut out = Vec::with_capacity(raw.len());
+        for item in raw {
+            let Ok(cookie) = serde_json::from_value::<BrowserCookie>(item) else {
+                continue;
+            };
+            if let Some(filter) = domain_filter.map(str::trim).filter(|s| !s.is_empty()) {
+                let norm_filter = filter.trim_start_matches('.').to_ascii_lowercase();
+                let norm_domain = cookie
+                    .domain
+                    .trim()
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                if norm_domain != norm_filter && !norm_domain.ends_with(&format!(".{norm_filter}"))
+                {
+                    continue;
+                }
+            }
+            out.push(cookie);
+        }
+        Ok(out)
+    }
+
+    pub async fn set_browser_cookies(
+        &self,
+        cookies: &[BrowserCookie],
+    ) -> Result<usize, BotBrowserError> {
+        let params: Vec<Value> = cookies.iter().map(|c| c.to_cdp_cookie_param()).collect();
+        self.set_cookies(&params).await
     }
 
     async fn inspect_true_origin_internal(
@@ -1176,6 +1348,10 @@ struct RawDomNodeSnapshot {
     #[serde(default)]
     placeholder: Option<String>,
     #[serde(default)]
+    test_id: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     autocomplete: Option<String>,
     #[serde(default)]
     text: String,
@@ -1193,14 +1369,31 @@ struct RawDomNodeSnapshot {
 fn sanitize_snapshot(raw: RawBrowserSnapshot) -> BrowserSnapshot {
     let mut redacted_count = 0usize;
     let mut elements = Vec::with_capacity(raw.interactive_elements.len());
+    let mut text_excerpt = raw.text_excerpt;
 
     for node in raw.interactive_elements {
         let sensitive = is_sensitive_dom_node(&node);
+        if sensitive {
+            let trimmed_text = node.text.trim();
+            if trimmed_text.len() >= 4 && trimmed_text != "[REDACTED]" {
+                text_excerpt = text_excerpt.replace(trimmed_text, "[REDACTED]");
+            }
+            if let Some(raw_val) = node.value.as_deref().map(str::trim) {
+                if raw_val.len() >= 4 && raw_val != "[REDACTED]" {
+                    text_excerpt = text_excerpt.replace(raw_val, "[REDACTED]");
+                }
+            }
+        }
         let value = if sensitive {
             redacted_count += 1;
             Some("[REDACTED]".to_string())
         } else {
             node.value
+        };
+        let text = if sensitive {
+            "[REDACTED]".to_string()
+        } else {
+            node.text
         };
 
         elements.push(DomNodeSnapshot {
@@ -1211,7 +1404,9 @@ fn sanitize_snapshot(raw: RawBrowserSnapshot) -> BrowserSnapshot {
             id: node.id,
             aria_label: node.aria_label,
             placeholder: node.placeholder,
-            text: node.text,
+            test_id: node.test_id,
+            role: node.role,
+            text,
             value,
             is_password: sensitive,
             selector: node.selector,
@@ -1229,7 +1424,7 @@ fn sanitize_snapshot(raw: RawBrowserSnapshot) -> BrowserSnapshot {
         url: raw.url,
         origin,
         title: raw.title,
-        text_excerpt: raw.text_excerpt,
+        text_excerpt,
         interactive_elements: elements,
         redacted_field_count: redacted_count.max(raw.redacted_field_count),
     }
@@ -1248,23 +1443,32 @@ fn is_sensitive_dom_node(node: &RawDomNodeSnapshot) -> bool {
     }
     if node.autocomplete.as_deref().is_some_and(|ac| {
         let lower = ac.to_ascii_lowercase();
-        lower.contains("password") || lower.contains("one-time-code") || contains_word(&lower, "otp")
+        lower.contains("password")
+            || lower.contains("one-time-code")
+            || contains_word(&lower, "otp")
+            || contains_word(&lower, "token")
+            || contains_word(&lower, "pin")
     }) {
         return true;
     }
 
     for candidate in [
+        node.autocomplete.as_deref(),
         node.name.as_deref(),
         node.id.as_deref(),
         node.aria_label.as_deref(),
         node.placeholder.as_deref(),
+        node.test_id.as_deref(),
         Some(node.selector.as_str()),
     ]
     .into_iter()
     .flatten()
     {
         let lower = candidate.to_ascii_lowercase();
-        if SENSITIVE_FIELD_MARKERS.iter().any(|m| lower.contains(m)) || contains_word(&lower, "otp")
+        if SENSITIVE_FIELD_MARKERS.iter().any(|m| lower.contains(m))
+            || contains_word(&lower, "otp")
+            || contains_word(&lower, "token")
+            || contains_word(&lower, "pin")
         {
             return true;
         }
@@ -1278,6 +1482,19 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
         .any(|token| token == needle)
 }
 
+pub fn check_eval_exception(res: &Value, op_name: &str) -> Result<(), BotBrowserError> {
+    if let Some(details) = res.get("exceptionDetails").filter(|v| !v.is_null()) {
+        let msg = details
+            .get("exception")
+            .and_then(|e| e.get("description").or_else(|| e.get("value")))
+            .and_then(|v| v.as_str())
+            .or_else(|| details.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("unknown JS exception");
+        return Err(BotBrowserError::Cdp(format!("{op_name}: JS exception: {msg}")));
+    }
+    Ok(())
+}
+
 fn extract_eval_value(res: &Value) -> Option<&Value> {
     res.get("result")
         .and_then(|r| r.get("value"))
@@ -1288,6 +1505,7 @@ fn parse_eval_json<T: for<'de> Deserialize<'de>>(
     res: &Value,
     op_name: &str,
 ) -> Result<T, BotBrowserError> {
+    check_eval_exception(res, op_name)?;
     let val = extract_eval_value(res)
         .ok_or_else(|| BotBrowserError::Cdp(format!("{op_name}: missing Runtime.evaluate result")))?;
     if let Some(json_str) = val.as_str() {

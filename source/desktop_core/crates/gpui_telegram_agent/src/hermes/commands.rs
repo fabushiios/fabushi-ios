@@ -223,8 +223,24 @@ pub enum CommandUiEffect {
     SteerActiveTurn { session_id: String, instruction: String },
     QueueMessage { session_id: String, message: String },
     LearnFromSession { skill_name: Option<String> },
+    DistillBrowserScript {
+        app_id: String,
+        slug: String,
+        name: String,
+        app_json: String,
+    },
     ShowDiff,
     ExportFile { filename: String, format: String, content: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDistilledScriptResult {
+    pub app_id: String,
+    pub slug: String,
+    pub name: String,
+    pub step_count: usize,
+    pub summary: String,
+    pub app_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +373,15 @@ pub trait CommandHost {
     fn list_skills(&self) -> Vec<CommandSkillInfo>;
     fn view_skill(&self, name: &str) -> Result<String, String>;
     fn learn_skill(&mut self, name: Option<&str>) -> Result<String, String>;
+    fn distill_browser_script(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<CommandDistilledScriptResult, String> {
+        let app_name = name.unwrap_or("browser-automation").trim();
+        Err(format!(
+            "No active browser session trace available to distill '{app_name}'."
+        ))
+    }
     fn mcp_action(&mut self, action: &str, arg: Option<&str>) -> Result<String, String>;
 
     fn memory_action(&mut self, target: &str, action: &str, args: &[String]) -> Result<String, String>;
@@ -887,6 +912,7 @@ impl SlashCommandRegistry {
         self.add("skills", &[], "/skills [search|list|approve <name>]", ToolsAndSkills, "List and manage SKILL.md skills", true);
         self.add("skill", &[], "/skill <name>", ToolsAndSkills, "View full instructions for a specific SKILL.md skill", true);
         self.add("learn", &[], "/learn [skill_name]", ToolsAndSkills, "Extract a reusable procedural skill from the current session", true);
+        self.add("distill", &["distill-script"], "/distill [name]", ToolsAndSkills, "Compile the recorded browser action trace into a reusable AutomationScriptApp", true);
         self.add("mcp", &[], "/mcp [list|call <tool> <json>|status]", ToolsAndSkills, "Inspect and invoke MCP server tools", true);
 
         // --- Memory, Persona & Honcho ---
@@ -1296,6 +1322,21 @@ impl SlashCommandRegistry {
                         })
                         .with_mutated(vec!["skills".into()]),
                     Err(e) => CommandExecutionOutcome::err("learn", e),
+                }
+            }
+
+            "distill" => {
+                let name = (!args_str.is_empty()).then_some(args_str);
+                match host.distill_browser_script(name) {
+                    Ok(res) => CommandExecutionOutcome::ok("distill", res.summary)
+                        .with_effect(CommandUiEffect::DistillBrowserScript {
+                            app_id: res.app_id,
+                            slug: res.slug,
+                            name: res.name,
+                            app_json: res.app_json,
+                        })
+                        .with_mutated(vec!["browser_scripts".into()]),
+                    Err(e) => CommandExecutionOutcome::err("distill", e),
                 }
             }
 

@@ -125,6 +125,8 @@ public final class FabushiCoordinator {
     @ObservationIgnored
     private var coordinatorLifecycleEpoch: UInt64 = 0
     @ObservationIgnored
+    public private(set) var sessionMutationEpoch: UInt64 = 0
+    @ObservationIgnored
     private var startTaskCounter: UInt64 = 0
     @ObservationIgnored
     private var inFlightStartId: UInt64 = 0
@@ -322,6 +324,7 @@ public final class FabushiCoordinator {
 
     public func shutdown() async {
         coordinatorLifecycleEpoch &+= 1
+        sessionMutationEpoch &+= 1
         clearCoordinatorStateForShutdown()
 
         if let existingShutdown = inFlightShutdownTask {
@@ -464,6 +467,7 @@ public final class FabushiCoordinator {
         extractIdentity: (Res) -> (userId: UInt64, username: String)?
     ) async throws -> FabushiRPCEnvelopeResult<Res> {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let capturedGen = accountScopeGeneration
         let capturedAccount = activeAccountId
@@ -513,6 +517,7 @@ public final class FabushiCoordinator {
     @discardableResult
     public func setAuthSession(_ params: FabushiSessionAuthParams) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.setAuthSession(params, generation: accountScopeGeneration)
         guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
@@ -542,6 +547,7 @@ public final class FabushiCoordinator {
         beforeUsernameLookup: (@MainActor () async -> Void)?
     ) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let res = try await host.switchAccount(accountId: accountId, generation: accountScopeGeneration)
         guard isStarted, coordinatorLifecycleEpoch == capturedEpoch else {
@@ -634,6 +640,7 @@ public final class FabushiCoordinator {
     @discardableResult
     public func clearLocalSession() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let departingAccountId = activeAccountId
         let res = try await host.clearSession(generation: accountScopeGeneration)
@@ -656,6 +663,7 @@ public final class FabushiCoordinator {
     @discardableResult
     public func logout() async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let departingAccountId = activeAccountId
         do {
@@ -707,6 +715,7 @@ public final class FabushiCoordinator {
     @discardableResult
     public func setServerURL(_ serverUrl: String) async throws -> UInt64 {
         guard isStarted else { throw FabushiCoordinatorError.notStarted }
+        sessionMutationEpoch &+= 1
         let capturedEpoch = coordinatorLifecycleEpoch
         let previousServerURL = settingsStore.activeServerURL
         let departingAccountId = activeAccountId
@@ -875,6 +884,9 @@ public final class FabushiCoordinator {
     private func applyGenerationAdvance(_ newGeneration: UInt64) -> Bool {
         guard newGeneration >= accountScopeGeneration else {
             return false
+        }
+        if newGeneration > accountScopeGeneration {
+            sessionMutationEpoch &+= 1
         }
         accountScopeGeneration = newGeneration
         resetAllDomainStores(generation: newGeneration)

@@ -277,18 +277,23 @@ public final class FabushiAuthViewModel {
                     extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                 )
 
+                let postLoginMutationEpoch = coordinator.sessionMutationEpoch
+                var bootstrapSessionValid = true
                 if let identity = envelope.result.identityTuple {
-                    await bootstrapVaultAfterSplitKeyLogin(
+                    bootstrapSessionValid = await bootstrapVaultAfterSplitKeyLogin(
                         userId: identity.userId,
                         password: passwordText,
                         vaultKekB64: derived.vaultKekB64,
                         saltB64: derived.authSaltB64,
                         kdfParams: derived.kdfParams,
-                        expectedGeneration: envelope.generation
+                        expectedGeneration: envelope.generation,
+                        expectedMutationEpoch: postLoginMutationEpoch
                     )
                 }
-                guard serverSwitchGeneration == capturedSwitchGen,
+                guard bootstrapSessionValid,
+                      serverSwitchGeneration == capturedSwitchGen,
                       coordinator.accountScopeGeneration == envelope.generation,
+                      coordinator.sessionMutationEpoch == postLoginMutationEpoch,
                       coordinator.authState != .unauthenticated
                 else {
                     return
@@ -305,15 +310,20 @@ public final class FabushiAuthViewModel {
                     extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                 )
 
+                let postLoginMutationEpoch = coordinator.sessionMutationEpoch
+                var bootstrapSessionValid = true
                 if let identity = envelope.result.identityTuple {
-                    await silentlyUpgradeLegacyV1ToSplitKeyV2(
+                    bootstrapSessionValid = await silentlyUpgradeLegacyV1ToSplitKeyV2(
                         userId: identity.userId,
                         oldPassword: passwordText,
-                        expectedGeneration: envelope.generation
+                        expectedGeneration: envelope.generation,
+                        expectedMutationEpoch: postLoginMutationEpoch
                     )
                 }
-                guard serverSwitchGeneration == capturedSwitchGen,
+                guard bootstrapSessionValid,
+                      serverSwitchGeneration == capturedSwitchGen,
                       coordinator.accountScopeGeneration == envelope.generation,
+                      coordinator.sessionMutationEpoch == postLoginMutationEpoch,
                       coordinator.authState != .unauthenticated
                 else {
                     return
@@ -403,17 +413,28 @@ public final class FabushiAuthViewModel {
                 )
             }
 
+            let postLoginMutationEpoch = coordinator.sessionMutationEpoch
+            var bootstrapSessionValid = true
             if let identity = envelope.result.identityTuple {
-                await initializeAndUploadSplitKeyVault(
+                bootstrapSessionValid = await initializeAndUploadSplitKeyVault(
                     userId: identity.userId,
                     password: passwordText,
                     saltB64: derived.authSaltB64,
                     kdfParams: derived.kdfParams,
                     presentInShellBanner: false,
-                    expectedGeneration: envelope.generation
+                    expectedGeneration: envelope.generation,
+                    expectedMutationEpoch: postLoginMutationEpoch
                 )
             }
-            guard serverSwitchGeneration == capturedSwitchGen else {
+            guard bootstrapSessionValid,
+                  serverSwitchGeneration == capturedSwitchGen,
+                  coordinator.accountScopeGeneration == envelope.generation,
+                  coordinator.sessionMutationEpoch == postLoginMutationEpoch,
+                  coordinator.authState != .unauthenticated
+            else {
+                generatedEmergencyKit = nil
+                hasAcknowledgedEmergencyKitSaved = false
+                didCopyEmergencyKit = false
                 router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
                 return
             }
@@ -566,17 +587,28 @@ public final class FabushiAuthViewModel {
                         ),
                         extractIdentity: { (res: FabushiAuthSessionResponse) in res.identityTuple }
                     )
+                    let postLoginMutationEpoch = coordinator.sessionMutationEpoch
+                    var bootstrapSessionValid = true
                     if let identity = envelope.result.identityTuple {
-                        await initializeAndUploadSplitKeyVault(
+                        bootstrapSessionValid = await initializeAndUploadSplitKeyVault(
                             userId: identity.userId,
                             password: passwordText,
                             saltB64: derived.authSaltB64,
                             kdfParams: derived.kdfParams,
                             presentInShellBanner: false,
-                            expectedGeneration: envelope.generation
+                            expectedGeneration: envelope.generation,
+                            expectedMutationEpoch: postLoginMutationEpoch
                         )
                     }
-                    guard serverSwitchGeneration == capturedSwitchGen else {
+                    guard bootstrapSessionValid,
+                          serverSwitchGeneration == capturedSwitchGen,
+                          coordinator.accountScopeGeneration == envelope.generation,
+                          coordinator.sessionMutationEpoch == postLoginMutationEpoch,
+                          coordinator.authState != .unauthenticated
+                    else {
+                        generatedEmergencyKit = nil
+                        hasAcknowledgedEmergencyKitSaved = false
+                        didCopyEmergencyKit = false
                         router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
                         return
                     }
@@ -990,14 +1022,50 @@ public final class FabushiAuthViewModel {
         return true
     }
 
+    private func isSessionInvalidationError(_ error: Error) -> Bool {
+        if let coordinatorError = error as? FabushiCoordinatorError {
+            switch coordinatorError {
+            case .staleGeneration, .notStarted:
+                return true
+            }
+        }
+        if let hostError = error as? FabushiHostError {
+            switch hostError.code {
+            case "stale_generation", "unauthorized", "host_closed", "not_initialized":
+                return true
+            default:
+                return false
+            }
+        }
+        return false
+    }
+
+    private func isPostLoginSessionValid(
+        expectedGeneration: UInt64?,
+        expectedMutationEpoch: UInt64?
+    ) -> Bool {
+        guard coordinator.authState != .unauthenticated else {
+            return false
+        }
+        if let expectedGeneration, coordinator.accountScopeGeneration != expectedGeneration {
+            return false
+        }
+        if let expectedMutationEpoch, coordinator.sessionMutationEpoch != expectedMutationEpoch {
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
     private func bootstrapVaultAfterSplitKeyLogin(
         userId: UInt64,
         password: String,
         vaultKekB64: String,
         saltB64: String,
         kdfParams: FabushiArgon2KdfParamsDTO,
-        expectedGeneration: UInt64? = nil
-    ) async {
+        expectedGeneration: UInt64? = nil,
+        expectedMutationEpoch: UInt64? = nil
+    ) async -> Bool {
         let accountId = String(userId)
         lastCompletedVaultBootstrap = false
         do {
@@ -1005,9 +1073,11 @@ public final class FabushiAuthViewModel {
                 method: FabushiRPCNamespace.vault.method("envelopeGet"),
                 params: FabushiEmptyParams()
             )
-            if let expectedGeneration,
-               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-                return
+            guard isPostLoginSessionValid(
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
+            ) else {
+                return false
             }
             if let flatEnv = envelopeResp.envelope {
                 let nested = FabushiVaultEnvelopeConverter.toNested(flatEnv)
@@ -1021,9 +1091,11 @@ public final class FabushiAuthViewModel {
                             envelope: nested
                         )
                     )
-                    if let expectedGeneration,
-                       coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-                        return
+                    guard isPostLoginSessionValid(
+                        expectedGeneration: expectedGeneration,
+                        expectedMutationEpoch: expectedMutationEpoch
+                    ) else {
+                        return false
                     }
                     if unlocked.unlocked {
                         if let rootKeyB64 = unlocked.rootKeyB64, !rootKeyB64.isEmpty {
@@ -1046,9 +1118,11 @@ public final class FabushiAuthViewModel {
                             password: paramsMatch ? nil : password
                         )
                     )
-                    if let expectedGeneration,
-                       coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-                        return
+                    guard isPostLoginSessionValid(
+                        expectedGeneration: expectedGeneration,
+                        expectedMutationEpoch: expectedMutationEpoch
+                    ) else {
+                        return false
                     }
                     if unlocked.unlocked {
                         try? securityKeychain.saveVaultRootKeyBase64(unlocked.rootKeyB64, accountId: accountId)
@@ -1060,30 +1134,46 @@ public final class FabushiAuthViewModel {
                     // vault stays locked so user can unlock via Emergency Kit or Device Sync.
                     lastCompletedVaultBootstrap = false
                 }
+                return isPostLoginSessionValid(
+                    expectedGeneration: expectedGeneration,
+                    expectedMutationEpoch: expectedMutationEpoch
+                )
             } else {
-                await initializeAndUploadSplitKeyVault(
+                return await initializeAndUploadSplitKeyVault(
                     userId: userId,
                     password: password,
                     saltB64: saltB64,
                     kdfParams: kdfParams,
                     presentInShellBanner: true,
-                    expectedGeneration: expectedGeneration
+                    expectedGeneration: expectedGeneration,
+                    expectedMutationEpoch: expectedMutationEpoch
                 )
             }
         } catch {
-            // Non-fatal: login succeeded even if server vault envelope endpoint is unavailable.
             lastCompletedVaultBootstrap = false
+            if isSessionInvalidationError(error)
+                || !isPostLoginSessionValid(
+                    expectedGeneration: expectedGeneration,
+                    expectedMutationEpoch: expectedMutationEpoch
+                )
+            {
+                return false
+            }
+            // Non-fatal: login succeeded even if server vault envelope endpoint is unavailable.
+            return true
         }
     }
 
+    @discardableResult
     private func initializeAndUploadSplitKeyVault(
         userId: UInt64,
         password: String,
         saltB64: String,
         kdfParams: FabushiArgon2KdfParamsDTO,
         presentInShellBanner: Bool,
-        expectedGeneration: UInt64? = nil
-    ) async {
+        expectedGeneration: UInt64? = nil,
+        expectedMutationEpoch: UInt64? = nil
+    ) async -> Bool {
         let accountId = String(userId)
         do {
             let initResp: FabushiVaultInitSplitKeyResponse = try await coordinator.dispatchFenced(
@@ -1096,9 +1186,11 @@ public final class FabushiAuthViewModel {
                     fastKdf: useFastKdfForTests ? true : nil
                 )
             )
-            if let expectedGeneration,
-               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-                return
+            guard isPostLoginSessionValid(
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
+            ) else {
+                return false
             }
             let flatEnvelope = FabushiVaultEnvelopeConverter.toFlat(initResp.envelope)
             do {
@@ -1110,18 +1202,36 @@ public final class FabushiAuthViewModel {
                 // CRITICAL rollback (FIX-2): vault.initSplitKey installed BOTH vault_unlocked_key
                 // and vault_envelope in Rust RAM before upload; lock with clear_envelope: true so
                 // failed cloud upload leaves neither unlocked key nor orphan envelope in RAM.
-                let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
-                    method: FabushiRPCNamespace.vault.method("lock"),
-                    params: FabushiVaultLockRequest(clearEnvelope: true)
-                )
-                coordinator.vaultStore.setUnlocked(false)
+                let sessionInvalidated = isSessionInvalidationError(error)
+                    || !isPostLoginSessionValid(
+                        expectedGeneration: expectedGeneration,
+                        expectedMutationEpoch: expectedMutationEpoch
+                    )
+                if !sessionInvalidated {
+                    let _: FabushiJSONValue? = try? await coordinator.dispatchFenced(
+                        method: FabushiRPCNamespace.vault.method("lock"),
+                        params: FabushiVaultLockRequest(clearEnvelope: true)
+                    )
+                    if isPostLoginSessionValid(
+                        expectedGeneration: expectedGeneration,
+                        expectedMutationEpoch: expectedMutationEpoch
+                    ) {
+                        coordinator.vaultStore.setUnlocked(false)
+                    }
+                }
                 lastCompletedVaultBootstrap = false
-                return
+                return !sessionInvalidated
+                    && isPostLoginSessionValid(
+                        expectedGeneration: expectedGeneration,
+                        expectedMutationEpoch: expectedMutationEpoch
+                    )
             }
 
-            if let expectedGeneration,
-               coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-                return
+            guard isPostLoginSessionValid(
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
+            ) else {
+                return false
             }
 
             try? securityKeychain.saveVaultRootKeyBase64(initResp.rootKeyB64, accountId: accountId)
@@ -1134,16 +1244,28 @@ public final class FabushiAuthViewModel {
             } else {
                 generatedEmergencyKit = initResp.emergencyKit
             }
+            return true
         } catch {
             lastCompletedVaultBootstrap = false
+            if isSessionInvalidationError(error)
+                || !isPostLoginSessionValid(
+                    expectedGeneration: expectedGeneration,
+                    expectedMutationEpoch: expectedMutationEpoch
+                )
+            {
+                return false
+            }
+            return true
         }
     }
 
+    @discardableResult
     private func silentlyUpgradeLegacyV1ToSplitKeyV2(
         userId: UInt64,
         oldPassword: String,
-        expectedGeneration: UInt64? = nil
-    ) async {
+        expectedGeneration: UInt64? = nil,
+        expectedMutationEpoch: UInt64? = nil
+    ) async -> Bool {
         do {
             let derived: FabushiDeriveSplitKeyResponse = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.vault.method("deriveSplitKey"),
@@ -1154,6 +1276,12 @@ public final class FabushiAuthViewModel {
                     fastKdf: useFastKdfForTests ? true : nil
                 )
             )
+            guard isPostLoginSessionValid(
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
+            ) else {
+                return false
+            }
             let _: FabushiAuthCustodyUpdateResponse = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.auth.method("upgradeSplitKey"),
                 params: FabushiUpgradeSplitKeyRequest(
@@ -1163,19 +1291,35 @@ public final class FabushiAuthViewModel {
                     kdfParams: derived.kdfParams
                 )
             )
+            guard isPostLoginSessionValid(
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
+            ) else {
+                return false
+            }
             // FIX-1: Delegate to bootstrapVaultAfterSplitKeyLogin so vault.envelopeGet runs FIRST,
             // preserving/unlocking existing argon2id/split_key_v2 envelopes, leaving device_keychain_v2
             // intact, and only initializing/uploading when server envelope is confirmed nil.
-            await bootstrapVaultAfterSplitKeyLogin(
+            return await bootstrapVaultAfterSplitKeyLogin(
                 userId: userId,
                 password: oldPassword,
                 vaultKekB64: derived.vaultKekB64,
                 saltB64: derived.authSaltB64,
                 kdfParams: derived.kdfParams,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                expectedMutationEpoch: expectedMutationEpoch
             )
         } catch {
+            if isSessionInvalidationError(error)
+                || !isPostLoginSessionValid(
+                    expectedGeneration: expectedGeneration,
+                    expectedMutationEpoch: expectedMutationEpoch
+                )
+            {
+                return false
+            }
             // Silent upgrade is intentionally non-fatal for legacy servers.
+            return true
         }
     }
 

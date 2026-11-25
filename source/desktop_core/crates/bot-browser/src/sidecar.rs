@@ -743,24 +743,53 @@ fn is_executable_file(path: &Path) -> bool {
 pub struct ProfileNamespace;
 
 impl ProfileNamespace {
+    pub fn profile_key_for(namespace: &str, origin: Option<&NormalizedOrigin>) -> String {
+        let mut ns_slug = sanitize_slug(namespace, "default");
+        match origin {
+            Some(orig) => {
+                let mut host_slug = sanitize_slug(orig.host(), "origin");
+                let mut hasher = Sha256::new();
+                hasher.update(orig.as_str().as_bytes());
+                let digest = hex::encode(hasher.finalize());
+                let short_sha = &digest[..12];
+                // Total budget: 128 bytes; suffix is `_` + 12 hex = 13, separator `__` = 2 => 113 bytes for slugs.
+                if ns_slug.len() + 2 + host_slug.len() + 1 + 12 > 128 {
+                    ns_slug.truncate(ns_slug.len().min(56));
+                    let remaining = 128usize.saturating_sub(2 + 13 + ns_slug.len());
+                    host_slug.truncate(host_slug.len().min(remaining));
+                    ns_slug = ns_slug.trim_matches(['_', '.']).to_string();
+                    host_slug = host_slug.trim_matches(['_', '.']).to_string();
+                    if ns_slug.is_empty() {
+                        ns_slug = "default".to_string();
+                    }
+                    if host_slug.is_empty() {
+                        host_slug = "origin".to_string();
+                    }
+                }
+                format!("{ns_slug}__{host_slug}_{short_sha}")
+            }
+            None => {
+                let suffix = "__global";
+                if ns_slug.len() + suffix.len() > 128 {
+                    ns_slug.truncate(128 - suffix.len());
+                    ns_slug = ns_slug.trim_matches(['_', '.']).to_string();
+                    if ns_slug.is_empty() {
+                        ns_slug = "default".to_string();
+                    }
+                }
+                format!("{ns_slug}{suffix}")
+            }
+        }
+    }
+
     pub fn storage_dir_for(
         base_dir: &Path,
         namespace: &str,
         origin: Option<&NormalizedOrigin>,
     ) -> PathBuf {
-        let ns_slug = sanitize_slug(namespace, "default");
-        let dir_name = match origin {
-            Some(orig) => {
-                let host_slug = sanitize_slug(orig.host(), "origin");
-                let mut hasher = Sha256::new();
-                hasher.update(orig.as_str().as_bytes());
-                let digest = hex::encode(hasher.finalize());
-                let short_sha = &digest[..12];
-                format!("{ns_slug}__{host_slug}_{short_sha}")
-            }
-            None => format!("{ns_slug}__global"),
-        };
-        base_dir.join("profiles").join(dir_name)
+        base_dir
+            .join("profiles")
+            .join(Self::profile_key_for(namespace, origin))
     }
 }
 

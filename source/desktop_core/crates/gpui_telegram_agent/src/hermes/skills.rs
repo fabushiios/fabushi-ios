@@ -565,6 +565,65 @@ impl SkillsManager {
         })
     }
 
+    /// Builds a `CreateSkillRequest` referencing a distilled, secret-free `AutomationScriptApp`.
+    pub fn build_distilled_browser_script_skill_request(
+        app: &bot_browser::AutomationScriptApp,
+    ) -> CreateSkillRequest {
+        let domains = if app.target_domains.is_empty() {
+            "any".to_string()
+        } else {
+            app.target_domains.join(", ")
+        };
+        let params_summary = if app.parameters.is_empty() {
+            "- (no parameters)\n".to_string()
+        } else {
+            app.parameters
+                .iter()
+                .map(|p| {
+                    format!(
+                        "- `{}` (required={}, secret={}): {}\n",
+                        p.name, p.required, p.is_secret, p.description
+                    )
+                })
+                .collect()
+        };
+        let body = format!(
+            "# {}\n\n## AutomationScriptApp\n- App ID: `{}`\n- Slug: `{}`\n- Version: `{}`\n- Target Domains: {}\n- Deterministic Steps: {}\n\n## Parameters\n{}",
+            app.name,
+            app.app_id,
+            app.slug,
+            app.version,
+            domains,
+            app.steps.len(),
+            params_summary,
+        );
+        let description = if app.description.trim().is_empty() {
+            format!("Deterministic browser automation script app ({})", app.name)
+        } else {
+            app.description.clone()
+        };
+        CreateSkillRequest {
+            name: app.slug.clone(),
+            description,
+            body,
+            platforms: Some(vec!["macos".into(), "linux".into()]),
+            toolsets: Some(vec!["browser".into()]),
+            tags: Some(vec!["browser".into(), "script_app".into(), "distilled".into()]),
+            version: Some(app.version.clone()),
+            origin: Some(SkillOrigin::Learned),
+            trusted: Some(true),
+        }
+    }
+
+    /// Registers a `SKILL.md` index entry referencing a distilled, secret-free `AutomationScriptApp`
+    /// without altering `/learn` behavior.
+    pub fn save_distilled_browser_script_skill(
+        &self,
+        app: &bot_browser::AutomationScriptApp,
+    ) -> Result<SkillDocument> {
+        self.skill_create(Self::build_distilled_browser_script_skill_request(app))
+    }
+
     /// Minimum multi-step tool call count in a turn before self-learning distillation is encouraged.
     pub const SELF_LEARNING_TOOL_CALL_THRESHOLD: usize = 5;
 

@@ -4,16 +4,36 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use std::time::Instant;
+
+use bot_browser::backend::{
+    BrowserSessionBackend, CdpBrowserBackend, KeyEventKind, KeyInputEvent, PointerButton,
+    PointerEventKind, PointerInputEvent,
+};
 use bot_browser::cdp::{CdpBridge, LoginFormSelectors, WsCdpTransport};
-use bot_browser::orchestrator::BotBrowserOrchestrator;
-use bot_browser::types::{BrowserSnapshot, NormalizedOrigin};
+use bot_browser::orchestrator::{
+    BotBrowserOrchestrator, ClickAssistResult, VaultFillResult, VaultListResult,
+    VaultRequestCardResult,
+};
+use bot_browser::script_app::ScriptAppMetadata;
+use bot_browser::types::{
+    BotBrowserError, BrowserBackendKind, BrowserSnapshot, NormalizedOrigin, ReusePolicy,
+    SemanticLocator,
+};
 use gpui_telegram_media::{
     compute_pcm_rms_level, decode_wav_pcm, encode_wav_i16, waveform_from_pcm_i16,
     ThumbnailGenerator,
 };
 
+use super::browser_session::{
+    looks_like_secret_value, redact_snapshot_for_observation, redact_url_for_trace, AiTurnGuard,
+    BrowserAutomationSession, SessionBackendSource, StepGateInfo,
+};
 use super::security::scan_content_for_injection;
-use super::toolsets::{HermesToolArtifact, HermesToolContext, HermesToolResult};
+use super::toolsets::{
+    HermesInlineButton, HermesToolArtifact, HermesToolContext, HermesToolResult, HermesUiAction,
+};
+use super::trajectory::SecretRedactor;
 
 pub async fn execute_web_media_tool(
     name: &str,
@@ -28,6 +48,12 @@ pub async fn execute_web_media_tool(
         "browser_click" => tool_browser_click(args, ctx).await,
         "browser_type" => tool_browser_type(args, ctx).await,
         "browser_screenshot" => tool_browser_screenshot(args, ctx).await,
+        "browser_press_key" => tool_browser_press_key(args, ctx).await,
+        "browser_scroll" => tool_browser_scroll(args, ctx).await,
+        "browser_wait_for" => tool_browser_wait_for(args, ctx).await,
+        "browser_extract_text" => tool_browser_extract_text(args, ctx).await,
+        "browser_request_takeover" => tool_browser_request_takeover(args, ctx).await,
+        "distill_browser_script_app" => tool_distill_browser_script_app(args, ctx).await,
         "vault_list" => tool_vault_list(args, ctx).await,
         "vault_request_card" => tool_vault_request_card(args, ctx).await,
         "vault_fill" => tool_vault_fill(args, ctx).await,
@@ -636,13 +662,151 @@ fn percent_encode(input: &str) -> String {
 // Pure Obscura Browser & Zero-Knowledge Vault / Assist Tools
 // ----------------------------------------------------------------------------
 
-fn resolve_session_id(args: &Value, ctx: &HermesToolContext) -> String {
+fn explicit_session_id(args: &Value) -> Option<&str> {
     args.get("session_id")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+fn resolve_session_id(args: &Value, ctx: &HermesToolContext) -> String {
+    explicit_session_id(args)
         .map(ToString::to_string)
         .unwrap_or_else(|| ctx.session_id.clone())
+}
+
+enum AcquiredBrowserSession {
+    TurnScoped(Arc<BrowserAutomationSession>),
+    Standalone(AiTurnGuard),
+}
+
+impl AcquiredBrowserSession {
+    fn session(&self) -> &Arc<BrowserAutomationSession> {
+        match self {
+            Self::TurnScoped(s) => s,
+            Self::Standalone(g) => g.session(),
+        }
+    }
+}
+
+async fn resolve_and_lock_session(
+    tool_name: &str,
+    args: &Value,
+    ctx: &HermesToolContext,
+    origin_hint: Option<&NormalizedOrigin>,
+) -> Result<AcquiredBrowserSession, HermesToolResult> {
+    let Some(ref registry) = ctx.browser_sessions else {
+        return Err(HermesToolResult::err(
+            tool_name,
+            "No BrowserSessionRegistry attached to HermesToolContext",
+        ));
+    };
+    let explicit_sid = explicit_session_id(args);
+    let cdp_url = resolve_obscura_endpoint(args, ctx);
+    let session = registry
+        .resolve_session(
+            explicit_sid,
+            &ctx.session_id,
+            ctx.bot_browser.as_ref(),
+            cdp_url.as_deref(),
+            origin_hint,
+        )
+        .await
+        .map_err(|e| HermesToolResult::err(tool_name, e.to_string()))?;
+
+    let canonical_sid = session.session_id().to_string();
+    if let Some(ref guard_map) = ctx.browser_ai_guards {
+        let mut guards = guard_map.lock().await;
+        if !guards.contains_key(&canonical_sid) {
+            let guard = session
+                .try_begin_ai_turn()
+                .map_err(|e| HermesToolResult::err(tool_name, e.to_string()))?;
+            guards.insert(canonical_sid, guard);
+        }
+        Ok(AcquiredBrowserSession::TurnScoped(session))
+    } else {
+        let guard = session
+            .try_begin_standalone_step()
+            .map_err(|e| HermesToolResult::err(tool_name, e.to_string()))?;
+        Ok(AcquiredBrowserSession::Standalone(guard))
+    }
+}
+
+fn parse_semantic_locator(args: &Value, allow_text_field: bool) -> SemanticLocator {
+    let get_opt = |k: &str| -> Option<String> {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    };
+    let css_selector = get_opt("css_selector").or_else(|| get_opt("selector"));
+    let text_anchor = get_opt("text_anchor").or_else(|| {
+        if allow_text_field {
+            get_opt("text")
+        } else {
+            None
+        }
+    });
+    SemanticLocator {
+        test_id: get_opt("test_id"),
+        aria_label: get_opt("aria_label"),
+        role: get_opt("role"),
+        text_anchor,
+        css_selector,
+        name_attr: get_opt("name_attr"),
+    }
+}
+
+fn has_non_css_semantic_fields(locator: &SemanticLocator) -> bool {
+    locator.test_id.is_some()
+        || locator.aria_label.is_some()
+        || locator.role.is_some()
+        || locator.text_anchor.is_some()
+        || locator.name_attr.is_some()
+}
+
+fn attach_resumed_context(mut res: HermesToolResult, gate_info: &StepGateInfo) -> HermesToolResult {
+    if !gate_info.resumed_from_takeover {
+        return res;
+    }
+    let url_str = gate_info.refreshed_url.as_deref().unwrap_or("");
+    let title_str = gate_info.refreshed_title.as_deref().unwrap_or("");
+    let excerpt = gate_info
+        .refreshed_snapshot
+        .as_ref()
+        .map(|s| s.text_excerpt.as_str())
+        .unwrap_or("");
+    res.output = format!(
+        "[Resumed from user takeover — live URL: {url_str}, title: {title_str}, excerpt: {excerpt}]\n{}",
+        res.output
+    );
+    let resumed_meta = json!({
+        "resumed_from_takeover": true,
+        "refreshed_url": gate_info.refreshed_url,
+        "refreshed_title": gate_info.refreshed_title,
+        "refreshed_snapshot": gate_info.refreshed_snapshot,
+    });
+    match &mut res.structured {
+        Some(Value::Object(map)) => {
+            map.insert("resumed_from_takeover".into(), json!(true));
+            if let Some(ref u) = gate_info.refreshed_url {
+                map.insert("refreshed_url".into(), json!(u));
+            }
+            if let Some(ref t) = gate_info.refreshed_title {
+                map.insert("refreshed_title".into(), json!(t));
+            }
+            if let Some(ref s) = gate_info.refreshed_snapshot {
+                if let Ok(sv) = serde_json::to_value(s) {
+                    map.insert("refreshed_snapshot".into(), sv);
+                }
+            }
+        }
+        _ => {
+            res.structured = Some(resumed_meta);
+        }
+    }
+    res
 }
 
 fn resolve_task_id(args: &Value, ctx: &HermesToolContext) -> String {
@@ -746,33 +910,81 @@ fn snapshot_to_tool_result(snapshot: &BrowserSnapshot) -> HermesToolResult {
     serialize_tool_json("browser_snapshot", snapshot)
 }
 
+fn normalize_selector_for_sensitivity(selector: &str) -> String {
+    let chars: Vec<char> = selector.chars().collect();
+    let mut out = String::with_capacity(selector.len() + 8);
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '-' {
+            out.push('_');
+            continue;
+        }
+        if ch.is_ascii_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_is_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
 fn is_sensitive_selector_str(selector: &str) -> bool {
     let lower = selector.to_ascii_lowercase();
-    ["password", "passwd", "passcode", "pwd", "one-time-code", "totp"]
+    let normalized = normalize_selector_for_sensitivity(selector);
+    const MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "passcode",
+        "pwd",
+        "one-time-code",
+        "one_time_code",
+        "totp",
+        "secret",
+        "api_key",
+        "apikey",
+        "auth_token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "oauth_token",
+        "bearer_token",
+        "session_id",
+        "ct0",
+    ];
+    MARKERS
         .iter()
-        .any(|m| lower.contains(m))
-        || lower
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|tok| tok == "otp")
+        .any(|m| lower.contains(m) || normalized.contains(m))
+        || [lower.as_str(), normalized.as_str()].into_iter().any(|s| {
+            s.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| matches!(tok, "otp" | "token" | "pin" | "bearer" | "cookie"))
+        })
+}
+
+fn is_sensitive_locator(locator: &SemanticLocator, raw_selector: Option<&str>) -> bool {
+    locator.is_sensitive_hint()
+        || raw_selector.is_some_and(is_sensitive_selector_str)
+        || [
+            locator.css_selector.as_deref(),
+            locator.name_attr.as_deref(),
+            locator.test_id.as_deref(),
+            locator.aria_label.as_deref(),
+            locator.text_anchor.as_deref(),
+            locator.role.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(is_sensitive_selector_str)
 }
 
 async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
     let Some(url) = args.get("url").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
         return HermesToolResult::err("browser_navigate", "Missing required 'url'");
     };
-    let session_id = resolve_session_id(&args, ctx);
-
-    if let Some(orch) = ctx.bot_browser.as_ref() {
-        return match orch.browser_navigate(&session_id, url).await {
-            Ok(res) => HermesToolResult::ok(
-                "browser_navigate",
-                format!("Navigated Obscura session '{session_id}' to {url}"),
-                serde_json::to_value(&res).ok(),
-            ),
-            Err(e) => HermesToolResult::err("browser_navigate", e.to_string()),
-        };
-    }
-
     let origin = match NormalizedOrigin::parse(url) {
         Ok(o) => {
             let host = o.host();
@@ -783,6 +995,107 @@ async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesTo
         }
         Err(e) => return HermesToolResult::err("browser_navigate", e.to_string()),
     };
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_navigate", &args, ctx, Some(&origin)).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess
+            .prepare_step("browser_navigate", None, Some(url.to_string()))
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_navigate", e.to_string()),
+        };
+
+        if sess.auto_pause_on_sensitive_origin() && origin.is_high_sensitivity() {
+            if let Err(e) = sess
+                .request_takeover_and_wait(
+                    "High-sensitivity origin navigation requires user confirmation or takeover",
+                    true,
+                    true,
+                )
+                .await
+            {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_navigate",
+                    0,
+                    e.to_string(),
+                );
+                return HermesToolResult::err("browser_navigate", e.to_string());
+            }
+        }
+
+        let start = Instant::now();
+        let nav_res: Result<(String, Option<Value>), BotBrowserError> = match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => orchestrator
+                .browser_navigate(sess.session_id(), url)
+                .await
+                .map(|r| (r.url.clone(), serde_json::to_value(&r).ok())),
+            SessionBackendSource::Registered(backend) => backend
+                .navigate(url)
+                .await
+                .map(|r| (r.url.clone(), serde_json::to_value(&r).ok())),
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match nav_res {
+            Ok((final_url, mut val)) => {
+                let redacted_url = redact_url_for_trace(&final_url);
+                if let Some(Value::Object(ref mut map)) = val {
+                    if map.contains_key("url") {
+                        map.insert("url".to_string(), json!(redacted_url));
+                    }
+                }
+                sess.record_navigate(&final_url, elapsed_ms);
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_navigate",
+                    elapsed_ms,
+                    None,
+                    Some(final_url.clone()),
+                );
+                let tool_res = HermesToolResult::ok(
+                    "browser_navigate",
+                    format!(
+                        "Navigated session '{}' to {}",
+                        sess.session_id(),
+                        redacted_url
+                    ),
+                    val,
+                );
+                attach_resumed_context(tool_res, &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_navigate",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_navigate", e.to_string())
+            }
+        };
+    }
+
+    let session_id = resolve_session_id(&args, ctx);
+    let redacted_url = redact_url_for_trace(url);
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch.browser_navigate(&session_id, url).await {
+            Ok(mut res) => {
+                res.url = redact_url_for_trace(&res.url);
+                HermesToolResult::ok(
+                    "browser_navigate",
+                    format!("Navigated Obscura session '{session_id}' to {redacted_url}"),
+                    serde_json::to_value(&res).ok(),
+                )
+            }
+            Err(e) => HermesToolResult::err("browser_navigate", e.to_string()),
+        };
+    }
+
     let bridge = match direct_obscura_bridge("browser_navigate", &args, ctx) {
         Ok(b) => b,
         Err(err_res) => return err_res,
@@ -790,8 +1103,8 @@ async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesTo
     match bridge.navigate(url).await {
         Ok(raw) => HermesToolResult::ok(
             "browser_navigate",
-            format!("Navigated Obscura page to {url}"),
-            Some(json!({ "session_id": session_id, "url": url, "origin": origin.as_str(), "cdp": raw })),
+            format!("Navigated Obscura page to {redacted_url}"),
+            Some(json!({ "session_id": session_id, "url": redacted_url, "origin": origin.as_str(), "cdp": raw })),
         ),
         Err(e) => HermesToolResult::err("browser_navigate", e.to_string()),
     }
@@ -800,11 +1113,57 @@ async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesTo
 async fn tool_browser_snapshot(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
     let selector = args
         .get("selector")
+        .or_else(|| args.get("css_selector"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let session_id = resolve_session_id(&args, ctx);
 
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_snapshot", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let loc = selector.map(SemanticLocator::by_css);
+        let gate_info = match sess.prepare_step("browser_snapshot", loc.clone(), None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_snapshot", e.to_string()),
+        };
+        let start = Instant::now();
+        let snap_res = match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                orchestrator
+                    .tool_browser_snapshot(sess.session_id(), selector)
+                    .await
+            }
+            SessionBackendSource::Registered(backend) => backend.snapshot_dom().await,
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match snap_res {
+            Ok(mut snapshot) => {
+                redact_snapshot_for_observation(&mut snapshot);
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_snapshot",
+                    elapsed_ms,
+                    loc,
+                    Some(snapshot.url.clone()),
+                );
+                attach_resumed_context(snapshot_to_tool_result(&snapshot), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_snapshot",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_snapshot", e.to_string())
+            }
+        };
+    }
+
+    let session_id = resolve_session_id(&args, ctx);
     if let Some(orch) = ctx.bot_browser.as_ref() {
         return match orch.tool_browser_snapshot(&session_id, selector).await {
             Ok(snapshot) => snapshot_to_tool_result(&snapshot),
@@ -828,12 +1187,115 @@ async fn tool_browser_click(args: Value, ctx: &HermesToolContext) -> HermesToolR
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let locator = parse_semantic_locator(&args, false);
+    let effective_selector = selector.or(locator.css_selector.as_deref());
     let x = args.get("x").and_then(|v| v.as_f64());
     let y = args.get("y").and_then(|v| v.as_f64());
-    let session_id = resolve_session_id(&args, ctx);
 
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_click", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let opt_loc = (!locator.is_empty()).then(|| locator.clone());
+        let gate_info = match sess.prepare_step("browser_click", opt_loc.clone(), None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_click", e.to_string()),
+        };
+        let start = Instant::now();
+        let use_orch = matches!(sess.source(), SessionBackendSource::Orchestrator { .. })
+            && (x.is_some()
+                || (effective_selector.is_some() && !has_non_css_semantic_fields(&locator)));
+        let click_res: Result<Value, BotBrowserError> = if use_orch {
+            match sess.source() {
+                SessionBackendSource::Orchestrator { orchestrator, .. } => orchestrator
+                    .browser_click(sess.session_id(), effective_selector, x, y)
+                    .await
+                    .and_then(|r| {
+                        serde_json::to_value(&r)
+                            .map_err(|e| BotBrowserError::Cdp(e.to_string()))
+                    }),
+                _ => unreachable!(),
+            }
+        } else {
+            let backend = sess.backend();
+            if !locator.is_empty() {
+                backend.click_locator(&locator).await.and_then(|r| {
+                    serde_json::to_value(&r).map_err(|e| BotBrowserError::Cdp(e.to_string()))
+                })
+            } else if let (Some(px), Some(py)) = (x, y) {
+                match backend
+                    .dispatch_pointer_event(PointerInputEvent {
+                        kind: PointerEventKind::Down,
+                        x: px,
+                        y: py,
+                        button: PointerButton::Left,
+                        click_count: 1,
+                        delta_x: 0.0,
+                        delta_y: 0.0,
+                        modifiers: 0,
+                    })
+                    .await
+                {
+                    Ok(()) => backend
+                        .dispatch_pointer_event(PointerInputEvent {
+                            kind: PointerEventKind::Up,
+                            x: px,
+                            y: py,
+                            button: PointerButton::Left,
+                            click_count: 1,
+                            delta_x: 0.0,
+                            delta_y: 0.0,
+                            modifiers: 0,
+                        })
+                        .await
+                        .map(|()| {
+                            json!({ "ok": true, "operation": "click_coords", "x": px, "y": py })
+                        }),
+                    Err(e) => Err(e),
+                }
+            } else {
+                Err(BotBrowserError::Cdp(
+                    "Provide a semantic locator / 'selector' or ('x', 'y')".to_string(),
+                ))
+            }
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match click_res {
+            Ok(val) => {
+                let page_url = sess.backend().current_url().await.ok();
+                if let Some(ref rec_loc) = opt_loc {
+                    sess.record_click(page_url.clone(), rec_loc.clone(), elapsed_ms);
+                }
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_click",
+                    elapsed_ms,
+                    opt_loc,
+                    page_url,
+                );
+                let output = serde_json::to_string_pretty(&val).unwrap_or_default();
+                attach_resumed_context(
+                    HermesToolResult::ok("browser_click", output, Some(val)),
+                    &gate_info,
+                )
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_click",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_click", e.to_string())
+            }
+        };
+    }
+
+    let session_id = resolve_session_id(&args, ctx);
     if let Some(orch) = ctx.bot_browser.as_ref() {
-        return match orch.browser_click(&session_id, selector, x, y).await {
+        return match orch.browser_click(&session_id, effective_selector, x, y).await {
             Ok(res) => serialize_tool_json("browser_click", &res),
             Err(e) => HermesToolResult::err("browser_click", e.to_string()),
         };
@@ -843,7 +1305,7 @@ async fn tool_browser_click(args: Value, ctx: &HermesToolContext) -> HermesToolR
         Ok(b) => b,
         Err(err_res) => return err_res,
     };
-    if let Some(sel) = selector {
+    if let Some(sel) = effective_selector {
         return match bridge.click_selector(sel).await {
             Ok(res) => HermesToolResult::ok(
                 "browser_click",
@@ -875,29 +1337,164 @@ async fn tool_browser_type(args: Value, ctx: &HermesToolContext) -> HermesToolRe
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let locator = parse_semantic_locator(&args, false);
+    let effective_selector = selector.or(locator.css_selector.as_deref());
     let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
-    let session_id = resolve_session_id(&args, ctx);
+    let param_hint = args
+        .get("parameter_name_hint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
 
-    if let Some(orch) = ctx.bot_browser.as_ref() {
-        return match orch.browser_type(&session_id, selector, text, submit).await {
-            Ok(res) => serialize_tool_json("browser_type", &res),
-            Err(e) => HermesToolResult::err("browser_type", e.to_string()),
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_type", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let opt_loc = (!locator.is_empty()).then(|| locator.clone());
+        let gate_info = match sess.prepare_step("browser_type", opt_loc.clone(), None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_type", e.to_string()),
+        };
+
+        let start = Instant::now();
+        if is_sensitive_locator(&locator, effective_selector) {
+            let err_msg = "Refusing to type into password/OTP/token field via browser_type; use vault_request_card / vault_fill.";
+            sess.emit_step_failed(
+                gate_info.step_index,
+                "browser_type",
+                start.elapsed().as_millis() as u64,
+                err_msg,
+            );
+            return HermesToolResult::err("browser_type", err_msg);
+        }
+
+        let use_orch = matches!(sess.source(), SessionBackendSource::Orchestrator { .. })
+            && !has_non_css_semantic_fields(&locator);
+
+        let type_res: Result<Value, BotBrowserError> = if use_orch {
+            match sess.source() {
+                SessionBackendSource::Orchestrator { orchestrator, .. } => orchestrator
+                    .browser_type(sess.session_id(), effective_selector, text, submit)
+                    .await
+                    .and_then(|r| {
+                        serde_json::to_value(&r)
+                            .map_err(|e| BotBrowserError::Cdp(e.to_string()))
+                    }),
+                _ => unreachable!(),
+            }
+        } else {
+            let backend = sess.backend();
+            if !locator.is_empty() {
+                match backend.fill_locator(&locator, text, false).await {
+                    Ok(outcome) => {
+                        if submit {
+                            let _ = backend.press_key("Enter").await;
+                        }
+                        serde_json::to_value(&outcome)
+                            .map_err(|e| BotBrowserError::Cdp(e.to_string()))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                let mut err_opt = None;
+                for ch in text.chars() {
+                    if let Err(e) = backend
+                        .dispatch_key_event(KeyInputEvent {
+                            kind: KeyEventKind::Char,
+                            key: ch.to_string(),
+                            code: None,
+                            text: Some(ch.to_string()),
+                            windows_virtual_key_code: None,
+                            modifiers: 0,
+                        })
+                        .await
+                    {
+                        err_opt = Some(e);
+                        break;
+                    }
+                }
+                if let Some(e) = err_opt {
+                    Err(e)
+                } else {
+                    if submit {
+                        let _ = backend.press_key("Enter").await;
+                    }
+                    Ok(json!({
+                        "ok": true,
+                        "chars_typed": text.chars().count(),
+                        "submitted": submit
+                    }))
+                }
+            }
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match type_res {
+            Ok(val) => {
+                let page_url = sess.backend().current_url().await.ok();
+                if let Some(ref rec_loc) = opt_loc {
+                    sess.record_fill(
+                        page_url.clone(),
+                        rec_loc.clone(),
+                        text,
+                        false,
+                        None,
+                        param_hint,
+                        elapsed_ms,
+                    );
+                }
+                if submit {
+                    sess.record_press_key(page_url.clone(), "Enter".to_string(), 0);
+                }
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_type",
+                    elapsed_ms,
+                    opt_loc,
+                    page_url,
+                );
+                let output = serde_json::to_string_pretty(&val).unwrap_or_default();
+                attach_resumed_context(
+                    HermesToolResult::ok("browser_type", output, Some(val)),
+                    &gate_info,
+                )
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_type",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_type", e.to_string())
+            }
         };
     }
 
-    if let Some(sel) = selector {
-        if is_sensitive_selector_str(sel) {
-            return HermesToolResult::err(
-                "browser_type",
-                "Refusing to type into password/OTP field via browser_type; use vault_request_card / vault_fill.",
-            );
-        }
+    if is_sensitive_locator(&locator, effective_selector) {
+        return HermesToolResult::err(
+            "browser_type",
+            "Refusing to type into password/OTP/token field via browser_type; use vault_request_card / vault_fill.",
+        );
+    }
+
+    let session_id = resolve_session_id(&args, ctx);
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return match orch
+            .browser_type(&session_id, effective_selector, text, submit)
+            .await
+        {
+            Ok(res) => serialize_tool_json("browser_type", &res),
+            Err(e) => HermesToolResult::err("browser_type", e.to_string()),
+        };
     }
     let bridge = match direct_obscura_bridge("browser_type", &args, ctx) {
         Ok(b) => b,
         Err(err_res) => return err_res,
     };
-    if let Some(sel) = selector {
+    if let Some(sel) = effective_selector {
         let sel_json = serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".to_string());
         let focus_expr = format!("document.querySelector({sel_json})?.focus()");
         if let Err(e) = bridge.evaluate_script(&focus_expr).await {
@@ -948,23 +1545,68 @@ async fn tool_browser_screenshot(args: Value, ctx: &HermesToolContext) -> Hermes
         .get("full_page")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let session_id = resolve_session_id(&args, ctx);
 
-    let png_bytes = if let Some(orch) = ctx.bot_browser.as_ref() {
-        match orch.browser_screenshot(&session_id, full_page).await {
-            Ok(bytes) => bytes,
-            Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
-        }
-    } else {
-        let bridge = match direct_obscura_bridge("browser_screenshot", &args, ctx) {
-            Ok(b) => b,
+    let (png_bytes, gate_info_opt, session_opt) = if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_screenshot", &args, ctx, None).await {
+            Ok(a) => a,
             Err(err_res) => return err_res,
         };
-        match bridge.capture_screenshot_png(full_page).await {
-            Ok(bytes) => bytes,
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("browser_screenshot", None, None).await {
+            Ok(g) => g,
             Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
+        };
+        let start = Instant::now();
+        let shot_res = match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                orchestrator
+                    .browser_screenshot(sess.session_id(), full_page)
+                    .await
+            }
+            SessionBackendSource::Registered(backend) => backend.capture_screenshot().await,
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match shot_res {
+            Ok(bytes) => {
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_screenshot",
+                    elapsed_ms,
+                    None,
+                    None,
+                );
+                (bytes, Some(gate_info), Some(Arc::clone(sess)))
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_screenshot",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                return HermesToolResult::err("browser_screenshot", e.to_string());
+            }
         }
+    } else {
+        let session_id = resolve_session_id(&args, ctx);
+        let bytes = if let Some(orch) = ctx.bot_browser.as_ref() {
+            match orch.browser_screenshot(&session_id, full_page).await {
+                Ok(bytes) => bytes,
+                Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
+            }
+        } else {
+            let bridge = match direct_obscura_bridge("browser_screenshot", &args, ctx) {
+                Ok(b) => b,
+                Err(err_res) => return err_res,
+            };
+            match bridge.capture_screenshot_png(full_page).await {
+                Ok(bytes) => bytes,
+                Err(e) => return HermesToolResult::err("browser_screenshot", e.to_string()),
+            }
+        };
+        (bytes, None, None)
     };
+    let _ = session_opt;
 
     let mut out_path = None;
     if let Some(raw_p) = args.get("output_path").and_then(|v| v.as_str()) {
@@ -981,7 +1623,7 @@ async fn tool_browser_screenshot(args: Value, ctx: &HermesToolContext) -> Hermes
     }
 
     let b64 = base64_encode(&png_bytes);
-    HermesToolResult::ok(
+    let res = HermesToolResult::ok(
         "browser_screenshot",
         format!("Captured Obscura screenshot ({} bytes)", png_bytes.len()),
         Some(json!({ "format": "png", "byte_len": png_bytes.len(), "output_path": out_path })),
@@ -993,10 +1635,627 @@ async fn tool_browser_screenshot(args: Value, ctx: &HermesToolContext) -> Hermes
         path: out_path,
         data_base64: Some(b64),
         metadata: json!({ "source": "obscura" }),
-    })
+    });
+    if let Some(ref gate_info) = gate_info_opt {
+        attach_resumed_context(res, gate_info)
+    } else {
+        res
+    }
+}
+
+async fn tool_browser_press_key(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(key) = args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("browser_press_key", "Missing required 'key'");
+    };
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_press_key", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("browser_press_key", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_press_key", e.to_string()),
+        };
+        let start = Instant::now();
+        let res = sess.backend().press_key(key).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match res {
+            Ok(outcome) => {
+                let page_url = sess.backend().current_url().await.ok();
+                sess.record_press_key(page_url.clone(), key.to_string(), elapsed_ms);
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_press_key",
+                    elapsed_ms,
+                    None,
+                    page_url,
+                );
+                attach_resumed_context(serialize_tool_json("browser_press_key", &outcome), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_press_key",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_press_key", e.to_string())
+            }
+        };
+    }
+
+    let backend = match resolve_fallback_backend("browser_press_key", &args, ctx).await {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    match backend.press_key(key).await {
+        Ok(outcome) => serialize_tool_json("browser_press_key", &outcome),
+        Err(e) => HermesToolResult::err("browser_press_key", e.to_string()),
+    }
+}
+
+async fn tool_browser_scroll(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let delta_x = args.get("delta_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let delta_y = args.get("delta_y").and_then(|v| v.as_f64()).unwrap_or(400.0);
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_scroll", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("browser_scroll", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_scroll", e.to_string()),
+        };
+        let start = Instant::now();
+        let res = sess.backend().scroll(delta_x, delta_y).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match res {
+            Ok(outcome) => {
+                let page_url = sess.backend().current_url().await.ok();
+                sess.record_scroll(page_url.clone(), delta_x, delta_y, elapsed_ms);
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_scroll",
+                    elapsed_ms,
+                    None,
+                    page_url,
+                );
+                attach_resumed_context(serialize_tool_json("browser_scroll", &outcome), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_scroll",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_scroll", e.to_string())
+            }
+        };
+    }
+
+    let backend = match resolve_fallback_backend("browser_scroll", &args, ctx).await {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    match backend.scroll(delta_x, delta_y).await {
+        Ok(outcome) => serialize_tool_json("browser_scroll", &outcome),
+        Err(e) => HermesToolResult::err("browser_scroll", e.to_string()),
+    }
+}
+
+async fn tool_browser_wait_for(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let locator = parse_semantic_locator(&args, false);
+    if locator.is_empty() {
+        return HermesToolResult::err(
+            "browser_wait_for",
+            "Provide a semantic locator (test_id, aria_label, role, text_anchor, name_attr) or selector",
+        );
+    }
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5_000)
+        .clamp(50, 30_000);
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_wait_for", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess
+            .prepare_step("browser_wait_for", Some(locator.clone()), None)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_wait_for", e.to_string()),
+        };
+        let start = Instant::now();
+        let res = sess.backend().wait_for_locator(&locator, timeout_ms).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match res {
+            Ok(outcome) => {
+                let page_url = sess.backend().current_url().await.ok();
+                sess.record_wait_for(page_url.clone(), locator.clone(), timeout_ms, elapsed_ms);
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_wait_for",
+                    elapsed_ms,
+                    Some(locator),
+                    page_url,
+                );
+                attach_resumed_context(serialize_tool_json("browser_wait_for", &outcome), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_wait_for",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_wait_for", e.to_string())
+            }
+        };
+    }
+
+    let backend = match resolve_fallback_backend("browser_wait_for", &args, ctx).await {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    match backend.wait_for_locator(&locator, timeout_ms).await {
+        Ok(outcome) => serialize_tool_json("browser_wait_for", &outcome),
+        Err(e) => HermesToolResult::err("browser_wait_for", e.to_string()),
+    }
+}
+
+async fn tool_browser_extract_text(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let selector = args
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let locator = parse_semantic_locator(&args, false);
+    if locator.is_empty() {
+        return HermesToolResult::err(
+            "browser_extract_text",
+            "Provide a semantic locator (test_id, aria_label, role, text_anchor, name_attr) or selector",
+        );
+    }
+    if is_sensitive_locator(&locator, selector) {
+        return HermesToolResult::err(
+            "browser_extract_text",
+            "Refusing to extract text from a sensitive/password element.",
+        );
+    }
+    let output_key = args
+        .get("output_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("extracted_text")
+        .to_string();
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("browser_extract_text", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess
+            .prepare_step("browser_extract_text", Some(locator.clone()), None)
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("browser_extract_text", e.to_string()),
+        };
+        let start = Instant::now();
+        let res = sess.backend().extract_text_locator(&locator).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match res {
+            Ok(raw_text) => {
+                let (mut safe_text, _) = SecretRedactor::new().redact_text(&raw_text);
+                if looks_like_secret_value(&safe_text) {
+                    safe_text = "[REDACTED]".to_string();
+                }
+                let page_url = sess.backend().current_url().await.ok();
+                sess.record_extract_text(
+                    page_url.clone(),
+                    locator.clone(),
+                    output_key.clone(),
+                    elapsed_ms,
+                );
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "browser_extract_text",
+                    elapsed_ms,
+                    Some(locator),
+                    page_url,
+                );
+                let tool_res = HermesToolResult::ok(
+                    "browser_extract_text",
+                    safe_text.clone(),
+                    Some(json!({ "output_key": output_key, "text": safe_text })),
+                );
+                attach_resumed_context(tool_res, &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "browser_extract_text",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("browser_extract_text", e.to_string())
+            }
+        };
+    }
+
+    let backend = match resolve_fallback_backend("browser_extract_text", &args, ctx).await {
+        Ok(b) => b,
+        Err(err_res) => return err_res,
+    };
+    match backend.extract_text_locator(&locator).await {
+        Ok(raw_text) => {
+            let (mut safe_text, _) = SecretRedactor::new().redact_text(&raw_text);
+            if looks_like_secret_value(&safe_text) {
+                safe_text = "[REDACTED]".to_string();
+            }
+            HermesToolResult::ok(
+                "browser_extract_text",
+                safe_text.clone(),
+                Some(json!({ "output_key": output_key, "text": safe_text })),
+            )
+        }
+        Err(e) => HermesToolResult::err("browser_extract_text", e.to_string()),
+    }
+}
+
+async fn tool_browser_request_takeover(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(reason) = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("browser_request_takeover", "Missing required 'reason'");
+    };
+    let wait_for_finish = args
+        .get("wait_for_finish")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let record_checkpoint = args
+        .get("record_checkpoint")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let acquired = match resolve_and_lock_session("browser_request_takeover", &args, ctx, None).await {
+        Ok(a) => a,
+        Err(err_res) => return err_res,
+    };
+    let sess = acquired.session();
+    let gate_info = match sess
+        .prepare_step("browser_request_takeover", None, None)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => return HermesToolResult::err("browser_request_takeover", e.to_string()),
+    };
+    let sid = sess.session_id().to_string();
+
+    let ui_action = HermesUiAction {
+        action_type: "browser_takeover_requested".to_string(),
+        payload: json!({
+            "session_id": sid,
+            "reason": reason,
+            "wait_for_finish": wait_for_finish,
+        }),
+    };
+    ctx.emit_ui(&ui_action);
+
+    let start = Instant::now();
+    match sess
+        .request_takeover_and_wait(reason, wait_for_finish, record_checkpoint)
+        .await
+    {
+        Ok(outcome) => {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            sess.emit_step_completed(
+                gate_info.step_index,
+                "browser_request_takeover",
+                elapsed_ms,
+                None,
+                outcome.current_url.clone(),
+            );
+            let msg = if outcome.resumed {
+                format!(
+                    "User completed browser takeover for session '{}' (URL: {}, title: {}). Live DOM refreshed.",
+                    outcome.session_id,
+                    outcome.current_url.as_deref().unwrap_or("unknown"),
+                    outcome.page_title.as_deref().unwrap_or(""),
+                )
+            } else {
+                format!(
+                    "Browser takeover requested for session '{}': {}",
+                    outcome.session_id, outcome.reason
+                )
+            };
+            let res = HermesToolResult::ok(
+                "browser_request_takeover",
+                msg,
+                serde_json::to_value(&outcome).ok(),
+            )
+            .with_ui_action(ui_action)
+            .with_inline_buttons(vec![
+                HermesInlineButton {
+                    label: "Take Over".into(),
+                    callback_data: format!("browser_takeover:{sid}"),
+                },
+                HermesInlineButton {
+                    label: "Resume AI".into(),
+                    callback_data: format!("browser_resume:{sid}"),
+                },
+                HermesInlineButton {
+                    label: "Cancel AI".into(),
+                    callback_data: format!("browser_cancel:{sid}"),
+                },
+            ]);
+            attach_resumed_context(res, &gate_info)
+        }
+        Err(e) => {
+            sess.emit_step_failed(
+                gate_info.step_index,
+                "browser_request_takeover",
+                start.elapsed().as_millis() as u64,
+                e.to_string(),
+            );
+            HermesToolResult::err("browser_request_takeover", e.to_string())
+        }
+    }
+}
+
+async fn tool_distill_browser_script_app(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    let Some(name) = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return HermesToolResult::err("distill_browser_script_app", "Missing required 'name'");
+    };
+    let Some(ref registry) = ctx.browser_sessions else {
+        return HermesToolResult::err(
+            "distill_browser_script_app",
+            "No BrowserSessionRegistry attached to HermesToolContext",
+        );
+    };
+
+    let target_sid = explicit_session_id(&args).unwrap_or(ctx.session_id.as_str());
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("automation")
+        .to_string();
+    let slug = args
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let target_domains: Vec<String> = args
+        .get("target_domains")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let meta = ScriptAppMetadata {
+        name: name.to_string(),
+        slug,
+        description,
+        category,
+        target_domains,
+        ..Default::default()
+    };
+
+    match registry.distill_script(target_sid, meta) {
+        Ok(app) => {
+            if args.get("save_as_skill").and_then(|v| v.as_bool()) == Some(true) {
+                let Some(ref bridge) = ctx.state_bridge else {
+                    return HermesToolResult::err(
+                        "distill_browser_script_app",
+                        format!(
+                            "Distilled '{}' ({}) but cannot save skill: no HermesStateBridge attached to HermesToolContext.",
+                            app.name, app.slug
+                        ),
+                    );
+                };
+                let app_val = serde_json::to_value(&app).unwrap_or(Value::Null);
+                let save_res = bridge
+                    .skill_op(&json!({
+                        "action": "save_distilled_browser_script",
+                        "app": app_val,
+                    }))
+                    .await;
+                let final_save_res = match save_res {
+                    Ok(v) => Ok(v),
+                    Err(err) if err.contains("Unknown skill action") => {
+                        let req = super::skills::SkillsManager::build_distilled_browser_script_skill_request(&app);
+                        bridge
+                            .skill_op(&json!({
+                                "action": "create",
+                                "name": req.name,
+                                "description": req.description,
+                                "body": req.body,
+                                "toolsets": req.toolsets,
+                                "tags": req.tags,
+                            }))
+                            .await
+                    }
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = final_save_res {
+                    return HermesToolResult::err(
+                        "distill_browser_script_app",
+                        format!(
+                            "Distilled '{}' ({}) but failed to save skill: {err}",
+                            app.name, app.slug
+                        ),
+                    );
+                }
+            }
+            let payload = serde_json::to_value(&app).unwrap_or(Value::Null);
+            let ui_action = HermesUiAction {
+                action_type: "browser_script_distilled".to_string(),
+                payload: json!({
+                    "app_id": app.app_id,
+                    "slug": app.slug,
+                    "name": app.name,
+                    "step_count": app.steps.len(),
+                    "app": payload,
+                }),
+            };
+            ctx.emit_ui(&ui_action);
+            HermesToolResult::ok(
+                "distill_browser_script_app",
+                format!(
+                    "Distilled '{}' ({}) with {} deterministic step(s) and {} parameter(s).",
+                    app.name,
+                    app.slug,
+                    app.steps.len(),
+                    app.parameters.len(),
+                ),
+                Some(payload),
+            )
+            .with_ui_action(ui_action)
+        }
+        Err(e) => HermesToolResult::err("distill_browser_script_app", e.to_string()),
+    }
+}
+
+async fn resolve_fallback_backend(
+    tool_name: &str,
+    args: &Value,
+    ctx: &HermesToolContext,
+) -> Result<Arc<dyn BrowserSessionBackend>, HermesToolResult> {
+    let session_id = resolve_session_id(args, ctx);
+    if let Some(orch) = ctx.bot_browser.as_ref() {
+        return orch
+            .ensure_session_backend(&session_id, None)
+            .await
+            .map(|b| b as Arc<dyn BrowserSessionBackend>)
+            .map_err(|e| HermesToolResult::err(tool_name, e.to_string()));
+    }
+    let Some(endpoint) = resolve_obscura_endpoint(args, ctx) else {
+        return Err(HermesToolResult::err(
+            tool_name,
+            "Obscura browser engine is not attached and no CDP endpoint was provided.",
+        ));
+    };
+    Ok(Arc::new(CdpBrowserBackend::connect_cdp(
+        BrowserBackendKind::ObscuraCdp,
+        endpoint,
+        std::time::Duration::from_secs(15),
+    )))
+}
+
+fn resolve_orchestrator_for_session(
+    ctx: &HermesToolContext,
+    sess: &BrowserAutomationSession,
+) -> Option<Arc<BotBrowserOrchestrator>> {
+    ctx.bot_browser
+        .clone()
+        .or_else(|| sess.source().orchestrator().cloned())
+        .or_else(|| {
+            ctx.browser_sessions
+                .as_ref()
+                .and_then(|reg| reg.orchestrator())
+        })
 }
 
 async fn tool_vault_list(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("vault_list", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("vault_list", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("vault_list", e.to_string()),
+        };
+        let start = Instant::now();
+        let res = match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                orchestrator.tool_vault_list(sess.session_id()).await
+            }
+            SessionBackendSource::Registered(backend) => {
+                if let Some(orch) = resolve_orchestrator_for_session(ctx, sess) {
+                    match backend.current_url().await {
+                        Ok(url) => match NormalizedOrigin::parse(&url) {
+                            Ok(origin) => orch.vault().list_for_origin(origin.as_str()).map(
+                                |credentials| VaultListResult {
+                                    origin: origin.as_str().to_string(),
+                                    credentials,
+                                },
+                            ),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err(BotBrowserError::Cdp(
+                        "Obscura BotBrowserOrchestrator is not attached to HermesToolContext"
+                            .to_string(),
+                    ))
+                }
+            }
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match res {
+            Ok(list_res) => {
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "vault_list",
+                    elapsed_ms,
+                    None,
+                    None,
+                );
+                attach_resumed_context(serialize_tool_json("vault_list", &list_res), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "vault_list",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("vault_list", e.to_string())
+            }
+        };
+    }
+
     let orch = match require_orchestrator("vault_list", ctx) {
         Ok(o) => o,
         Err(err_res) => return err_res,
@@ -1009,15 +2268,10 @@ async fn tool_vault_list(args: Value, ctx: &HermesToolContext) -> HermesToolResu
 }
 
 async fn tool_vault_request_card(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let orch = match require_orchestrator("vault_request_card", ctx) {
-        Ok(o) => o,
-        Err(err_res) => return err_res,
-    };
     let selectors = match parse_login_selectors(&args) {
         Ok(s) => s,
         Err(msg) => return HermesToolResult::err("vault_request_card", msg),
     };
-    let session_id = resolve_session_id(&args, ctx);
     let task_id = resolve_task_id(&args, ctx);
     let site_title = args
         .get("site_title")
@@ -1025,6 +2279,195 @@ async fn tool_vault_request_card(args: Value, ctx: &HermesToolContext) -> Hermes
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("Site Login");
+    let wait_for_finish = args
+        .get("wait_for_finish")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("vault_request_card", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("vault_request_card", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("vault_request_card", e.to_string()),
+        };
+        let start = Instant::now();
+        match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                let res = orchestrator
+                    .tool_vault_request_card(
+                        sess.session_id(),
+                        &task_id,
+                        ctx.chat_id,
+                        site_title,
+                        selectors,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match res {
+                    Ok(card_res) => {
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            elapsed_ms,
+                            None,
+                            None,
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("vault_request_card", &card_res),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("vault_request_card", e.to_string())
+                    }
+                };
+            }
+            SessionBackendSource::Registered(backend) => {
+                let current_url = match backend.current_url().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("vault_request_card", e.to_string());
+                    }
+                };
+                let origin = match NormalizedOrigin::parse(&current_url) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("vault_request_card", e.to_string());
+                    }
+                };
+                let sid = sess.session_id().to_string();
+                let card_id = format!("card_{}", uuid::Uuid::new_v4().simple());
+                let ui_action = HermesUiAction {
+                    action_type: "vault_login_card".to_string(),
+                    payload: json!({
+                        "card_id": card_id,
+                        "task_id": task_id,
+                        "session_id": sid,
+                        "chat_id": ctx.chat_id,
+                        "origin": origin.as_str(),
+                        "target_url": redact_url_for_trace(&current_url),
+                        "site_title": site_title,
+                        "is_high_sensitivity": origin.is_high_sensitivity(),
+                        "suggested_reuse_policy": ReusePolicy::default_for_origin(&origin),
+                        "selectors": {
+                            "username_selector": selectors.username_selector,
+                            "password_selector": selectors.password_selector,
+                            "totp_selector": selectors.totp_selector,
+                            "submit_selector": selectors.submit_selector,
+                        },
+                    }),
+                };
+                ctx.emit_ui(&ui_action);
+
+                let takeover_res = sess
+                    .request_takeover_and_wait(
+                        &format!("Enter login credentials for '{site_title}' ({origin})"),
+                        wait_for_finish,
+                        true,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match takeover_res {
+                    Ok(outcome) => {
+                        let latest_cred = resolve_orchestrator_for_session(ctx, sess)
+                            .and_then(|orch| orch.vault().list_for_origin(origin.as_str()).ok())
+                            .and_then(|mut list| list.drain(..).next());
+                        let (status, credential_id, account_hint) = if let Some(meta) = latest_cred {
+                            (
+                                if outcome.resumed {
+                                    "saved".to_string()
+                                } else {
+                                    "awaiting_user_takeover".to_string()
+                                },
+                                Some(meta.credential_id),
+                                Some(meta.account_hint),
+                            )
+                        } else {
+                            (
+                                if outcome.resumed {
+                                    "resumed_from_takeover".to_string()
+                                } else {
+                                    "awaiting_user_takeover".to_string()
+                                },
+                                None,
+                                None,
+                            )
+                        };
+                        let card_res = VaultRequestCardResult {
+                            status,
+                            card_id,
+                            credential_id,
+                            account_hint,
+                            origin: origin.as_str().to_string(),
+                        };
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            elapsed_ms,
+                            None,
+                            outcome.current_url.or_else(|| Some(current_url)),
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("vault_request_card", &card_res)
+                                .with_ui_action(ui_action)
+                                .with_inline_buttons(vec![
+                                    HermesInlineButton {
+                                        label: "Take Over".into(),
+                                        callback_data: format!("browser_takeover:{sid}"),
+                                    },
+                                    HermesInlineButton {
+                                        label: "Resume AI".into(),
+                                        callback_data: format!("browser_resume:{sid}"),
+                                    },
+                                    HermesInlineButton {
+                                        label: "Cancel AI".into(),
+                                        callback_data: format!("browser_cancel:{sid}"),
+                                    },
+                                ]),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "vault_request_card",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("vault_request_card", e.to_string())
+                    }
+                };
+            }
+        }
+    }
+
+    let orch = match require_orchestrator("vault_request_card", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let session_id = resolve_session_id(&args, ctx);
 
     match orch
         .tool_vault_request_card(&session_id, &task_id, ctx.chat_id, site_title, selectors)
@@ -1036,10 +2479,6 @@ async fn tool_vault_request_card(args: Value, ctx: &HermesToolContext) -> Hermes
 }
 
 async fn tool_vault_fill(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let orch = match require_orchestrator("vault_fill", ctx) {
-        Ok(o) => o,
-        Err(err_res) => return err_res,
-    };
     let Some(credential_id) = args
         .get("credential_id")
         .and_then(|v| v.as_str())
@@ -1052,29 +2491,218 @@ async fn tool_vault_fill(args: Value, ctx: &HermesToolContext) -> HermesToolResu
         Ok(s) => s,
         Err(msg) => return HermesToolResult::err("vault_fill", msg),
     };
-    let session_id = resolve_session_id(&args, ctx);
     let task_id = resolve_task_id(&args, ctx);
 
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("vault_fill", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("vault_fill", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("vault_fill", e.to_string()),
+        };
+        let start = Instant::now();
+        let fill_outcome: Result<(VaultFillResult, Option<String>), BotBrowserError> =
+            match sess.source() {
+                SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                    match orchestrator
+                        .tool_vault_fill(
+                            sess.session_id(),
+                            &task_id,
+                            ctx.chat_id,
+                            credential_id,
+                            selectors.clone(),
+                        )
+                        .await
+                    {
+                        Ok(res) => {
+                            let page_url = sess.backend().current_url().await.ok();
+                            Ok((res, page_url))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                SessionBackendSource::Registered(backend) => {
+                    let Some(orch) = resolve_orchestrator_for_session(ctx, sess) else {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let err_msg = "Obscura BotBrowserOrchestrator is not attached to HermesToolContext";
+                        sess.emit_step_failed(gate_info.step_index, "vault_fill", elapsed_ms, err_msg);
+                        return HermesToolResult::err("vault_fill", err_msg);
+                    };
+
+                    async {
+                        let meta = orch.vault().get_meta(credential_id)?;
+                        let current_url = backend.current_url().await?;
+                        let page_origin = NormalizedOrigin::parse(&current_url)?;
+                        if page_origin.as_str() != meta.origin {
+                            return Err(BotBrowserError::OriginMismatch {
+                                expected: meta.origin,
+                                actual: page_origin.as_str().to_string(),
+                            });
+                        }
+
+                        if meta.reuse_policy == ReusePolicy::ConfirmEveryTime {
+                            let confirm_ui = HermesUiAction {
+                                action_type: "vault_reuse_confirm_card".to_string(),
+                                payload: json!({
+                                    "session_id": sess.session_id(),
+                                    "credential_id": meta.credential_id,
+                                    "origin": meta.origin,
+                                    "account_hint": meta.account_hint,
+                                }),
+                            };
+                            ctx.emit_ui(&confirm_ui);
+                            sess.request_takeover_and_wait(
+                                &format!(
+                                    "Confirm credential reuse for '{}' on {}",
+                                    meta.account_hint, meta.origin
+                                ),
+                                true,
+                                false,
+                            )
+                            .await?;
+                        }
+
+                        let secret = orch.vault().decrypt_for_origin(
+                            credential_id,
+                            page_origin.as_str(),
+                            None,
+                        )?;
+                        let totp_code = match secret.totp_secret.as_deref() {
+                            Some(raw) => Some(bot_browser::generate_totp_now(raw)?),
+                            None => None,
+                        };
+
+                        backend
+                            .fill_locator(
+                                &SemanticLocator::by_css(&selectors.username_selector),
+                                secret.username.as_str(),
+                                true,
+                            )
+                            .await?;
+                        backend
+                            .fill_locator(
+                                &SemanticLocator::by_css(&selectors.password_selector),
+                                secret.password.as_str(),
+                                true,
+                            )
+                            .await?;
+
+                        let mut used_totp = false;
+                        if let (Some(totp_sel), Some(code)) =
+                            (selectors.totp_selector.as_deref(), totp_code.as_ref())
+                        {
+                            backend
+                                .fill_locator(&SemanticLocator::by_css(totp_sel), code.as_str(), true)
+                                .await?;
+                            used_totp = true;
+                        }
+                        drop(totp_code);
+                        drop(secret);
+
+                        if let Some(submit_sel) = selectors.submit_selector.as_deref() {
+                            backend
+                                .click_locator(&SemanticLocator::by_css(submit_sel))
+                                .await?;
+                        }
+
+                        Ok((
+                            VaultFillResult {
+                                status: "filled_and_submitted".to_string(),
+                                origin: page_origin.as_str().to_string(),
+                                credential_id: credential_id.to_string(),
+                                used_totp,
+                                card_id: None,
+                            },
+                            Some(current_url),
+                        ))
+                    }
+                    .await
+                }
+            };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        return match fill_outcome {
+            Ok((res, page_url)) => {
+                let totp_sel = res
+                    .used_totp
+                    .then(|| selectors.totp_selector.as_deref())
+                    .flatten();
+                sess.record_vault_fill(
+                    page_url.clone(),
+                    credential_id,
+                    &selectors.username_selector,
+                    &selectors.password_selector,
+                    totp_sel,
+                    selectors.submit_selector.as_deref(),
+                    elapsed_ms,
+                );
+                sess.emit_step_completed(
+                    gate_info.step_index,
+                    "vault_fill",
+                    elapsed_ms,
+                    None,
+                    page_url,
+                );
+                attach_resumed_context(serialize_tool_json("vault_fill", &res), &gate_info)
+            }
+            Err(e) => {
+                sess.emit_step_failed(
+                    gate_info.step_index,
+                    "vault_fill",
+                    elapsed_ms,
+                    e.to_string(),
+                );
+                HermesToolResult::err("vault_fill", e.to_string())
+            }
+        };
+    }
+
+    let orch = match require_orchestrator("vault_fill", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let session_id = resolve_session_id(&args, ctx);
+
+    let start = Instant::now();
     match orch
         .tool_vault_fill(
             &session_id,
             &task_id,
             ctx.chat_id,
             credential_id,
-            selectors,
+            selectors.clone(),
         )
         .await
     {
-        Ok(res) => serialize_tool_json("vault_fill", &res),
+        Ok(res) => {
+            if let Some(ref reg) = ctx.browser_sessions {
+                if let Some(sess) = reg.get_session(&session_id) {
+                    let page_url = sess.backend().current_url().await.ok();
+                    let totp_sel = res
+                        .used_totp
+                        .then(|| selectors.totp_selector.as_deref())
+                        .flatten();
+                    sess.record_vault_fill(
+                        page_url,
+                        credential_id,
+                        &selectors.username_selector,
+                        &selectors.password_selector,
+                        totp_sel,
+                        selectors.submit_selector.as_deref(),
+                        start.elapsed().as_millis() as u64,
+                    );
+                }
+            }
+            serialize_tool_json("vault_fill", &res)
+        }
         Err(e) => HermesToolResult::err("vault_fill", e.to_string()),
     }
 }
 
 async fn tool_human_assist_qr(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let orch = match require_orchestrator("human_assist_qr", ctx) {
-        Ok(o) => o,
-        Err(err_res) => return err_res,
-    };
     let Some(qr_selector) = args
         .get("qr_selector")
         .and_then(|v| v.as_str())
@@ -1098,8 +2726,180 @@ async fn tool_human_assist_qr(args: Value, ctx: &HermesToolContext) -> HermesToo
                 .collect()
         })
         .unwrap_or_default();
-    let session_id = resolve_session_id(&args, ctx);
     let task_id = resolve_task_id(&args, ctx);
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("human_assist_qr", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("human_assist_qr", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("human_assist_qr", e.to_string()),
+        };
+        let start = Instant::now();
+        match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                let res = orchestrator
+                    .tool_human_assist_qr(
+                        sess.session_id(),
+                        &task_id,
+                        ctx.chat_id,
+                        qr_selector,
+                        success_url_contains,
+                        auth_cookie_names,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match res {
+                    Ok(qr_res) => {
+                        let page_url = sess.backend().current_url().await.ok();
+                        sess.record_human_checkpoint(
+                            page_url.clone(),
+                            format!("Human QR login checkpoint ({qr_selector})"),
+                        );
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            elapsed_ms,
+                            None,
+                            page_url,
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("human_assist_qr", &qr_res),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("human_assist_qr", e.to_string())
+                    }
+                };
+            }
+            SessionBackendSource::Registered(backend) => {
+                let initial_url = match backend.current_url().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("human_assist_qr", e.to_string());
+                    }
+                };
+                let origin = match NormalizedOrigin::parse(&initial_url) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("human_assist_qr", e.to_string());
+                    }
+                };
+                let png_b64 = backend
+                    .capture_screenshot()
+                    .await
+                    .ok()
+                    .map(|bytes| base64_encode(&bytes));
+                let card_id = format!("card_{}", uuid::Uuid::new_v4().simple());
+                let sid = sess.session_id().to_string();
+                let ui_action = HermesUiAction {
+                    action_type: "human_assist_qr_card".to_string(),
+                    payload: json!({
+                        "card_id": card_id,
+                        "task_id": task_id,
+                        "session_id": sid,
+                        "chat_id": ctx.chat_id,
+                        "origin": origin.as_str(),
+                        "target_url": redact_url_for_trace(&initial_url),
+                        "qr_selector": qr_selector,
+                        "success_url_contains": success_url_contains,
+                        "auth_cookie_names": auth_cookie_names,
+                        "png_base64": png_b64,
+                    }),
+                };
+                ctx.emit_ui(&ui_action);
+
+                if let Err(e) = sess
+                    .request_takeover_and_wait(
+                        &format!("Human QR login checkpoint ({qr_selector})"),
+                        false,
+                        true,
+                    )
+                    .await
+                {
+                    sess.emit_step_failed(
+                        gate_info.step_index,
+                        "human_assist_qr",
+                        start.elapsed().as_millis() as u64,
+                        e.to_string(),
+                    );
+                    return HermesToolResult::err("human_assist_qr", e.to_string());
+                }
+
+                let (refresh_interval, max_wait) = resolve_orchestrator_for_session(ctx, sess)
+                    .map(|o| (o.config().qr_refresh_interval, o.config().qr_max_wait))
+                    .unwrap_or((
+                        std::time::Duration::from_millis(200),
+                        std::time::Duration::from_secs(180),
+                    ));
+                let wait_res = sess
+                    .wait_for_qr_assist_or_resume(
+                        gate_info.step_index,
+                        card_id,
+                        &initial_url,
+                        success_url_contains,
+                        &auth_cookie_names,
+                        refresh_interval,
+                        max_wait,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match wait_res {
+                    Ok(qr_res) => {
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            elapsed_ms,
+                            None,
+                            qr_res.redirected_url.clone().or(Some(initial_url)),
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("human_assist_qr", &qr_res)
+                                .with_ui_action(ui_action),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_qr",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("human_assist_qr", e.to_string())
+                    }
+                };
+            }
+        }
+    }
+
+    let orch = match require_orchestrator("human_assist_qr", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let session_id = resolve_session_id(&args, ctx);
 
     match orch
         .tool_human_assist_qr(
@@ -1112,16 +2912,23 @@ async fn tool_human_assist_qr(args: Value, ctx: &HermesToolContext) -> HermesToo
         )
         .await
     {
-        Ok(res) => serialize_tool_json("human_assist_qr", &res),
+        Ok(res) => {
+            if let Some(ref reg) = ctx.browser_sessions {
+                if let Some(sess) = reg.get_session(&session_id) {
+                    let page_url = sess.backend().current_url().await.ok();
+                    sess.record_human_checkpoint(
+                        page_url,
+                        format!("Human QR login checkpoint ({qr_selector})"),
+                    );
+                }
+            }
+            serialize_tool_json("human_assist_qr", &res)
+        }
         Err(e) => HermesToolResult::err("human_assist_qr", e.to_string()),
     }
 }
 
 async fn tool_human_assist_click(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let orch = match require_orchestrator("human_assist_click", ctx) {
-        Ok(o) => o,
-        Err(err_res) => return err_res,
-    };
     let Some(target_selector) = args
         .get("target_selector")
         .and_then(|v| v.as_str())
@@ -1141,8 +2948,159 @@ async fn tool_human_assist_click(args: Value, ctx: &HermesToolContext) -> Hermes
         .and_then(|v| v.as_u64())
         .unwrap_or(3)
         .clamp(1, 16) as u8;
-    let session_id = resolve_session_id(&args, ctx);
     let task_id = resolve_task_id(&args, ctx);
+
+    if ctx.browser_sessions.is_some() {
+        let acquired = match resolve_and_lock_session("human_assist_click", &args, ctx, None).await {
+            Ok(a) => a,
+            Err(err_res) => return err_res,
+        };
+        let sess = acquired.session();
+        let gate_info = match sess.prepare_step("human_assist_click", None, None).await {
+            Ok(g) => g,
+            Err(e) => return HermesToolResult::err("human_assist_click", e.to_string()),
+        };
+        let start = Instant::now();
+        match sess.source() {
+            SessionBackendSource::Orchestrator { orchestrator, .. } => {
+                let res = orchestrator
+                    .tool_human_assist_click(
+                        sess.session_id(),
+                        &task_id,
+                        ctx.chat_id,
+                        target_selector,
+                        instruction,
+                        max_clicks,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match res {
+                    Ok(click_res) => {
+                        let page_url = sess.backend().current_url().await.ok();
+                        sess.record_human_checkpoint(
+                            page_url.clone(),
+                            format!("Human click assist checkpoint: {instruction}"),
+                        );
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            elapsed_ms,
+                            None,
+                            page_url,
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("human_assist_click", &click_res),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("human_assist_click", e.to_string())
+                    }
+                };
+            }
+            SessionBackendSource::Registered(backend) => {
+                let current_url = match backend.current_url().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("human_assist_click", e.to_string());
+                    }
+                };
+                let origin = match NormalizedOrigin::parse(&current_url) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            start.elapsed().as_millis() as u64,
+                            e.to_string(),
+                        );
+                        return HermesToolResult::err("human_assist_click", e.to_string());
+                    }
+                };
+                let png_b64 = backend
+                    .capture_screenshot()
+                    .await
+                    .ok()
+                    .map(|bytes| base64_encode(&bytes));
+                let card_id = format!("card_{}", uuid::Uuid::new_v4().simple());
+                let sid = sess.session_id().to_string();
+                let ui_action = HermesUiAction {
+                    action_type: "human_assist_click_card".to_string(),
+                    payload: json!({
+                        "card_id": card_id,
+                        "task_id": task_id,
+                        "session_id": sid,
+                        "chat_id": ctx.chat_id,
+                        "origin": origin.as_str(),
+                        "target_url": redact_url_for_trace(&current_url),
+                        "target_selector": target_selector,
+                        "instruction": instruction,
+                        "max_clicks": max_clicks,
+                        "png_base64": png_b64,
+                    }),
+                };
+                ctx.emit_ui(&ui_action);
+
+                let takeover_res = sess
+                    .request_takeover_and_wait(
+                        &format!("Human click assist: {instruction} ({target_selector})"),
+                        true,
+                        true,
+                    )
+                    .await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return match takeover_res {
+                    Ok(outcome) => {
+                        let click_res = ClickAssistResult {
+                            status: "completed_via_takeover".to_string(),
+                            card_id,
+                            count: 0,
+                            dispatched_points: Vec::new(),
+                        };
+                        sess.emit_step_completed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            elapsed_ms,
+                            None,
+                            outcome.current_url.or(Some(current_url)),
+                        );
+                        attach_resumed_context(
+                            serialize_tool_json("human_assist_click", &click_res)
+                                .with_ui_action(ui_action),
+                            &gate_info,
+                        )
+                    }
+                    Err(e) => {
+                        sess.emit_step_failed(
+                            gate_info.step_index,
+                            "human_assist_click",
+                            elapsed_ms,
+                            e.to_string(),
+                        );
+                        HermesToolResult::err("human_assist_click", e.to_string())
+                    }
+                };
+            }
+        }
+    }
+
+    let orch = match require_orchestrator("human_assist_click", ctx) {
+        Ok(o) => o,
+        Err(err_res) => return err_res,
+    };
+    let session_id = resolve_session_id(&args, ctx);
 
     match orch
         .tool_human_assist_click(
@@ -1155,7 +3113,18 @@ async fn tool_human_assist_click(args: Value, ctx: &HermesToolContext) -> Hermes
         )
         .await
     {
-        Ok(res) => serialize_tool_json("human_assist_click", &res),
+        Ok(res) => {
+            if let Some(ref reg) = ctx.browser_sessions {
+                if let Some(sess) = reg.get_session(&session_id) {
+                    let page_url = sess.backend().current_url().await.ok();
+                    sess.record_human_checkpoint(
+                        page_url,
+                        format!("Human click assist checkpoint: {instruction}"),
+                    );
+                }
+            }
+            serialize_tool_json("human_assist_click", &res)
+        }
         Err(e) => HermesToolResult::err("human_assist_click", e.to_string()),
     }
 }

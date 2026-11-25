@@ -145,7 +145,10 @@ impl SecretRedactor {
         // 4. Prefixed secret tokens (`sk-`, `ghp_`, `xoxb-`, `AIza`, `AKIA`)
         text = redact_prefixed_tokens(&text, &mut report);
 
-        // 5. Key-value credential assignments (`api_key=...`, `aws_secret_access_key=...`, `x-api-key: ...`)
+        // 5. Raw JWT tokens (`eyJ<header>.<payload>.<sig>`)
+        text = redact_jwt_tokens(&text, &mut report);
+
+        // 6. Key-value credential assignments (`api_key=...`, `ct0=...`, `auth_token=...`, etc.)
         text = redact_key_value_secrets(&text, &mut report);
 
         (text, report)
@@ -302,63 +305,178 @@ fn redact_prefixed_tokens(input: &str, report: &mut RedactionReport) -> String {
     out
 }
 
+fn redact_jwt_tokens(input: &str, report: &mut RedactionReport) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let byte_idx = chars[i].0;
+        let slice = &input[byte_idx..];
+        let prev_ok = if i == 0 {
+            true
+        } else {
+            let p = chars[i - 1].1;
+            !p.is_ascii_alphanumeric() && p != '_'
+        };
+
+        let mut matched = false;
+        if prev_ok && slice.starts_with("eyJ") {
+            let tok_bytes = slice
+                .char_indices()
+                .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(*c, '_' | '-' | '.'))
+                .map(|(idx, c)| idx + c.len_utf8())
+                .last()
+                .unwrap_or(0);
+            let tok = &slice[..tok_bytes];
+            let mut parts = tok.split('.');
+            let p1 = parts.next().unwrap_or("");
+            let p2 = parts.next().unwrap_or("");
+            let p3 = parts.next().unwrap_or("");
+            let extra = parts.next();
+            if tok.len() >= 24
+                && extra.is_none()
+                && p1.len() >= 4
+                && p2.len() >= 4
+                && p3.len() >= 4
+            {
+                out.push_str("[REDACTED:JWT]");
+                report.record("jwt");
+                let target_byte = byte_idx + tok_bytes;
+                while i < chars.len() && chars[i].0 < target_byte {
+                    i += 1;
+                }
+                matched = true;
+            }
+        }
+        if !matched {
+            out.push(chars[i].1);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn redact_key_value_secrets(input: &str, report: &mut RedactionReport) -> String {
     const KEYS: &[&str] = &[
         "aws_secret_access_key",
         "openai_api_key",
         "anthropic_api_key",
         "openrouter_api_key",
+        "refresh_token",
+        "oauth_token",
+        "access_token",
+        "auth_token",
+        "session_id",
+        "client_secret",
+        "secret_key",
+        "set-cookie",
         "x-api-key",
+        "password",
+        "passcode",
+        "passwd",
         "api_key",
         "apikey",
-        "access_token",
-        "secret_key",
-        "client_secret",
-        "password",
+        "id_token",
+        "cookie",
+        "secret",
+        "token",
+        "totp",
+        "otp",
+        "ct0",
+        "pwd",
     ];
 
     let mut lines_out = Vec::new();
     for line in input.split('\n') {
-        let lower = line.to_ascii_lowercase();
         let mut modified = line.to_string();
         for key in KEYS {
-            if let Some(pos) = lower.find(key) {
-                let after_key = &modified[pos + key.len()..];
-                let trimmed = after_key.trim_start();
-                if let Some(sep) = trimmed.chars().next() {
-                    if sep == '=' || sep == ':' {
-                        let sep_offset = after_key.len() - trimmed.len() + sep.len_utf8();
-                        let val_slice = &after_key[sep_offset..];
-                        let ws_len = val_slice.len() - val_slice.trim_start().len();
-                        let val_start = pos + key.len() + sep_offset + ws_len;
-                        let rest = &modified[val_start..];
-                        let (quote_prefix, actual_rest) = if let Some(r) = rest.strip_prefix('"') {
-                            ("\"", r)
-                        } else if let Some(r) = rest.strip_prefix('\'') {
-                            ("'", r)
-                        } else {
-                            ("", rest)
-                        };
-                        let val_len = actual_rest
-                            .char_indices()
-                            .take_while(|(_, c)| {
-                                !c.is_whitespace() && *c != '"' && *c != '\'' && *c != ',' && *c != ';' && *c != '}'
-                            })
-                            .map(|(idx, c)| idx + c.len_utf8())
-                            .last()
-                            .unwrap_or(0);
-                        let candidate = &actual_rest[..val_len];
-                        if val_len >= 6 && !candidate.starts_with("[REDACTED") {
-                            let end_idx = val_start + quote_prefix.len() + val_len;
-                            let mut rebuilt = String::new();
-                            rebuilt.push_str(&modified[..val_start + quote_prefix.len()]);
-                            rebuilt.push_str("[REDACTED:SECRET]");
-                            rebuilt.push_str(&modified[end_idx..]);
-                            modified = rebuilt;
-                            report.record("key_value_secret");
-                            break;
-                        }
+            let mut search_from = 0usize;
+            loop {
+                let lower = modified.to_ascii_lowercase();
+                if search_from >= lower.len() {
+                    break;
+                }
+                let Some(rel_pos) = lower[search_from..].find(key) else {
+                    break;
+                };
+                let pos = search_from + rel_pos;
+                let prev_ok = if pos == 0 {
+                    true
+                } else {
+                    let prev = lower.as_bytes()[pos - 1] as char;
+                    if matches!(*key, "otp" | "ct0" | "pwd" | "totp") {
+                        !prev.is_ascii_alphanumeric() && prev != '_'
+                    } else {
+                        !prev.is_ascii_alphanumeric()
                     }
+                };
+                if !prev_ok {
+                    search_from = pos + key.len();
+                    continue;
+                }
+
+                let after_key_raw = &modified[pos + key.len()..];
+                // Allow closing quote right after key in JSON (e.g. `"auth_token": "secret"`).
+                let quote_after_key = if after_key_raw.starts_with('"') || after_key_raw.starts_with('\'') {
+                    1
+                } else {
+                    0
+                };
+                let after_key = &after_key_raw[quote_after_key..];
+                let trimmed = after_key.trim_start();
+                let Some(sep) = trimmed.chars().next() else {
+                    search_from = pos + key.len();
+                    continue;
+                };
+                if sep != '=' && sep != ':' {
+                    search_from = pos + key.len();
+                    continue;
+                }
+
+                let sep_offset = after_key.len() - trimmed.len() + sep.len_utf8();
+                let val_slice = &after_key[sep_offset..];
+                let ws_len = val_slice.len() - val_slice.trim_start().len();
+                let val_start = pos + key.len() + quote_after_key + sep_offset + ws_len;
+                let rest = &modified[val_start..];
+                let (quote_prefix, actual_rest) = if let Some(r) = rest.strip_prefix('"') {
+                    ("\"", r)
+                } else if let Some(r) = rest.strip_prefix('\'') {
+                    ("'", r)
+                } else {
+                    ("", rest)
+                };
+                let val_len = actual_rest
+                    .char_indices()
+                    .take_while(|(_, c)| {
+                        !c.is_whitespace()
+                            && *c != '"'
+                            && *c != '\''
+                            && *c != ','
+                            && *c != ';'
+                            && *c != '}'
+                            && *c != '&'
+                            && *c != '#'
+                    })
+                    .map(|(idx, c)| idx + c.len_utf8())
+                    .last()
+                    .unwrap_or(0);
+                let candidate = &actual_rest[..val_len];
+                let candidate_lower = candidate.to_ascii_lowercase();
+                let is_benign_literal = matches!(
+                    candidate_lower.as_str(),
+                    "true" | "false" | "null" | "none"
+                );
+                if val_len >= 4 && !is_benign_literal && !candidate.starts_with("[REDACTED") {
+                    let end_idx = val_start + quote_prefix.len() + val_len;
+                    let mut rebuilt = String::new();
+                    rebuilt.push_str(&modified[..val_start + quote_prefix.len()]);
+                    rebuilt.push_str("[REDACTED:SECRET]");
+                    rebuilt.push_str(&modified[end_idx..]);
+                    modified = rebuilt;
+                    report.record("key_value_secret");
+                    search_from = val_start + quote_prefix.len() + "[REDACTED:SECRET]".len();
+                } else {
+                    search_from = pos + key.len();
                 }
             }
         }
@@ -929,6 +1047,29 @@ mod tests {
         assert!(!scrubbed.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!scrubbed.contains("MIIEpAIBAAKCAQ"));
         assert!(report.total_redactions >= 6);
+    }
+
+    #[test]
+    fn test_secret_redactor_multi_secret_line_cookies_and_jwt() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let sample = format!(
+            "Debug: ct0=CT0_EXTRACTED_444 auth_token=AUTH_EXTRACTED_555 refresh_token=REF_EXTRACTED_666 jwt={jwt}\n\
+             {{\"oauth_token\": \"OAUTH_JSON_777\", \"session_id\": \"SESS_JSON_888\"}}\n\
+             Set-Cookie: session_cookie_val_999\n\
+             laptop=MacBookPro require_password=false"
+        );
+        let (scrubbed, report) = SecretRedactor::new().redact_text(&sample);
+        assert!(!scrubbed.contains("CT0_EXTRACTED_444"), "{scrubbed}");
+        assert!(!scrubbed.contains("AUTH_EXTRACTED_555"), "{scrubbed}");
+        assert!(!scrubbed.contains("REF_EXTRACTED_666"), "{scrubbed}");
+        assert!(!scrubbed.contains(jwt), "{scrubbed}");
+        assert!(!scrubbed.contains("OAUTH_JSON_777"), "{scrubbed}");
+        assert!(!scrubbed.contains("SESS_JSON_888"), "{scrubbed}");
+        assert!(!scrubbed.contains("session_cookie_val_999"), "{scrubbed}");
+        // Benign non-secrets preserved
+        assert!(scrubbed.contains("laptop=MacBookPro"), "{scrubbed}");
+        assert!(scrubbed.contains("require_password=false"), "{scrubbed}");
+        assert!(report.total_redactions >= 7);
     }
 
     #[test]

@@ -342,7 +342,14 @@ impl CredentialVault {
                  last_used_at_ms INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_vault_credentials_origin
-                 ON vault_credentials(origin);",
+                 ON vault_credentials(origin);
+             CREATE TABLE IF NOT EXISTS vault_browser_profiles (
+                 profile_key TEXT PRIMARY KEY NOT NULL,
+                 origin TEXT,
+                 nonce BLOB NOT NULL,
+                 ciphertext BLOB NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );",
         )
         .map_err(|e| BotBrowserError::Storage(format!("failed to initialize vault schema: {e}")))?;
 
@@ -943,6 +950,177 @@ impl CredentialVault {
 
         Ok(true)
     }
+
+    pub fn store_profile_snapshot(
+        &self,
+        profile_key: &str,
+        origin: Option<&NormalizedOrigin>,
+        bundle_bytes: &[u8],
+    ) -> Result<(), BotBrowserError> {
+        let key_trimmed = profile_key.trim();
+        if key_trimmed.is_empty() {
+            return Err(BotBrowserError::Storage(
+                "profile_key cannot be empty".to_string(),
+            ));
+        }
+        let origin_str = origin.map(|o| o.as_str()).unwrap_or("");
+        let subkey = derive_profile_key(&self.master_key, key_trimmed)?;
+        let aad = build_profile_aad(key_trimmed, origin_str);
+
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+            BotBrowserError::Crypto(format!("failed to generate profile AEAD nonce: {e}"))
+        })?;
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: bundle_bytes,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| {
+                BotBrowserError::Crypto(format!("profile snapshot encryption failed: {e}"))
+            })?;
+
+        let now_ms = Utc::now().timestamp_millis();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO vault_browser_profiles (profile_key, origin, nonce, ciphertext, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(profile_key) DO UPDATE SET
+                 origin = excluded.origin,
+                 nonce = excluded.nonce,
+                 ciphertext = excluded.ciphertext,
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                key_trimmed,
+                origin.map(|o| o.as_str()),
+                nonce_bytes.as_slice(),
+                ciphertext,
+                now_ms,
+            ],
+        )
+        .map_err(|e| {
+            BotBrowserError::Storage(format!("failed to store profile snapshot: {e}"))
+        })?;
+        Ok(())
+    }
+
+    pub fn load_profile_snapshot(
+        &self,
+        profile_key: &str,
+        origin: Option<&NormalizedOrigin>,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, BotBrowserError> {
+        let key_trimmed = profile_key.trim();
+        if key_trimmed.is_empty() {
+            return Err(BotBrowserError::Storage(
+                "profile_key cannot be empty".to_string(),
+            ));
+        }
+        let row: Option<(Option<String>, Vec<u8>, Vec<u8>)> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT origin, nonce, ciphertext
+                 FROM vault_browser_profiles
+                 WHERE profile_key = ?1",
+                params![key_trimmed],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| {
+                BotBrowserError::Storage(format!("failed to query profile snapshot: {e}"))
+            })?
+        };
+
+        let Some((stored_origin, nonce_bytes, ciphertext)) = row else {
+            return Ok(None);
+        };
+        if let Some(expected_origin) = origin {
+            if stored_origin.as_deref() != Some(expected_origin.as_str()) {
+                return Err(BotBrowserError::OriginMismatch {
+                    expected: expected_origin.as_str().to_string(),
+                    actual: stored_origin.unwrap_or_default(),
+                });
+            }
+        }
+        if nonce_bytes.len() != 12 {
+            return Err(BotBrowserError::Crypto(format!(
+                "invalid profile nonce length {}, expected 12",
+                nonce_bytes.len()
+            )));
+        }
+        let origin_str = stored_origin.as_deref().unwrap_or("");
+        let subkey = derive_profile_key(&self.master_key, key_trimmed)?;
+        let aad = build_profile_aad(key_trimmed, origin_str);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*subkey));
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|e| {
+                BotBrowserError::Crypto(format!("profile snapshot decryption failed: {e}"))
+            })?;
+        Ok(Some(Zeroizing::new(plaintext)))
+    }
+
+    pub fn delete_profile_snapshot(&self, profile_key: &str) -> Result<bool, BotBrowserError> {
+        let conn = self.conn.lock();
+        let affected = conn
+            .execute(
+                "DELETE FROM vault_browser_profiles WHERE profile_key = ?1",
+                params![profile_key.trim()],
+            )
+            .map_err(|e| {
+                BotBrowserError::Storage(format!("failed to delete profile snapshot: {e}"))
+            })?;
+        Ok(affected > 0)
+    }
+
+    pub fn list_profile_keys(&self) -> Result<Vec<String>, BotBrowserError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT profile_key FROM vault_browser_profiles ORDER BY updated_at_ms DESC, profile_key ASC",
+            )
+            .map_err(|e| {
+                BotBrowserError::Storage(format!("failed to prepare profile keys query: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| {
+                BotBrowserError::Storage(format!("failed to list profile keys: {e}"))
+            })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row.map_err(|e| {
+                BotBrowserError::Storage(format!("failed reading profile key row: {e}"))
+            })?);
+        }
+        Ok(keys)
+    }
+}
+
+fn derive_profile_key(
+    master_key: &[u8; 32],
+    profile_key: &str,
+) -> Result<Zeroizing<[u8; 32]>, BotBrowserError> {
+    let hk = Hkdf::<Sha256>::new(Some(VAULT_HKDF_SALT), master_key);
+    let mut subkey = Zeroizing::new([0u8; 32]);
+    let info = format!("profile:{profile_key}");
+    hk.expand(info.as_bytes(), &mut *subkey)
+        .map_err(|e| BotBrowserError::Crypto(format!("HKDF profile key derivation failed: {e}")))?;
+    Ok(subkey)
+}
+
+fn build_profile_aad(profile_key: &str, canonical_origin: &str) -> String {
+    format!("bot-browser-vault:profile:v1|{profile_key}|{canonical_origin}")
 }
 
 fn derive_credential_key(

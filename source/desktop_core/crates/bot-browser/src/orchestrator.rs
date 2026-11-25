@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,9 +13,15 @@ use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
+use crate::backend::{BrowserBackendKind, BrowserSessionBackend, CdpBrowserBackend};
 use crate::cdp::{
     CdpBridge, CdpTransport, FillSubmitResult, LoginFormSelectors, ObscuraSidecarTransport,
 };
+use crate::script_app::{
+    AutomationScriptApp, BrowserControlGate, CredentialVaultSecretResolver,
+    DeterministicScriptRunner, ScriptReplayReport,
+};
+use crate::session_import::BrowserProfileStore;
 use crate::sidecar::{
     ObscuraBinaryManifest, ObscuraDownloader, ObscuraSidecar, ProfileNamespace, SidecarConfig,
 };
@@ -288,6 +294,7 @@ pub struct ClickAssistResult {
 
 struct SessionState {
     bridge: Arc<CdpBridge>,
+    backend: Arc<CdpBrowserBackend>,
 }
 
 #[derive(Clone)]
@@ -412,13 +419,106 @@ impl BotBrowserOrchestrator {
             .create_transport(session_id, &self.config.data_dir, origin_hint, &self.event_tx)
             .await?;
         let bridge = Arc::new(CdpBridge::new(transport));
+        let backend = Arc::new(CdpBrowserBackend::from_bridge(
+            BrowserBackendKind::ObscuraCdp,
+            Arc::clone(&bridge),
+        ));
         sessions.insert(
             session_id.to_string(),
             SessionState {
                 bridge: Arc::clone(&bridge),
+                backend,
             },
         );
         Ok(bridge)
+    }
+
+    /// Ensures a live `CdpBrowserBackend` exists for `session_id`, spawning/connecting via the factory if absent.
+    pub async fn ensure_session_backend(
+        &self,
+        session_id: &str,
+        origin_hint: Option<&NormalizedOrigin>,
+    ) -> Result<Arc<CdpBrowserBackend>, BotBrowserError> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(session_id) {
+            return Ok(Arc::clone(&existing.backend));
+        }
+
+        let transport = self
+            .transport_factory
+            .create_transport(session_id, &self.config.data_dir, origin_hint, &self.event_tx)
+            .await?;
+        let bridge = Arc::new(CdpBridge::new(transport));
+        let backend = Arc::new(CdpBrowserBackend::from_bridge(
+            BrowserBackendKind::ObscuraCdp,
+            Arc::clone(&bridge),
+        ));
+        sessions.insert(
+            session_id.to_string(),
+            SessionState {
+                bridge,
+                backend: Arc::clone(&backend),
+            },
+        );
+        Ok(backend)
+    }
+
+    pub fn profile_store(&self) -> BrowserProfileStore {
+        BrowserProfileStore::new(&self.config.data_dir)
+    }
+
+    pub async fn persist_session_cookies(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        origin: Option<&NormalizedOrigin>,
+    ) -> Result<usize, BotBrowserError> {
+        let backend = self.ensure_session_backend(session_id, origin).await?;
+        let domain_filter = origin.map(|o| o.host());
+        let cookies = backend.export_cookies(domain_filter).await?;
+        let count = cookies.len();
+        self.profile_store()
+            .save_cookies(namespace, origin, &cookies)?;
+        Ok(count)
+    }
+
+    pub async fn restore_session_cookies(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        origin: Option<&NormalizedOrigin>,
+    ) -> Result<usize, BotBrowserError> {
+        let cookies = self.profile_store().load_cookies(namespace, origin)?;
+        if cookies.is_empty() {
+            return Ok(0);
+        }
+        let backend = self.ensure_session_backend(session_id, origin).await?;
+        backend.import_cookies(&cookies).await
+    }
+
+    pub async fn run_script_app(
+        &self,
+        session_id: &str,
+        app: &AutomationScriptApp,
+        params: &BTreeMap<String, String>,
+        control: Option<&BrowserControlGate>,
+    ) -> Result<ScriptReplayReport, BotBrowserError> {
+        let origin_hint = app
+            .target_domains
+            .first()
+            .and_then(|d| NormalizedOrigin::parse(&format!("https://{d}")).ok());
+        let backend = self
+            .ensure_session_backend(session_id, origin_hint.as_ref())
+            .await?;
+        let resolver = CredentialVaultSecretResolver::new(Arc::clone(&self.vault));
+        DeterministicScriptRunner::run(
+            backend.as_ref(),
+            app,
+            params,
+            Some(&resolver),
+            control,
+        )
+        .await
     }
 
     /// Closes and removes a browser session, invoking `close_transport` on the factory.

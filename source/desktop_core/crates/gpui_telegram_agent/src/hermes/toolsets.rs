@@ -901,6 +901,8 @@ pub struct HermesToolContext {
     pub http_client: reqwest::Client,
     pub browser_cdp_url: Option<String>,
     pub bot_browser: Option<Arc<bot_browser::orchestrator::BotBrowserOrchestrator>>,
+    pub browser_sessions: Option<Arc<super::browser_session::BrowserSessionRegistry>>,
+    pub browser_ai_guards: Option<super::browser_session::TurnBrowserGuardMap>,
     pub terminal_backend: TerminalBackendConfig,
 }
 
@@ -944,6 +946,8 @@ impl HermesToolContext {
             http_client,
             browser_cdp_url: std::env::var("HERMES_BROWSER_CDP_URL").ok(),
             bot_browser: None,
+            browser_sessions: None,
+            browser_ai_guards: None,
             terminal_backend: TerminalBackendConfig::default(),
         }
     }
@@ -1041,6 +1045,19 @@ impl HermesToolContext {
         self
     }
 
+    pub fn with_browser_sessions(
+        mut self,
+        registry: Arc<super::browser_session::BrowserSessionRegistry>,
+    ) -> Self {
+        self.browser_sessions = Some(registry);
+        self
+    }
+
+    pub fn with_browser_turn_scope(mut self) -> Self {
+        self.browser_ai_guards = Some(Arc::new(tokio::sync::Mutex::new(HashMap::new())));
+        self
+    }
+
     pub fn cancel(&self) {
         self.cancellation.store(true, Ordering::SeqCst);
     }
@@ -1059,6 +1076,7 @@ impl HermesToolContext {
         child.session_id = child_session_id.into();
         child.caller_depth = self.caller_depth.saturating_add(1);
         child.cancellation = Arc::new(AtomicBool::new(false));
+        child.browser_ai_guards = None;
         if let Some(ts) = allowed_toolsets {
             child.toolsets = Arc::new(RwLock::new(ToolsetRegistry::from_toolsets(ts.iter().copied())));
         }
@@ -1434,12 +1452,17 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_click",
             ToolsetId::Browser,
-            "Click an element by CSS selector or page coordinates in the active Obscura browser session.",
+            "Click an element by semantic locator (test_id, aria_label, role, text_anchor, name_attr), CSS selector, or page coordinates in the active browser session.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "selector": { "type": "string" },
+                    "test_id": { "type": "string" },
+                    "aria_label": { "type": "string" },
+                    "role": { "type": "string" },
+                    "text_anchor": { "type": "string" },
+                    "name_attr": { "type": "string" },
                     "x": { "type": "number" },
                     "y": { "type": "number" },
                     "cdp_url": { "type": "string" }
@@ -1451,13 +1474,19 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
         HermesToolSpec::new(
             "browser_type",
             ToolsetId::Browser,
-            "Type non-secret text into a focused or selected element in the active Obscura browser session (refuses password/OTP fields; use vault_request_card / vault_fill for credentials).",
+            "Type non-secret text into a focused or selected element in the active browser session (refuses password/OTP fields; use vault_request_card / vault_fill for credentials).",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "text": { "type": "string" },
                     "selector": { "type": "string" },
+                    "test_id": { "type": "string" },
+                    "aria_label": { "type": "string" },
+                    "role": { "type": "string" },
+                    "text_anchor": { "type": "string" },
+                    "name_attr": { "type": "string" },
+                    "parameter_name_hint": { "type": "string" },
                     "submit": { "type": "boolean" },
                     "cdp_url": { "type": "string" }
                 },
@@ -1481,6 +1510,117 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             }),
             ToolRiskLevel::ReadOnly,
             true,
+        ),
+        HermesToolSpec::new(
+            "browser_press_key",
+            ToolsetId::Browser,
+            "Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown) in the active browser session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "key": { "type": "string" },
+                    "cdp_url": { "type": "string" }
+                },
+                "required": ["key"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "browser_scroll",
+            ToolsetId::Browser,
+            "Scroll the active browser viewport by delta_x and delta_y pixels.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "delta_x": { "type": "number" },
+                    "delta_y": { "type": "number" },
+                    "cdp_url": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::Low,
+            false,
+        ),
+        HermesToolSpec::new(
+            "browser_wait_for",
+            ToolsetId::Browser,
+            "Wait until an element matching a semantic locator or CSS selector appears in the active browser session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "test_id": { "type": "string" },
+                    "aria_label": { "type": "string" },
+                    "role": { "type": "string" },
+                    "text_anchor": { "type": "string" },
+                    "name_attr": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 50, "maximum": 30000 },
+                    "cdp_url": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "browser_extract_text",
+            ToolsetId::Browser,
+            "Extract visible text from a non-sensitive element matching a semantic locator or CSS selector in the active browser session.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "test_id": { "type": "string" },
+                    "aria_label": { "type": "string" },
+                    "role": { "type": "string" },
+                    "text_anchor": { "type": "string" },
+                    "name_attr": { "type": "string" },
+                    "output_key": { "type": "string" },
+                    "cdp_url": { "type": "string" }
+                }
+            }),
+            ToolRiskLevel::ReadOnly,
+            true,
+        ),
+        HermesToolSpec::new(
+            "browser_request_takeover",
+            ToolsetId::Browser,
+            "Pause AI browser automation and request human takeover so the user can manually sign in, complete 2FA/captcha, or adjust the page, then resume with refreshed live DOM state.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "wait_for_finish": { "type": "boolean" },
+                    "record_checkpoint": { "type": "boolean" }
+                },
+                "required": ["reason"]
+            }),
+            ToolRiskLevel::Medium,
+            false,
+        ),
+        HermesToolSpec::new(
+            "distill_browser_script_app",
+            ToolsetId::Browser,
+            "Compile the recorded browser action trace into a validated, secret-free, deterministic AutomationScriptApp that can replay without LLM inference.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "category": { "type": "string" },
+                    "slug": { "type": "string" },
+                    "target_domains": { "type": "array", "items": { "type": "string" } },
+                    "save_as_skill": { "type": "boolean" }
+                },
+                "required": ["name"]
+            }),
+            ToolRiskLevel::Low,
+            false,
         ),
         HermesToolSpec::new(
             "vault_list",

@@ -1,6 +1,7 @@
 use crate::cache::sqlite_cache::{CachedMediaEntry, SqliteClientCache};
 use gpui_telegram_core::error::Result;
 use gpui_telegram_core::types::{ChatId, MessageId, UserId};
+use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomationApp};
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
 use gpui_telegram_proto::message::{MessageContent, MessageItem, ReactionCount};
 use gpui_telegram_proto::{PollCard, TodoCard};
@@ -23,6 +24,8 @@ struct LocalCacheState {
     read_outbox_max: HashMap<ChatId, MessageId>,
     media_entries: HashMap<String, CachedMediaEntry>,
     mem_media_bytes: HashMap<String, Vec<u8>>,
+    installed_automation_apps: HashMap<String, InstalledAutomationApp>,
+    cached_automation_apps: HashMap<String, AutomationAppDetail>,
 }
 
 #[derive(Default, Clone)]
@@ -67,6 +70,8 @@ impl LocalStore {
         let chat_ttls = db.load_chat_ttls()?;
         let (read_inbox_max, read_outbox_max) = db.load_read_states()?;
         let media_entries = db.load_media_index()?;
+        let installed_automation_apps = db.load_installed_automation_apps()?;
+        let cached_automation_apps = db.load_cached_automation_apps()?;
         let state = LocalCacheState {
             owner_scope,
             messages,
@@ -80,6 +85,8 @@ impl LocalStore {
             read_outbox_max,
             media_entries,
             mem_media_bytes: HashMap::new(),
+            installed_automation_apps,
+            cached_automation_apps,
         };
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
@@ -165,6 +172,8 @@ impl LocalStore {
             guard.pinned_ids.clear();
             guard.read_inbox_max.clear();
             guard.read_outbox_max.clear();
+            guard.installed_automation_apps.clear();
+            guard.cached_automation_apps.clear();
             guard.mem_media_bytes.clear();
         }
         if let Some(db) = &self.sqlite {
@@ -754,6 +763,127 @@ impl LocalStore {
             }
         }
         self.state.read().mem_media_bytes.get(file_id).cloned()
+    }
+
+    pub fn replace_installed_automation_apps(&self, apps: Vec<InstalledAutomationApp>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let mut guard = self.state.write();
+            guard.installed_automation_apps.clear();
+            for app in &apps {
+                guard
+                    .installed_automation_apps
+                    .insert(app.app_id.clone(), app.clone());
+            }
+        }
+        if let Some(db) = &self.sqlite {
+            db.replace_installed_automation_apps(&apps, now_ms);
+        }
+    }
+
+    pub fn upsert_installed_automation_app(&self, entry: InstalledAutomationApp) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.state
+            .write()
+            .installed_automation_apps
+            .insert(entry.app_id.clone(), entry.clone());
+        if let Some(db) = &self.sqlite {
+            db.upsert_installed_automation_app(&entry, now_ms);
+        }
+    }
+
+    pub fn remove_installed_automation_app(&self, app_id: &str) {
+        self.state.write().installed_automation_apps.remove(app_id);
+        if let Some(db) = &self.sqlite {
+            db.delete_installed_automation_app(app_id);
+        }
+    }
+
+    pub fn list_installed_automation_apps(&self) -> Vec<InstalledAutomationApp> {
+        let mut items: Vec<InstalledAutomationApp> = self
+            .state
+            .read()
+            .installed_automation_apps
+            .values()
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.installed_at_ms
+                .cmp(&a.installed_at_ms)
+                .then_with(|| a.app_id.cmp(&b.app_id))
+        });
+        items
+    }
+
+    pub fn get_installed_automation_app(&self, app_id: &str) -> Option<InstalledAutomationApp> {
+        self.state
+            .read()
+            .installed_automation_apps
+            .get(app_id)
+            .cloned()
+    }
+
+    pub fn mark_automation_app_run(&self, app_id: &str, run_at_ms: i64) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated = {
+            let mut guard = self.state.write();
+            if let Some(entry) = guard.installed_automation_apps.get_mut(app_id) {
+                entry.last_run_at_ms = Some(run_at_ms);
+                entry.local_run_count = entry.local_run_count.saturating_add(1);
+                Some(entry.clone())
+            } else {
+                None
+            }
+        };
+        if let (Some(db), Some(entry)) = (&self.sqlite, updated) {
+            db.upsert_installed_automation_app(&entry, now_ms);
+        }
+    }
+
+    pub fn upsert_cached_automation_app(&self, detail: AutomationAppDetail) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let updated_installed = {
+            let mut guard = self.state.write();
+            guard
+                .cached_automation_apps
+                .insert(detail.app_id.clone(), detail.clone());
+            if let Some(installed) = guard.installed_automation_apps.get_mut(&detail.app_id) {
+                installed.latest_version = detail.latest_version.clone();
+                Some(installed.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(db) = &self.sqlite {
+            db.upsert_cached_automation_app(&detail, now_ms);
+            if let Some(entry) = updated_installed {
+                db.upsert_installed_automation_app(&entry, now_ms);
+            }
+        }
+    }
+
+    pub fn get_cached_automation_app(&self, app_id: &str) -> Option<AutomationAppDetail> {
+        self.state
+            .read()
+            .cached_automation_apps
+            .get(app_id)
+            .cloned()
+    }
+
+    pub fn list_cached_automation_apps(&self) -> Vec<AutomationAppDetail> {
+        let mut items: Vec<AutomationAppDetail> = self
+            .state
+            .read()
+            .cached_automation_apps
+            .values()
+            .cloned()
+            .collect();
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.app_id.cmp(&b.app_id))
+        });
+        items
     }
 
     pub fn wal_checkpoint_truncate(&self) -> Result<(i32, i32, i32)> {

@@ -16,6 +16,11 @@ pub mod fabushi {
     pub use crate::hermes::toolsets::{
         HermesToolContext as FabushiToolContext, HermesToolExecutor as FabushiToolExecutor,
     };
+    pub use crate::hermes::browser_session::{
+        forward_events_to_mpsc, BrowserAutomationEvent, BrowserAutomationSession,
+        BrowserSessionConfig, BrowserSessionRegistry, StepGateInfo, TakeoverOutcome,
+    };
+    pub use crate::hermes::commands::{CommandDistilledScriptResult, CommandUiEffect};
     pub use crate::hermes::{
         CronRunOutcome, HeartbeatConfig, HeartbeatManager, HeartbeatTickOutcome,
         HermesEngine as FabushiAgentEngine, HermesEngineConfig as FabushiEngineConfig,
@@ -23,6 +28,7 @@ pub mod fabushi {
         HermesTurnResult as FabushiTurnResult, MessageQueueManager, QueuedMessage,
         RecordedToolStep, SessionRuntimeSettings,
     };
+    pub use bot_browser::{BrowserControlGate, BrowserControlMode};
     pub type FabushiAgentHost = crate::fabushi_bot::FabushiBotHost;
 }
 
@@ -56,9 +62,13 @@ pub use computer::{
     ComputerCloudProvider, ComputerControlLease, ComputerLeaseBroker, CuaAction, CuaExecutor,
     LeaseState, CUA_BACKEND_UNAVAILABLE_ERR,
 };
+pub use hermes::browser_session::{
+    forward_events_to_mpsc, BrowserAutomationEvent, BrowserAutomationSession, BrowserSessionConfig,
+    BrowserSessionRegistry, StepGateInfo, TakeoverOutcome,
+};
 pub use hermes::commands::{
-    CommandDescriptor, CommandExecutionOutcome, CommandUiEffect, InlineActionButton,
-    SlashCommandParser, SlashCommandRegistry,
+    CommandDescriptor, CommandDistilledScriptResult, CommandExecutionOutcome, CommandUiEffect,
+    InlineActionButton, SlashCommandParser, SlashCommandRegistry,
 };
 pub use hermes::context::{
     AssembledPrompt, CompressionConfig, ContextCompressor, ContextRefResolver, PromptBuilder,

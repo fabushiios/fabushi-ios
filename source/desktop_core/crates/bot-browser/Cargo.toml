@@ -37,6 +37,9 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tempfile = "3"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }

@@ -1,5 +1,6 @@
 use gpui_telegram_core::error::{Result, TelegramError};
 use gpui_telegram_core::types::{ChatId, MessageId};
+use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomationApp};
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use parking_lot::Mutex;
@@ -186,6 +187,25 @@ const CLIENT_SCHEMA_SQL: &str = "
         distributed_at_ms INTEGER NOT NULL,
         PRIMARY KEY (chat_id, chain_id, peer_user_id, peer_device_id)
     );
+    CREATE TABLE IF NOT EXISTS installed_automation_apps (
+        app_id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL,
+        name TEXT NOT NULL,
+        installed_version TEXT NOT NULL,
+        installed_at_ms INTEGER NOT NULL,
+        last_run_at_ms INTEGER,
+        payload_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_installed_automation_apps_updated
+        ON installed_automation_apps(updated_at_ms DESC, app_id);
+    CREATE TABLE IF NOT EXISTS automation_app_cache (
+        app_id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL,
+        latest_version TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        cached_at_ms INTEGER NOT NULL
+    );
 ";
 
 impl SqliteClientCache {
@@ -315,7 +335,9 @@ impl SqliteClientCache {
              DELETE FROM e2ee_sessions;
              DELETE FROM e2ee_sender_keys;
              DELETE FROM e2ee_sender_key_history;
-             DELETE FROM e2ee_distributed_keys;",
+             DELETE FROM e2ee_distributed_keys;
+             DELETE FROM installed_automation_apps;
+             DELETE FROM automation_app_cache;",
         );
     }
 
@@ -589,6 +611,145 @@ impl SqliteClientCache {
         )
         .map_err(db_err)?;
         Ok(entry)
+    }
+
+    pub(crate) fn load_installed_automation_apps(
+        &self,
+    ) -> Result<HashMap<String, InstalledAutomationApp>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json, last_run_at_ms FROM installed_automation_apps ORDER BY installed_at_ms DESC, app_id ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (json, last_run_col) = row.map_err(db_err)?;
+            if let Ok(mut entry) = serde_json::from_str::<InstalledAutomationApp>(&json) {
+                if entry.last_run_at_ms.is_none() {
+                    entry.last_run_at_ms = last_run_col;
+                }
+                out.insert(entry.app_id.clone(), entry);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn replace_installed_automation_apps(
+        &self,
+        apps: &[InstalledAutomationApp],
+        now_ms: i64,
+    ) {
+        let mut conn = self.conn.lock();
+        if let Ok(tx) = conn.transaction() {
+            let _ = tx.execute("DELETE FROM installed_automation_apps", []);
+            for entry in apps {
+                if let Ok(json) = serde_json::to_string(entry) {
+                    let _ = tx.execute(
+                        r#"
+                        INSERT OR REPLACE INTO installed_automation_apps (
+                            app_id, slug, name, installed_version, installed_at_ms,
+                            last_run_at_ms, payload_json, updated_at_ms
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "#,
+                        params![
+                            entry.app_id,
+                            entry.slug,
+                            entry.name,
+                            entry.installed_version,
+                            entry.installed_at_ms,
+                            entry.last_run_at_ms,
+                            json,
+                            now_ms,
+                        ],
+                    );
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    pub(crate) fn upsert_installed_automation_app(
+        &self,
+        entry: &InstalledAutomationApp,
+        now_ms: i64,
+    ) {
+        if let Ok(json) = serde_json::to_string(entry) {
+            let conn = self.conn.lock();
+            let _ = conn.execute(
+                r#"
+                INSERT OR REPLACE INTO installed_automation_apps (
+                    app_id, slug, name, installed_version, installed_at_ms,
+                    last_run_at_ms, payload_json, updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    entry.app_id,
+                    entry.slug,
+                    entry.name,
+                    entry.installed_version,
+                    entry.installed_at_ms,
+                    entry.last_run_at_ms,
+                    json,
+                    now_ms,
+                ],
+            );
+        }
+    }
+
+    pub(crate) fn delete_installed_automation_app(&self, app_id: &str) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM installed_automation_apps WHERE app_id = ?1",
+            params![app_id],
+        );
+    }
+
+    pub(crate) fn load_cached_automation_apps(
+        &self,
+    ) -> Result<HashMap<String, AutomationAppDetail>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM automation_app_cache")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(detail) = serde_json::from_str::<AutomationAppDetail>(&json) {
+                out.insert(detail.app_id.clone(), detail);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn upsert_cached_automation_app(
+        &self,
+        detail: &AutomationAppDetail,
+        cached_at_ms: i64,
+    ) {
+        if let Ok(json) = serde_json::to_string(detail) {
+            let conn = self.conn.lock();
+            let _ = conn.execute(
+                r#"
+                INSERT OR REPLACE INTO automation_app_cache (
+                    app_id, slug, latest_version, payload_json, cached_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    detail.app_id,
+                    detail.slug,
+                    detail.latest_version,
+                    json,
+                    cached_at_ms,
+                ],
+            );
+        }
     }
 
     pub(crate) fn wal_checkpoint_truncate(&self) -> Result<(i32, i32, i32)> {

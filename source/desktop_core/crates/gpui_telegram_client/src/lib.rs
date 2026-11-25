@@ -75,6 +75,11 @@ pub use net::{
     USER_VAULT_CATEGORY_AI_OAUTH, USER_VAULT_CATEGORY_BROWSER_COOKIE, USER_VAULT_CATEGORY_PASSWORD,
     USER_VAULT_KDF_ALG_ARGON2ID, USER_VAULT_KDF_ALG_DEVICE_KEYCHAIN_V2,
     USER_VAULT_KDF_ALG_SPLIT_KEY_V2,
+    AutomationAppDetail, AutomationAppParameterDto, AutomationAppSummary,
+    InstallAutomationAppResponse, InstalledAutomationApp, ListAutomationAppsQuery,
+    ListAutomationAppsResponse, ListInstalledAutomationAppsResponse, PublishAutomationAppRequest,
+    RecordAutomationRunRequest, RecordAutomationRunResponse, UninstallAutomationAppResponse,
+    AUTOMATION_APP_SCHEMA_VERSION_V1,
 };
 pub use session_persistence::{
     AccountSessionRecord, ActiveDeviceSession, PersistedClientState, ProxyEndpointRecord,
