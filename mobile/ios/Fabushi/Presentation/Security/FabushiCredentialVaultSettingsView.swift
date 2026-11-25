@@ -668,7 +668,7 @@ public struct FabushiCredentialVaultSettingsView: View {
                             .foregroundStyle(theme.textSecondary)
 
                         Text(kit)
-                            .fabushiFont(.monospacedBody)
+                            .fabushiFont(.monospacedCaption)
                             .foregroundStyle(theme.textPrimary)
                             .textSelection(.enabled)
                             .padding(.vertical, 6)

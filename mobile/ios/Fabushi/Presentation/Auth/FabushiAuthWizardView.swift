@@ -690,7 +690,7 @@ public struct FabushiAuthWizardView: View {
                 .foregroundStyle(theme.textSecondary)
 
             Text(emergencyKit)
-                .fabushiFont(.monospacedBody)
+                .fabushiFont(.monospacedCaption)
                 .foregroundStyle(theme.textPrimary)
                 .textSelection(.enabled)
                 .padding(12)
