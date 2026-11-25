@@ -183,4 +183,61 @@ pub enum UpdateEvent {
         active_tool: Option<String>,
     },
     CodingHostCommand(crate::coding_agent_contracts::CodingHostCommand),
+    #[serde(rename = "community_event")]
+    CommunityEvent {
+        event_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        community_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_id: Option<String>,
+        #[serde(default)]
+        payload_json: String,
+        timestamp_ms: i64,
+    },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn community_event_serde_roundtrip() {
+        let ev = UpdateEvent::CommunityEvent {
+            event_kind: "post_created".to_string(),
+            community_id: Some("comm_rust".to_string()),
+            post_id: Some("post_123".to_string()),
+            comment_id: None,
+            actor_id: Some("b:42".to_string()),
+            payload_json: r#"{"score":1}"#.to_string(),
+            timestamp_ms: 1_760_000_000_000,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize CommunityEvent");
+        assert!(json.contains(r#""type":"community_event""#), "json was: {json}");
+        assert!(!json.contains("comment_id"), "None field should be omitted: {json}");
+        let decoded: UpdateEvent = serde_json::from_str(&json).expect("deserialize CommunityEvent");
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn community_event_deserializes_with_minimal_fields() {
+        let raw = r#"{"type":"community_event","data":{"event_kind":"trending_updated","timestamp_ms":1760000000123}}"#;
+        let decoded: UpdateEvent = serde_json::from_str(raw).expect("deserialize minimal");
+        assert_eq!(
+            decoded,
+            UpdateEvent::CommunityEvent {
+                event_kind: "trending_updated".to_string(),
+                community_id: None,
+                post_id: None,
+                comment_id: None,
+                actor_id: None,
+                payload_json: String::new(),
+                timestamp_ms: 1_760_000_000_123,
+            }
+        );
+    }
+}
+

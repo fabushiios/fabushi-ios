@@ -568,6 +568,33 @@ impl FloorControlQueue {
         invalidated_nonce
     }
 
+    /// Renews the active floor lease for `(agent_id, nonce)` while an LLM/tool turn is actively
+    /// making progress, preventing long turns from self-expiring while strictly rejecting
+    /// preempted, cancelled, or already-expired nonces.
+    pub fn renew_lease(&self, agent_id: &str, nonce: &str) -> bool {
+        let mut inner = self.inner.lock();
+        let now_ms = inner
+            .last_explicit_clock_ms
+            .unwrap_or_else(Self::wall_clock_ms);
+        let changed = inner.drain_expired_leases_internal(now_ms);
+        let lease_ms = inner.lease_duration_ms;
+        let renewed = if let Some(active) = inner.active_turn.as_mut() {
+            if active.agent_id == agent_id && active.nonce == nonce {
+                active.lease_end_ms = now_ms.saturating_add(lease_ms);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        drop(inner);
+        if changed {
+            self.notify.notify_waiters();
+        }
+        renewed
+    }
+
     /// Fenced floor release: only releases the floor if the active turn matches both `agent_id`
     /// and `nonce`, preventing a stale/cancelled turn guard from releasing the next speaker's floor.
     pub fn release_turn(&self, agent_id: &str, nonce: &str) -> bool {

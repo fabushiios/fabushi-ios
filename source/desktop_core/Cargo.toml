@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    # 11 Mobile-Compilable Pure-Rust Domain Crates vendored from
-    # bhrumom/gpui-telegram@c8decb499a13e253c5524ed35207e808eddf55fc (Fabushi v1.6.12)
+    # 12 Mobile-Compilable Pure-Rust Domain Crates vendored from
+    # bhrumom/gpui-telegram@e577d52f9159aa02538c5495777288871f75f572 (Fabushi v1.6.14 + feat(community))
     # Note: crates/gpui_telegram_common has NO Cargo.toml upstream (only 1 legacy auth.rs file)
     # and is therefore excluded from Cargo workspace members.
     "crates/gpui_telegram_core",
     "crates/gpui_telegram_proto",
+    "crates/gpui_telegram_community",
     "crates/gpui_telegram_client",
     "crates/gpui_telegram_media",
     "crates/gpui_telegram_webrtc",
@@ -31,16 +32,17 @@ exclude = [
 ]
 
 [workspace.package]
-version = "1.6.12"
+version = "1.6.14"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Teamwork GPUI Telegram Contributors"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-# --- Internal Crates (11 mobile Cargo crates) ---
+# --- Internal Crates (12 mobile Cargo crates) ---
 gpui_telegram_core = { path = "crates/gpui_telegram_core" }
 gpui_telegram_proto = { path = "crates/gpui_telegram_proto" }
+gpui_telegram_community = { path = "crates/gpui_telegram_community" }
 gpui_telegram_client = { path = "crates/gpui_telegram_client" }
 gpui_telegram_media = { path = "crates/gpui_telegram_media" }
 gpui_telegram_webrtc = { path = "crates/gpui_telegram_webrtc" }
@@ -78,6 +80,7 @@ prost-types = "0.13"
 
 # --- Storage & Database ---
 rusqlite = { version = "0.39", features = ["bundled", "backup", "blob"] }
+tantivy = { version = "0.22", default-features = false, features = ["mmap"] }
 
 # --- Cryptography & Security ---
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }

@@ -105,6 +105,7 @@ pub enum GroupWakeReason {
     ReplyToBot,
     SingleBotRoom,
     RelevanceMatch,
+    PrimaryFallback,
     BudgetExhausted,
     NoRelevantCandidate,
     EmptyCandidates,
@@ -175,11 +176,11 @@ pub fn evaluate_group_wake_gate(input: &GroupWakeGateInput) -> GroupWakeGateDeci
     }
 
     // Rule 2: Explicit `@mention` matching one or more candidate bots.
-    if !mentions.is_empty() {
+    if !mentions.is_empty() || input.message_text.contains('@') {
         let mut matched_ids = Vec::new();
         let mut scores = Vec::new();
         for c in &input.candidates {
-            if candidate_matches_mentions(c, &mentions) {
+            if candidate_matches_mentions(c, &mentions, &input.message_text) {
                 matched_ids.push(c.bot_user_id);
                 scores.push(GroupWakeBotScore {
                     bot_user_id: c.bot_user_id,
@@ -380,6 +381,44 @@ pub fn evaluate_group_wake_gate(input: &GroupWakeGateInput) -> GroupWakeGateDeci
         .collect();
 
     if wake_bot_user_ids.is_empty() {
+        // When a human sends a substantive message (not empty / not low-signal acknowledgement)
+        // to a group with AI bots and no specialist matched the lexical threshold, wake ONE
+        // deterministic primary responder instead of going completely silent:
+        //   1. Top partially-scored candidate (score > 0.0)
+        //   2. Recent speaker bot (conversation continuity)
+        //   3. Official default generalist bot (777_000) if present
+        //   4. First candidate in room order
+        // Bot-to-bot unmentioned messages with no relevant match still stay silent (Pass).
+        if input.sender_is_human {
+            let chosen_id = scored
+                .first()
+                .filter(|s| s.score > 0.0)
+                .map(|s| s.bot_user_id)
+                .or_else(|| {
+                    input.recent_speaker_bot_user_id.filter(|rid| {
+                        input.candidates.iter().any(|c| c.bot_user_id == *rid)
+                    })
+                })
+                .or_else(|| {
+                    input
+                        .candidates
+                        .iter()
+                        .find(|c| c.bot_user_id == crate::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID)
+                        .map(|c| c.bot_user_id)
+                })
+                .or_else(|| input.candidates.first().map(|c| c.bot_user_id));
+
+            if let Some(primary_id) = chosen_id {
+                return GroupWakeGateDecision {
+                    should_wake: true,
+                    outcome: RoomMemberTurnOutcome::Sent,
+                    wake_bot_user_ids: vec![primary_id],
+                    reason: GroupWakeReason::PrimaryFallback,
+                    scores: scored,
+                    is_winding_down,
+                };
+            }
+        }
         GroupWakeGateDecision {
             should_wake: false,
             outcome: RoomMemberTurnOutcome::Pass,
@@ -547,32 +586,62 @@ fn collect_normalized_mentions(explicit: &[String], text: &str) -> Vec<String> {
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i].1 == '@' {
+            let prev_is_slash_cmd = i > 0 && {
+                let mut k = i;
+                while k > 0 && (chars[k - 1].1.is_ascii_alphanumeric() || chars[k - 1].1 == '_') {
+                    k -= 1;
+                }
+                k < i
+                    && k > 0
+                    && chars[k - 1].1 == '/'
+                    && (k == 1 || chars[k - 2].1.is_whitespace())
+            };
             let prev_ident = i > 0
+                && !prev_is_slash_cmd
                 && (chars[i - 1].1.is_ascii_alphanumeric() || chars[i - 1].1 == '_');
             if !prev_ident {
                 let start_idx = i + 1;
-                let mut end_idx = start_idx;
-                while end_idx < chars.len()
-                    && (chars[end_idx].1.is_alphanumeric()
-                        || chars[end_idx].1 == '_'
-                        || chars[end_idx].1 == '-')
-                {
-                    end_idx += 1;
-                }
-                if end_idx > start_idx {
-                    let byte_start = chars[start_idx].0;
-                    let byte_end = if end_idx < chars.len() {
-                        chars[end_idx].0
-                    } else {
-                        text.len()
-                    };
-                    let norm = text[byte_start..byte_end].to_lowercase();
-                    if !norm.is_empty() && seen.insert(norm.clone()) {
-                        out.push(norm);
+                if start_idx < chars.len() {
+                    let rest = &text[chars[start_idx].0..];
+                    if rest.starts_with("所有人") && seen.insert("所有人".to_string()) {
+                        out.push("所有人".to_string());
                     }
+                    let first_is_ascii_ident = chars[start_idx].1.is_ascii_alphanumeric()
+                        || chars[start_idx].1 == '_'
+                        || chars[start_idx].1 == '-';
+                    let mut end_idx = start_idx;
+                    if first_is_ascii_ident {
+                        while end_idx < chars.len()
+                            && (chars[end_idx].1.is_ascii_alphanumeric()
+                                || chars[end_idx].1 == '_'
+                                || chars[end_idx].1 == '-')
+                        {
+                            end_idx += 1;
+                        }
+                    } else {
+                        while end_idx < chars.len()
+                            && (chars[end_idx].1.is_alphanumeric()
+                                || chars[end_idx].1 == '_'
+                                || chars[end_idx].1 == '-')
+                        {
+                            end_idx += 1;
+                        }
+                    }
+                    if end_idx > start_idx {
+                        let byte_start = chars[start_idx].0;
+                        let byte_end = if end_idx < chars.len() {
+                            chars[end_idx].0
+                        } else {
+                            text.len()
+                        };
+                        let norm = text[byte_start..byte_end].to_lowercase();
+                        if !norm.is_empty() && seen.insert(norm.clone()) {
+                            out.push(norm);
+                        }
+                    }
+                    i = end_idx;
+                    continue;
                 }
-                i = end_idx;
-                continue;
             }
         }
         i += 1;
@@ -580,7 +649,44 @@ fn collect_normalized_mentions(explicit: &[String], text: &str) -> Vec<String> {
     out
 }
 
-fn candidate_matches_mentions(cand: &GroupWakeBotCandidate, mentions: &[String]) -> bool {
+fn text_has_at_mention_label(text: &str, label_lower: &str) -> bool {
+    if label_lower.is_empty() || !text.contains('@') {
+        return false;
+    }
+    let text_lower = text.to_lowercase();
+    let bytes = text_lower.as_bytes();
+    let label_ends_ascii = label_lower
+        .chars()
+        .last()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut search_from = 0usize;
+    while let Some(rel) = text_lower[search_from..].find('@') {
+        let at_idx = search_from + rel;
+        let prev_ident = at_idx > 0
+            && (bytes[at_idx - 1].is_ascii_alphanumeric() || bytes[at_idx - 1] == b'_');
+        if !prev_ident {
+            let after = &text_lower[at_idx + 1..];
+            if let Some(rem) = after.strip_prefix(label_lower) {
+                if !label_ends_ascii
+                    || rem
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    return true;
+                }
+            }
+        }
+        search_from = at_idx + 1;
+    }
+    false
+}
+
+fn candidate_matches_mentions(
+    cand: &GroupWakeBotCandidate,
+    mentions: &[String],
+    message_text: &str,
+) -> bool {
     let username = cand.username.trim().trim_start_matches('@').to_lowercase();
     let agent_id = cand.agent_id.trim().to_lowercase();
     let name = cand.name.trim().to_lowercase();
@@ -591,7 +697,7 @@ fn candidate_matches_mentions(cand: &GroupWakeBotCandidate, mentions: &[String])
             || (!agent_id.is_empty() && *m == agent_id)
             || (!name.is_empty() && *m == name)
             || *m == id_str
-    })
+    }) || (!name.is_empty() && text_has_at_mention_label(message_text, &name))
 }
 
 fn is_cjk(c: char) -> bool {
@@ -721,9 +827,9 @@ fn contains_term(haystack_lower: &str, needle_lower: &str) -> bool {
 fn is_low_signal_acknowledgement(trimmed: &str) -> bool {
     let lower = trimmed
         .to_lowercase()
-        .trim_matches(|c: char| matches!(c, '!' | '.' | '。' | '！' | '~' | '～' | ' '))
+        .trim_matches(|c: char| matches!(c, '!' | '.' | '。' | '！' | '~' | '～' | ',' | '，' | ' '))
         .to_string();
-    matches!(
+    if matches!(
         lower.as_str(),
         "ok" | "okay"
             | "k"
@@ -736,12 +842,15 @@ fn is_low_signal_acknowledgement(trimmed: &str) -> bool {
             | "lol"
             | "haha"
             | "thanks"
+            | "thank you"
             | "thx"
             | "ty"
             | "nice"
             | "cool"
             | "got it"
             | "sounds good"
+            | "ok thanks"
+            | "okay thanks"
             | "好的"
             | "好"
             | "收到"
@@ -749,6 +858,7 @@ fn is_low_signal_acknowledgement(trimmed: &str) -> bool {
             | "嗯嗯"
             | "谢谢"
             | "感谢"
+            | "多谢"
             | "哈哈"
             | "哈哈哈"
             | "了解"
@@ -757,7 +867,56 @@ fn is_low_signal_acknowledgement(trimmed: &str) -> bool {
             | "👍"
             | "👌"
             | "🙏"
-    )
+    ) {
+        return true;
+    }
+
+    let parts: Vec<&str> = lower
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '，' | '!' | '！' | '.' | '。' | '~' | '～')
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    !parts.is_empty()
+        && parts.len() <= 3
+        && parts.iter().all(|p| {
+            matches!(
+                *p,
+                "ok" | "okay"
+                    | "k"
+                    | "kk"
+                    | "yes"
+                    | "yep"
+                    | "yup"
+                    | "sure"
+                    | "thanks"
+                    | "thank"
+                    | "you"
+                    | "thx"
+                    | "ty"
+                    | "nice"
+                    | "cool"
+                    | "lol"
+                    | "haha"
+                    | "好的"
+                    | "好"
+                    | "收到"
+                    | "嗯"
+                    | "嗯嗯"
+                    | "谢谢"
+                    | "感谢"
+                    | "多谢"
+                    | "哈哈"
+                    | "哈哈哈"
+                    | "了解"
+                    | "明白"
+                    | "明白了"
+                    | "知道了"
+                    | "👍"
+                    | "👌"
+                    | "🙏"
+            )
+        })
 }
 
 fn is_followup_cue(lower: &str, raw: &str) -> bool {

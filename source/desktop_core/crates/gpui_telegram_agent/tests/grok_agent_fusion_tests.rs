@@ -911,3 +911,167 @@ async fn test_cua_executor_honest_unavailable_and_provider_routing() {
     assert_eq!(recorded[0].text.as_deref(), Some("hello world"));
     assert_eq!(recorded[0].node_id.as_deref(), Some("cloud:box-1"));
 }
+
+#[tokio::test]
+async fn test_group_wake_gate_primary_fallback_cjk_mentions_and_floor_lease_renewal() {
+    let bots = vec![
+        GroupWakeBotCandidate {
+            bot_user_id: 1001,
+            agent_id: "rust-architect".into(),
+            name: "Rust Architect".into(),
+            username: "rust_bot".into(),
+            role: "Rust Systems Architect".into(),
+            description: "Specializes in Rust async tokio systems".into(),
+            skills: vec!["rust".into(), "tokio".into()],
+            seconds_since_last_reply: None,
+        },
+        GroupWakeBotCandidate {
+            bot_user_id: 1002,
+            agent_id: "dharma-guide".into(),
+            name: "全球法布施".into(),
+            username: "fabushi_bot".into(),
+            role: "Dharma Assistant".into(),
+            description: "禅修与法布施助手".into(),
+            skills: vec!["禅修".into(), "经典".into()],
+            seconds_since_last_reply: None,
+        },
+    ];
+
+    // 1. Unmentioned substantive Chinese/English human greetings in a multi-bot group
+    //    must wake 1 deterministic primary responder instead of returning [].
+    let d_zh = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "你好，有人在吗？".into(),
+        sender_is_human: true,
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert!(d_zh.should_wake, "unmentioned Chinese greeting must wake a primary bot");
+    assert_eq!(d_zh.reason, GroupWakeReason::PrimaryFallback);
+    assert_eq!(d_zh.wake_bot_user_ids, vec![1001]);
+
+    // Prefer recent_speaker_bot_user_id when set for conversational continuity.
+    let d_recent = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "继续说一下你的想法".into(),
+        recent_speaker_bot_user_id: Some(1002),
+        sender_is_human: true,
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert!(d_recent.should_wake);
+    assert!(matches!(
+        d_recent.reason,
+        GroupWakeReason::RelevanceMatch | GroupWakeReason::PrimaryFallback
+    ));
+    assert_eq!(d_recent.wake_bot_user_ids, vec![1002]);
+
+    // When OFFICIAL_DEFAULT_BOT_USER_ID (777_000) is in the group, PrimaryFallback prefers it.
+    let mut bots_with_official = bots.clone();
+    bots_with_official.push(GroupWakeBotCandidate {
+        bot_user_id: gpui_telegram_agent::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID,
+        agent_id: "official-assistant".into(),
+        name: "Official Assistant".into(),
+        username: "official_bot".into(),
+        role: "General Assistant".into(),
+        description: "Official general helper".into(),
+        skills: vec![],
+        seconds_since_last_reply: None,
+    });
+    let d_official = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots_with_official,
+        message_text: "你好，今天有什么安排？".into(),
+        sender_is_human: true,
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert!(d_official.should_wake);
+    assert_eq!(d_official.reason, GroupWakeReason::PrimaryFallback);
+    assert_eq!(
+        d_official.wake_bot_user_ids,
+        vec![gpui_telegram_agent::fabushi_bot::OFFICIAL_DEFAULT_BOT_USER_ID]
+    );
+
+    // Low-signal acknowledgements still pass silently.
+    for ack in ["ok", "收到！", "好的", "thanks!"] {
+        let d_ack = evaluate_group_wake_gate(&GroupWakeGateInput {
+            candidates: bots.clone(),
+            message_text: ack.into(),
+            sender_is_human: true,
+            remaining_loop_budget: 5,
+            ..Default::default()
+        });
+        assert!(!d_ack.should_wake, "ack '{ack}' should stay silent");
+        assert_eq!(d_ack.outcome, RoomMemberTurnOutcome::Pass);
+    }
+
+    // Bot-to-bot unmentioned general messages must NOT trigger PrimaryFallback loops.
+    let d_bot_loop = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "你好，有人在吗？".into(),
+        sender_is_human: false,
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert!(!d_bot_loop.should_wake);
+    assert_eq!(d_bot_loop.outcome, RoomMemberTurnOutcome::Pass);
+
+    // 2. CJK-adjacent @mentions, @所有人你好, /cmd@bot, and multi-word/CJK display names.
+    let d_cjk_adj = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "@rust_bot你好请看看".into(),
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert_eq!(d_cjk_adj.reason, GroupWakeReason::ExplicitMention);
+    assert_eq!(d_cjk_adj.wake_bot_user_ids, vec![1001]);
+
+    let d_all_cjk = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "@所有人你好".into(),
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert_eq!(d_all_cjk.reason, GroupWakeReason::MentionAll);
+    assert_eq!(d_all_cjk.wake_bot_user_ids, vec![1001, 1002]);
+
+    let d_slash_at = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "/start@fabushi_bot".into(),
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert_eq!(d_slash_at.reason, GroupWakeReason::ExplicitMention);
+    assert_eq!(d_slash_at.wake_bot_user_ids, vec![1002]);
+
+    let d_multiword_display = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "@Rust Architect 帮我设计一下".into(),
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert_eq!(d_multiword_display.reason, GroupWakeReason::ExplicitMention);
+    assert_eq!(d_multiword_display.wake_bot_user_ids, vec![1001]);
+
+    let d_cjk_display = evaluate_group_wake_gate(&GroupWakeGateInput {
+        candidates: bots.clone(),
+        message_text: "@全球法布施你好".into(),
+        remaining_loop_budget: 5,
+        ..Default::default()
+    });
+    assert_eq!(d_cjk_display.reason, GroupWakeReason::ExplicitMention);
+    assert_eq!(d_cjk_display.wake_bot_user_ids, vec![1002]);
+
+    // 3. FloorControlQueue::renew_lease extends active turn and rejects wrong/preempted nonces.
+    let queue = FloorControlQueue::new(500);
+    let grant = queue
+        .acquire_floor_wait("agent_a", FloorPriority::DirectMention, Duration::from_secs(1))
+        .await
+        .expect("acquire floor");
+    assert!(queue.renew_lease("agent_a", &grant.nonce));
+    assert!(!queue.renew_lease("agent_a", "wrong-nonce"));
+    assert!(!queue.renew_lease("agent_b", &grant.nonce));
+    let _ = queue.preempt_for_user_interruption();
+    assert!(!queue.renew_lease("agent_a", &grant.nonce));
+}
+

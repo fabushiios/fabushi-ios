@@ -210,7 +210,13 @@ impl ClientConfig {
     /// and ensuring standard http:// or https:// scheme prefix.
     pub fn normalize_url(raw: &str) -> String {
         let trimmed = raw.trim().trim_end_matches('/');
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if trimmed
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+            || trimmed
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        {
             trimmed.to_string()
         } else {
             format!("http://{}", trimmed)
@@ -278,18 +284,29 @@ impl ClientConfig {
         Self::get_app_dir().join("session.json")
     }
 
-    /// Persists session data atomically with strictly enforced POSIX 0600 mode at creation time.
-    pub fn save_session(session: &StoredSession) -> Result<(), std::io::Error> {
-        let dir = Self::get_app_dir();
-        fs::create_dir_all(&dir)?;
+    /// Returns `true` when two server URLs match after normalization (or when `stored_url` is empty).
+    pub fn server_urls_match(stored_url: &str, active_url: &str) -> bool {
+        let stored_trim = stored_url.trim();
+        if stored_trim.is_empty() {
+            return true;
+        }
+        Self::normalize_url(stored_trim).eq_ignore_ascii_case(&Self::normalize_url(active_url))
+    }
+
+    /// Persists session data atomically inside `dir/session.json` with strictly enforced POSIX 0600 mode.
+    pub fn save_session_in_dir(
+        dir: &std::path::Path,
+        session: &StoredSession,
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(dir)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
 
-        let target_path = Self::get_session_path();
+        let target_path = dir.join("session.json");
         let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tid_raw = format!("{:?}", std::thread::current().id());
         let tid = tid_raw
@@ -339,6 +356,33 @@ impl ClientConfig {
         }
 
         Ok(())
+    }
+
+    /// Persists session data atomically with strictly enforced POSIX 0600 mode at creation time.
+    pub fn save_session(session: &StoredSession) -> Result<(), std::io::Error> {
+        let dir = Self::get_app_dir();
+        Self::save_session_in_dir(&dir, session)
+    }
+
+    /// Loads persisted session from `dir/session.json`.
+    pub fn load_session_in_dir(dir: &std::path::Path) -> Option<StoredSession> {
+        let path = dir.join("session.json");
+        if path.is_file() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(sess) = serde_json::from_str::<StoredSession>(&content) {
+                    return Some(sess);
+                }
+            }
+        }
+        None
+    }
+
+    /// Clears persisted session file from `dir/session.json`.
+    pub fn clear_session_in_dir(dir: &std::path::Path) {
+        let path = dir.join("session.json");
+        if path.is_file() {
+            let _ = fs::remove_file(path);
+        }
     }
 
     /// Returns path to secondary XDG Data Home session persistence file (~/.local/share/gpui_telegram/session.json).

@@ -544,6 +544,33 @@ impl TelegramClient {
         self.outbox.start(self.runtime.handle());
     }
 
+    pub fn update_auth_profile(
+        &self,
+        expected_user_id: u64,
+        username: String,
+        first_name: Option<String>,
+        created_at: Option<String>,
+        expires_at: Option<String>,
+    ) {
+        let mut sess_guard = self.auth_session.write();
+        if let Some(ref mut sess) = *sess_guard {
+            if sess.user_id == expected_user_id {
+                if !username.trim().is_empty() {
+                    sess.username = username;
+                }
+                if first_name.is_some() {
+                    sess.first_name = first_name;
+                }
+                if created_at.is_some() {
+                    sess.created_at = created_at;
+                }
+                if expires_at.is_some() {
+                    sess.expires_at = expires_at;
+                }
+            }
+        }
+    }
+
     pub fn set_token(&self, token: Option<String>) {
         let mut tok_guard = self.auth_token.write();
         let sess_guard = self.auth_session.read();

@@ -15,7 +15,7 @@ pub mod outbox;
 pub mod session_persistence;
 pub mod sync;
 
-pub use cache::{CachedMediaEntry, LocalStore};
+pub use cache::{CachedChatHistorySnapshot, CachedMediaEntry, LocalStore};
 pub use client::TelegramClient;
 pub use client_dispatch::ClientDomainEvent;
 pub use config::{ClientConfig, ConfigSource, StoredSession};

@@ -1,10 +1,14 @@
+use crate::net::hermes_client::{HermesRichChatDto, HermesRichMessageDto};
+use crate::net::http_client::{ChatSummary, HistoricalMessage};
 use gpui_telegram_core::error::{Result, TelegramError};
 use gpui_telegram_core::types::{ChatId, MessageId};
 use gpui_telegram_proto::automation_apps::{AutomationAppDetail, InstalledAutomationApp};
+use gpui_telegram_proto::contracts::auth::ContactDto;
 use gpui_telegram_proto::contracts::{ChatDetailDto, ChatFolderDto, DraftDto};
 use gpui_telegram_proto::message::{MessageItem, ReactionCount};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -17,6 +21,15 @@ pub struct CachedMediaEntry {
     pub mime_type: Option<String>,
     pub size_bytes: u64,
     pub local_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedChatHistorySnapshot {
+    pub messages: Vec<HistoricalMessage>,
+    #[serde(default)]
+    pub rich_messages: Vec<HermesRichMessageDto>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
 }
 
 pub(crate) struct SqliteClientCache {
@@ -206,6 +219,29 @@ const CLIENT_SCHEMA_SQL: &str = "
         payload_json TEXT NOT NULL,
         cached_at_ms INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS cached_dialog_summaries (
+        chat_id INTEGER PRIMARY KEY,
+        sort_order INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cached_dialog_summaries_order
+        ON cached_dialog_summaries(sort_order ASC, chat_id ASC);
+    CREATE TABLE IF NOT EXISTS cached_rich_chats (
+        chat_id INTEGER PRIMARY KEY,
+        payload_json TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cached_chat_histories (
+        chat_id INTEGER PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cached_contacts (
+        user_id INTEGER PRIMARY KEY,
+        sort_order INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cached_contacts_order
+        ON cached_contacts(sort_order ASC, user_id ASC);
 ";
 
 impl SqliteClientCache {
@@ -337,7 +373,11 @@ impl SqliteClientCache {
              DELETE FROM e2ee_sender_key_history;
              DELETE FROM e2ee_distributed_keys;
              DELETE FROM installed_automation_apps;
-             DELETE FROM automation_app_cache;",
+             DELETE FROM automation_app_cache;
+             DELETE FROM cached_dialog_summaries;
+             DELETE FROM cached_rich_chats;
+             DELETE FROM cached_chat_histories;
+             DELETE FROM cached_contacts;",
         );
     }
 
@@ -749,6 +789,207 @@ impl SqliteClientCache {
                     cached_at_ms,
                 ],
             );
+        }
+    }
+
+    pub(crate) fn load_meta_value(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT value FROM cache_meta WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    pub(crate) fn save_meta_value(&self, key: &str, value: Option<&str>) {
+        let conn = self.conn.lock();
+        match value {
+            Some(v) => {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?1, ?2)",
+                    params![key, v],
+                );
+            }
+            None => {
+                let _ = conn.execute("DELETE FROM cache_meta WHERE key = ?1", params![key]);
+            }
+        }
+    }
+
+    pub(crate) fn load_cached_dialog_summaries(&self) -> Result<Vec<ChatSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM cached_dialog_summaries ORDER BY sort_order ASC, chat_id ASC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(chat) = serde_json::from_str::<ChatSummary>(&json) {
+                out.push(chat);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn replace_cached_dialog_summaries(&self, chats: &[ChatSummary]) {
+        let mut conn = self.conn.lock();
+        if let Ok(tx) = conn.transaction() {
+            let _ = tx.execute("DELETE FROM cached_dialog_summaries", []);
+            for (idx, chat) in chats.iter().enumerate() {
+                if let Ok(json) = serde_json::to_string(chat) {
+                    let _ = tx.execute(
+                        "INSERT OR REPLACE INTO cached_dialog_summaries (chat_id, sort_order, payload_json) VALUES (?1, ?2, ?3)",
+                        params![chat.chat_id as i64, idx as i64, json],
+                    );
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    pub(crate) fn delete_cached_dialog_summary(&self, chat_id: u64) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM cached_dialog_summaries WHERE chat_id = ?1",
+            params![chat_id as i64],
+        );
+    }
+
+    pub(crate) fn load_cached_rich_chats(&self) -> Result<HashMap<u64, HermesRichChatDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT chat_id, payload_json FROM cached_rich_chats")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, json) = row.map_err(db_err)?;
+            if cid > 0 {
+                if let Ok(rc) = serde_json::from_str::<HermesRichChatDto>(&json) {
+                    out.insert(cid as u64, rc);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn replace_cached_rich_chats(&self, chats: &[HermesRichChatDto]) {
+        let mut conn = self.conn.lock();
+        if let Ok(tx) = conn.transaction() {
+            let _ = tx.execute("DELETE FROM cached_rich_chats", []);
+            for rc in chats {
+                if rc.chat_id > 0 {
+                    if let Ok(json) = serde_json::to_string(rc) {
+                        let _ = tx.execute(
+                            "INSERT OR REPLACE INTO cached_rich_chats (chat_id, payload_json) VALUES (?1, ?2)",
+                            params![rc.chat_id, json],
+                        );
+                    }
+                }
+            }
+            let _ = tx.commit();
+        }
+    }
+
+    pub(crate) fn upsert_cached_rich_chat(&self, rc: &HermesRichChatDto) {
+        if rc.chat_id <= 0 {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(rc) {
+            let conn = self.conn.lock();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO cached_rich_chats (chat_id, payload_json) VALUES (?1, ?2)",
+                params![rc.chat_id, json],
+            );
+        }
+    }
+
+    pub(crate) fn delete_cached_rich_chat(&self, chat_id: u64) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM cached_rich_chats WHERE chat_id = ?1",
+            params![chat_id as i64],
+        );
+    }
+
+    pub(crate) fn load_cached_chat_histories(&self) -> Result<HashMap<u64, CachedChatHistorySnapshot>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT chat_id, payload_json FROM cached_chat_histories")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (cid, json) = row.map_err(db_err)?;
+            if cid > 0 {
+                if let Ok(snap) = serde_json::from_str::<CachedChatHistorySnapshot>(&json) {
+                    out.insert(cid as u64, snap);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn upsert_cached_chat_history(&self, chat_id: u64, snap: &CachedChatHistorySnapshot) {
+        if chat_id == 0 {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(snap) {
+            let conn = self.conn.lock();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO cached_chat_histories (chat_id, payload_json, updated_at_ms) VALUES (?1, ?2, ?3)",
+                params![chat_id as i64, json, snap.updated_at_ms],
+            );
+        }
+    }
+
+    pub(crate) fn delete_cached_chat_history(&self, chat_id: u64) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM cached_chat_histories WHERE chat_id = ?1",
+            params![chat_id as i64],
+        );
+    }
+
+    pub(crate) fn load_cached_contacts(&self) -> Result<Vec<ContactDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM cached_contacts ORDER BY sort_order ASC, user_id ASC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let json = row.map_err(db_err)?;
+            if let Ok(contact) = serde_json::from_str::<ContactDto>(&json) {
+                out.push(contact);
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn replace_cached_contacts(&self, contacts: &[ContactDto]) {
+        let mut conn = self.conn.lock();
+        if let Ok(tx) = conn.transaction() {
+            let _ = tx.execute("DELETE FROM cached_contacts", []);
+            for (idx, c) in contacts.iter().enumerate() {
+                if let Ok(json) = serde_json::to_string(c) {
+                    let _ = tx.execute(
+                        "INSERT OR REPLACE INTO cached_contacts (user_id, sort_order, payload_json) VALUES (?1, ?2, ?3)",
+                        params![c.user_id as i64, idx as i64, json],
+                    );
+                }
+            }
+            let _ = tx.commit();
         }
     }
 

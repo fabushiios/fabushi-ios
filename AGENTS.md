@@ -4,7 +4,7 @@ Repository: fabushiios/fabushi-ios (not historical redirects fabushi-ios/fabushi
 
 ## Mandatory active authority
 
-The **only live desktop product/architecture upstream** is bhrumom/gpui-telegram branch main (verified tag Fabushi v1.6.12; exact HEAD `c8decb499a13e253c5524ed35207e808eddf55fc`, root tree `3c1d5838d7f739b87f03de651249fec71ffa89a6`, `11381` blobs: `3085` `crates/**` + `7713` `inherited/**`, `0` gitlinks). The canonical iOS migration Spec is docs/specs/gpui-telegram-main-ios-parity.md and the machine lock is manifests/desktop-main-authority.json.
+The **only live desktop product/architecture upstream** is bhrumom/gpui-telegram branch main (latest release Fabushi v1.6.14 + untagged `feat(community)` commit; exact HEAD `e577d52f9159aa02538c5495777288871f75f572`, root tree `0963ca28ab41290872387d19c4a593fac06357d1`, `11406` blobs: `3110` `crates/**` + `7713` `inherited/**`, `0` gitlinks). The canonical iOS migration Spec is docs/specs/gpui-telegram-main-ios-parity.md and the machine lock is manifests/desktop-main-authority.json.
 
 - Note on upstream naming & lineage: `bhrunom/gpui-telegram` is a verified HTTP 404 1-character typo for `bhrumom/gpui-telegram`. `bhrum/gpui-telegram` (archived `v1.3.0` mirror), `bhrumom/fabushi-desktop` (`78d076cb8cc7d1ec157974cb9e91df9f599f0a71`, legacy Electron predecessor absorbed into `bhrumom/gpui-telegram/inherited/`), and PR #11/#12/#20 are historical/lineage references only.
 

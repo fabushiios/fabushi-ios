@@ -354,6 +354,7 @@ pub(crate) fn apply_update_event(
         UpdateEvent::CodingHostCommand(cmd) => {
             out_events.push(ClientDomainEvent::CodingHostCommand(cmd));
         }
+        UpdateEvent::CommunityEvent { .. } => {}
     }
 }
 

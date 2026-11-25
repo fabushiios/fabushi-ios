@@ -129,7 +129,7 @@ pub fn build_group_turn_guidance(
         format!("Room: {display_room}"),
         format!("Teammates in Room: {peer_list}"),
         format!("Remaining Multi-Agent Turn Budget: {remaining_hops} hop(s)"),
-        "- Stay-Silent Protocol: If another teammate already answered completely, or the message does not require your role/expertise and you have nothing materially new to contribute, respond ONLY with `[PASS]` (or `<PASS/>` / `NO_REPLY`) to yield the floor cleanly without cluttering the room.".to_string(),
+        "- Stay-Silent Protocol: ONLY when another AI teammate in this room has already fully answered the user's message and you have nothing materially new to contribute, respond ONLY with `[PASS]` (or `<PASS/>` / `NO_REPLY`) to yield the floor cleanly without cluttering the room. If a human directly addressed you, you are the only bot in the room, or no teammate has answered the user's latest message yet, you MUST respond helpfully and NEVER output `[PASS]`.".to_string(),
         "- Shared Group Workspace: Use `group_workspace_list`, `group_workspace_read`, and `group_workspace_write` to coordinate structured plans, checklists, and intermediate artifacts with room teammates.".to_string(),
     ];
 
