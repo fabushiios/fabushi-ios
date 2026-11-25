@@ -154,7 +154,6 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
                 mode: .primaryGate,
                 securityKeychain: secKC,
-                useFastKdfForTests: true,
                 onAuthenticated: {
                     didCompleteCallback = true
                 }
@@ -967,7 +966,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: FabushiKeychainStore())
         let router = ShellNavigationRouter()
         let explicitLaunch = FabushiLaunchConfiguration(
-            environment: ["FABUSHI_SERVER_URL": "https://auth-test.example"],
+            environment: ["GPUI_TELEGRAM_SERVER_URL": "https://auth-test.example"],
             arguments: []
         )
         let vm = FabushiAuthViewModel(
@@ -1056,8 +1055,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator: coordinator,
                 router: router,
                 mode: .primaryGate,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             primaryVM.serverURLText = server.baseURLString
             primaryVM.authTab = .register
@@ -1096,7 +1094,6 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 router: router,
                 mode: .addAccount,
                 securityKeychain: secKC,
-                useFastKdfForTests: true,
                 onAuthenticated: {
                     addAccountCompleted = true
                 }
@@ -1131,11 +1128,11 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             struct InitNewParams: Encodable, Sendable {
                 let userId: UInt64
                 let passphrase: String
-                let fastKdf: Bool
+                let kdfParams: FabushiArgon2KdfParamsDTO
                 enum CodingKeys: String, CodingKey {
                     case userId = "user_id"
                     case passphrase
-                    case fastKdf = "fast_kdf"
+                    case kdfParams = "kdf_params"
                 }
             }
             struct InitNewResp: Decodable, Sendable {
@@ -1148,7 +1145,11 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             }
             let legacyInit: InitNewResp = try await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.vault.method("initNew"),
-                params: InitNewParams(userId: 9103, passphrase: "ArgonUserPass!9", fastKdf: true)
+                params: InitNewParams(
+                    userId: 9103,
+                    passphrase: "ArgonUserPass!9",
+                    kdfParams: FabushiArgon2KdfParamsDTO(mCostKib: 16_384, tCost: 2, pCost: 1)
+                )
             )
             let flatArgon = FabushiVaultEnvelopeConverter.toFlat(legacyInit.envelope)
             let flatArgonData = try JSONEncoder().encode(flatArgon)
@@ -1164,8 +1165,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
                 coordinator: coordinator,
                 router: router,
                 mode: .primaryGate,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             loginVM.serverURLText = server.baseURLString
             loginVM.usernameText = "argon_env_user"

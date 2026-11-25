@@ -399,8 +399,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
             let vm = FabushiCredentialVaultViewModel(
                 coordinator: coordinator,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             await vm.unlockVault(passphraseOrPassword: "VaultMasterPass!7")
             XCTAssertTrue(vm.isUnlocked)
@@ -629,8 +628,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
             let vm = FabushiCredentialVaultViewModel(
                 coordinator: coordinator,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
             await vm.unlockVault(passphraseOrPassword: "SyncVaultPass!1")
             XCTAssertTrue(vm.isUnlocked)
@@ -1004,8 +1002,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
             let vm = FabushiCredentialVaultViewModel(
                 coordinator: coordinator,
-                securityKeychain: secKC,
-                useFastKdfForTests: true
+                securityKeychain: secKC
             )
 
             // Case B2: No remote envelope, empty Keychain, bare unlockVault() -> MUST fail closed (ZERO random key!)
