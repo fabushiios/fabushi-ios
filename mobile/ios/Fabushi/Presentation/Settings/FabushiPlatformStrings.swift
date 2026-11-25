@@ -237,6 +237,204 @@ public enum FabushiPlatformStrings: Sendable {
         case browserStoreSecretParamHint
         case browserStorePublishSuccess
         case browserStoreReplayComplete
+
+        // MARK: - Calls, LiveKitWebRTC, CallKit, ReplayKit & AI Talk Mode (Feature #29)
+        case callsTabTitle
+        case callsSegmentVoiceVideo
+        case callsSegmentTalkMode
+        case callsStartVoiceCall
+        case callsStartVideoCall
+        case callsTargetUserIdPlaceholder
+        case callsGroupRoomChatIdPlaceholder
+        case callsJoinGroupRoom
+        case callsLeaveGroupRoom
+        case callsHistoryTitle
+        case callsHistoryEmptyTitle
+        case callsHistoryEmptySubtitle
+        case callsStateIdle
+        case callsStateRingingOutgoing
+        case callsStateRingingIncoming
+        case callsStateConnecting
+        case callsStateConnected
+        case callsStateReconnecting
+        case callsStateEnded
+        case callsStateFailed
+        case callsAcceptAction
+        case callsDeclineAction
+        case callsHangupAction
+        case callsMuteAction
+        case callsUnmuteAction
+        case callsCameraOnAction
+        case callsCameraOffAction
+        case callsScreenShareAction
+        case callsStopScreenShareAction
+        case callsMinimizePipAction
+        case callsFingerprintTitle
+        case callsPermissionDeniedTitle
+        case callsPermissionDeniedBody
+        case callsOpenSystemSettings
+        case callsScreenShareUnavailableTitle
+        case callsScreenShareUnavailableBody
+        case callsSfuDisclosureTitle
+        case callsSfuDisclosureBody
+        case callsRateCallTitle
+        case callsRateFeedbackPlaceholder
+        case callsRateSubmitAction
+        case callsRateSubmittedToast
+        case callsVoipRegisteredLabel
+        case callsVoipPendingLabel
+        case talkModeTitle
+        case talkModeStartSession
+        case talkModeStopSession
+        case talkModeBargeInAction
+        case talkModeResumeListening
+        case talkModeStateIdle
+        case talkModeStateListening
+        case talkModeStateThinking
+        case talkModeStateSpeaking
+        case talkModeStateInterrupted
+        case talkModeStateReconnecting
+        case talkModeStateClosed
+        case talkModeHardwareAecActive
+        case talkModeHardwareAecUnavailable
+        case talkModeOfflineAsrLabel
+        case talkModeSendTurnPlaceholder
+        case talkModeSendTurnAction
+        case talkModeVoiceCaptureAction
+        case talkModeVoiceStopAction
+
+        // MARK: - Economy, Stars Ledger, Star Gifts, Premium & StoreKit 2 (Feature #31)
+        case economyTitle
+        case economyStarsBalanceTitle
+        case economyTopupStarsAction
+        case economyGiftStarsAction
+        case economyRedeemCodeAction
+        case economyRedeemCodePlaceholder
+        case economyRedeemCodeSubmit
+        case economyGiftRecipientPlaceholder
+        case economyGiftAmountPlaceholder
+        case economyGiftMessagePlaceholder
+        case economyGiftSendAction
+        case economyTransactionsTitle
+        case economyTransactionsEmpty
+        case economyPremiumTitle
+        case economyPremiumActiveBadge
+        case economyPremiumFreeBadge
+        case economyPremiumPurchaseAction
+        case economyStoreKitRestoreAction
+        case economyStoreKitDisclosureTitle
+        case economyStoreKitDisclosureBody
+        case economyTonDisclosureTitle
+        case economyTonDisclosureBody
+        case economyAlipaySectionTitle
+        case economyAlipayCreateOrder
+        case economyAlipayQueryOrder
+        case economyAlipayOrderIdPlaceholder
+
+        // MARK: - Network, Strict Proxy (D10-13), Server URL, Notifications/APNs, Updates & Action Bus (#32, #33)
+        case settingsServerUrlSectionTitle
+        case settingsServerUrlPlaceholder
+        case settingsServerUrlApplyAction
+        case settingsServerUrlInvalidToast
+        case settingsServerUrlUpdatedToast
+        case settingsProxySectionTitle
+        case settingsProxyKindDirect
+        case settingsProxyKindHttp
+        case settingsProxyKindSocks5
+        case settingsProxyKindMtproto
+        case settingsProxyHostPlaceholder
+        case settingsProxyPortPlaceholder
+        case settingsProxyUsernamePlaceholder
+        case settingsProxyPasswordPlaceholder
+        case settingsProxyMtprotoSecretPlaceholder
+        case settingsProxyAddAction
+        case settingsProxyProbeAction
+        case settingsProxyDisableAction
+        case settingsProxyShareLinkAction
+        case settingsProxyImportTitle
+        case settingsProxyImportPlaceholder
+        case settingsProxyImportAction
+        case settingsProxyStatusDirect
+        case settingsProxyStatusProbing
+        case settingsProxyStatusReachable
+        case settingsProxyStatusFailed
+        case settingsNotificationsApnsTitle
+        case settingsNotificationsRequestPermission
+        case settingsNotificationsRegisterApns
+        case settingsNotificationsUnregisterApns
+        case settingsNotificationsBlk01Body
+        case settingsNotificationsPrivateChats
+        case settingsNotificationsGroups
+        case settingsNotificationsChannels
+        case settingsNotificationsSound
+        case settingsNotificationsBadgeCount
+        case settingsUpdatesTitle
+        case settingsUpdatesCheckAction
+        case settingsUpdatesAppStoreNote
+        case settingsActionBusTitle
+        case settingsActionBusRunAction
+        case settingsActionBusSandboxNotice
+        case settingsActionBusSiriNote
+
+        // MARK: - Full 26-Section Settings Suite (Feature #30 + BLK-08)
+        case settingsGroupAccount
+        case settingsGroupExperience
+        case settingsGroupSecurityAndData
+        case settingsGroupAiAndPlatform
+        case settingsGroupEconomyAndSystem
+        case settingsSectionMyProfile
+        case settingsSectionAccounts
+        case settingsSectionAppearance
+        case settingsSectionLanguage
+        case settingsSectionChatSettings
+        case settingsSectionChatFolders
+        case settingsSectionStickersEmoji
+        case settingsSectionNotifications
+        case settingsSectionPrivacySecurity
+        case settingsSectionDevices
+        case settingsSectionCredentialVault
+        case settingsSectionDataStorage
+        case settingsSectionNetworkProxy
+        case settingsSectionPowerSaving
+        case settingsSectionAiProviders
+        case settingsSectionOfficialMcp
+        case settingsSectionRemoteComputers
+        case settingsSectionMiniApps
+        case settingsSectionBuiltInBrowser
+        case settingsSectionCallsAndTalk
+        case settingsSectionWalletStars
+        case settingsSectionBusiness
+        case settingsSectionPassportTon
+        case settingsSectionActionBusIntents
+        case settingsSectionAppUpdates
+        case settingsSectionCapabilities
+        case settingsProfileFirstName
+        case settingsProfileLastName
+        case settingsProfileUsername
+        case settingsProfileBio
+        case settingsProfileSaveAction
+        case settingsProfileSavedToast
+        case settingsBlockedUsersTitle
+        case settingsBlockedUsersEmpty
+        case settingsUnblockAction
+        case settingsStorageOverviewTitle
+        case settingsStorageMediaCache
+        case settingsStorageSqliteDb
+        case settingsStorageSearchIndex
+        case settingsStorageVaultDb
+        case settingsStorageHermesData
+        case settingsStoragePurgeAction
+        case settingsStorageCheckpointWalAction
+        case settingsStoragePurgedToast
+        case settingsStorageCheckpointToast
+        case settingsBusinessNoticeTitle
+        case settingsBusinessNoticeBody
+        case settingsPassportTonNoticeTitle
+        case settingsPassportTonNoticeBody
+        case settingsCommunityFoundationTitle
+        case settingsCommunityFoundationBadge
+        case settingsCommunityFoundationBody
+        case settingsNoMatchingSections
     }
 
     public static func text(_ key: Key, locale: FabushiLocale) -> String {
@@ -768,6 +966,446 @@ public enum FabushiPlatformStrings: Sendable {
             return text(locale, en: "Automation app published", zhHans: "自动化应用已发布")
         case .browserStoreReplayComplete:
             return text(locale, en: "Deterministic replay completed", zhHans: "确定性脚本回放完成")
+
+        // MARK: Calls, LiveKitWebRTC, CallKit, ReplayKit & AI Talk Mode
+        case .callsTabTitle:
+            return text(locale, en: "Calls & AI Talk", zhHans: "通话与 AI 语音")
+        case .callsSegmentVoiceVideo:
+            return text(locale, en: "Voice & Video", zhHans: "音视频通话")
+        case .callsSegmentTalkMode:
+            return text(locale, en: "AI Talk Mode", zhHans: "AI 全双工对话")
+        case .callsStartVoiceCall:
+            return text(locale, en: "Voice Call", zhHans: "语音通话")
+        case .callsStartVideoCall:
+            return text(locale, en: "Video Call", zhHans: "视频通话")
+        case .callsTargetUserIdPlaceholder:
+            return text(locale, en: "Peer User ID", zhHans: "对方用户 ID")
+        case .callsGroupRoomChatIdPlaceholder:
+            return text(locale, en: "Group Chat ID", zhHans: "群组会话 ID")
+        case .callsJoinGroupRoom:
+            return text(locale, en: "Join Group Room", zhHans: "加入群通话房间")
+        case .callsLeaveGroupRoom:
+            return text(locale, en: "Leave Group Room", zhHans: "离开群通话房间")
+        case .callsHistoryTitle:
+            return text(locale, en: "Recent Calls", zhHans: "最近通话记录")
+        case .callsHistoryEmptyTitle:
+            return text(locale, en: "No Call History", zhHans: "暂无通话记录")
+        case .callsHistoryEmptySubtitle:
+            return text(
+                locale,
+                en: "Start a 1:1 call, join a group room, or launch Full-Duplex AI Talk Mode.",
+                zhHans: "发起一对一通话、加入群通话房间，或启动 AI 全双工语音对话。"
+            )
+        case .callsStateIdle:
+            return text(locale, en: "Ready", zhHans: "就绪")
+        case .callsStateRingingOutgoing:
+            return text(locale, en: "Ringing…", zhHans: "正在呼叫…")
+        case .callsStateRingingIncoming:
+            return text(locale, en: "Incoming Call", zhHans: "来电响铃")
+        case .callsStateConnecting:
+            return text(locale, en: "Connecting Media…", zhHans: "正在建立媒体连接…")
+        case .callsStateConnected:
+            return text(locale, en: "Connected", zhHans: "通话中")
+        case .callsStateReconnecting:
+            return text(locale, en: "Reconnecting…", zhHans: "网络重连中…")
+        case .callsStateEnded:
+            return text(locale, en: "Call Ended", zhHans: "通话已结束")
+        case .callsStateFailed:
+            return text(locale, en: "Call Failed", zhHans: "通话失败")
+        case .callsAcceptAction:
+            return text(locale, en: "Accept", zhHans: "接听")
+        case .callsDeclineAction:
+            return text(locale, en: "Decline", zhHans: "拒绝")
+        case .callsHangupAction:
+            return text(locale, en: "End Call", zhHans: "挂断")
+        case .callsMuteAction:
+            return text(locale, en: "Mute", zhHans: "静音")
+        case .callsUnmuteAction:
+            return text(locale, en: "Unmute", zhHans: "取消静音")
+        case .callsCameraOnAction:
+            return text(locale, en: "Camera On", zhHans: "开启摄像头")
+        case .callsCameraOffAction:
+            return text(locale, en: "Camera Off", zhHans: "关闭摄像头")
+        case .callsScreenShareAction:
+            return text(locale, en: "Screen Share", zhHans: "共享屏幕")
+        case .callsStopScreenShareAction:
+            return text(locale, en: "Stop Sharing", zhHans: "停止共享")
+        case .callsMinimizePipAction:
+            return text(locale, en: "Floating Capsule", zhHans: "悬浮窗")
+        case .callsFingerprintTitle:
+            return text(locale, en: "E2EE Emoji Fingerprint", zhHans: "端到端加密指纹")
+        case .callsPermissionDeniedTitle:
+            return text(locale, en: "Microphone or Camera Access Denied", zhHans: "麦克风或摄像头权限未开启")
+        case .callsPermissionDeniedBody:
+            return text(
+                locale,
+                en: "Enable Microphone and Camera access in iOS Settings to place voice and video calls.",
+                zhHans: "请在 iOS 系统设置中开启麦克风与摄像头权限后再发起音视频通话。"
+            )
+        case .callsOpenSystemSettings:
+            return text(locale, en: "Open Settings", zhHans: "前往系统设置")
+        case .callsScreenShareUnavailableTitle:
+            return text(locale, en: "Screen Share Unavailable", zhHans: "屏幕共享暂不可用")
+        case .callsScreenShareUnavailableBody:
+            return text(
+                locale,
+                en: "Apple ReplayKit broadcast capture is unavailable or restricted in the current environment.",
+                zhHans: "当前环境不支持或已限制 Apple ReplayKit 屏幕广播采集。"
+            )
+        case .callsSfuDisclosureTitle:
+            return text(locale, en: "WebRTC NAT / SFU Status (BLK-02)", zhHans: "WebRTC NAT / SFU 说明 (BLK-02)")
+        case .callsSfuDisclosureBody:
+            return text(
+                locale,
+                en: "Client media uses LiveKitWebRTC, CallKit, and ReplayKit. Production server-side NAT/SFU transport and two-device physical media verification remain blocked under BLK-02.",
+                zhHans: "客户端已接入 LiveKitWebRTC、CallKit 与 ReplayKit；服务端生产级 NAT/SFU 转发及双真机媒体联调仍受 BLK-02 阻塞。"
+            )
+        case .callsRateCallTitle:
+            return text(locale, en: "Rate Call Quality", zhHans: "评价本次通话质量")
+        case .callsRateFeedbackPlaceholder:
+            return text(locale, en: "Optional feedback…", zhHans: "补充反馈（可选）…")
+        case .callsRateSubmitAction:
+            return text(locale, en: "Submit Rating", zhHans: "提交评分")
+        case .callsRateSubmittedToast:
+            return text(locale, en: "Call quality rating submitted", zhHans: "已提交通话质量评价")
+        case .callsVoipRegisteredLabel:
+            return text(locale, en: "CallKit / PushKit VoIP Ready", zhHans: "CallKit / PushKit VoIP 已就绪")
+        case .callsVoipPendingLabel:
+            return text(locale, en: "CallKit Ready (Awaiting VoIP Token)", zhHans: "CallKit 已就绪（等待 VoIP 令牌）")
+        case .talkModeTitle:
+            return text(locale, en: "Full-Duplex AI Talk Mode", zhHans: "AI 全双工语音对话")
+        case .talkModeStartSession:
+            return text(locale, en: "Start Talk Session", zhHans: "开启语音对话")
+        case .talkModeStopSession:
+            return text(locale, en: "End Talk Session", zhHans: "结束语音对话")
+        case .talkModeBargeInAction:
+            return text(locale, en: "Barge In (<60ms)", zhHans: "即时打断 (<60ms)")
+        case .talkModeResumeListening:
+            return text(locale, en: "Resume Listening", zhHans: "继续聆听")
+        case .talkModeStateIdle:
+            return text(locale, en: "Idle", zhHans: "空闲")
+        case .talkModeStateListening:
+            return text(locale, en: "Listening", zhHans: "正在聆听")
+        case .talkModeStateThinking:
+            return text(locale, en: "Thinking", zhHans: "思考中")
+        case .talkModeStateSpeaking:
+            return text(locale, en: "Speaking", zhHans: "正在播报")
+        case .talkModeStateInterrupted:
+            return text(locale, en: "Interrupted (Flushed)", zhHans: "已打断并清空缓冲")
+        case .talkModeStateReconnecting:
+            return text(locale, en: "Reconnecting", zhHans: "重连中")
+        case .talkModeStateClosed:
+            return text(locale, en: "Session Closed", zhHans: "会话已关闭")
+        case .talkModeHardwareAecActive:
+            return text(locale, en: "Hardware AEC Active", zhHans: "硬件回声消除已启用")
+        case .talkModeHardwareAecUnavailable:
+            return text(locale, en: "Software Fallback (No Hardware AEC)", zhHans: "软降级模式（当前无硬件回声消除）")
+        case .talkModeOfflineAsrLabel:
+            return text(locale, en: "On-Device Apple Speech ASR", zhHans: "Apple 本地离线语音识别")
+        case .talkModeSendTurnPlaceholder:
+            return text(locale, en: "Speak or enter transcript…", zhHans: "语音输入或键入对话内容…")
+        case .talkModeSendTurnAction:
+            return text(locale, en: "Send Turn", zhHans: "发送")
+        case .talkModeVoiceCaptureAction:
+            return text(locale, en: "Capture Voice", zhHans: "录制语音")
+        case .talkModeVoiceStopAction:
+            return text(locale, en: "Transcribe & Send", zhHans: "转写并发送")
+
+        // MARK: Economy, Stars Ledger, Star Gifts, Premium & StoreKit 2
+        case .economyTitle:
+            return text(locale, en: "Wallet, Stars & Premium", zhHans: "钱包、星币与会员")
+        case .economyStarsBalanceTitle:
+            return text(locale, en: "Stars Balance", zhHans: "星币余额")
+        case .economyTopupStarsAction:
+            return text(locale, en: "Top Up Stars", zhHans: "充值星币")
+        case .economyGiftStarsAction:
+            return text(locale, en: "Send Star Gift", zhHans: "赠送星币礼物")
+        case .economyRedeemCodeAction:
+            return text(locale, en: "Redeem Code", zhHans: "兑换码")
+        case .economyRedeemCodePlaceholder:
+            return text(locale, en: "Enter redemption code…", zhHans: "输入兑换码…")
+        case .economyRedeemCodeSubmit:
+            return text(locale, en: "Redeem", zhHans: "立即兑换")
+        case .economyGiftRecipientPlaceholder:
+            return text(locale, en: "Recipient User ID", zhHans: "接收方用户 ID")
+        case .economyGiftAmountPlaceholder:
+            return text(locale, en: "Stars Amount", zhHans: "赠送星币数量")
+        case .economyGiftMessagePlaceholder:
+            return text(locale, en: "Gift message (optional)", zhHans: "祝福附言（可选）")
+        case .economyGiftSendAction:
+            return text(locale, en: "Send Gift", zhHans: "发送礼物")
+        case .economyTransactionsTitle:
+            return text(locale, en: "Stars Ledger", zhHans: "星币账单明细")
+        case .economyTransactionsEmpty:
+            return text(locale, en: "No Stars transactions recorded yet.", zhHans: "暂无星币交易记录。")
+        case .economyPremiumTitle:
+            return text(locale, en: "Fabushi Premium & StoreKit 2", zhHans: "Fabushi 会员与 StoreKit 2")
+        case .economyPremiumActiveBadge:
+            return text(locale, en: "Premium Active", zhHans: "会员生效中")
+        case .economyPremiumFreeBadge:
+            return text(locale, en: "Standard Plan", zhHans: "标准版")
+        case .economyPremiumPurchaseAction:
+            return text(locale, en: "Purchase via App Store", zhHans: "通过 App Store 购买")
+        case .economyStoreKitRestoreAction:
+            return text(locale, en: "Restore Purchases", zhHans: "恢复购买")
+        case .economyStoreKitDisclosureTitle:
+            return text(locale, en: "StoreKit 2 Server Binding Status (BLK-04)", zhHans: "StoreKit 2 服务端核验说明 (BLK-04)")
+        case .economyStoreKitDisclosureBody:
+            return text(
+                locale,
+                en: "In-app purchases and Restore Purchases use Apple StoreKit 2 (Guideline 3.1.1). Server-side JWS receipt and entitlement binding remains blocked under BLK-04 until provisioned.",
+                zhHans: "应用内购买与恢复购买严格使用 Apple StoreKit 2（遵循 3.1.1 规范）；服务端 JWS 收据核验与权益绑定尚未配置，当前按 BLK-04 如实披露。"
+            )
+        case .economyTonDisclosureTitle:
+            return text(locale, en: "TON On-Chain Signing (BLK-03)", zhHans: "TON 链上签名状态 (BLK-03)")
+        case .economyTonDisclosureBody:
+            return text(
+                locale,
+                en: "TON on-chain signing and broadcast are upstream_not_implemented (BLK-03). Read-only balance metadata is displayed without fabricating transactions.",
+                zhHans: "TON 链上签名与广播在上游尚未实现（upstream_not_implemented，BLK-03）。此处仅展示只读余额信息，绝不伪造链上交易。"
+            )
+        case .economyAlipaySectionTitle:
+            return text(locale, en: "External Order Status Lookup", zhHans: "已有订单状态查询")
+        case .economyAlipayCreateOrder:
+            return text(locale, en: "Create Order Intent", zhHans: "创建订单意向")
+        case .economyAlipayQueryOrder:
+            return text(locale, en: "Query Order Status", zhHans: "查询订单状态")
+        case .economyAlipayOrderIdPlaceholder:
+            return text(locale, en: "Order ID", zhHans: "订单号")
+
+        // MARK: Network, Proxy, Notifications, Updates & Action Bus
+        case .settingsServerUrlSectionTitle:
+            return text(locale, en: "Server Endpoint", zhHans: "服务器地址")
+        case .settingsServerUrlPlaceholder:
+            return text(locale, en: "https://api.example.com", zhHans: "https://api.example.com")
+        case .settingsServerUrlApplyAction:
+            return text(locale, en: "Switch Server", zhHans: "切换服务器")
+        case .settingsServerUrlInvalidToast:
+            return text(locale, en: "Enter a valid http:// or https:// server URL", zhHans: "请输入有效的 http:// 或 https:// 服务器地址")
+        case .settingsServerUrlUpdatedToast:
+            return text(locale, en: "Server endpoint updated; session scope reset", zhHans: "服务器地址已更新并重置会话隔离域")
+        case .settingsProxySectionTitle:
+            return text(locale, en: "Proxy Profiles (Strict D10-13)", zhHans: "代理配置（严格校验 D10-13）")
+        case .settingsProxyKindDirect:
+            return text(locale, en: "Direct", zhHans: "直连")
+        case .settingsProxyKindHttp:
+            return text(locale, en: "HTTP / HTTPS", zhHans: "HTTP / HTTPS")
+        case .settingsProxyKindSocks5:
+            return text(locale, en: "SOCKS5", zhHans: "SOCKS5")
+        case .settingsProxyKindMtproto:
+            return text(locale, en: "MTProto", zhHans: "MTProto")
+        case .settingsProxyHostPlaceholder:
+            return text(locale, en: "Host or IPv6 (e.g. proxy.example.com or ::1)", zhHans: "主机名或 IPv6（如 proxy.example.com 或 ::1）")
+        case .settingsProxyPortPlaceholder:
+            return text(locale, en: "Port (1–65535)", zhHans: "端口 (1–65535)")
+        case .settingsProxyUsernamePlaceholder:
+            return text(locale, en: "Username (optional)", zhHans: "用户名（可选）")
+        case .settingsProxyPasswordPlaceholder:
+            return text(locale, en: "Password (requires username)", zhHans: "密码（需先填用户名）")
+        case .settingsProxyMtprotoSecretPlaceholder:
+            return text(locale, en: "MTProto Secret (hex or base64url)", zhHans: "MTProto 密钥（hex 或 base64url）")
+        case .settingsProxyAddAction:
+            return text(locale, en: "Save Proxy", zhHans: "保存代理")
+        case .settingsProxyProbeAction:
+            return text(locale, en: "Probe Latency", zhHans: "探测延迟")
+        case .settingsProxyDisableAction:
+            return text(locale, en: "Use Direct Connection", zhHans: "切回直连")
+        case .settingsProxyShareLinkAction:
+            return text(locale, en: "Copy Share Link", zhHans: "复制分享链接")
+        case .settingsProxyImportTitle:
+            return text(locale, en: "Import tg://proxy or tg://socks Link", zhHans: "导入 tg://proxy 或 tg://socks 链接")
+        case .settingsProxyImportPlaceholder:
+            return text(locale, en: "Paste tg://proxy?... or tg://socks?...", zhHans: "粘贴 tg://proxy?... 或 tg://socks?...")
+        case .settingsProxyImportAction:
+            return text(locale, en: "Import Link", zhHans: "解析导入")
+        case .settingsProxyStatusDirect:
+            return text(locale, en: "Direct connection (no proxy active)", zhHans: "当前为直连模式（未启用代理）")
+        case .settingsProxyStatusProbing:
+            return text(locale, en: "Probing proxy reachability…", zhHans: "正在探测代理可达性…")
+        case .settingsProxyStatusReachable:
+            return text(locale, en: "Proxy reachable", zhHans: "代理连接正常")
+        case .settingsProxyStatusFailed:
+            return text(locale, en: "Proxy unreachable or invalid", zhHans: "代理不可达或配置无效")
+        case .settingsNotificationsApnsTitle:
+            return text(locale, en: "Apple Push Notifications (APNs)", zhHans: "Apple 推送通知 (APNs)")
+        case .settingsNotificationsRequestPermission:
+            return text(locale, en: "Request System Permission", zhHans: "请求系统通知权限")
+        case .settingsNotificationsRegisterApns:
+            return text(locale, en: "Register APNs Token", zhHans: "注册 APNs 令牌")
+        case .settingsNotificationsUnregisterApns:
+            return text(locale, en: "Clear Local Token", zhHans: "注销本地令牌")
+        case .settingsNotificationsBlk01Body:
+            return text(
+                locale,
+                en: "iOS registers your real APNs device token via UNUserNotificationCenter and push.registerToken. Server HTTP/2 APNs delivery remains blocked upstream (BLK-01).",
+                zhHans: "iOS 客户端已通过 UNUserNotificationCenter 与 push.registerToken 真实注册设备令牌；服务端 HTTP/2 APNs 下发仍处于上游阻塞状态（BLK-01）。"
+            )
+        case .settingsNotificationsPrivateChats:
+            return text(locale, en: "Private Chats", zhHans: "私聊通知")
+        case .settingsNotificationsGroups:
+            return text(locale, en: "Group Chats", zhHans: "群组通知")
+        case .settingsNotificationsChannels:
+            return text(locale, en: "Channels", zhHans: "频道通知")
+        case .settingsNotificationsSound:
+            return text(locale, en: "Notification Sound", zhHans: "提示音")
+        case .settingsNotificationsBadgeCount:
+            return text(locale, en: "Include Muted in Badge", zhHans: "角标计入静音会话")
+        case .settingsUpdatesTitle:
+            return text(locale, en: "App Store & TestFlight Updates", zhHans: "App Store 与 TestFlight 更新")
+        case .settingsUpdatesCheckAction:
+            return text(locale, en: "Check Update Policy", zhHans: "检查版本与分发状态")
+        case .settingsUpdatesAppStoreNote:
+            return text(
+                locale,
+                en: "iOS updates are delivered strictly through App Store and TestFlight. In-app binary self-updating is disabled per Apple App Review Guidelines.",
+                zhHans: "iOS 应用更新仅通过 App Store 与 TestFlight 分发，遵循 Apple 审核规范，不包含应用内二进制自更新。"
+            )
+        case .settingsActionBusTitle:
+            return text(locale, en: "Typed Action Bus & Siri Shortcuts", zhHans: "类型化动作总线与 Siri 快捷指令")
+        case .settingsActionBusRunAction:
+            return text(locale, en: "Execute Action", zhHans: "执行动作")
+        case .settingsActionBusSandboxNotice:
+            return text(
+                locale,
+                en: "Desktop host-control actions (power, mouse, keyboard, local terminal) fail closed with capability_unavailable inside the iOS sandbox.",
+                zhHans: "桌面宿主机控制类动作（电源、键鼠、本地终端）在 iOS 沙盒中严格按 fail-closed 返回 capability_unavailable。"
+            )
+        case .settingsActionBusSiriNote:
+            return text(
+                locale,
+                en: "Available in Apple Shortcuts via Fabushi App Intents (Remote Computers, Mini Apps, Built-in Browser, Calls, Settings, and Action Bus).",
+                zhHans: "已通过原生 App Intents 接入 Apple 快捷指令与 Siri（支持打开远程电脑、小程序、内置浏览器、通话、设置及动作总线）。"
+            )
+
+        // MARK: Full 26-Section Settings Suite
+        case .settingsGroupAccount:
+            return text(locale, en: "Account & Profile", zhHans: "账号与资料")
+        case .settingsGroupExperience:
+            return text(locale, en: "Appearance & Messaging", zhHans: "外观与消息体验")
+        case .settingsGroupSecurityAndData:
+            return text(locale, en: "Privacy, Security & Network", zhHans: "隐私、安全与网络")
+        case .settingsGroupAiAndPlatform:
+            return text(locale, en: "AI, Remote & Platform", zhHans: "AI、远程与平台工具")
+        case .settingsGroupEconomyAndSystem:
+            return text(locale, en: "Economy, Updates & Capabilities", zhHans: "经济、更新与能力清单")
+        case .settingsSectionMyProfile:
+            return text(locale, en: "My Profile", zhHans: "个人资料")
+        case .settingsSectionAccounts:
+            return text(locale, en: "Multi-Account", zhHans: "多账号切换")
+        case .settingsSectionAppearance:
+            return text(locale, en: "Appearance", zhHans: "外观主题")
+        case .settingsSectionLanguage:
+            return text(locale, en: "Language", zhHans: "语言设置")
+        case .settingsSectionChatSettings:
+            return text(locale, en: "Chat Settings", zhHans: "聊天设置")
+        case .settingsSectionChatFolders:
+            return text(locale, en: "Chat Folders", zhHans: "会话分组")
+        case .settingsSectionStickersEmoji:
+            return text(locale, en: "Stickers & Emoji", zhHans: "贴纸与表情")
+        case .settingsSectionNotifications:
+            return text(locale, en: "Notifications & Sounds", zhHans: "通知与声音")
+        case .settingsSectionPrivacySecurity:
+            return text(locale, en: "Privacy & Security", zhHans: "隐私与安全")
+        case .settingsSectionDevices:
+            return text(locale, en: "Active Devices", zhHans: "活动设备")
+        case .settingsSectionCredentialVault:
+            return text(locale, en: "Credential Vault", zhHans: "加密凭证库")
+        case .settingsSectionDataStorage:
+            return text(locale, en: "Data & Storage", zhHans: "数据与存储")
+        case .settingsSectionNetworkProxy:
+            return text(locale, en: "Network & Proxy", zhHans: "网络与代理")
+        case .settingsSectionPowerSaving:
+            return text(locale, en: "Power Saving", zhHans: "省电与性能")
+        case .settingsSectionAiProviders:
+            return text(locale, en: "AI Providers (Magpie)", zhHans: "AI 模型与供应商")
+        case .settingsSectionOfficialMcp:
+            return text(locale, en: "Official MCP Console", zhHans: "官方 MCP 控制台")
+        case .settingsSectionRemoteComputers:
+            return text(locale, en: "Remote Computers", zhHans: "远程电脑")
+        case .settingsSectionMiniApps:
+            return text(locale, en: "Mini Apps & Global Dharma", zhHans: "小程序与全球法布施")
+        case .settingsSectionBuiltInBrowser:
+            return text(locale, en: "Built-in Browser & Apps", zhHans: "内置浏览器 · 自动化应用")
+        case .settingsSectionCallsAndTalk:
+            return text(locale, en: "Calls & AI Talk Mode", zhHans: "通话与 AI 语音")
+        case .settingsSectionWalletStars:
+            return text(locale, en: "Wallet, Stars & Premium", zhHans: "钱包、星币与会员")
+        case .settingsSectionBusiness:
+            return text(locale, en: "Business Tools", zhHans: "商业工具")
+        case .settingsSectionPassportTon:
+            return text(locale, en: "Passport & TON", zhHans: "身份护照与 TON")
+        case .settingsSectionActionBusIntents:
+            return text(locale, en: "Action Bus & Shortcuts", zhHans: "动作总线与快捷指令")
+        case .settingsSectionAppUpdates:
+            return text(locale, en: "App Updates", zhHans: "版本更新")
+        case .settingsSectionCapabilities:
+            return text(locale, en: "Capability Ledger & Status", zhHans: "能力清单与阻塞披露")
+        case .settingsProfileFirstName:
+            return text(locale, en: "First Name", zhHans: "名")
+        case .settingsProfileLastName:
+            return text(locale, en: "Last Name", zhHans: "姓")
+        case .settingsProfileUsername:
+            return text(locale, en: "Username", zhHans: "用户名")
+        case .settingsProfileBio:
+            return text(locale, en: "Bio", zhHans: "个人简介")
+        case .settingsProfileSaveAction:
+            return text(locale, en: "Save Profile", zhHans: "保存资料")
+        case .settingsProfileSavedToast:
+            return text(locale, en: "Profile updated", zhHans: "个人资料已更新")
+        case .settingsBlockedUsersTitle:
+            return text(locale, en: "Blocked Users", zhHans: "黑名单用户")
+        case .settingsBlockedUsersEmpty:
+            return text(locale, en: "No blocked users.", zhHans: "暂无已拉黑用户。")
+        case .settingsUnblockAction:
+            return text(locale, en: "Unblock", zhHans: "解除拉黑")
+        case .settingsStorageOverviewTitle:
+            return text(locale, en: "Local Storage Breakdown", zhHans: "本地存储占用明细")
+        case .settingsStorageMediaCache:
+            return text(locale, en: "Media CAS Cache", zhHans: "媒体内容缓存")
+        case .settingsStorageSqliteDb:
+            return text(locale, en: "SQLite WAL Databases", zhHans: "SQLite WAL 数据库")
+        case .settingsStorageSearchIndex:
+            return text(locale, en: "Search Index (Tantivy)", zhHans: "全文检索索引")
+        case .settingsStorageVaultDb:
+            return text(locale, en: "Encrypted Vault Store", zhHans: "加密凭证库存储")
+        case .settingsStorageHermesData:
+            return text(locale, en: "Agent & Studio Data", zhHans: "智能体与工作室数据")
+        case .settingsStoragePurgeAction:
+            return text(locale, en: "Purge Media Cache", zhHans: "清理媒体缓存")
+        case .settingsStorageCheckpointWalAction:
+            return text(locale, en: "Checkpoint SQLite WAL", zhHans: "压缩 SQLite WAL")
+        case .settingsStoragePurgedToast:
+            return text(locale, en: "Media cache purged", zhHans: "媒体缓存已清理")
+        case .settingsStorageCheckpointToast:
+            return text(locale, en: "SQLite WAL checkpoint completed", zhHans: "SQLite WAL 检查点已完成")
+        case .settingsBusinessNoticeTitle:
+            return text(locale, en: "Business Automations (Partial Upstream)", zhHans: "商业工具（上游部分实现）")
+        case .settingsBusinessNoticeBody:
+            return text(
+                locale,
+                en: "Business hours, greeting rules, and chatbot routing are tracked against the v1.6.15 baseline. Configure AI bot workflows via Agent Studio and Managed Bots.",
+                zhHans: "营业时间、自动欢迎语与商业路由按 v1.6.15 基线如实披露为部分支持；您可通过智能体工作室与托管机器人配置自动化流程。"
+            )
+        case .settingsPassportTonNoticeTitle:
+            return text(locale, en: "Telegram Passport & TON (BLK-03)", zhHans: "身份护照与 TON 状态 (BLK-03)")
+        case .settingsPassportTonNoticeBody:
+            return text(
+                locale,
+                en: "Telegram Passport document vaults and TON on-chain signing/broadcast remain upstream-planned (BLK-03) and fail closed without fabricating credentials or transactions.",
+                zhHans: "Telegram Passport 证件库与 TON 链上签名广播仍处于上游规划阶段（BLK-03），客户端严格按 fail-closed 展示状态，不伪造任何凭证或交易。"
+            )
+        case .settingsCommunityFoundationTitle:
+            return text(locale, en: "Community Module (BLK-08 · Upstream Foundation)", zhHans: "社区模块（BLK-08 · 上游基础层）")
+        case .settingsCommunityFoundationBadge:
+            return text(locale, en: "UPSTREAM-FOUNDATION", zhHans: "仅上游基础层")
+        case .settingsCommunityFoundationBody:
+            return text(
+                locale,
+                en: "At locked v1.6.15, upstream ships pure-Rust community contracts and core engine only, with zero server HTTP/WS routes or desktop UI. No speculative feeds, awards, or moderation screens are fabricated.",
+                zhHans: "在锁定的 v1.6.15 基线中，上游仅提供纯 Rust 社区契约与核心引擎，尚无服务端 HTTP/WS 路由与桌面端界面。iOS 端绝不伪造社区动态、打赏或管理页面。"
+            )
+        case .settingsNoMatchingSections:
+            return text(locale, en: "No matching settings sections.", zhHans: "没有找到匹配的设置项。")
         }
     }
 
@@ -847,5 +1485,34 @@ public enum FabushiPlatformStrings: Sendable {
         case .zhHans:
             return "已导入 \(count) 条 Cookie"
         }
+    }
+
+    public static func starsBalanceFormatted(_ stars: Int64, locale: FabushiLocale) -> String {
+        switch locale {
+        case .en:
+            return "\(stars) Stars"
+        case .zhHans:
+            return "\(stars) 星币"
+        }
+    }
+
+    public static func proxyLatencyFormatted(_ latencyMs: UInt32, locale: FabushiLocale) -> String {
+        switch locale {
+        case .en:
+            return "Reachable · \(latencyMs) ms"
+        case .zhHans:
+            return "可达 · \(latencyMs) 毫秒"
+        }
+    }
+
+    public static func storageBytesFormatted(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))), countStyle: .file)
+    }
+
+    public static func callDurationFormatted(_ seconds: Int) -> String {
+        let clamped = max(0, seconds)
+        let mins = clamped / 60
+        let secs = clamped % 60
+        return String(format: "%02d:%02d", mins, secs)
     }
 }
