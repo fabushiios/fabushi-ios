@@ -376,12 +376,9 @@ public struct FabushiMediaLightboxView: View {
             return
         }
 
-        let resourceType: PHAssetResourceType = target.isVideo ? .video : .photo
+        let isVideo = target.isVideo
         do {
-            try await PHPhotoLibrary.shared().performChanges {
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: resourceType, data: data, options: nil)
-            }
+            try await Self.performPhotoLibrarySave(isVideo: isVideo, data: data)
             _ = router.showChatToastIfVisible(
                 theme.messagingString(.mediaSavedToast),
                 chatId: targetChatId,
@@ -398,6 +395,16 @@ public struct FabushiMediaLightboxView: View {
                 isError: true
             )
         }
+    }
+
+    nonisolated private static func performPhotoLibrarySave(isVideo: Bool, data: Data) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            let resourceType: PHAssetResourceType = isVideo ? .video : .photo
+            try PHPhotoLibrary.shared().performChangesAndWait {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: resourceType, data: data, options: nil)
+            }
+        }.value
     }
 
     #if canImport(UIKit)
