@@ -146,8 +146,9 @@ public final class FabushiMultiAgentViewModel {
         case .agentWorkspaceUpdated(let eventChatId, let revision, _, _):
             guard eventChatId == chatId else { return }
             if revision > workspace.revision {
-                let refreshTask = Task { @MainActor [weak self] in
-                    await self?.loadWorkspaceSnapshot()
+                let refreshTask = Task<Void, Never> { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.loadWorkspaceSnapshot()
                 }
                 taskBag.replace(key: "multiAgent.workspaceRefresh", with: refreshTask)
             }

@@ -162,87 +162,117 @@ public struct FabushiMagpieSettingsView: View {
                     .foregroundStyle(theme.textSecondary)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous))
+                    .background(
+                        theme.surfaceSecondary,
+                        in: RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous)
+                    )
             } else {
                 ForEach(viewModel.subscriptions) { sub in
-                    let isActive = sub.isActiveFor(activeProvider: viewModel.activeProvider)
-                    let models = sub.candidateModels(fallbackActiveModel: isActive ? viewModel.activeModel : "")
-                    let selectedModel = viewModel.selectedSubscriptionModels[sub.id] ?? sub.defaultModel ?? ""
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        ViewThatFits(in: .horizontal) {
-                            HStack(spacing: 8) {
-                                subscriptionIdentity(sub: sub, isActive: isActive, locale: locale)
-                                Spacer(minLength: 8)
-                                if !isActive {
-                                    FabushiGlassPillButton(
-                                        title: FabushiAgentStudioStrings.text("m4.magpie.activateSubscription", locale: locale),
-                                        systemImage: "bolt.fill",
-                                        accessibilityID: "fabushi.internal.magpie.activate.\(sub.id)",
-                                        isProminent: true
-                                    ) {
-                                        viewModel.activateSubscription(subscriptionId: sub.id)
-                                    }
-                                }
-                            }
-                            VStack(alignment: .leading, spacing: 8) {
-                                subscriptionIdentity(sub: sub, isActive: isActive, locale: locale)
-                                if !isActive {
-                                    FabushiGlassPillButton(
-                                        title: FabushiAgentStudioStrings.text("m4.magpie.activateSubscription", locale: locale),
-                                        systemImage: "bolt.fill",
-                                        accessibilityID: "fabushi.internal.magpie.activate.\(sub.id)",
-                                        isProminent: true
-                                    ) {
-                                        viewModel.activateSubscription(subscriptionId: sub.id)
-                                    }
-                                }
-                            }
-                        }
-
-                        if !models.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    ForEach(models, id: \.self) { model in
-                                        let chipSelected = selectedModel == model
-                                        Button {
-                                            if reduceMotion {
-                                                viewModel.selectSubscriptionModel(subscriptionId: sub.id, model: model)
-                                            } else {
-                                                withAnimation(.easeInOut(duration: 0.16)) {
-                                                    viewModel.selectSubscriptionModel(subscriptionId: sub.id, model: model)
-                                                }
-                                            }
-                                        } label: {
-                                            Text(model)
-                                                .fabushiFont(.caption)
-                                                .fontWeight(chipSelected ? .semibold : .regular)
-                                                .foregroundStyle(chipSelected ? theme.accentForegroundColor : theme.textPrimary)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 6)
-                                                .fabushiMinimumTouchTarget()
-                                                .background(
-                                                    chipSelected ? theme.accentColor : theme.surfaceElevated,
-                                                    in: Capsule()
-                                                )
-                                        }
-                                        .buttonStyle(.plain)
-                                        .accessibilityAddTraits(chipSelected ? [.isSelected] : [])
-                                        .accessibilityIdentifier("fabushi.internal.magpie.subModel.\(sub.id).\(model)")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(12)
-                    .background(theme.surfaceSecondary, in: RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous)
-                            .strokeBorder(isActive ? theme.accentColor : theme.hairlineBorder, lineWidth: isActive ? 1.25 : 0.75)
-                    )
+                    subscriptionCard(sub: sub, locale: locale, reduceMotion: reduceMotion)
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func subscriptionCard(
+        sub: FabushiMagpieSubscriptionDTO,
+        locale: FabushiLocale,
+        reduceMotion: Bool
+    ) -> some View {
+        let isActive = sub.isActiveFor(activeProvider: viewModel.activeProvider)
+        let models = sub.candidateModels(fallbackActiveModel: isActive ? viewModel.activeModel : "")
+        let selectedModel = viewModel.selectedSubscriptionModels[sub.id] ?? sub.defaultModel ?? ""
+        let borderColor = isActive ? theme.accentColor : theme.hairlineBorder
+        let borderWidth: CGFloat = isActive ? 1.25 : 0.75
+
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    subscriptionIdentity(sub: sub, isActive: isActive, locale: locale)
+                    Spacer(minLength: 8)
+                    if !isActive {
+                        subscriptionActivateButton(subId: sub.id, locale: locale)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    subscriptionIdentity(sub: sub, isActive: isActive, locale: locale)
+                    if !isActive {
+                        subscriptionActivateButton(subId: sub.id, locale: locale)
+                    }
+                }
+            }
+
+            if !models.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(models, id: \.self) { model in
+                            subscriptionModelChip(
+                                subId: sub.id,
+                                model: model,
+                                isSelected: selectedModel == model,
+                                reduceMotion: reduceMotion
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            theme.surfaceSecondary,
+            in: RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: FabushiLayoutMetrics.cardCornerRadius, style: .continuous)
+                .strokeBorder(borderColor, lineWidth: borderWidth)
+        )
+    }
+
+    @ViewBuilder
+    private func subscriptionActivateButton(subId: String, locale: FabushiLocale) -> some View {
+        FabushiGlassPillButton(
+            title: FabushiAgentStudioStrings.text("m4.magpie.activateSubscription", locale: locale),
+            systemImage: "bolt.fill",
+            accessibilityID: "fabushi.internal.magpie.activate.\(subId)",
+            isProminent: true
+        ) {
+            viewModel.activateSubscription(subscriptionId: subId)
+        }
+    }
+
+    @ViewBuilder
+    private func subscriptionModelChip(
+        subId: String,
+        model: String,
+        isSelected: Bool,
+        reduceMotion: Bool
+    ) -> some View {
+        let fgColor = isSelected ? theme.accentForegroundColor : theme.textPrimary
+        let bgColor = isSelected ? theme.accentColor : theme.surfaceElevated
+        let weight: Font.Weight = isSelected ? .semibold : .regular
+
+        Button {
+            if reduceMotion {
+                _ = viewModel.selectSubscriptionModel(subscriptionId: subId, model: model)
+            } else {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    _ = viewModel.selectSubscriptionModel(subscriptionId: subId, model: model)
+                }
+            }
+        } label: {
+            Text(model)
+                .fabushiFont(.caption)
+                .fontWeight(weight)
+                .foregroundStyle(fgColor)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .fabushiMinimumTouchTarget()
+                .background(bgColor, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityIdentifier("fabushi.internal.magpie.subModel.\(subId).\(model)")
     }
 
     @ViewBuilder

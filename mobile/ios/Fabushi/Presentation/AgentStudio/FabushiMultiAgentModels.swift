@@ -175,7 +175,7 @@ public struct FabushiMultiAgentWorkspaceEntryDTO: Codable, Sendable, Equatable, 
         if let text = value.stringValue {
             return text
         }
-        return value.toJSONString() ?? ""
+        return value.toJSONString()
     }
 
     public enum CodingKeys: String, CodingKey {
