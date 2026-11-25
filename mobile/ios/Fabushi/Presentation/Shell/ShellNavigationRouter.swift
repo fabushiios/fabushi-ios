@@ -245,7 +245,7 @@ public final class ShellNavigationRouter {
             }
         }
     }
-    @ObservationIgnored private var pendingEmergencyKitAccountId: String?
+    @ObservationIgnored public private(set) var pendingEmergencyKitAccountId: String?
 
     public let toastController: FabushiToastController
     public private(set) var observedGeneration: UInt64 = 1
@@ -408,8 +408,11 @@ public final class ShellNavigationRouter {
     public func presentPendingEmergencyKit(_ emergencyKit: String, forAccountId accountId: String?) {
         let trimmed = emergencyKit.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard let rawAccountId = accountId else { return }
+        let trimmedAccountId = rawAccountId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAccountId.isEmpty else { return }
         pendingEmergencyKit = trimmed
-        pendingEmergencyKitAccountId = accountId
+        pendingEmergencyKitAccountId = trimmedAccountId
     }
 
     public func acknowledgePendingEmergencyKit() {
@@ -637,8 +640,8 @@ public final class ShellNavigationRouter {
             isHoldingPrimaryAuthGate = false
             isHoldingAddAccountGate = false
             acknowledgePendingEmergencyKit()
-        } else if let kitAccount = pendingEmergencyKitAccountId,
-                  coordinator.activeAccountId != kitAccount {
+        } else if pendingEmergencyKit != nil,
+                  (pendingEmergencyKitAccountId == nil || coordinator.activeAccountId != pendingEmergencyKitAccountId) {
             acknowledgePendingEmergencyKit()
         }
 

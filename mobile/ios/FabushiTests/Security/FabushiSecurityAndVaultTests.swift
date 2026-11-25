@@ -1402,7 +1402,9 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 coordinator: nil
             )
 
-            // FIX-8 Subcase B: Corrupted/undecodable Keychain record MUST fail closed (propagate decodingFailed, NOT bypass re-auth!)
+            // FIX-8 / R2-FIX-2 Subcase B: Corrupted/undecodable Keychain record MUST fail closed on
+            // cold launch, verifyPasscode, reloadFromKeychain, setPasscode & clearPasscode (NEVER overwrite
+            // Keychain with isEnabled: false or downgrade isPasscodeEnabled to false!)
             let corruptQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: secKC.passcodeService,
@@ -1416,16 +1418,34 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
                 useFastIterationsForTests: true,
                 nowProvider: { clock.withLock { $0 } }
             )
-            XCTAssertFalse(corruptController.isPasscodeEnabled)
+            XCTAssertTrue(
+                corruptController.isPasscodeEnabled,
+                "Cold launch against corrupted Keychain record MUST NOT downgrade lock posture to disabled (R2-FIX-2)"
+            )
+            XCTAssertTrue(corruptController.hasUnreadableKeychainRecord)
+
+            // A failed verifyPasscode MUST NOT overwrite the corrupted Keychain item with isEnabled: false!
+            let corruptVerify = await corruptController.verifyPasscode("wrong", coordinator: nil)
+            XCTAssertEqual(corruptVerify, .incorrect(failedAttempts: 1))
+
+            // Reloading from corrupted Keychain MUST NOT downgrade isPasscodeEnabled to false!
+            corruptController.reloadFromKeychain()
+            XCTAssertTrue(
+                corruptController.isPasscodeEnabled,
+                "reloadFromKeychain on corrupted Keychain MUST preserve fail-closed isPasscodeEnabled == true (R2-FIX-2)"
+            )
+            XCTAssertTrue(corruptController.hasUnreadableKeychainRecord)
+            XCTAssertEqual(corruptController.failedAttempts, 1)
+
             do {
                 try await corruptController.setPasscode("Overwrite!9", coordinator: nil)
-                XCTFail("Expected fail-closed Keychain error on corrupted passcode record")
+                XCTFail("Expected fail-closed Keychain error on corrupted passcode record after verifyPasscode + reload")
             } catch let kcErr as FabushiSecurityKeychainError {
                 XCTAssertEqual(kcErr, .decodingFailed)
             }
             do {
                 try await corruptController.clearPasscode(coordinator: nil)
-                XCTFail("Expected fail-closed Keychain error on clearPasscode with corrupted record")
+                XCTFail("Expected fail-closed Keychain error on clearPasscode with corrupted record after verifyPasscode + reload")
             } catch let kcErr as FabushiSecurityKeychainError {
                 XCTAssertEqual(kcErr, .decodingFailed)
             }
@@ -1718,7 +1738,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - FIX-5 Regression: Top-Level Overlay UIWindow Covers Child Sheets & Cleans Up on Teardown
 
-    func testFix5SecurityOverlayWindowCoversSheetsAndCleansUpOnTeardown() {
+    func testFix5SecurityOverlayWindowCoversSheetsAndCleansUpOnTeardown() throws {
         #if canImport(UIKit)
         let coordinator = FabushiCoordinator(host: FabushiRustHostActor())
         let theme = FabushiTheme(locale: .en)
@@ -1739,11 +1759,10 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(overlayCoordinator.overlayWindow)
         XCTAssertFalse(overlayCoordinator.isOverlayWindowVisible)
 
-        let activeScene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-        guard activeScene != nil else {
-            // Skip UIWindowScene presentation assertions only if no UIWindowScene exists in host environment
-            return
-        }
+        let activeScene = try XCTUnwrap(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first,
+            "iOS Simulator test host must expose an active UIWindowScene for FIX-5 overlay verification"
+        )
 
         // 1. Privacy blur active -> top-level overlay UIWindow mounts above UIWindow.Level.alert
         overlayCoordinator.update(
@@ -1760,6 +1779,7 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(overlayCoordinator.isOverlayWindowVisible)
         let blurWindow = overlayCoordinator.overlayWindow
         XCTAssertNotNil(blurWindow)
+        XCTAssertTrue(blurWindow?.windowScene === activeScene)
         XCTAssertGreaterThan(
             blurWindow?.windowLevel.rawValue ?? 0,
             UIWindow.Level.alert.rawValue,
@@ -1803,5 +1823,124 @@ final class FabushiSecurityAndVaultTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(overlayCoordinator.overlayWindow)
         XCTAssertFalse(overlayCoordinator.isOverlayWindowVisible)
         #endif
+    }
+
+    // MARK: - R2-FIX-3 Regression: Rust-Only Passcode Cold-Launch Sync & Settings UX Alignment + Corrupted Keychain Fail-Closed
+
+    func testR2Fix3RustOnlyPasscodeColdLaunchSyncAndSettingsAlignment() async throws {
+        let dir = try makeTempDir("r2_fix3_rust_passcode_sync")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            try? secKC.deletePasscodeRecord()
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: "http://127.0.0.1:9",
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            // 1. Configure passcode ONLY in Rust host_meta (Keychain remains nil)
+            struct RustSetParams: Encodable, Sendable { let passcode: String }
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.settings.method("passcodeSet"),
+                params: RustSetParams(passcode: "RustCold!99")
+            )
+            XCTAssertNil(try secKC.loadPasscodeRecord())
+
+            // Simulate cold launch: fresh controller + fresh unlocked router before coordinator.start() sync
+            let controller = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true
+            )
+            let router = ShellNavigationRouter(isPasscodeLockEnabled: false)
+            XCTAssertFalse(controller.isPasscodeEnabled)
+            XCTAssertFalse(router.isPasscodeLockEnabled)
+            XCTAssertFalse(router.isPasscodeLocked)
+
+            // Cold-launch sync queries Rust settings.passcodeStatus -> marks passcode configured AND engages lock!
+            let syncedEnabled = await controller.syncPasscodeStatus(
+                coordinator: coordinator,
+                router: router,
+                requirePasscode: false
+            )
+            XCTAssertTrue(syncedEnabled)
+            XCTAssertTrue(
+                controller.isPasscodeEnabled,
+                "Cold-launch sync must mark isPasscodeEnabled == true for Rust-only passcode so passcodeConfigSheet shows Current Passcode field"
+            )
+            XCTAssertTrue(router.isPasscodeLockEnabled)
+            XCTAssertTrue(
+                router.isPasscodeLocked,
+                "Cold-launch sync must engage passcode lock when Rust reports configured passcode"
+            )
+
+            // Unlock with Rust passcode, then ensure passive re-sync (e.g. opening Settings) does NOT spuriously re-lock
+            let unlockRes = await controller.verifyPasscode("RustCold!99", coordinator: coordinator)
+            XCTAssertEqual(unlockRes, .unlocked)
+            _ = router.unlockPasscode(coordinator: coordinator)
+            XCTAssertFalse(router.isPasscodeLocked)
+
+            let reSynced = await controller.syncPasscodeStatus(
+                coordinator: coordinator,
+                router: router,
+                requirePasscode: false
+            )
+            XCTAssertTrue(reSynced)
+            XCTAssertTrue(controller.isPasscodeEnabled)
+            XCTAssertTrue(router.isPasscodeLockEnabled)
+            XCTAssertFalse(router.isPasscodeLocked, "Passive re-sync must not re-lock an already-unlocked session")
+
+            // Cleanly clear Rust-only passcode via authorized clearPasscode
+            try await controller.clearPasscode(
+                authorization: .currentPasscode("RustCold!99"),
+                coordinator: coordinator
+            )
+            XCTAssertFalse(controller.isPasscodeEnabled)
+
+            // 2. Corrupted Keychain record MUST stay fail-closed during syncPasscodeStatus too
+            let corruptQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: secKC.passcodeService,
+                kSecAttrAccount as String: secKC.passcodeAccount,
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                kSecValueData as String: Data("corrupted-record-bytes".utf8),
+            ]
+            XCTAssertEqual(SecItemAdd(corruptQuery as CFDictionary, nil), errSecSuccess)
+
+            let corruptController = FabushiPasscodeLockController(
+                keychainStore: secKC,
+                useFastIterationsForTests: true
+            )
+            let corruptRouter = ShellNavigationRouter(isPasscodeLockEnabled: false)
+            let corruptSynced = await corruptController.syncPasscodeStatus(
+                coordinator: coordinator,
+                router: corruptRouter,
+                requirePasscode: false
+            )
+            XCTAssertTrue(corruptSynced)
+            XCTAssertTrue(corruptController.isPasscodeEnabled)
+            XCTAssertTrue(corruptController.hasUnreadableKeychainRecord)
+            XCTAssertTrue(corruptRouter.isPasscodeLockEnabled)
+            XCTAssertTrue(corruptRouter.isPasscodeLocked)
+
+            do {
+                try await corruptController.setPasscode("Bypass!9", coordinator: coordinator)
+                XCTFail("Expected decodingFailed on setPasscode against corrupted Keychain")
+            } catch let kcErr as FabushiSecurityKeychainError {
+                XCTAssertEqual(kcErr, .decodingFailed)
+            }
+            try secKC.deletePasscodeRecord()
+
+            await coordinator.shutdown()
+        } catch {
+            await coordinator.shutdown()
+            throw error
+        }
     }
 }

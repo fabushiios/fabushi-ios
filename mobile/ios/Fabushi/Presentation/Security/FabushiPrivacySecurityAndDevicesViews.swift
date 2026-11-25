@@ -418,6 +418,9 @@ public struct FabushiPrivacySecuritySettingsView: View {
                     .disabled(isWorking)
                 }
             }
+            .task {
+                _ = await passcodeController.syncPasscodeStatus(coordinator: coordinator)
+            }
         }
     }
 
@@ -576,6 +579,10 @@ public struct FabushiPrivacySecuritySettingsView: View {
 
     private func loadSecurityStatus() async {
         guard coordinator.isStarted else { return }
+        _ = await passcodeController.syncPasscodeStatus(coordinator: coordinator)
+        if passcodeController.isPasscodeEnabled {
+            router.isPasscodeLockEnabled = true
+        }
         if let status: FabushiTwoFactorStatusResponse = try? await coordinator.dispatchFenced(
             method: FabushiRPCNamespace.auth.method("twoFactorStatus"),
             params: FabushiEmptyParams()

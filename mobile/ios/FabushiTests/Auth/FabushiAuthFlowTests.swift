@@ -1238,6 +1238,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             var kdfSaltB64: String = ""
             var kdfTCost: UInt32 = 2
             var storedEnvelopeJSON: String? = nil
+            var failEnvelopeGetWith500: Bool = false
             var envelopePutCount: Int = 0
             var envelopeGetCount: Int = 0
         }
@@ -1264,9 +1265,12 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             case ("POST", "/api/v1/auth/upgrade-split-key"):
                 return .json(200, #"{"ok":true,"auth_version":2}"#)
             case ("GET", "/api/v1/user-vault/envelope"):
-                let env = state.withLock { s -> String? in
+                let (env, fail500) = state.withLock { s -> (String?, Bool) in
                     s.envelopeGetCount += 1
-                    return s.storedEnvelopeJSON
+                    return (s.storedEnvelopeJSON, s.failEnvelopeGetWith500)
+                }
+                if fail500 {
+                    return .json(500, #"{"error":"internal_server_error"}"#)
                 }
                 if let env {
                     return .json(200, "{\"envelope\":\(env)}")
@@ -1288,7 +1292,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         let (coreKC, secKC) = makeIsolatedKeychains()
         defer {
             try? coreKC.deletePassphrase()
-            for uid in ["9201", "9202", "9203", "9204"] {
+            for uid in ["9201", "9202", "9203", "9204", "9205"] {
                 try? coreKC.deleteAccountKey(accountId: uid)
                 secKC.purgeAccountSecrets(accountId: uid)
             }
@@ -1474,6 +1478,36 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertFalse(coordinator.vaultStore.isUnlocked)
             XCTAssertFalse(vm.lastCompletedVaultBootstrap)
             XCTAssertFalse(secKC.hasVaultRootKey(accountId: "9204"))
+
+            // Case E (R2-FIX-3): Legacy V1 silent upgrade when GET /api/v1/user-vault/envelope fails with HTTP 500
+            // MUST NOT clobber the server's stored envelope (0 PUTs, envelope preserved intact, login still succeeds).
+            _ = try await coordinator.clearLocalSession()
+            state.withLock { s in
+                s.legacyMode = true
+                s.activeUserId = 9205
+                s.activeUsername = "legacy_get500"
+                s.storedEnvelopeJSON = flatArgonJSON
+                s.failEnvelopeGetWith500 = true
+                s.envelopeGetCount = 0
+                s.envelopePutCount = 0
+            }
+
+            vm.usernameText = "legacy_get500"
+            vm.passwordText = "Legacy500!2026"
+            await vm.submitLogin(theme: theme)
+
+            let countsE = state.withLock { ($0.envelopeGetCount, $0.envelopePutCount, $0.storedEnvelopeJSON) }
+            XCTAssertEqual(countsE.0, 1, "Legacy V1 silent upgrade must attempt GET /envelope once")
+            XCTAssertEqual(countsE.1, 0, "HTTP 500 from GET /envelope MUST NEVER trigger a clobbering PUT /envelope")
+            XCTAssertEqual(countsE.2, flatArgonJSON, "Existing cloud envelope must remain untouched on HTTP 500")
+            XCTAssertEqual(
+                coordinator.authState,
+                .authenticated(userId: 9205, username: "legacy_get500", accountId: "9205")
+            )
+            XCTAssertFalse(coordinator.vaultStore.isUnlocked)
+            XCTAssertFalse(vm.lastCompletedVaultBootstrap)
+            XCTAssertFalse(secKC.hasVaultRootKey(accountId: "9205"))
+            XCTAssertNil(router.pendingEmergencyKit)
 
             await coordinator.shutdown()
         } catch {
@@ -1790,6 +1824,8 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
     func testM2D2ServerURLSwitchCancelsActivePollsScrubsStaleOtpAnd2FAAndFencesInFlightAuth() async throws {
         let holdPhoneSend = OSAllocatedUnfairLock<Bool>(initialState: false)
         let phoneSendArrived = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let holdServerBSend = OSAllocatedUnfairLock<Bool>(initialState: false)
+        let serverBSendArrived = OSAllocatedUnfairLock<Bool>(initialState: false)
 
         let serverA = try M2bLoopbackHTTPTestServer { req in
             switch (req.method, req.path) {
@@ -1814,6 +1850,10 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         let serverB = try M2bLoopbackHTTPTestServer { req in
             switch (req.method, req.path) {
             case ("POST", "/api/v1/auth/phone/send-code"):
+                serverBSendArrived.withLock { $0 = true }
+                while holdServerBSend.withLock({ $0 }) {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
                 return .json(200, #"{"ok":true,"sent":true,"phone_code_hash":"server-b-hash-88","expires_at_ms":2900000000000,"resend_after_ms":45000,"debug_code":"111222"}"#)
             default:
                 return .json(404, #"{"error":"not_found"}"#)
@@ -1821,6 +1861,7 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
         }
         defer {
             holdPhoneSend.withLock { $0 = false }
+            holdServerBSend.withLock { $0 = false }
             serverA.stop()
             serverB.stop()
         }
@@ -1854,11 +1895,12 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             vm.otpChannel = .phone
             vm.phoneText = "+14155550199"
 
-            // 1. Populate active OTP, Alipay poll, QR Pair poll, and 2FA challenge against Server A
+            // 1. Populate active OTP (including typed otpCodeText), Alipay poll, QR Pair poll, and 2FA challenge against Server A
             await vm.sendOTP(theme: theme)
             XCTAssertEqual(vm.phoneCodeHash, "server-a-hash-77")
             XCTAssertTrue(vm.otpCodeSent)
             XCTAssertGreaterThan(vm.otpResendRemainingSeconds, 0)
+            vm.otpCodeText = "654321"
 
             await vm.startAlipayLogin(theme: theme)
             XCTAssertTrue(vm.isAlipayActive)
@@ -1888,13 +1930,15 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertNil(vm.qrPairToken)
             XCTAssertNil(vm.phoneCodeHash, "Server switch must clear previous server phoneCodeHash")
             XCTAssertFalse(vm.otpCodeSent, "Server switch must clear otpCodeSent")
+            XCTAssertEqual(vm.otpCodeText, "", "Server switch must clear stale Server A otpCodeText (R2-FIX-3)")
             XCTAssertEqual(vm.otpResendRemainingSeconds, 0, "Server switch must cancel OTP countdown")
             XCTAssertNil(vm.otpStatusMessage)
             XCTAssertNil(vm.activeTwoFactorChallenge, "Server switch must clear previous server 2FA challenge")
             XCTAssertEqual(vm.twoFactorPasswordText, "")
 
-            // 3. Mid-flight race fence: start sendOTP against Server A, switch to Server B mid-flight,
-            //    release Server A response -> stale Server A phoneCodeHash & error MUST be discarded!
+            // 3. Mid-flight race fence + submission token isolation:
+            //    start sendOTP against Server A, switch to Server B mid-flight, start sendOTP on Server B,
+            //    release stale Server A response -> MUST discard stale hash AND NOT clobber Server B's isSubmitting!
             vm.serverURLText = serverA.baseURLString
             let switchedBackToA = await vm.applyServerURLIfNeeded(theme: theme)
             XCTAssertTrue(switchedBackToA)
@@ -1902,23 +1946,42 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
 
             holdPhoneSend.withLock { $0 = true }
             phoneSendArrived.withLock { $0 = false }
-            let inFlightSend = Task { @MainActor in
+            let inFlightSendA = Task { @MainActor in
                 await vm.sendOTP(theme: theme)
             }
-            let deadline = Date().addingTimeInterval(5.0)
-            while !phoneSendArrived.withLock({ $0 }) && Date() < deadline {
+            let deadlineA = Date().addingTimeInterval(5.0)
+            while !phoneSendArrived.withLock({ $0 }) && Date() < deadlineA {
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
             XCTAssertTrue(phoneSendArrived.withLock { $0 })
+            XCTAssertTrue(vm.isSubmitting)
 
             vm.serverURLText = serverB.baseURLString
             let switchedMidFlight = await vm.applyServerURLIfNeeded(theme: theme)
             XCTAssertTrue(switchedMidFlight)
             XCTAssertEqual(vm.serverSwitchGeneration, 3)
+            XCTAssertFalse(vm.isSubmitting, "Server switch must immediately release stale Server A spinner")
 
+            holdServerBSend.withLock { $0 = true }
+            serverBSendArrived.withLock { $0 = false }
+            let inFlightSendB = Task { @MainActor in
+                await vm.sendOTP(theme: theme)
+            }
+            let deadlineB = Date().addingTimeInterval(5.0)
+            while !serverBSendArrived.withLock({ $0 }) && Date() < deadlineB {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(serverBSendArrived.withLock { $0 })
+            XCTAssertTrue(vm.isSubmitting)
+
+            // Release stale Server A request while Server B is still in flight
             holdPhoneSend.withLock { $0 = false }
-            await inFlightSend.value
+            await inFlightSendA.value
 
+            XCTAssertTrue(
+                vm.isSubmitting,
+                "Stale canceled Server A submission finishing MUST NOT clobber active Server B isSubmitting (R2-FIX-3)"
+            )
             XCTAssertNil(
                 vm.phoneCodeHash,
                 "Stale Server A sendOTP response arriving after switch to Server B must be discarded (M2-D2)"
@@ -1926,8 +1989,10 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             XCTAssertFalse(vm.otpCodeSent)
             XCTAssertNil(vm.errorMessage, "Stale Server A failure/cancellation must not bleed into Server B UI")
 
-            // 4. Positive control: fresh sendOTP against Server B succeeds cleanly
-            await vm.sendOTP(theme: theme)
+            // 4. Positive control: release Server B request -> completes cleanly & clears isSubmitting
+            holdServerBSend.withLock { $0 = false }
+            await inFlightSendB.value
+            XCTAssertFalse(vm.isSubmitting)
             XCTAssertEqual(vm.phoneCodeHash, "server-b-hash-88")
             XCTAssertTrue(vm.otpCodeSent)
 
@@ -1935,6 +2000,234 @@ final class FabushiAuthFlowTests: XCTestCase, @unchecked Sendable {
             await coordinator.shutdown()
         } catch {
             holdPhoneSend.withLock { $0 = false }
+            holdServerBSend.withLock { $0 = false }
+            await coordinator.shutdown()
+            throw error
+        }
+    }
+
+    // MARK: - R2-FIX-1 Regression: Emergency Kit Account Isolation Across Logout, SwitchAccount & Fail-Closed Router
+
+    func testR2Fix1EmergencyKitOwnershipIsolationOnLogoutSwitchAndFailClosedRouter() async throws {
+        let server = try M2bLoopbackHTTPTestServer { req in
+            switch (req.method, req.path) {
+            case ("GET", "/api/v1/auth/kdf-params"):
+                return .json(404, #"{"error":"not_found"}"#)
+            case ("POST", "/api/v1/auth/register"):
+                if req.bodyString.contains("acct_a_ack") {
+                    return .json(200, #"{"user_id":9503,"username":"acct_a_ack","session_id":"s-9503","token":"tok-9503","first_name":"AcctAck","auth_version":2}"#)
+                }
+                return .json(200, #"{"user_id":9501,"username":"acct_a","session_id":"s-9501","token":"tok-9501","first_name":"AcctA","auth_version":2}"#)
+            case ("POST", "/api/v1/auth/login"):
+                return .json(200, #"{"user_id":9502,"username":"acct_b","session_id":"s-9502","token":"tok-9502","first_name":"AcctB","auth_version":1}"#)
+            case ("POST", "/api/v1/auth/upgrade-split-key"):
+                return .json(404, #"{"error":"not_found"}"#)
+            case ("PUT", "/api/v1/user-vault/envelope"):
+                return .json(200, "{\"envelope\":\(req.bodyString)}")
+            default:
+                return .json(404, #"{"error":"not_found"}"#)
+            }
+        }
+        defer { server.stop() }
+
+        let dir = try makeTempDir("r2_fix1_ek_isolation")
+        let (coreKC, secKC) = makeIsolatedKeychains()
+        defer {
+            try? coreKC.deletePassphrase()
+            for uid in ["9501", "9502", "9503"] {
+                try? coreKC.deleteAccountKey(accountId: uid)
+                secKC.purgeAccountSecrets(accountId: uid)
+            }
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let coordinator = FabushiCoordinator(host: FabushiRustHostActor(), keychain: coreKC)
+        try await coordinator.start(
+            appDataDirectory: dir,
+            serverURL: server.baseURLString,
+            testMode: true,
+            startNetworkMonitor: false
+        )
+
+        do {
+            let router = ShellNavigationRouter()
+            let theme = FabushiTheme(locale: .en)
+
+            // (d) Direct fail-closed check on ShellNavigationRouter.presentPendingEmergencyKit(forAccountId:)
+            router.presentPendingEmergencyKit("EK-NIL-OWNER", forAccountId: nil)
+            XCTAssertNil(router.pendingEmergencyKit, "presentPendingEmergencyKit must fail closed on nil accountId")
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            router.presentPendingEmergencyKit("EK-EMPTY-OWNER", forAccountId: "")
+            XCTAssertNil(router.pendingEmergencyKit, "presentPendingEmergencyKit must fail closed on empty accountId")
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            router.presentPendingEmergencyKit("EK-SPACE-OWNER", forAccountId: "   \n ")
+            XCTAssertNil(router.pendingEmergencyKit, "presentPendingEmergencyKit must fail closed on whitespace accountId")
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            // (a) Real SwiftUI unmount order after logout:
+            //     Account A registers (kit set) -> clearLocalSession() + handleAccountScopeChange
+            //     -> handleViewDisappear() -> Account B logs in -> router MUST NOT leak Account A's kit!
+            router.isAccountSwitcherPresented = true
+            let logoutUnmountVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC
+            )
+            logoutUnmountVM.handleViewAppear()
+            logoutUnmountVM.serverURLText = server.baseURLString
+            logoutUnmountVM.authTab = .register
+            logoutUnmountVM.usernameText = "acct_a"
+            logoutUnmountVM.passwordText = "AcctAPass!1"
+            await logoutUnmountVM.submitRegistration(theme: theme)
+
+            let accountAKit = try XCTUnwrap(logoutUnmountVM.generatedEmergencyKit)
+            XCTAssertTrue(accountAKit.hasPrefix("EK-"))
+            XCTAssertEqual(coordinator.activeAccountId, "9501")
+            XCTAssertTrue(router.isHoldingAddAccountGate)
+
+            // External logout clears session & runs router.handleAccountScopeChange BEFORE SwiftUI fires .onDisappear
+            let unauthGen = try await coordinator.clearLocalSession()
+            XCTAssertTrue(router.handleAccountScopeChange(generation: unauthGen, coordinator: coordinator))
+            XCTAssertFalse(router.isHoldingAddAccountGate)
+            XCTAssertNil(router.pendingEmergencyKit)
+
+            // SwiftUI now tears down FabushiAuthWizardView and fires handleViewDisappear()
+            logoutUnmountVM.handleViewDisappear()
+            XCTAssertNil(logoutUnmountVM.generatedEmergencyKit)
+            XCTAssertNil(
+                router.pendingEmergencyKit,
+                "Post-logout handleViewDisappear MUST NOT resurrect Account A's Emergency Kit (R2-FIX-1)"
+            )
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            // Account B signs in -> Shell banner MUST remain completely empty
+            let loginBVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC
+            )
+            loginBVM.serverURLText = server.baseURLString
+            loginBVM.usernameText = "acct_b"
+            loginBVM.passwordText = "AcctBPass!2"
+            await loginBVM.submitLogin(theme: theme)
+            XCTAssertEqual(coordinator.activeAccountId, "9502")
+            XCTAssertNil(router.pendingEmergencyKit, "Account B MUST NOT inherit Account A's Emergency Kit")
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            // Also verify handleAccountScopeChange fails closed if pendingEmergencyKit somehow has nil accountId
+            let unownedKitRouter = ShellNavigationRouter()
+            unownedKitRouter.pendingEmergencyKit = "EK-RAW-UNOWNED"
+            XCTAssertNil(unownedKitRouter.pendingEmergencyKitAccountId)
+            XCTAssertTrue(
+                unownedKitRouter.handleAccountScopeChange(
+                    generation: coordinator.accountScopeGeneration,
+                    coordinator: coordinator
+                )
+            )
+            XCTAssertNil(
+                unownedKitRouter.pendingEmergencyKit,
+                "handleAccountScopeChange must fail closed and clear pendingEmergencyKit when owner accountId is nil"
+            )
+            XCTAssertNil(unownedKitRouter.pendingEmergencyKitAccountId)
+
+            // (b) Real SwiftUI unmount order after switchAccount:
+            //     Account B ("9502") is stored; Account A ("9501") registers -> switchAccount to "9502"
+            //     -> handleViewDisappear() MUST wipe Account A's kit WITHOUT tagging it to "9502"!
+            router.isAccountSwitcherPresented = true
+            let switchUnmountVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC
+            )
+            switchUnmountVM.handleViewAppear()
+            switchUnmountVM.serverURLText = server.baseURLString
+            switchUnmountVM.authTab = .register
+            switchUnmountVM.usernameText = "acct_a"
+            switchUnmountVM.passwordText = "AcctAPass!1"
+            await switchUnmountVM.submitRegistration(theme: theme)
+            XCTAssertNotNil(switchUnmountVM.generatedEmergencyKit)
+            XCTAssertEqual(coordinator.activeAccountId, "9501")
+
+            let switchedToBGen = try await coordinator.switchAccount(accountId: "9502")
+            XCTAssertEqual(coordinator.activeAccountId, "9502")
+            _ = router.handleAccountScopeChange(generation: switchedToBGen, coordinator: coordinator)
+
+            switchUnmountVM.handleViewDisappear()
+            XCTAssertNil(switchUnmountVM.generatedEmergencyKit)
+            XCTAssertNil(
+                router.pendingEmergencyKit,
+                "Post-switchAccount handleViewDisappear MUST NOT leak Account A's Emergency Kit to Account B (R2-FIX-1)"
+            )
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            // (c1) acknowledgeEmergencyKitAndContinue() after logout MUST wipe kit & end hold WITHOUT completing auth
+            var ackLogoutCallbacks = 0
+            let ackLogoutVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .primaryGate,
+                securityKeychain: secKC,
+                onAuthenticated: { ackLogoutCallbacks += 1 }
+            )
+            ackLogoutVM.handleViewAppear()
+            ackLogoutVM.serverURLText = server.baseURLString
+            ackLogoutVM.authTab = .register
+            ackLogoutVM.usernameText = "acct_a_ack"
+            ackLogoutVM.passwordText = "AcctAckPass!3"
+            await ackLogoutVM.submitRegistration(theme: theme)
+            XCTAssertNotNil(ackLogoutVM.generatedEmergencyKit)
+            XCTAssertTrue(router.isHoldingPrimaryAuthGate)
+            ackLogoutVM.hasAcknowledgedEmergencyKitSaved = true
+
+            _ = try await coordinator.clearLocalSession()
+            XCTAssertEqual(coordinator.authState, .unauthenticated)
+            XCTAssertFalse(
+                ackLogoutVM.acknowledgeEmergencyKitAndContinue(),
+                "acknowledgeEmergencyKitAndContinue must fail closed after logout"
+            )
+            XCTAssertNil(ackLogoutVM.generatedEmergencyKit)
+            XCTAssertFalse(router.isHoldingPrimaryAuthGate)
+            XCTAssertEqual(ackLogoutCallbacks, 0)
+
+            // (c2) acknowledgeEmergencyKitAndContinue() after account switch MUST wipe kit & end hold WITHOUT completing auth
+            var ackSwitchCallbacks = 0
+            let ackSwitchVM = FabushiAuthViewModel(
+                coordinator: coordinator,
+                router: router,
+                mode: .addAccount,
+                securityKeychain: secKC,
+                onAuthenticated: { ackSwitchCallbacks += 1 }
+            )
+            ackSwitchVM.handleViewAppear()
+            ackSwitchVM.serverURLText = server.baseURLString
+            ackSwitchVM.authTab = .register
+            ackSwitchVM.usernameText = "acct_a_ack"
+            ackSwitchVM.passwordText = "AcctAckPass!3"
+            await ackSwitchVM.submitRegistration(theme: theme)
+            XCTAssertNotNil(ackSwitchVM.generatedEmergencyKit)
+            XCTAssertEqual(coordinator.activeAccountId, "9503")
+            XCTAssertTrue(router.isHoldingAddAccountGate)
+            ackSwitchVM.hasAcknowledgedEmergencyKitSaved = true
+
+            _ = try await coordinator.switchAccount(accountId: "9502")
+            XCTAssertEqual(coordinator.activeAccountId, "9502")
+            XCTAssertFalse(
+                ackSwitchVM.acknowledgeEmergencyKitAndContinue(),
+                "acknowledgeEmergencyKitAndContinue must fail closed after account switch"
+            )
+            XCTAssertNil(ackSwitchVM.generatedEmergencyKit)
+            XCTAssertFalse(router.isHoldingAddAccountGate)
+            XCTAssertEqual(ackSwitchCallbacks, 0)
+            XCTAssertNil(router.pendingEmergencyKit)
+            XCTAssertNil(router.pendingEmergencyKitAccountId)
+
+            await coordinator.shutdown()
+        } catch {
             await coordinator.shutdown()
             throw error
         }

@@ -348,10 +348,9 @@ pub fn handle_vault(
         }
         "status" => {
             let (unlocked, has_envelope) = host.with_fenced_session_read(&client, || {
-                Ok((
-                    host.vault_unlocked_key.lock().is_some(),
-                    host.vault_envelope.lock().is_some(),
-                ))
+                let unlocked = host.vault_unlocked_key.lock().is_some();
+                let has_envelope = host.vault_envelope.lock().is_some();
+                Ok((unlocked, has_envelope))
             })?;
             Ok(json!({
                 "unlocked": unlocked,

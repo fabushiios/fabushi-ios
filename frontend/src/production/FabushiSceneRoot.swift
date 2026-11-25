@@ -287,13 +287,11 @@ private struct FabushiCanonicalSceneHost: View {
             )
             await theme.loadPersistedPreferences(using: FabushiCoordinator.shared)
             let passcodeController = FabushiPasscodeLockController.shared
-            let wasPasscodeLockEnabled = router.isPasscodeLockEnabled
-            passcodeController.reloadFromKeychain()
-            let shouldEnablePasscode = launchConfiguration.requirePasscode || passcodeController.isPasscodeEnabled
-            router.isPasscodeLockEnabled = shouldEnablePasscode
-            if shouldEnablePasscode && !wasPasscodeLockEnabled {
-                router.engagePasscodeLockIfEnabled()
-            }
+            _ = await passcodeController.syncPasscodeStatus(
+                coordinator: FabushiCoordinator.shared,
+                router: router,
+                requirePasscode: launchConfiguration.requirePasscode
+            )
             passcodeController.startIdleMonitorIfNeeded(router: router)
             router.handleAccountScopeChange(
                 generation: FabushiCoordinator.shared.accountScopeGeneration,

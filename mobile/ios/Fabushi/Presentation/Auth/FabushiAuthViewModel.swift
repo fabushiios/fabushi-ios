@@ -78,6 +78,9 @@ public final class FabushiAuthViewModel {
     @ObservationIgnored private let taskBag = FabushiCancellableTaskBag()
     @ObservationIgnored private var hasViewDisappeared: Bool = false
     @ObservationIgnored public private(set) var serverSwitchGeneration: UInt64 = 0
+    @ObservationIgnored private var activeSubmissionToken: UInt64 = 0
+    @ObservationIgnored private var generatedEmergencyKitAccountId: String? = nil
+    @ObservationIgnored private var generatedEmergencyKitGeneration: UInt64? = nil
 
     // Core F01 Form State
     public var serverURLText: String
@@ -126,7 +129,14 @@ public final class FabushiAuthViewModel {
     // Global Feedback & One-Time Emergency Kit (D4)
     public var isSubmitting: Bool = false
     public var errorMessage: String?
-    public var generatedEmergencyKit: String?
+    public var generatedEmergencyKit: String? {
+        didSet {
+            if generatedEmergencyKit == nil {
+                generatedEmergencyKitAccountId = nil
+                generatedEmergencyKitGeneration = nil
+            }
+        }
+    }
     public var hasAcknowledgedEmergencyKitSaved: Bool = false
     public var didCopyEmergencyKit: Bool = false
     public var lastCompletedVaultBootstrap: Bool = false
@@ -174,18 +184,57 @@ public final class FabushiAuthViewModel {
 
     /// Teardown safety net invoked from `FabushiAuthWizardView.onDisappear`.
     /// Always cancels active tasks, rescues any unacknowledged one-time Emergency Kit into the
-    /// persistent Shell banner so it can never be lost, wipes the ViewModel copy, and releases
-    /// any onboarding hold so `ShellNavigationRouter` can never leak a stuck gate.
+    /// persistent Shell banner ONLY when the owning account & session generation are still active
+    /// (never resurrecting a departed account's kit after logout or account switch), wipes the
+    /// ViewModel copy, and releases any onboarding hold so `ShellNavigationRouter` never leaks a gate.
     public func handleViewDisappear() {
         hasViewDisappeared = true
         cancelActiveTasks()
         if let kit = generatedEmergencyKit, !kit.isEmpty {
-            router.presentPendingEmergencyKit(kit, forAccountId: coordinator.activeAccountId)
-            generatedEmergencyKit = nil
-            hasAcknowledgedEmergencyKitSaved = false
-            didCopyEmergencyKit = false
+            if let ownerId = verifiedEmergencyKitOwnerAccountId() {
+                router.presentPendingEmergencyKit(kit, forAccountId: ownerId)
+            }
+            clearGeneratedEmergencyKit()
         }
         router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+    }
+
+    private func clearGeneratedEmergencyKit() {
+        generatedEmergencyKit = nil
+        generatedEmergencyKitAccountId = nil
+        generatedEmergencyKitGeneration = nil
+        hasAcknowledgedEmergencyKitSaved = false
+        didCopyEmergencyKit = false
+    }
+
+    private func verifiedEmergencyKitOwnerAccountId() -> String? {
+        guard coordinator.authState != .unauthenticated,
+              let rawOwnerId = generatedEmergencyKitAccountId
+        else {
+            return nil
+        }
+        let ownerId = rawOwnerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ownerId.isEmpty, coordinator.activeAccountId == ownerId else {
+            return nil
+        }
+        if let expectedGeneration = generatedEmergencyKitGeneration,
+           coordinator.accountScopeGeneration != expectedGeneration {
+            return nil
+        }
+        return ownerId
+    }
+
+    private func beginSubmission() -> UInt64 {
+        activeSubmissionToken &+= 1
+        let token = activeSubmissionToken
+        isSubmitting = true
+        return token
+    }
+
+    private func endSubmission(_ token: UInt64) {
+        if activeSubmissionToken == token {
+            isSubmitting = false
+        }
     }
 
     public func clearErrors() {
@@ -212,11 +261,16 @@ public final class FabushiAuthViewModel {
         // concurrent pre-switch poll/submit discards its stale response.
         serverSwitchGeneration &+= 1
         let switchGen = serverSwitchGeneration
+        activeSubmissionToken &+= 1
+        isSubmitting = false
         cancelAlipayLogin()
         cancelQrPair()
         taskBag.cancel(key: "otpCountdown")
+        clearGeneratedEmergencyKit()
+        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
         phoneCodeHash = nil
         otpCodeSent = false
+        otpCodeText = ""
         otpResendRemainingSeconds = 0
         otpStatusMessage = nil
         activeTwoFactorChallenge = nil
@@ -249,8 +303,8 @@ public final class FabushiAuthViewModel {
             return
         }
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let kdfParamsResponse = try await fetchKdfParamsOrFallback(username: trimmedUsername)
@@ -266,6 +320,7 @@ public final class FabushiAuthViewModel {
                         fastKdf: nil
                     )
                 )
+                guard serverSwitchGeneration == capturedSwitchGen else { return }
 
                 let envelope: FabushiRPCEnvelopeResult<FabushiAuthSessionResponse> = try await coordinator.dispatchAuthTransition(
                     method: FabushiRPCNamespace.auth.method("loginSplitKey"),
@@ -354,8 +409,8 @@ public final class FabushiAuthViewModel {
             ? trimmedUsername
             : firstNameText.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let derived: FabushiDeriveSplitKeyResponse = try await coordinator.dispatchFenced(
@@ -367,6 +422,7 @@ public final class FabushiAuthViewModel {
                     fastKdf: useFastKdfForTests ? true : nil
                 )
             )
+            guard serverSwitchGeneration == capturedSwitchGen else { return }
 
             let trimmedEmail = emailText.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedOtp = otpCodeText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -432,16 +488,16 @@ public final class FabushiAuthViewModel {
                   coordinator.sessionMutationEpoch == postLoginMutationEpoch,
                   coordinator.authState != .unauthenticated
             else {
-                generatedEmergencyKit = nil
-                hasAcknowledgedEmergencyKitSaved = false
-                didCopyEmergencyKit = false
-                router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                clearGeneratedEmergencyKit()
+                if serverSwitchGeneration == capturedSwitchGen {
+                    router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                }
                 return
             }
             finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
         } catch {
-            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             if serverSwitchGeneration == capturedSwitchGen {
+                router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
                 handleAuthError(error, isQrPair: false)
             }
         }
@@ -455,8 +511,8 @@ public final class FabushiAuthViewModel {
         guard await applyServerURLIfNeeded(theme: theme) else { return }
         let capturedSwitchGen = serverSwitchGeneration
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             switch otpChannel {
@@ -513,8 +569,8 @@ public final class FabushiAuthViewModel {
             return
         }
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             switch otpChannel {
@@ -606,10 +662,10 @@ public final class FabushiAuthViewModel {
                           coordinator.sessionMutationEpoch == postLoginMutationEpoch,
                           coordinator.authState != .unauthenticated
                     else {
-                        generatedEmergencyKit = nil
-                        hasAcknowledgedEmergencyKitSaved = false
-                        didCopyEmergencyKit = false
-                        router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                        clearGeneratedEmergencyKit()
+                        if serverSwitchGeneration == capturedSwitchGen {
+                            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                        }
                         return
                     }
                     finishAuthenticationOrRequireEmergencyKitBackup(expectedGeneration: envelope.generation)
@@ -624,8 +680,8 @@ public final class FabushiAuthViewModel {
                 }
             }
         } catch {
-            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             if serverSwitchGeneration == capturedSwitchGen {
+                router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
                 handleAuthError(error, isQrPair: false)
             }
         }
@@ -639,8 +695,8 @@ public final class FabushiAuthViewModel {
         guard await applyServerURLIfNeeded(theme: theme) else { return }
         let capturedSwitchGen = serverSwitchGeneration
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let startResp: FabushiAlipayStartResponse = try await coordinator.dispatchFenced(
@@ -684,11 +740,25 @@ public final class FabushiAuthViewModel {
         guard let urlString = alipayLoginURL, let url = URL(string: urlString) else {
             return
         }
+        let capturedSwitchGen = serverSwitchGeneration
+        let capturedAttemptId = alipayAttemptId
         alipayWebController.startOAuthSession(url: url, callbackScheme: "fabushi") { [weak self] result in
             guard let self else { return }
+            guard self.serverSwitchGeneration == capturedSwitchGen,
+                  self.isAlipayActive,
+                  self.alipayAttemptId == capturedAttemptId
+            else {
+                return
+            }
             switch result {
             case .success(let callbackURL):
                 Task { @MainActor in
+                    guard self.serverSwitchGeneration == capturedSwitchGen,
+                          self.isAlipayActive,
+                          self.alipayAttemptId == capturedAttemptId
+                    else {
+                        return
+                    }
                     await self.handleAuthCallbackURL(callbackURL, theme: theme)
                 }
             case .failure(let error):
@@ -768,8 +838,8 @@ public final class FabushiAuthViewModel {
         guard await applyServerURLIfNeeded(theme: theme) else { return }
         let capturedSwitchGen = serverSwitchGeneration
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let trimmedUsername = usernameText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -824,8 +894,8 @@ public final class FabushiAuthViewModel {
         guard await applyServerURLIfNeeded(theme: theme) else { return }
         let capturedSwitchGen = serverSwitchGeneration
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let initResp: FabushiQrPairInitResponse = try await coordinator.dispatchFenced(
@@ -926,8 +996,8 @@ public final class FabushiAuthViewModel {
             return
         }
 
-        isSubmitting = true
-        defer { isSubmitting = false }
+        let submissionToken = beginSubmission()
+        defer { endSubmission(submissionToken) }
 
         do {
             let expectedGeneration: UInt64
@@ -999,6 +1069,10 @@ public final class FabushiAuthViewModel {
     @discardableResult
     public func copyGeneratedEmergencyKitToSecurePasteboard() -> Bool {
         guard let kit = generatedEmergencyKit, !kit.isEmpty else { return false }
+        guard verifiedEmergencyKitOwnerAccountId() != nil else {
+            clearGeneratedEmergencyKit()
+            return false
+        }
         FabushiSecureClipboard.copySensitive(
             kit,
             expirationSeconds: FabushiSecureClipboard.defaultExpirationSeconds
@@ -1007,18 +1081,28 @@ public final class FabushiAuthViewModel {
         return true
     }
 
-    /// Fail-closed: requires `hasAcknowledgedEmergencyKitSaved == true`, then wipes `generatedEmergencyKit`
-    /// from memory, releases the auth onboarding hold, and completes authentication.
+    /// Fail-closed: requires an active authenticated session matching the Emergency Kit's owning
+    /// account & generation plus `hasAcknowledgedEmergencyKitSaved == true`, then wipes
+    /// `generatedEmergencyKit` and ownership metadata from memory, releases the auth onboarding hold,
+    /// and completes authentication. If the session logged out or switched accounts before ack,
+    /// wipes the kit and ends the hold WITHOUT completing authentication.
     @discardableResult
     public func acknowledgeEmergencyKitAndContinue() -> Bool {
-        guard isAwaitingEmergencyKitBackup, hasAcknowledgedEmergencyKitSaved else {
+        guard isAwaitingEmergencyKitBackup else {
             return false
         }
-        generatedEmergencyKit = nil
-        hasAcknowledgedEmergencyKitSaved = false
-        didCopyEmergencyKit = false
+        let expectedGeneration = generatedEmergencyKitGeneration
+        guard verifiedEmergencyKitOwnerAccountId() != nil else {
+            clearGeneratedEmergencyKit()
+            router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+            return false
+        }
+        guard hasAcknowledgedEmergencyKitSaved else {
+            return false
+        }
+        clearGeneratedEmergencyKit()
         router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
-        completeAuthentication()
+        completeAuthentication(expectedGeneration: expectedGeneration)
         return true
     }
 
@@ -1241,8 +1325,12 @@ public final class FabushiAuthViewModel {
                 if coordinator.authState != .unauthenticated, coordinator.activeAccountId == accountId {
                     router.presentPendingEmergencyKit(initResp.emergencyKit, forAccountId: accountId)
                 }
-            } else {
+            } else if coordinator.authState != .unauthenticated,
+                      coordinator.activeAccountId == accountId,
+                      !initResp.emergencyKit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 generatedEmergencyKit = initResp.emergencyKit
+                generatedEmergencyKitAccountId = accountId
+                generatedEmergencyKitGeneration = expectedGeneration ?? coordinator.accountScopeGeneration
             }
             return true
         } catch {
@@ -1327,26 +1415,30 @@ public final class FabushiAuthViewModel {
         passwordText = ""
         otpCodeText = ""
         twoFactorPasswordText = ""
-        if let expectedGeneration,
-           coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
-            generatedEmergencyKit = nil
-            hasAcknowledgedEmergencyKitSaved = false
-            didCopyEmergencyKit = false
+        if coordinator.authState == .unauthenticated
+            || (expectedGeneration != nil && coordinator.accountScopeGeneration != expectedGeneration)
+        {
+            clearGeneratedEmergencyKit()
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             return
         }
         if hasViewDisappeared {
             if let kit = generatedEmergencyKit, !kit.isEmpty {
-                router.presentPendingEmergencyKit(kit, forAccountId: coordinator.activeAccountId)
-                generatedEmergencyKit = nil
-                hasAcknowledgedEmergencyKitSaved = false
-                didCopyEmergencyKit = false
+                if let ownerId = verifiedEmergencyKitOwnerAccountId() {
+                    router.presentPendingEmergencyKit(kit, forAccountId: ownerId)
+                }
+                clearGeneratedEmergencyKit()
             }
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             completeAuthentication(expectedGeneration: expectedGeneration)
             return
         }
         if isAwaitingEmergencyKitBackup {
+            guard verifiedEmergencyKitOwnerAccountId() != nil else {
+                clearGeneratedEmergencyKit()
+                router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
+                return
+            }
             cancelActiveTasks()
             hasAcknowledgedEmergencyKitSaved = false
             didCopyEmergencyKit = false
@@ -1358,8 +1450,9 @@ public final class FabushiAuthViewModel {
     }
 
     private func completeAuthentication(expectedGeneration: UInt64? = nil) {
-        if let expectedGeneration,
-           coordinator.accountScopeGeneration != expectedGeneration || coordinator.authState == .unauthenticated {
+        if coordinator.authState == .unauthenticated
+            || (expectedGeneration != nil && coordinator.accountScopeGeneration != expectedGeneration)
+        {
             router.endAuthOnboardingHold(isAddAccount: mode == .addAccount)
             return
         }

@@ -127,6 +127,7 @@ public final class FabushiPasscodeLockController {
     @ObservationIgnored private let taskBag = FabushiCancellableTaskBag()
 
     public private(set) var isPasscodeEnabled: Bool = false
+    public private(set) var hasUnreadableKeychainRecord: Bool = false
     public private(set) var biometricsEnabled: Bool = false
     public private(set) var autoLockTimeoutSeconds: Int = FabushiAutoLockPreset.fiveMinutes.rawValue
     public private(set) var failedAttempts: Int = 0
@@ -168,19 +169,71 @@ public final class FabushiPasscodeLockController {
     }
 
     public func reloadFromKeychain() {
-        if let record = try? keychainStore.loadPasscodeRecord() {
-            isPasscodeEnabled = record.isEnabled
-            biometricsEnabled = record.biometricsEnabled
-            autoLockTimeoutSeconds = record.autoLockTimeoutSeconds
-            failedAttempts = record.failedAttempts
-            lockoutUntilEpochMs = record.lockoutUntilEpochMs
-        } else {
-            isPasscodeEnabled = false
-            biometricsEnabled = false
-            autoLockTimeoutSeconds = FabushiAutoLockPreset.fiveMinutes.rawValue
-            failedAttempts = 0
-            lockoutUntilEpochMs = nil
+        do {
+            if let record = try keychainStore.loadPasscodeRecord() {
+                hasUnreadableKeychainRecord = false
+                isPasscodeEnabled = record.isEnabled
+                biometricsEnabled = record.biometricsEnabled
+                autoLockTimeoutSeconds = record.autoLockTimeoutSeconds
+                failedAttempts = record.failedAttempts
+                lockoutUntilEpochMs = record.lockoutUntilEpochMs
+            } else {
+                hasUnreadableKeychainRecord = false
+                isPasscodeEnabled = false
+                biometricsEnabled = false
+                autoLockTimeoutSeconds = FabushiAutoLockPreset.fiveMinutes.rawValue
+                failedAttempts = 0
+                lockoutUntilEpochMs = nil
+            }
+        } catch {
+            // Fail closed: a corrupted or unreadable Keychain record MUST NEVER downgrade
+            // passcode lock posture to disabled on cold launch or reload.
+            hasUnreadableKeychainRecord = true
+            isPasscodeEnabled = true
         }
+    }
+
+    /// Reloads local Keychain passcode state and synchronizes with Rust `settings.passcodeStatus`.
+    /// Fail-closed: if Keychain read fails (corrupted/unreadable record), preserves
+    /// `isPasscodeEnabled = true` and `hasUnreadableKeychainRecord = true` without downgrading
+    /// lock posture. If Keychain has no enabled record while Rust `host_meta` reports a configured
+    /// passcode, sets `isPasscodeEnabled = true` so cold launch engages lock immediately and
+    /// Settings displays the "Current Passcode" re-authentication field.
+    @discardableResult
+    public func syncPasscodeStatus(
+        coordinator: FabushiCoordinator?,
+        router: ShellNavigationRouter? = nil,
+        requirePasscode: Bool = false
+    ) async -> Bool {
+        let wasRouterEnabled = router?.isPasscodeLockEnabled ?? false
+        reloadFromKeychain()
+
+        if !hasUnreadableKeychainRecord,
+           !isPasscodeEnabled,
+           let coordinator,
+           coordinator.isStarted {
+            do {
+                let rustStatus: RustPasscodeStatusResult = try await coordinator.dispatchFenced(
+                    method: FabushiRPCNamespace.settings.method("passcodeStatus"),
+                    params: FabushiEmptyParams()
+                )
+                if rustStatus.configured {
+                    isPasscodeEnabled = true
+                }
+            } catch {
+                // Non-fatal during passive status sync; mutating operations (`setPasscode` /
+                // `clearPasscode`) still propagate errors fail-closed via `hasConfiguredPasscode`.
+            }
+        }
+
+        let shouldEnablePasscode = requirePasscode || isPasscodeEnabled
+        if let router {
+            router.isPasscodeLockEnabled = shouldEnablePasscode
+            if shouldEnablePasscode && !wasRouterEnabled {
+                router.engagePasscodeLockIfEnabled()
+            }
+        }
+        return shouldEnablePasscode
     }
 
     nonisolated public static func lockoutDurationSeconds(forFailedAttempts attempts: Int) -> Int {
@@ -202,13 +255,12 @@ public final class FabushiPasscodeLockController {
 
     // MARK: - Configure / Clear Passcode & Preferences
 
-    /// Fail-closed check for whether a passcode is configured in memory, Keychain, or Rust `host_meta`.
-    /// Propagates Keychain read/decoding errors and Rust RPC errors instead of failing open.
+    /// Fail-closed check for whether a passcode is configured in Keychain, Rust `host_meta`, or memory.
+    /// Always reads Keychain first so corrupted/unreadable Keychain records immediately propagate
+    /// `FabushiSecurityKeychainError` instead of failing open or masking corruption.
     private func hasConfiguredPasscode(coordinator: FabushiCoordinator?) async throws -> Bool {
-        if isPasscodeEnabled {
-            return true
-        }
-        if let record = try keychainStore.loadPasscodeRecord(), record.isEnabled {
+        let record = try keychainStore.loadPasscodeRecord()
+        if let record, record.isEnabled {
             reloadFromKeychain()
             return true
         }
@@ -218,8 +270,12 @@ public final class FabushiPasscodeLockController {
                 params: FabushiEmptyParams()
             )
             if rustStatus.configured {
+                isPasscodeEnabled = true
                 return true
             }
+        }
+        if isPasscodeEnabled {
+            return true
         }
         return false
     }
@@ -301,6 +357,7 @@ public final class FabushiPasscodeLockController {
         )
         try keychainStore.savePasscodeRecord(record)
 
+        hasUnreadableKeychainRecord = false
         isPasscodeEnabled = true
         failedAttempts = 0
         lockoutUntilEpochMs = nil
@@ -323,6 +380,7 @@ public final class FabushiPasscodeLockController {
             try await enforceReauthentication(authorization, coordinator: coordinator)
         }
         try keychainStore.deletePasscodeRecord()
+        hasUnreadableKeychainRecord = false
         isPasscodeEnabled = false
         biometricsEnabled = false
         failedAttempts = 0
@@ -338,18 +396,24 @@ public final class FabushiPasscodeLockController {
     }
 
     public func setBiometricsEnabled(_ enabled: Bool) throws {
-        biometricsEnabled = enabled
-        guard var record = try keychainStore.loadPasscodeRecord() else { return }
+        guard var record = try keychainStore.loadPasscodeRecord() else {
+            biometricsEnabled = enabled
+            return
+        }
         record.biometricsEnabled = enabled
         try keychainStore.savePasscodeRecord(record)
+        biometricsEnabled = enabled
     }
 
     public func setAutoLockTimeoutSeconds(_ seconds: Int) throws {
         let clamped = max(0, seconds)
-        autoLockTimeoutSeconds = clamped
-        guard var record = try keychainStore.loadPasscodeRecord() else { return }
+        guard var record = try keychainStore.loadPasscodeRecord() else {
+            autoLockTimeoutSeconds = clamped
+            return
+        }
         record.autoLockTimeoutSeconds = clamped
         try keychainStore.savePasscodeRecord(record)
+        autoLockTimeoutSeconds = clamped
     }
 
     // MARK: - Fail-Closed Verification & Progressive Lockout
@@ -364,7 +428,17 @@ public final class FabushiPasscodeLockController {
             return .lockedOut(remainingSeconds: remaining, failedAttempts: failedAttempts)
         }
 
-        let storedRecord = try? keychainStore.loadPasscodeRecord()
+        let storedRecord: FabushiPasscodeRecord?
+        let keychainReadFailed: Bool
+        do {
+            storedRecord = try keychainStore.loadPasscodeRecord()
+            keychainReadFailed = false
+        } catch {
+            storedRecord = nil
+            keychainReadFailed = true
+            hasUnreadableKeychainRecord = true
+            isPasscodeEnabled = true
+        }
         var isValid = false
 
         if let record = storedRecord,
@@ -379,8 +453,9 @@ public final class FabushiPasscodeLockController {
                 iterations: record.iterations
             )
             isValid = FabushiPasscodeCrypto.constantTimeEqual(computed, expectedHash)
-        } else if let coordinator, coordinator.isStarted {
-            // Fallback to Rust Argon2id verification if configured only in Rust host_meta;
+        } else if !keychainReadFailed, let coordinator, coordinator.isStarted {
+            // Fallback to Rust Argon2id verification only when Keychain read succeeded without an
+            // enabled local PBKDF2 record (e.g. Rust-only host_meta configuration);
             // fails closed (`configured == false` -> `valid == false`) when unconfigured (`T2_11`).
             if let rustResult: RustPasscodeVerifyResult = try? await coordinator.dispatchFenced(
                 method: FabushiRPCNamespace.settings.method("passcodeVerify"),
@@ -394,7 +469,7 @@ public final class FabushiPasscodeLockController {
             failedAttempts = 0
             lockoutUntilEpochMs = nil
             lastActivityDate = nowProvider()
-            if var updated = storedRecord {
+            if !keychainReadFailed, var updated = storedRecord {
                 updated.failedAttempts = 0
                 updated.lockoutUntilEpochMs = nil
                 try? keychainStore.savePasscodeRecord(updated)
@@ -411,22 +486,26 @@ public final class FabushiPasscodeLockController {
             : nil
         lockoutUntilEpochMs = nextLockoutMs
 
-        if var updated = storedRecord {
-            updated.failedAttempts = nextAttempts
-            updated.lockoutUntilEpochMs = nextLockoutMs
-            try? keychainStore.savePasscodeRecord(updated)
-        } else {
-            let lockoutRecord = FabushiPasscodeRecord(
-                isEnabled: false,
-                saltB64: "",
-                hashB64: "",
-                iterations: 0,
-                biometricsEnabled: false,
-                autoLockTimeoutSeconds: autoLockTimeoutSeconds,
-                failedAttempts: nextAttempts,
-                lockoutUntilEpochMs: nextLockoutMs
-            )
-            try? keychainStore.savePasscodeRecord(lockoutRecord)
+        // CRITICAL fail-closed invariant (R2-FIX-2): NEVER overwrite an unreadable/corrupted
+        // Keychain passcode item with a synthetic `isEnabled: false` lockout record.
+        if !keychainReadFailed {
+            if var updated = storedRecord {
+                updated.failedAttempts = nextAttempts
+                updated.lockoutUntilEpochMs = nextLockoutMs
+                try? keychainStore.savePasscodeRecord(updated)
+            } else {
+                let lockoutRecord = FabushiPasscodeRecord(
+                    isEnabled: false,
+                    saltB64: "",
+                    hashB64: "",
+                    iterations: 0,
+                    biometricsEnabled: false,
+                    autoLockTimeoutSeconds: autoLockTimeoutSeconds,
+                    failedAttempts: nextAttempts,
+                    lockoutUntilEpochMs: nextLockoutMs
+                )
+                try? keychainStore.savePasscodeRecord(lockoutRecord)
+            }
         }
 
         if backoffSeconds > 0 {
@@ -502,10 +581,14 @@ public final class FabushiPasscodeLockController {
             failedAttempts = 0
             lockoutUntilEpochMs = nil
             lastActivityDate = nowProvider()
-            if var updated = try? keychainStore.loadPasscodeRecord() {
-                updated.failedAttempts = 0
-                updated.lockoutUntilEpochMs = nil
-                try? keychainStore.savePasscodeRecord(updated)
+            do {
+                if var updated = try keychainStore.loadPasscodeRecord() {
+                    updated.failedAttempts = 0
+                    updated.lockoutUntilEpochMs = nil
+                    try? keychainStore.savePasscodeRecord(updated)
+                }
+            } catch {
+                // Preserve unreadable/corrupted Keychain passcode record untouched.
             }
         }
         return result
