@@ -47,12 +47,17 @@ public final class FabushiCallSessionController {
     public private(set) var pendingRatingCallId: String? = nil
     public var isRatingSheetPresented: Bool = false
 
+    public typealias MediaPermissionRequester = @MainActor (_ audio: Bool, _ video: Bool) async -> (microphoneGranted: Bool, cameraGranted: Bool)
+
     // Status
     public private(set) var isLoading: Bool = false
     public private(set) var lastErrorMessage: String? = nil
+    public private(set) var lastResolvedIceServerCount: Int = 0
     public private(set) var observedGeneration: UInt64
 
     @ObservationIgnored private let mediaPort: HumanCallMediaPort
+    @ObservationIgnored private let mediaPermissionRequester: MediaPermissionRequester?
+    @ObservationIgnored private let autoConfigureLiveKitMedia: Bool
     @ObservationIgnored private var peerConnection: HumanCallPeerConnection?
     @ObservationIgnored private var activeBroadcastSessionId: String?
     @ObservationIgnored private let purgerId = "m5.calls.\(UUID().uuidString)"
@@ -63,11 +68,15 @@ public final class FabushiCallSessionController {
     public init(
         coordinator: FabushiCoordinator,
         router: ShellNavigationRouter,
-        launchConfiguration: FabushiLaunchConfiguration = .current
+        launchConfiguration: FabushiLaunchConfiguration = .current,
+        mediaPermissionRequester: MediaPermissionRequester? = nil,
+        autoConfigureLiveKitMedia: Bool = true
     ) {
         self.coordinator = coordinator
         self.router = router
         self.launchConfiguration = launchConfiguration
+        self.mediaPermissionRequester = mediaPermissionRequester
+        self.autoConfigureLiveKitMedia = autoConfigureLiveKitMedia
         self.observedGeneration = coordinator.accountScopeGeneration
         self.mediaPort = HumanCallMediaPort(defaults: .standard)
 
@@ -325,9 +334,9 @@ public final class FabushiCallSessionController {
             return false
         }
 
-        let permissions = await mediaPort.requestPermissions(audio: true, video: isVideo)
+        let granted = await requestMediaPermissions(audio: true, video: isVideo)
         guard coordinator.accountScopeGeneration == capturedGen else { return false }
-        if permissions.microphone == .denied || (isVideo && permissions.camera == .denied) {
+        if !granted.microphoneGranted || (isVideo && !granted.cameraGranted) {
             isPermissionDenied = true
             callState = .failed
             lastErrorMessage = FabushiPlatformStrings.text(.callsPermissionDeniedBody, locale: locale)
@@ -663,8 +672,8 @@ public final class FabushiCallSessionController {
         }
         let target = !isCameraEnabled
         if target {
-            let perms = await mediaPort.requestPermissions(audio: false, video: true)
-            if perms.camera == .denied {
+            let perms = await requestMediaPermissions(audio: false, video: true)
+            if !perms.cameraGranted {
                 isPermissionDenied = true
                 return
             }
@@ -798,6 +807,8 @@ public final class FabushiCallSessionController {
             iceServers = Self.parseIceServers(from: rawTurn)
         }
         guard coordinator.accountScopeGeneration == expectedGeneration else { return }
+        lastResolvedIceServerCount = iceServers.count
+        guard autoConfigureLiveKitMedia else { return }
 
         let pc = HumanCallPeerConnection()
         pc.onLocalVideoTrack = { [weak self] track in
@@ -935,6 +946,20 @@ public final class FabushiCallSessionController {
                 generation: coordinator.accountScopeGeneration
             )
         }
+    }
+
+    private func requestMediaPermissions(
+        audio: Bool,
+        video: Bool
+    ) async -> (microphoneGranted: Bool, cameraGranted: Bool) {
+        if let mediaPermissionRequester {
+            return await mediaPermissionRequester(audio, video)
+        }
+        let perms = await mediaPort.requestPermissions(audio: audio, video: video)
+        return (
+            microphoneGranted: perms.microphone != .denied,
+            cameraGranted: perms.camera != .denied
+        )
     }
 
     private func currentUserId() -> UInt64 {

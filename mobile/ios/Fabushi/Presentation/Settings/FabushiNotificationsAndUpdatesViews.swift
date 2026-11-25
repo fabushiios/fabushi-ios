@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -210,8 +211,23 @@ public final class FabushiNotificationsViewModel {
 
     nonisolated private static func currentAuthorizationStatus() async -> UNAuthorizationStatus {
         await withCheckedContinuation { continuation in
+            let settled = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable (UNAuthorizationStatus) -> Void = { status in
+                let shouldResume = settled.withLock { done -> Bool in
+                    if done { return false }
+                    done = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(returning: status)
+                }
+            }
             UNUserNotificationCenter.current().getNotificationSettings { settings in
-                continuation.resume(returning: settings.authorizationStatus)
+                finish(settings.authorizationStatus)
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                finish(.notDetermined)
             }
         }
     }

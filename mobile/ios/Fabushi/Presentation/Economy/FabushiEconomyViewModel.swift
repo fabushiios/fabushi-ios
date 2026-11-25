@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 import StoreKit
 
 /// Generation-fenced ViewModel driving Economy, Stars Ledger, Star Gifts, Redeem Codes,
@@ -316,12 +317,37 @@ public final class FabushiEconomyViewModel {
 
     public func refreshStoreKitCatalog() async {
         let productIds = FabushiStoreKitPlanOption.canonicalCatalog.map(\.productId)
-        guard let products = try? await Product.products(for: productIds) else { return }
-        var map: [String: String] = [:]
-        for product in products {
-            map[product.id] = product.displayPrice
+        let fetchedPrices: [String: String]? = await withCheckedContinuation { continuation in
+            let settled = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable ([String: String]?) -> Void = { value in
+                let shouldResume = settled.withLock { done -> Bool in
+                    if done { return false }
+                    done = true
+                    return true
+                }
+                if shouldResume {
+                    continuation.resume(returning: value)
+                }
+            }
+            Task {
+                guard let products = try? await Product.products(for: productIds) else {
+                    finish(nil)
+                    return
+                }
+                var map: [String: String] = [:]
+                for product in products {
+                    map[product.id] = product.displayPrice
+                }
+                finish(map)
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                finish(nil)
+            }
         }
-        storeKitDisplayPrices = map
+        if let fetchedPrices {
+            storeKitDisplayPrices = fetchedPrices
+        }
     }
 
     public func purchaseViaStoreKit(

@@ -177,7 +177,9 @@ final class FabushiCallsAndTalkModeTests: XCTestCase, @unchecked Sendable {
             let controller = FabushiCallSessionController(
                 coordinator: coordinator,
                 router: router,
-                launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: [])
+                launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+                mediaPermissionRequester: { _, _ in (true, true) },
+                autoConfigureLiveKitMedia: false
             )
             defer { controller.detachLifecycleHooks() }
 
@@ -194,6 +196,7 @@ final class FabushiCallsAndTalkModeTests: XCTestCase, @unchecked Sendable {
             XCTAssertTrue(started)
             XCTAssertEqual(controller.activeCallId, "call-live-9")
             XCTAssertEqual(controller.callState, .connecting)
+            XCTAssertEqual(controller.lastResolvedIceServerCount, 1)
 
             // Minimize to floating Call PiP capsule
             controller.minimizeToFloatingPip(locale: .en)
@@ -286,6 +289,24 @@ final class FabushiCallsAndTalkModeTests: XCTestCase, @unchecked Sendable {
 
         // Verify HumanCallMediaPort interruption recovery helper works deterministically
         XCTAssertFalse(HumanCallMediaPort.shouldRecoverAfterAudioInterruption(userInfo: nil))
+
+        // Verify non-simulated runtime permission denial also fails closed cleanly
+        let deniedRuntimeController = FabushiCallSessionController(
+            coordinator: coordinator,
+            router: router,
+            launchConfiguration: FabushiLaunchConfiguration(environment: [:], arguments: []),
+            mediaPermissionRequester: { _, _ in (false, false) },
+            autoConfigureLiveKitMedia: false
+        )
+        defer { deniedRuntimeController.detachLifecycleHooks() }
+        let runtimeAllowed = await deniedRuntimeController.startOutgoingCall(
+            calleeUserId: 1000,
+            peerTitle: "Denied Peer",
+            isVideo: false
+        )
+        XCTAssertFalse(runtimeAllowed)
+        XCTAssertTrue(deniedRuntimeController.isPermissionDenied)
+        XCTAssertEqual(deniedRuntimeController.callState, .failed)
 
         await coordinator.shutdown()
     }
