@@ -1403,21 +1403,11 @@ public final class FabushiAgentStudioViewModel {
             let content_sha256: String?
             let now_ms: Int64?
         }
-        do {
-            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
-                method: FabushiRPCNamespace.fabushi.method("approvalConsumeValueBound"),
-                params: ConsumeParams(
-                    approval_id: approvalId,
-                    action: action,
-                    target: target,
-                    working_directory: workingDirectory,
-                    content_sha256: contentSha256,
-                    now_ms: nowMs
-                )
-            )
+        let capturedGen = coordinator.accountScopeGeneration
+        let buildConsumedToken: () -> FabushiStudioValueBoundTokenDTO = {
             let nowTimestampMs = nowMs ?? Int64(Date().timeIntervalSince1970 * 1000)
-            if let idx = valueBoundTokens.firstIndex(where: { $0.approvalId == approvalId }) {
-                let existing = valueBoundTokens[idx]
+            if let idx = self.valueBoundTokens.firstIndex(where: { $0.approvalId == approvalId }) {
+                let existing = self.valueBoundTokens[idx]
                 let updated = FabushiStudioValueBoundTokenDTO(
                     approvalId: existing.approvalId,
                     action: existing.action,
@@ -1429,7 +1419,7 @@ public final class FabushiAgentStudioViewModel {
                     spent: true,
                     retired: existing.retired
                 )
-                valueBoundTokens[idx] = updated
+                self.valueBoundTokens[idx] = updated
                 return updated
             }
             return FabushiStudioValueBoundTokenDTO(
@@ -1443,6 +1433,36 @@ public final class FabushiAgentStudioViewModel {
                 spent: true,
                 retired: false
             )
+        }
+
+        do {
+            let _: FabushiJSONValue = try await coordinator.dispatchFenced(
+                method: FabushiRPCNamespace.fabushi.method("approvalConsumeValueBound"),
+                params: ConsumeParams(
+                    approval_id: approvalId,
+                    action: action,
+                    target: target,
+                    working_directory: workingDirectory,
+                    content_sha256: contentSha256,
+                    now_ms: nowMs
+                )
+            )
+            return buildConsumedToken()
+        } catch let hostError as FabushiHostError {
+            // Rust `ApprovalLedger::verify_and_consume` returns `Result<(), ApprovalConsumeError>`,
+            // which serializes `Ok(())` as `{"ok": true, "result": null}`. Validate strictly that
+            // `ok == true`, `error == nil`, and generation has not drifted before treating as consumed.
+            if case .invalidResponse(let raw) = hostError,
+               coordinator.accountScopeGeneration == capturedGen,
+               let data = raw.data(using: .utf8),
+               let envelope = try? JSONDecoder().decode(FabushiRPCResponse<FabushiJSONValue>.self, from: data),
+               envelope.ok,
+               envelope.error == nil
+            {
+                return buildConsumedToken()
+            }
+            handleRPCFailure(hostError)
+            return nil
         } catch {
             handleRPCFailure(error)
             return nil

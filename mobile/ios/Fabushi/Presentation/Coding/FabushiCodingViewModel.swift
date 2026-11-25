@@ -374,6 +374,20 @@ public final class FabushiCodingViewModel {
                 latestDiffStat = FabushiCodingDiffStatDTO()
             }
             return thread
+        } catch let hostError as FabushiHostError {
+            if case .invalidResponse(let raw) = hostError,
+               let data = raw.data(using: .utf8),
+               let envelope = try? JSONDecoder().decode(FabushiRPCResponse<FabushiJSONValue>.self, from: data),
+               envelope.ok,
+               envelope.error == nil
+            {
+                activeThread = nil
+                checkpoints = []
+                latestDiffStat = FabushiCodingDiffStatDTO()
+                return nil
+            }
+            handleError(hostError)
+            return nil
         } catch {
             handleError(error)
             return nil
