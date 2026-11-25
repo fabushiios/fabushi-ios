@@ -795,13 +795,22 @@ public final class FabushiMessagingStore {
                 let batch = Array(candidates[offset..<end])
                 offset = end
 
+                struct PrefetchHistoryParams: Encodable, Sendable {
+                    let chat_id: UInt64
+                    let limit: Int
+                }
+                let host = self.coordinator.host
+                let capturedAccount = self.coordinator.activeAccountId
+                let limit = Self.prefetchHistoryLimit
+
                 await withTaskGroup(of: (Int64, [FabushiMessageRecord]?).self) { group in
-                    for chatId in batch {
-                        group.addTask { @MainActor [weak self] in
-                            guard let self else { return (chatId, nil) }
-                            let fetched = try? await self.client.fetchHistory(
-                                chatId: chatId,
-                                limit: Self.prefetchHistoryLimit
+                    for chatId in batch where chatId >= 0 {
+                        group.addTask {
+                            let fetched: [FabushiMessageRecord]? = try? await host.dispatch(
+                                method: FabushiRPCNamespace.messages.method("history"),
+                                params: PrefetchHistoryParams(chat_id: UInt64(chatId), limit: limit),
+                                generation: capturedGeneration,
+                                accountId: capturedAccount
                             )
                             return (chatId, fetched)
                         }
