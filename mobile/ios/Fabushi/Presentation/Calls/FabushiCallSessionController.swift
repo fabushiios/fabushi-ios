@@ -184,12 +184,22 @@ public final class FabushiCallSessionController {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let shouldRecover = HumanCallMediaPort.shouldRecoverAfterAudioInterruption(
-                userInfo: notification.userInfo
-            )
-            guard shouldRecover else { return }
+            let typeRaw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionRaw = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
             Task { @MainActor [weak self] in
-                guard let self, self.callState.isActive else { return }
+                var payload: [AnyHashable: Any] = [:]
+                if let typeRaw {
+                    payload[AVAudioSessionInterruptionTypeKey] = typeRaw
+                }
+                if let optionRaw {
+                    payload[AVAudioSessionInterruptionOptionKey] = optionRaw
+                }
+                guard let self,
+                      self.callState.isActive,
+                      HumanCallMediaPort.shouldRecoverAfterAudioInterruption(userInfo: payload)
+                else {
+                    return
+                }
                 _ = try? self.mediaPort.applyPreferredMicrophone()
             }
         }

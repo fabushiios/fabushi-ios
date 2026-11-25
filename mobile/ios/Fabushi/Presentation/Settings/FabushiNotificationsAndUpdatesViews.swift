@@ -131,8 +131,8 @@ public final class FabushiNotificationsViewModel {
     }
 
     public func refresh() async {
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        authorizationStatusLabel = Self.label(for: settings.authorizationStatus)
+        let authStatus = await Self.currentAuthorizationStatus()
+        authorizationStatusLabel = Self.label(for: authStatus)
 
         if let status: FabushiPushStatusDto = try? await coordinator.dispatchFenced(
             method: FabushiRPCNamespace.push.method("status"),
@@ -206,6 +206,14 @@ public final class FabushiNotificationsViewModel {
     public var formattedApnsStatusSummary: String {
         let regText = pushStatus.registered ? "registered" : "unregistered"
         return "APNs: \(regText) · \(authorizationStatusLabel) · \(pushStatus.serverApnsDispatch) (\(pushStatus.blockerId))"
+    }
+
+    nonisolated private static func currentAuthorizationStatus() async -> UNAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
     }
 
     private static func label(for status: UNAuthorizationStatus) -> String {
